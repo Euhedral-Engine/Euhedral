@@ -140,4 +140,16 @@ tasks.named<ProcessResources>("processResources") {
         include("*.cuh")
         into("cuda/trellis")
     }
+    // The kernel sources the Rust crate also includes live under rust/kernels; they keep their classpath path cuda/.
+    from(rootProject.layout.projectDirectory.dir("rust/kernels/quantization")) {
+        include("*.cu")
+        into("cuda")
+    }
+}
+
+// The GPTQ fixture the Rust tests also read lives under rust/resources; it keeps its classpath path gptq-fixture/.
+tasks.named<ProcessResources>("processTestResources") {
+    from(rootProject.layout.projectDirectory.dir("rust/resources/fixtures/gptq-fixture")) {
+        into("gptq-fixture")
+    }
 }

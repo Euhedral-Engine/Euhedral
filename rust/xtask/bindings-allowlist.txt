@@ -1,0 +1,34 @@
+# The native entry points and constants the cuda crate calls; `cargo xtask bindings` passes each line to bindgen as an
+# allowlist, so crates/cuda/src/sys.rs holds nothing else. A new native entry point (or constant) is added to this list
+# in the same change that first calls it, and the bindings are regenerated. Lines: `function NAME`, `type NAME` or
+# `var NAME`; blank lines and `#` lines are ignored. Names are matched whole.
+function euhedral_cuda_compute_capability
+function euhedral_cuda_copy_device_to_host
+function euhedral_cuda_copy_host_to_device
+function euhedral_cuda_device_memory_info
+function euhedral_cuda_free
+function euhedral_cuda_free_async
+function euhedral_cuda_host_free
+function euhedral_cuda_host_malloc
+function euhedral_cuda_host_weights_device_pointer
+function euhedral_cuda_host_weights_free
+function euhedral_cuda_host_weights_malloc
+function euhedral_cuda_linear_kernel_available
+function euhedral_cuda_linear_kernel_count
+function euhedral_cuda_linear_kernel_name
+function euhedral_cuda_malloc
+function euhedral_cuda_malloc_async
+function euhedral_cuda_multiprocessor_count
+function euhedral_cuda_nvfp4_native_available
+function euhedral_cuda_nvfp4_native_scratch_bytes
+function euhedral_cuda_q3_mx_available
+function euhedral_cuda_qwen4_kernel_name
+function euhedral_cuda_select_exact_numerics
+function euhedral_cuda_set_include_directory
+function euhedral_cuda_stream_clear
+function euhedral_cuda_stream_select
+function euhedral_cuda_synchronize
+var EUHEDRAL_CUDA_FORMAT_MISMATCH
+var EUHEDRAL_CUDA_INVALID_ARGUMENT
+var EUHEDRAL_CUDA_ROUTE_UNAVAILABLE
+var EUHEDRAL_CUDA_SIZE_OVERFLOW

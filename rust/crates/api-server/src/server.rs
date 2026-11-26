@@ -5,7 +5,7 @@ use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
@@ -19,6 +19,7 @@ use euhedral_net::{Counters, ServerHandle, serve};
 use crate::admission::Admission;
 use crate::answer::Answerer;
 use crate::backend::Backend;
+use crate::clock::{Clock, Timers};
 use crate::frames::once_or_refused;
 use crate::limits::Limits;
 use crate::metrics::Metrics;
@@ -41,6 +42,9 @@ pub struct ApiConfig {
     /// The sockets' engine, when the caller has one to share: it must be attached to the lattice already, and the
     /// caller completes it. `None`: the server opens one, attaches it and completes it on release.
     pub io: Option<Arc<AsyncIo>>,
+    /// The time admission and the stop's drain limit read and the timers they arm, when the caller owns them (a test
+    /// that moves time itself). `None`: the wall clock, with timers of the lattice.
+    pub clock: Option<Arc<dyn Clock>>,
 }
 
 impl Debug for ApiConfig {
@@ -59,6 +63,7 @@ pub struct ApiServer {
     local_addr: SocketAddr,
     sink: Arc<QueueIngestSink>,
     timers: Arc<Completions>,
+    clock: Arc<dyn Clock>,
     admission: Admission,
     drain_limit: Duration,
     // The sockets' engine, held so that it outlives the server (the transport holds it weakly); `own_io` says the
@@ -122,7 +127,8 @@ pub fn start_on(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig, listener:
         undo(true);
         return Err(error);
     }
-    let admission = Admission::new(config.backend.clone(), &config.limits, sink.clone(), timers.clone());
+    let clock = config.clock.unwrap_or_else(|| Arc::new(Timers::new(timers.clone())));
+    let admission = Admission::with_clock(config.backend.clone(), &config.limits, sink.clone(), clock.clone());
     let metrics = Arc::new(Metrics::new(
         config.backend.engine_report().speculative_depth,
         Metrics::wall_clock_ms(),
@@ -164,6 +170,7 @@ pub fn start_on(lattice: &Arc<ControlPlaneLattice>, config: ApiConfig, listener:
         local_addr,
         sink,
         timers,
+        clock,
         admission,
         drain_limit: config.limits.drain_limit,
         io,
@@ -214,10 +221,10 @@ impl ApiServer {
             drained.arrive();
         }));
         let late = stop;
-        let deadline = Instant::now().checked_add(self.drain_limit);
+        let deadline = self.clock.now().checked_add(self.drain_limit);
         let frame = once_or_refused(move |_| late.stop_admission());
         match deadline {
-            Some(deadline) => self.timers.at(deadline, frame),
+            Some(deadline) => self.clock.at(deadline, frame),
             // A drain limit too long to count is never reached.
             None => drop(frame),
         }

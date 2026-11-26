@@ -38,6 +38,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
+name = "bazel-gen"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -340,7 +347,7 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 [[package]]
 name = "euhedral-core"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bd5ac5b43bf883a8e3fe56256555230e4784ad28#bd5ac5b43bf883a8e3fe56256555230e4784ad28"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-data-structures",
  "euhedral-hardware-utils",
@@ -351,7 +358,7 @@ dependencies = [
 [[package]]
 name = "euhedral-data-structures"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bd5ac5b43bf883a8e3fe56256555230e4784ad28#bd5ac5b43bf883a8e3fe56256555230e4784ad28"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "loom",
 ]
@@ -359,7 +366,7 @@ dependencies = [
 [[package]]
 name = "euhedral-gpu"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bd5ac5b43bf883a8e3fe56256555230e4784ad28#bd5ac5b43bf883a8e3fe56256555230e4784ad28"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -373,7 +380,7 @@ dependencies = [
 [[package]]
 name = "euhedral-graph"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bd5ac5b43bf883a8e3fe56256555230e4784ad28#bd5ac5b43bf883a8e3fe56256555230e4784ad28"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -385,7 +392,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hardware-utils"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bd5ac5b43bf883a8e3fe56256555230e4784ad28#bd5ac5b43bf883a8e3fe56256555230e4784ad28"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-data-structures",
  "libc",
@@ -396,7 +403,7 @@ dependencies = [
 [[package]]
 name = "euhedral-hashing"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bd5ac5b43bf883a8e3fe56256555230e4784ad28#bd5ac5b43bf883a8e3fe56256555230e4784ad28"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 
 [[package]]
 name = "euhedral-inference-api-protocol"
@@ -441,9 +448,11 @@ version = "0.1.0"
 dependencies = [
  "euhedral-core",
  "euhedral-graph",
+ "euhedral-hardware-utils",
  "euhedral-hashing",
  "euhedral-inference-edrl",
  "euhedral-inference-engine",
+ "euhedral-inference-quantization",
  "euhedral-inference-settings",
  "euhedral-inference-tokenizer",
  "euhedral-io",
@@ -475,6 +484,7 @@ name = "euhedral-inference-edrl"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "euhedral-inference-edrl",
  "serde_json",
  "test-support",
  "thiserror",
@@ -509,6 +519,59 @@ dependencies = [
 [[package]]
 name = "euhedral-inference-host-gemv"
 version = "0.1.0"
+
+[[package]]
+name = "euhedral-inference-hub-deps"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "log",
+ "windows-sys",
+]
+
+[[package]]
+name = "euhedral-inference-quantization"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "euhedral-core",
+ "euhedral-data-structures",
+ "euhedral-gpu",
+ "euhedral-graph",
+ "euhedral-hashing",
+ "euhedral-inference-api-protocol",
+ "euhedral-inference-cuda",
+ "euhedral-inference-edrl",
+ "euhedral-inference-engine",
+ "euhedral-inference-quantization",
+ "euhedral-inference-settings",
+ "euhedral-inference-tokenizer",
+ "euhedral-io",
+ "euhedral-memory",
+ "same-file",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "test-support",
+ "thiserror",
+]
+
+[[package]]
+name = "euhedral-inference-quantize"
+version = "0.1.0"
+dependencies = [
+ "euhedral-core",
+ "euhedral-graph",
+ "euhedral-inference-edrl",
+ "euhedral-inference-engine",
+ "euhedral-inference-quantization",
+ "euhedral-inference-settings",
+ "euhedral-io",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "euhedral-inference-server"
@@ -549,7 +612,7 @@ dependencies = [
 [[package]]
 name = "euhedral-io"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bd5ac5b43bf883a8e3fe56256555230e4784ad28#bd5ac5b43bf883a8e3fe56256555230e4784ad28"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -561,7 +624,7 @@ dependencies = [
 [[package]]
 name = "euhedral-memory"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bd5ac5b43bf883a8e3fe56256555230e4784ad28#bd5ac5b43bf883a8e3fe56256555230e4784ad28"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -574,7 +637,7 @@ dependencies = [
 [[package]]
 name = "euhedral-net"
 version = "0.1.0"
-source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=bd5ac5b43bf883a8e3fe56256555230e4784ad28#bd5ac5b43bf883a8e3fe56256555230e4784ad28"
+source = "git+https://github.com/Euhedral-Engine/RustEE.git?rev=2d11a4aff406d7aa326f735b97da888d35f29d5f#2d11a4aff406d7aa326f735b97da888d35f29d5f"
 dependencies = [
  "euhedral-core",
  "euhedral-data-structures",
@@ -1146,6 +1209,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1553,6 +1625,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]

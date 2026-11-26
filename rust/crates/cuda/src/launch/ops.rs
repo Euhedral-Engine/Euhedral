@@ -15,7 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use euhedral_gpu::cuda::CudaKernel;
-use euhedral_gpu::{GpuError, LaneEnqueue, LaneStream};
+use euhedral_gpu::{Args, GpuError, LaneEnqueue, LaneStream, Launch as GpuLaunch, RawStream};
 use euhedral_graph::Marker;
 
 use crate::error::{CudaError, check};
@@ -35,6 +35,10 @@ use crate::launch::gdn::{
 };
 use crate::launch::load::KernelTable;
 use crate::launch::nvfp4::{Nvfp4Operands, plan_linear, plan_native};
+use crate::launch::q3::{
+    Bits, Q3Operands, plan_linear_q3, plan_linear_q45, plan_mx, plan_mx_gate_up_swiglu, plan_p2e2_decode,
+    plan_p2e2_expand,
+};
 use crate::launch::queue::{EnqueueError, enqueue_overlapping};
 use crate::launch::table::{Geometry, plan_linear_launch, plan_qwen4_launch};
 use crate::launch::{Modes, PlanError};
@@ -443,6 +447,180 @@ where
             scratch_bytes,
             self.table.dispatch().skinny_target_ctas(),
             self.modes.exact_numerics,
+        )
+        .map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn linear_q3_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_linear_q3_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features,
+            out_features,
+            weights_byte_size: weights_bytes,
+        };
+        let plan = plan_linear_q3(&operands, self.modes.exact_numerics).map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn linear_quantized_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+        bits: u32,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_linear_quantized_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features,
+            out_features,
+            weights_byte_size: weights_bytes,
+        };
+        let bits = Bits::from_number(bits)
+            .filter(|bits| *bits != Bits::Q3)
+            .ok_or_else(|| refused(CALL, PlanError::FormatMismatch))?;
+        let plan = plan_linear_q45(bits, &operands, self.modes.exact_numerics).map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn linear_q3_p2e2_decode_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_linear_q3_p2e2_decode_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features,
+            out_features,
+            weights_byte_size: weights_bytes,
+        };
+        let plan = plan_p2e2_decode(&operands, self.modes.exact_numerics).map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn q3_p2e2_expand(
+        &mut self,
+        weights: DevicePtr,
+        weights_bytes: u64,
+        rows: u32,
+        in_features: u32,
+        first_row: u32,
+        row_count: u32,
+        destination: DevicePtr,
+        destination_bytes: u64,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_q3_p2e2_expand";
+        let plan = plan_p2e2_expand(
+            weights,
+            weights_bytes,
+            rows,
+            in_features,
+            first_row,
+            row_count,
+            destination,
+            destination_bytes,
+        )
+        .map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn linear_q3_mx_bf16(
+        &mut self,
+        bits: u32,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+        split_rows: u32,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_linear_q3_mx_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features,
+            out_features,
+            weights_byte_size: weights_bytes,
+        };
+        let bits = Bits::from_number(bits).ok_or_else(|| refused(CALL, PlanError::InvalidArgument))?;
+        let plan = plan_mx(
+            bits,
+            &operands,
+            scratch,
+            scratch_bytes,
+            self.table.dispatch().sm_count,
+            split_rows,
+            self.modes.exact_numerics,
+            self.modes.row_exact,
+        )
+        .map_err(|error| refused(CALL, error))?;
+        self.enqueue_all(plan.launches())
+    }
+
+    fn q3_mx_gate_up_swiglu_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        width: u32,
+        outputs: u32,
+        weights_bytes: u64,
+        scratch_bytes: u64,
+    ) -> Result<(), CudaError> {
+        const CALL: &str = "euhedral_cuda_q3_mx_gate_up_swiglu_bf16";
+        let operands = Q3Operands {
+            input,
+            weights,
+            output,
+            rows,
+            in_features: width,
+            out_features: outputs,
+            weights_byte_size: weights_bytes,
+        };
+        let plan = plan_mx_gate_up_swiglu(
+            &operands,
+            scratch,
+            scratch_bytes,
+            self.modes.exact_numerics,
+            self.modes.row_exact,
         )
         .map_err(|error| refused(CALL, error))?;
         self.enqueue_all(plan.launches())
@@ -925,26 +1103,135 @@ where
     /// the selection after. The lent stream is private to the submission and the operations enqueued after the lend go
     /// to it too, so the call is ordered with everything enqueued before it and after it.
     pub fn on_lent_stream<R>(&self, call: impl FnOnce(&Arc<CudaLibrary>) -> R) -> Result<R, CudaError> {
-        let Some((library, _)) = self.lane else {
-            return Err(CudaError::Argument(
-                "the operations were made without a lane's library: use `on_lane`".to_string(),
-            ));
+        with_lent_stream(self.lane_library()?, &*self.queue, call)
+    }
+
+    fn lane_library(&self) -> Result<&Arc<CudaLibrary>, CudaError> {
+        self.lane.map(|(library, _)| library).ok_or_else(|| {
+            CudaError::Argument("the operations were made without a lane's library: use `on_lane`".to_string())
+        })
+    }
+}
+
+/// Runs `call` with the C library's stream selected for the calling thread to the stream `queue` lends, and clears the
+/// selection after.
+fn with_lent_stream<Q, R>(
+    library: &Arc<CudaLibrary>,
+    queue: &Q,
+    call: impl FnOnce(&Arc<CudaLibrary>) -> R,
+) -> Result<R, CudaError>
+where
+    Q: LaneStream<Raw = *mut c_void>,
+{
+    let stream = queue
+        .raw_stream()
+        .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?
+        .as_raw();
+    // SAFETY: the stream is live for this submission; the selection is cleared before the lent stream can end.
+    let status = unsafe {
+        library
+            .api()
+            .euhedral_cuda_stream_select(stream.expose_provenance() as u64)
+    };
+    check("euhedral_cuda_stream_select", status)?;
+    // The selection is cleared when the call returns or panics.
+    let _selection = SelectedStream(library);
+    Ok(call(library))
+}
+
+impl DeviceBuffer {
+    /// Allocates `bytes` in stream order on the stream `queue` lends: the allocation is ordered with the work already
+    /// enqueued on it and with what is enqueued after. Free it with [`DeviceBuffer::free_on_lane`]; a plain drop
+    /// waits for the device.
+    pub fn alloc_on_lane<Q>(library: &Arc<CudaLibrary>, queue: &Q, bytes: usize) -> Result<DeviceBuffer, CudaError>
+    where
+        Q: LaneStream<Raw = *mut c_void>,
+    {
+        with_lent_stream(library, queue, |library| {
+            DeviceBuffer::alloc_on_selected(library, bytes)
+        })?
+    }
+
+    /// Frees a stream-ordered buffer in stream order on the stream `queue` lends, so the free waits for the work
+    /// already enqueued there and never waits for the device. A buffer that was not allocated stream-ordered is
+    /// refused (and dropped, with the plain free). When the stream cannot be selected the buffer comes back in the
+    /// error, still allocated: dropping it would be the plain free, so the caller parks it and tries again.
+    pub fn free_on_lane<Q>(self, library: &Arc<CudaLibrary>, queue: &Q) -> Result<(), FreeFailure>
+    where
+        Q: LaneStream<Raw = *mut c_void>,
+    {
+        if !self.is_stream_ordered() {
+            return Err(FreeFailure {
+                buffer: None,
+                error: CudaError::Argument(
+                    "a buffer from DeviceBuffer::alloc is freed with cudaFree, which waits for the device; allocate \
+                     with alloc_async to free it in stream order"
+                        .to_string(),
+                ),
+            });
+        }
+        let mut slot = Some(self);
+        match with_lent_stream(library, queue, |_| slot.take().map(DeviceBuffer::free_on_selected)) {
+            Ok(Some(freed)) => freed.map_err(|error| FreeFailure { buffer: None, error }),
+            Ok(None) => Ok(()),
+            Err(error) => Err(FreeFailure { buffer: slot, error }),
+        }
+    }
+}
+
+/// A free in stream order that did not happen.
+#[derive(Debug)]
+pub struct FreeFailure {
+    /// The buffer, still allocated, when it was not freed and not dropped.
+    pub buffer: Option<DeviceBuffer>,
+    pub error: CudaError,
+}
+
+impl<Q> RusteeOps<'_, Q>
+where
+    Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
+{
+    /// Launches `kernel`, a kernel that is not in the catalog (another module's), in order with the operations queued
+    /// through `self`.
+    ///
+    /// # Safety
+    /// As [`LaneEnqueue::launch`]: every address the kernel touches is valid
+    /// for that access until the work retires.
+    pub unsafe fn launch_kernel(
+        &mut self,
+        kernel: &CudaKernel,
+        geometry: GpuLaunch,
+        args: &Args,
+    ) -> Result<(), CudaError> {
+        let driver = kernel.parameter_sizes().ok_or_else(|| {
+            CudaError::Argument("launch_kernel: the driver does not report the kernel's parameter sizes".into())
+        })?;
+        let same =
+            args.len() == driver.len() && args.sizes().zip(driver).all(|(size, &driver)| size == driver as usize);
+        if !same {
+            return Err(CudaError::Argument(format!(
+                "launch_kernel: the arguments' sizes {:?} are not the kernel's parameter sizes {driver:?}",
+                args.sizes().collect::<Vec<_>>()
+            )));
+        }
+        let geometry = GpuLaunch {
+            programmatic: geometry.programmatic && self.pdl,
+            ..geometry
         };
+        // SAFETY: the caller's contract; the arguments were checked against the kernel's parameter sizes above.
+        unsafe { self.queue.launch(kernel, geometry, args) }.map_err(|error| lane_error("launch_kernel", &error))
+    }
+
+    /// Runs `call` with the stream the lane lends, for a library call that takes the stream itself (cuBLAS through
+    /// [`LaneHandles`](crate::math::LaneHandles)). The lent stream is the one every operation of this submission goes
+    /// to, so the call is ordered with everything enqueued before it and after it; the contract of
+    /// [`LaneStream::raw_stream`] applies to what `call` does with it.
+    pub fn with_raw_stream<R>(&self, call: impl FnOnce(&RawStream<'_, *mut c_void>) -> R) -> Result<R, CudaError> {
         let stream = self
             .queue
             .raw_stream()
-            .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?
-            .as_raw();
-        // SAFETY: the stream is live for this submission; the selection is cleared before the lent stream can end.
-        let status = unsafe {
-            library
-                .api()
-                .euhedral_cuda_stream_select(stream.expose_provenance() as u64)
-        };
-        check("euhedral_cuda_stream_select", status)?;
-        // The selection is cleared when the call returns or panics.
-        let _selection = SelectedStream(library);
-        Ok(call(library))
+            .ok_or_else(|| CudaError::Argument("the lane lent no stream".to_string()))?;
+        Ok(call(&stream))
     }
 }
 
@@ -969,18 +1256,14 @@ where
     }
 
     fn alloc_async(&mut self, bytes: usize) -> Result<DeviceBuffer, CudaError> {
-        self.on_lent_stream(|library| DeviceBuffer::alloc_on_selected(library, bytes))?
+        let library = self.lane_library()?;
+        DeviceBuffer::alloc_on_lane(library, &*self.queue, bytes)
     }
 
     fn free_async(&mut self, buffer: DeviceBuffer) -> Result<(), CudaError> {
-        if !buffer.is_stream_ordered() {
-            // Dropped here: the plain free, which waits for the device. Freeing it with `cudaFreeAsync` would be wrong.
-            return Err(CudaError::Argument(
-                "a buffer from DeviceBuffer::alloc is freed with cudaFree, which waits for the device; allocate with \
-                 alloc_async to free it in stream order"
-                    .to_string(),
-            ));
-        }
-        self.on_lent_stream(|_| buffer.free_on_selected())?
+        let library = self.lane_library()?;
+        buffer
+            .free_on_lane(library, &*self.queue)
+            .map_err(|failure| failure.error)
     }
 }

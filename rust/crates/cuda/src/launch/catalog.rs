@@ -7,8 +7,8 @@
 //! dynamic shared memory it sets as the function's maximum, and whether it registers the kernel for programmatic
 //! dependent launch (`euhedral_cuda_pdl_register`).
 //!
-//! The families are the ones the Rust engine calls (`ops.rs`). The native library has more kernels (the Q3 and Q4/Q5
-//! linears, the multi-expert GEMMs, the drafter's, `euhedral_linear_bf16_to_float`, `euhedral_gdn_control_fp32`,
+//! The families are the ones the Rust engine calls (`ops.rs`). The native library has more kernels (the Q3 gate-up
+//! SwiGLU, the multi-expert GEMMs, the drafter's, `euhedral_linear_bf16_to_float`, `euhedral_gdn_control_fp32`,
 //! `euhedral_bf16_embedding`, the native gate-up SwiGLU); they stay out until the engine calls them.
 
 use crate::DevicePtr;
@@ -32,6 +32,12 @@ pub enum Module {
     Nvfp4,
     /// Native Blackwell NVFP4; compiled for the architecture-specific target.
     Nvfp4Native,
+    /// The Q3 decode kernels and the P2E2 decode and expansion.
+    Q3,
+    /// The Q4 and Q5 decode kernels.
+    Q45,
+    /// Block-scaled FP8 tensor cores for the Q3, Q4 and Q5 prefill; compiled for the architecture-specific target.
+    Q3Mx,
     Reference,
 }
 
@@ -50,6 +56,9 @@ impl Module {
             Module::Attention => "attention/kernels.cu",
             Module::Nvfp4 => "nvfp4/kernels.cu",
             Module::Nvfp4Native => "nvfp4_native/kernels.cu",
+            Module::Q3 => "q3/kernels.cu",
+            Module::Q45 => "q45/kernels.cu",
+            Module::Q3Mx => "q3_mx/kernels.cu",
             Module::Reference => "reference/kernels.cu",
         }
     }
@@ -57,7 +66,7 @@ impl Module {
     /// Whether the module needs the architecture-specific target (`sm_XYa`), which exists on compute capability 12.x
     /// only; on another device its kernels are unavailable.
     pub const fn architecture_specific(self) -> bool {
-        matches!(self, Module::TrellisFp8 | Module::Nvfp4Native)
+        matches!(self, Module::TrellisFp8 | Module::Nvfp4Native | Module::Q3Mx)
     }
 }
 
@@ -76,6 +85,8 @@ pub enum Family {
     Nvfp4,
     /// The embedding lookups outside the linear table.
     Embedding,
+    /// The Q3, Q4 and Q5 grouped linears: decode, reference, FP8 prefill and the P2E2 expansion.
+    Q3,
 }
 
 /// One kernel, as the native library has it.
@@ -215,7 +226,7 @@ const LINEAR_TABLE_LEN: usize = 11;
 /// `native/src/host/qwen4_ops.c:12-50`.
 const QWEN4_TABLE_LEN: usize = 36;
 
-const SPECS: [KernelSpec; 148] = [
+const SPECS: [KernelSpec; 188] = [
     spec(
         Family::LinearTable,
         "euhedral_trellis_prepass",
@@ -1018,12 +1029,58 @@ const SPECS: [KernelSpec; 148] = [
         0,
         false,
     ),
+    spec(Family::Q3, "euhedral_q3_decode_contiguous", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_decode_contiguous_rows2", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_decode_contiguous_rows3", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_decode_contiguous_rows4", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_decode_contiguous_rows5", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_decode_contiguous_rows6", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_decode_contiguous_rows7", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_decode_contiguous_rows8", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_decode_contiguous_tokens", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_p2e2_decode", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_p2e2_decode_rows2", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_p2e2_decode_rows3", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_p2e2_decode_rows4", Module::Q3, 0, true),
+    spec(Family::Q3, "euhedral_q3_p2e2_expand", Module::Q3, 0, false),
+    spec(Family::Q3, "euhedral_q4_decode_contiguous", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q4_decode_contiguous_rows2", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q4_decode_contiguous_rows3", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q4_decode_contiguous_rows4", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q4_decode_contiguous_rows5", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q4_decode_contiguous_rows6", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q4_decode_contiguous_rows7", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q4_decode_contiguous_rows8", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q4_decode_contiguous_tokens", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q5_decode_contiguous", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q5_decode_contiguous_rows2", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q5_decode_contiguous_rows3", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q5_decode_contiguous_rows4", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q5_decode_contiguous_rows5", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q5_decode_contiguous_rows6", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q5_decode_contiguous_rows7", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q5_decode_contiguous_rows8", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q5_decode_contiguous_tokens", Module::Q45, 0, true),
+    spec(Family::Q3, "euhedral_q3mx_quantize", Module::Q3Mx, 0, false),
+    spec(Family::Q3, "euhedral_q3mx_linear_128x128", Module::Q3Mx, 75264, false),
+    spec(Family::Q3, "euhedral_q4mx_linear_128x128", Module::Q3Mx, 75264, false),
+    spec(Family::Q3, "euhedral_q5mx_linear_128x128", Module::Q3Mx, 75264, false),
+    spec(
+        Family::Q3,
+        "euhedral_q3mx_gate_up_swiglu_128x64",
+        Module::Q3Mx,
+        75264,
+        false,
+    ),
+    spec(Family::Q3, "euhedral_q3mx_reduce", Module::Q3Mx, 0, false),
+    spec(Family::Q3, "euhedral_q3_reference", Module::Reference, 0, false),
+    spec(Family::Q3, "euhedral_q45_reference", Module::Reference, 0, false),
 ];
 
 /// The parameters of one tensor map, as the C code passes them to `cuTensorMapEncodeTiled` (`byte_map`,
 /// `nvfp4_linear.c`). Every map is over bytes (`UINT8`) with unit element strides, no interleave, 128-byte L2
 /// promotion and no out-of-bounds fill; those do not vary and are not fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TensorMapPlan {
     /// The global address (`CUdeviceptr`).
     pub address: u64,
@@ -1039,7 +1096,7 @@ pub struct TensorMapPlan {
 }
 
 /// The swizzle of a tensor map (`CUtensorMapSwizzle`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TensorMapSwizzle {
     None,
     B64,
@@ -1304,6 +1361,25 @@ mod tests {
                 }
             }
         }
+        // q3_linear_bf16.c:`initialize`: the one-row decode kernel, its 2 to 8 row twins and the token-row twin, and the
+        // P2E2 decode kernels of 1 to 4 rows (the expansion is not registered).
+        registered.insert("euhedral_q3_decode_contiguous".to_string());
+        registered.insert("euhedral_q3_decode_contiguous_tokens".to_string());
+        for rows in 2..=8 {
+            registered.insert(format!("euhedral_q3_decode_contiguous_rows{rows}"));
+        }
+        registered.insert("euhedral_q3_p2e2_decode".to_string());
+        for rows in 2..=4 {
+            registered.insert(format!("euhedral_q3_p2e2_decode_rows{rows}"));
+        }
+        // q45_linear.c:`initialize`, for Q4 and Q5.
+        for bits in [4, 5] {
+            registered.insert(format!("euhedral_q{bits}_decode_contiguous"));
+            registered.insert(format!("euhedral_q{bits}_decode_contiguous_tokens"));
+            for rows in 2..=8 {
+                registered.insert(format!("euhedral_q{bits}_decode_contiguous_rows{rows}"));
+            }
+        }
         // Registered natively and not launched by the Rust engine, so not in the catalog: qwen_layer_ops.c:170
         // (`euhedral_linear_bf16_to_float`) and :171 (`euhedral_gdn_control_fp32`).
         for name in ["euhedral_linear_bf16_to_float", "euhedral_gdn_control_fp32"] {
@@ -1414,7 +1490,7 @@ mod tests {
             .collect();
         assert_eq!(
             specific,
-            BTreeSet::from(["trellis_fp8/kernels.cu", "nvfp4_native/kernels.cu"])
+            BTreeSet::from(["trellis_fp8/kernels.cu", "nvfp4_native/kernels.cu", "q3_mx/kernels.cu"])
         );
     }
 
@@ -1459,7 +1535,26 @@ mod tests {
         assert_eq!(kernel!("euhedral_nvfp4n_skinny_64").spec().shared_opt_in_bytes, 92160);
         // Everything else sets none.
         let with: usize = KERNELS.iter().filter(|kernel| kernel.shared_opt_in_bytes != 0).count();
-        assert_eq!(with, 1 + 1 + 2 + 5 + 2 + 6);
+        // The three FP8 prefill linears of Q3, Q4 and Q5 (`Q3MX_SHARED_BYTES`, `q3_mx.c`).
+        assert_eq!(
+            kernel!("euhedral_q3mx_linear_128x128").spec().shared_opt_in_bytes,
+            75264
+        );
+        assert_eq!(
+            kernel!("euhedral_q4mx_linear_128x128").spec().shared_opt_in_bytes,
+            75264
+        );
+        assert_eq!(
+            kernel!("euhedral_q5mx_linear_128x128").spec().shared_opt_in_bytes,
+            75264
+        );
+        assert_eq!(
+            kernel!("euhedral_q3mx_gate_up_swiglu_128x64")
+                .spec()
+                .shared_opt_in_bytes,
+            75264
+        );
+        assert_eq!(with, 1 + 1 + 2 + 5 + 2 + 6 + 3 + 1);
     }
 
     #[test]

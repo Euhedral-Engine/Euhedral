@@ -7,8 +7,8 @@ use crate::format::{TensorDataType, WeightFormat, WeightLayout, accepts_byte_siz
 use crate::header::{Header, MAX_COUNT};
 use crate::reader::{Reader, checked_end, non_negative};
 
-const MAX_RANK: i32 = 64;
-const MAX_NAME_BYTES: usize = 1 << 20;
+pub(crate) const MAX_RANK: i32 = 64;
+pub(crate) const MAX_NAME_BYTES: usize = 1 << 20;
 /// The smallest entry: a one-byte name, rank 0, and the ordinals, offset and size.
 const MIN_ENTRY_BYTES: usize = 4 + 1 + 4 + 12 + 16;
 
@@ -25,6 +25,28 @@ pub struct TensorEntry {
 }
 
 impl TensorEntry {
+    /// An entry to encode: nothing is checked until [`encode_table`](crate::encode_table), which holds the table to
+    /// the rules [`TensorTable::parse`] enforces.
+    pub fn new(
+        name: impl Into<String>,
+        shape: Vec<u64>,
+        dtype: TensorDataType,
+        format: WeightFormat,
+        layout: WeightLayout,
+        offset: u64,
+        bytes: u64,
+    ) -> TensorEntry {
+        TensorEntry {
+            name: name.into(),
+            shape,
+            dtype,
+            format,
+            layout,
+            offset,
+            bytes,
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -92,6 +114,20 @@ impl TensorTable {
             return Err(EdrlError::invalid("tensor table has trailing or missing bytes"));
         }
         validate_non_overlapping(&entries)?;
+        let mut index = HashMap::with_capacity(entries.len());
+        for (position, entry) in entries.iter().enumerate() {
+            if index.insert(entry.name.clone(), position).is_some() {
+                return Err(EdrlError::DuplicateName {
+                    name: entry.name.clone(),
+                });
+            }
+        }
+        Ok(TensorTable { entries, index })
+    }
+
+    /// A table of `entries` in the order given, whose payloads may lie in different files: only the names are checked
+    /// (unique). Offsets are not compared across entries, because two files' payloads overlap by position.
+    pub fn from_entries(entries: Vec<TensorEntry>) -> Result<TensorTable, EdrlError> {
         let mut index = HashMap::with_capacity(entries.len());
         for (position, entry) in entries.iter().enumerate() {
             if index.insert(entry.name.clone(), position).is_some() {
@@ -178,7 +214,7 @@ fn entry(reader: &mut Reader<'_>, header: &Header, content_end: u64) -> Result<T
 }
 
 /// Rejects two non-empty payloads that share a byte.
-fn validate_non_overlapping(entries: &[TensorEntry]) -> Result<(), EdrlError> {
+pub(crate) fn validate_non_overlapping(entries: &[TensorEntry]) -> Result<(), EdrlError> {
     let mut by_offset: Vec<&TensorEntry> = entries.iter().filter(|entry| entry.bytes > 0).collect();
     by_offset.sort_by_key(|entry| entry.offset);
     for pair in by_offset.windows(2) {

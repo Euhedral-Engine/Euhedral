@@ -15,7 +15,7 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use common::{Fixture, PATIENCE, assert_json, lattice, small_limits};
+use common::{Fixture, HANG_GUARD, assert_json, lattice, small_limits};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
@@ -103,7 +103,7 @@ impl Rig {
             }),
         );
         self.publisher.publish(first);
-        rx.recv_timeout(PATIENCE).expect("the chain ended")
+        rx.recv_timeout(HANG_GUARD).expect("the chain ended")
     }
 
     fn count(&self, body: &[u8]) -> Result<usize, ApiError> {
@@ -116,7 +116,7 @@ impl Rig {
             }),
         );
         self.publisher.publish(first);
-        rx.recv_timeout(PATIENCE).expect("the chain ended")
+        rx.recv_timeout(HANG_GUARD).expect("the chain ended")
     }
 
     /// How many frames the last chain published, its first included.
@@ -345,7 +345,7 @@ impl Rig {
             }),
         );
         self.publisher.publish(first);
-        rx.recv_timeout(PATIENCE).expect("the chain ended")
+        rx.recv_timeout(HANG_GUARD).expect("the chain ended")
     }
 }
 
@@ -728,7 +728,7 @@ fn a_step_that_panics_gets_the_servers_error() {
         }),
     );
     Inline.publish(first);
-    let outcome = rx.recv_timeout(PATIENCE).expect("the chain answered");
+    let outcome = rx.recv_timeout(HANG_GUARD).expect("the chain answered");
     assert_eq!(outcome.expect_err("an error"), ApiError::server_error());
     // The outcome was called once: nothing else is waiting.
     assert!(rx.try_recv().is_err());

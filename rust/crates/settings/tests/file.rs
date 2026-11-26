@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use euhedral_inference_settings::{
-    Auto, ByteSize, CpuList, HostLayerCompute, KvFormat, ModelSettings, Settings, SettingsErrors, load_file,
+    Auto, ByteSize, CpuList, HostLayerCompute, KvFormat, ModelSettings, Settings, SettingsErrors, SpeculationMode,
+    load_file, load_for_tool,
 };
 
 const MODEL: &str = "model:\n  artifact: /m/a.edrl\n  name: q\n";
@@ -117,7 +118,7 @@ fn file_must_be_a_mapping_and_must_exist() {
 #[test]
 fn values_parse() {
     let settings = load(&format!(
-        "{MODEL}context:\n  kv-cache-format: bf16\nmemory:\n  gpu-limit: 1GiB\n  host-limit: 0\n  runtime-reserve: 900MiB\nhost:\n  cpus: 2-5,8\n  idle-release: 0\n  max-batch-size: 2\n\
+        "{MODEL}context:\n  kv-cache-format: bf16\nmemory:\n  gpu-limit: 1GiB\n  host-limit: 0\n  runtime-reserve: 900MiB\n  runtime-headroom: 256MiB\nhost:\n  cpus: 2-5,8\n  idle-release: 0\n  max-batch-size: 2\n\
          server:\n  requests:\n    timeout: 90s\n    max-body-size: 2MiB\n"
     ))
     .unwrap();
@@ -125,6 +126,7 @@ fn values_parse() {
     assert_eq!(settings.memory.gpu_limit, Auto::Value(ByteSize::gib(1)));
     assert_eq!(settings.memory.host_limit, Auto::Value(ByteSize(0)));
     assert_eq!(settings.memory.runtime_reserve, Auto::Value(ByteSize::mib(900)));
+    assert_eq!(settings.memory.runtime_headroom, Auto::Value(ByteSize::mib(256)));
     assert_eq!(
         settings.host.cpus.value().unwrap().ids().collect::<Vec<_>>(),
         [2, 3, 4, 5, 8]
@@ -234,6 +236,14 @@ fn limits_and_formats() {
         ByteSize::mib(4)
     );
     assert_eq!(load(MODEL).unwrap().prefix_cache.copy_piece_bytes, ByteSize::mib(16));
+    assert!(problems(&format!("{MODEL}host:\n  copy-chunk-bytes: 0\n"))[0].contains("host.copy-chunk-bytes"));
+    assert_eq!(
+        load(&format!("{MODEL}host:\n  copy-chunk-bytes: 4MiB\n"))
+            .unwrap()
+            .host
+            .copy_chunk_bytes,
+        ByteSize::mib(4)
+    );
     assert!(problems(&format!("{MODEL}kernels:\n  trellis:\n    tensor-core-max-tokens: 7\n"))[0].contains("8 to"));
     assert!(problems(&format!("{MODEL}context:\n  kv-cache-format: fp8\n"))[0].contains("nvfp4, bf16 or auto"));
     assert_eq!(
@@ -338,4 +348,27 @@ fn the_dispatch_kernel_settings_default_to_auto_and_parse() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn a_tool_that_serves_no_model_loads_without_the_model_keys() {
+    assert!(
+        load("host:\n  copy-chunk-bytes: 1MiB\n").is_err(),
+        "a server needs its model"
+    );
+    let settings = load_for_tool(&[], &no_env).unwrap();
+    assert_eq!(settings.host.copy_chunk_bytes, ByteSize::mib(16));
+}
+
+#[test]
+fn speculation_mode_reads_artifact_or_none_and_refuses_anything_else() {
+    assert_eq!(load(MODEL).unwrap().speculation.mode, SpeculationMode::Artifact);
+    assert_eq!(
+        load(&format!("{MODEL}speculation:\n  mode: none\n"))
+            .unwrap()
+            .speculation
+            .mode,
+        SpeculationMode::None
+    );
+    assert!(problems(&format!("{MODEL}speculation:\n  mode: mtp\n"))[0].contains("artifact or none"));
 }

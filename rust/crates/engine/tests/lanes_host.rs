@@ -12,7 +12,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,7 @@ use euhedral_graph::{
     StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_inference_engine::quantum::home::{home_of, lane_for};
-use euhedral_inference_engine::quantum::whole::{Launches, Site, run_cached};
+use euhedral_inference_engine::quantum::whole::{Launches, Site, run_cached, run_held};
 use euhedral_inference_engine::runtime::open_lane_set;
 use euhedral_inference_engine::stages::{Unmarked, submit_on};
 
@@ -784,4 +784,64 @@ fn a_failure_in_a_graph_body_answers_its_error_and_a_busy_lane_retries() {
         &mut hold,
     );
     assert!(matches!(retried, Err(StageError::Retry)), "{retried:?}");
+}
+
+/// A body that keeps a value, queues work, then panics.
+struct Panics {
+    kernel: FakeKernel,
+    words: [u64; 3],
+    kept: Arc<()>,
+}
+
+impl Launches<FakeGpu> for Panics {
+    fn launch<E: Enqueue<Kernel = FakeKernel>>(&mut self, enq: &mut E) -> Result<(), StageError> {
+        enq.keep(Box::new(Arc::clone(&self.kept)));
+        combine(enq, &self.kernel, self.words, 2)?;
+        panic!("the body panicked");
+    }
+}
+
+/// A body that panics after it kept a value and queued work does not drop what the run kept: the quantum's store holds it
+/// until the quantum drops it, after the queued work ran.
+#[test]
+fn a_panicking_graph_body_leaves_its_hold_in_the_store() {
+    let gpu = gpu();
+    let words = [gpu.alloc(4), gpu.alloc(4), gpu.alloc(4)];
+    let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
+    let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
+    let cache = SharedGraphCache::<FakeGpu, u128>::with_capacity(4);
+    let kept = Arc::new(());
+    let mut launches = Panics {
+        kernel: kernel(&gpu),
+        words,
+        kept: Arc::clone(&kept),
+    };
+    let store = OnceLock::new();
+    let caught = catch_unwind(AssertUnwindSafe(|| {
+        run_held(
+            &Site {
+                gpu: &*gpu,
+                lane: &*lane,
+                waits: &[],
+            },
+            &cache,
+            1,
+            &mut launches,
+            &store,
+        )
+    }));
+    assert!(caught.is_err(), "the panic goes on");
+    let hold = store.get().expect("the hold was stored before the panic went on");
+    assert!(!hold.is_empty(), "the stored hold keeps what the run kept");
+    assert_eq!(Arc::strong_count(&kept), 3, "the value the body kept is alive");
+    gpu.run_until_idle();
+    assert_eq!(
+        Arc::strong_count(&kept),
+        3,
+        "the queued work ran and the hold still keeps the value"
+    );
+    drop(store);
+    assert_eq!(Arc::strong_count(&kept), 2, "the quantum's drop releases it");
+    drop(launches);
+    assert_eq!(Arc::strong_count(&kept), 1);
 }

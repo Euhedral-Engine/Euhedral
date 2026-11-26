@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/api-protocol", "crates/api-server", "crates/bench", "crates/cuda", "crates/edrl", "crates/engine", "crates/host-gemv", "crates/server", "crates/settings", "crates/test-support", "crates/tokenizer", "xtask"]
+members = ["crates/api-protocol", "crates/api-server", "crates/bench", "crates/cuda", "crates/edrl", "crates/engine", "crates/host-gemv", "crates/hub-deps", "crates/quantization", "crates/quantize", "crates/server", "crates/settings", "crates/test-support", "crates/tokenizer", "tools/bazel-gen", "xtask"]
 resolver = "3"
 
 [workspace.package]
@@ -11,26 +11,27 @@ publish = false
 # every one pinned to the same `rev`.
 [workspace.dependencies]
 crc32fast = "1.5"
-euhedral-core = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bd5ac5b43bf883a8e3fe56256555230e4784ad28" }
-euhedral-data-structures = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bd5ac5b43bf883a8e3fe56256555230e4784ad28" }
-euhedral-gpu = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bd5ac5b43bf883a8e3fe56256555230e4784ad28", default-features = false }
-euhedral-graph = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bd5ac5b43bf883a8e3fe56256555230e4784ad28", default-features = false }
-euhedral-hardware-utils = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bd5ac5b43bf883a8e3fe56256555230e4784ad28" }
-euhedral-io = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bd5ac5b43bf883a8e3fe56256555230e4784ad28" }
-euhedral-memory = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bd5ac5b43bf883a8e3fe56256555230e4784ad28", default-features = false }
-euhedral-hashing = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bd5ac5b43bf883a8e3fe56256555230e4784ad28" }
-euhedral-net = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "bd5ac5b43bf883a8e3fe56256555230e4784ad28" }
+euhedral-core = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "2d11a4aff406d7aa326f735b97da888d35f29d5f" }
+euhedral-data-structures = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "2d11a4aff406d7aa326f735b97da888d35f29d5f" }
+euhedral-gpu = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "2d11a4aff406d7aa326f735b97da888d35f29d5f", default-features = false }
+euhedral-graph = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "2d11a4aff406d7aa326f735b97da888d35f29d5f", default-features = false }
+euhedral-hardware-utils = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "2d11a4aff406d7aa326f735b97da888d35f29d5f" }
+euhedral-io = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "2d11a4aff406d7aa326f735b97da888d35f29d5f" }
+euhedral-memory = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "2d11a4aff406d7aa326f735b97da888d35f29d5f", default-features = false }
+euhedral-hashing = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "2d11a4aff406d7aa326f735b97da888d35f29d5f" }
+euhedral-net = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "2d11a4aff406d7aa326f735b97da888d35f29d5f" }
 java-properties = "2"
 libloading = "0.8"
 llguidance = { version = "=1.9.1", default-features = false, features = ["lark", "referencing", "ahash"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 serde_yaml_ng = "0.10"
 smallvec = "1.16"
 signal-hook = "0.4"
 socket2 = "0.6"
 sha2 = "0.10"
+same-file = "1.0.6"
 tempfile = "3.27"
 thiserror = "2"
 toktrie = "=1.9.1"
@@ -49,3 +50,11 @@ print_stdout = "warn"
 todo = "warn"
 undocumented_unsafe_blocks = "warn"
 unwrap_used = "warn"
+
+# The device tests run optimised, because the host side of a generation (tokenizing, sampling, planning, the lattice)
+# is slow unoptimised, with the assertions and the overflow checks of a debug build still on. Only `--profile device`
+# selects it.
+[profile.device]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

@@ -1,7 +1,7 @@
 //! The model's dimensions, from the artifact's metadata, and the profile its tensors give it.
 
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorTable, WeightFormat, WeightLayout};
-use euhedral_inference_settings::KvFormat;
+use euhedral_inference_settings::{KvFormat, SpeculationMode};
 
 use crate::error::PlanError;
 
@@ -255,6 +255,19 @@ impl ArtifactProfile {
         })
     }
 
+    /// The profile as the settings' speculation mode leaves it: `none` drops the drafter, so the depth is 0 and no
+    /// draft tensor is uploaded, whatever the artifact stores; `artifact` leaves the profile as read.
+    pub fn under(self, mode: SpeculationMode) -> Self {
+        match mode {
+            SpeculationMode::Artifact => self,
+            SpeculationMode::None => Self {
+                speculation: Speculation::None,
+                draft_depth: None,
+                ..self
+            },
+        }
+    }
+
     /// The attention cache format a sequence takes unless the settings select one: BF16 for the unquantized model,
     /// NVFP4 for every quantized one (`ArtifactProfile.kvFormat`).
     pub fn kv_format(&self) -> KvFormat {
@@ -275,7 +288,7 @@ impl ArtifactProfile {
             Speculation::Mtp => match (self.draft_depth, self.quantization) {
                 (Some(depth), _) => Ok(usize::from(depth)),
                 (None, Quantization::Mixed) => Err(PlanError::Inventory(
-                    "a mixed artifact stores no MTP draft depth".to_string(),
+                    "a mixed artifact stores no MTP draft depth (a composite can supply one)".to_string(),
                 )),
                 (None, Quantization::Q3) => Ok(2),
                 (None, _) => Ok(4),

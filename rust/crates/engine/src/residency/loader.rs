@@ -29,12 +29,16 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
+use euhedral_gpu::Lane;
+use euhedral_gpu::cuda::CudaQueue;
+use euhedral_graph::{Completions, DeviceQueue, LaneId, Marker};
 use euhedral_inference_cuda::{ArenaRange, DeviceBuffer, DevicePtr, HostWeightsArena, PooledPinned};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use euhedral_io::{IoDoneOwned, OwnedFile};
 
 use crate::error::EngineError;
 use crate::frames::{Kind, step};
+use crate::residency::p2e2::{P2e2Geometry, P2e2Validation};
 use crate::residency::planner::{Placement, PlacementSource, ResidencyPlan, Tier, nvfp4};
 use crate::runtime::{Core, raw_file};
 use crate::stages::SubmitError;
@@ -49,6 +53,10 @@ pub enum Check {
     /// An NVFP4 trailer: for an SD4 layout the 16-entry scale table (no NaN), then the global scale, a finite
     /// non-negative little-endian FP32.
     Nvfp4Trailer { sd4: bool },
+    /// A piece of a P2E2 tensor of `rows` rows of `k` codes in `bytes` bytes, starting `from` bytes into it. The
+    /// tensor's check needs all its pieces (see [`P2e2Validation`]): the pieces' scans are put together as they land
+    /// and the last one's verdict is the tensor's.
+    P2e2 { from: u64, rows: u64, k: u64, bytes: u64 },
 }
 
 /// Where a piece's bytes go.
@@ -58,6 +66,11 @@ pub enum Target {
     Device { arena_offset: u64 },
     /// To `arena_offset` of the pinned host arena, read in place: no copy follows.
     Host { arena_offset: u64 },
+}
+
+/// The file a placement is read from: the one `file_of` names, or the first (the base) when it names none.
+fn file_index(file_of: &[usize], placement: usize) -> usize {
+    file_of.get(placement).copied().unwrap_or(0)
 }
 
 /// One read: `len` bytes at `file_offset` of the artifact go to `target`.
@@ -104,6 +117,12 @@ pub fn pieces(plan: &ResidencyPlan, piece_bytes: u64) -> Vec<Piece> {
                 let len = (copy.len - done).min(piece_bytes);
                 let check = match copy.check {
                     Check::Nvfp4Scales { from } => Check::Nvfp4Scales { from: from + done },
+                    Check::P2e2 { from, rows, k, bytes } => Check::P2e2 {
+                        from: from + done,
+                        rows,
+                        k,
+                        bytes,
+                    },
                     other => other,
                 };
                 out.push(Piece {
@@ -215,18 +234,39 @@ fn copies(placement: &Placement) -> Vec<Copy> {
 }
 
 fn whole(placement: &Placement) -> Vec<Copy> {
+    let check = match (
+        placement.format,
+        placement.layout,
+        placement.shape.as_slice(),
+        &placement.source,
+    ) {
+        (WeightFormat::Q3G64Fp16, WeightLayout::RowSplitP2e2V1, [rows, k], PlacementSource::Object) => Check::P2e2 {
+            from: 0,
+            rows: *rows,
+            k: *k,
+            bytes: placement.bytes,
+        },
+        _ => Check::None,
+    };
     vec![Copy {
         file_offset: placement.file_offset,
         arena_offset: 0,
         len: placement.bytes,
-        check: Check::None,
+        check,
     }]
 }
 
-/// Applies `check` to a piece's bytes.
+/// Applies `check` to a piece's bytes. What needs the tensor's other pieces is left to the load's
+/// [`P2e2Validation`] of the tensor: here a P2E2 piece is only read as words of a tensor of its shape.
 pub fn check_piece(check: Check, bytes: &[u8]) -> Result<(), String> {
     match check {
         Check::None => Ok(()),
+        Check::P2e2 {
+            from,
+            rows,
+            k,
+            bytes: size,
+        } => P2e2Geometry::new(rows, k, size)?.scan(from, bytes).map(drop),
         Check::Nvfp4Scales { from } => match bytes.iter().position(|byte| byte & 0x7f == 0x7f) {
             Some(at) => Err(format!("NVFP4 block scale at byte {} is NaN", from + at as u64)),
             None => Ok(()),
@@ -316,7 +356,10 @@ type Done = Box<dyn FnOnce(LoadOutcome) + Send + Sync>;
 /// What the chains share. Its last owner reports the outcome when it drops.
 struct Shared {
     core: Arc<Core>,
-    file: Arc<OwnedFile>,
+    /// The files the pieces are read from.
+    files: Arc<[Arc<OwnedFile>]>,
+    /// The file of each placement, an index into `files`; empty when every piece reads from the first.
+    file_of: Arc<[usize]>,
     pieces: Arc<[Piece]>,
     names: Arc<[String]>,
     chains: usize,
@@ -330,6 +373,9 @@ struct Shared {
     pinned_at_start: u64,
     arena: Option<DeviceBuffer>,
     done: Option<Done>,
+    /// The P2E2 tensors being checked, by placement: built before the first piece is read, so that no piece waits for
+    /// another to make it.
+    p2e2: Box<[Option<P2e2Validation>]>,
 }
 
 impl Shared {
@@ -338,8 +384,34 @@ impl Shared {
         let _ = self.error.set(error);
     }
 
+    /// Checks a piece's bytes: its own, and for a P2E2 tensor the tensor's once the piece is the last to land.
+    fn verify(&self, piece: Piece, bytes: &[u8]) -> Result<(), String> {
+        let Check::P2e2 {
+            from,
+            rows,
+            k,
+            bytes: size,
+        } = piece.check
+        else {
+            return check_piece(piece.check, bytes);
+        };
+        let geometry = P2e2Geometry::new(rows, k, size)?;
+        let scan = geometry.scan(from, bytes)?;
+        let validation = self
+            .p2e2
+            .get(piece.placement)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("no P2E2 check was made ready for placement {}", piece.placement))?;
+        validation.absorb(scan)
+    }
+
     fn has_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    /// The file `piece` is read from.
+    fn file(&self, piece: &Piece) -> &Arc<OwnedFile> {
+        &self.files[file_index(&self.file_of, piece.placement)]
     }
 }
 
@@ -366,6 +438,22 @@ impl Drop for Shared {
     }
 }
 
+/// The checks of the P2E2 tensors among `pieces`, by placement, each made once before any piece is read. A tensor
+/// whose shape and size do not fit has none: its pieces are refused for that when they are read.
+pub(crate) fn p2e2_validations(pieces: &[Piece]) -> Box<[Option<P2e2Validation>]> {
+    let placements = pieces.iter().map(|piece| piece.placement + 1).max().unwrap_or(0);
+    let mut validations: Vec<Option<P2e2Validation>> = (0..placements).map(|_| None).collect();
+    for piece in pieces {
+        if let Check::P2e2 { rows, k, bytes, .. } = piece.check
+            && validations[piece.placement].is_none()
+            && let Ok(geometry) = P2e2Geometry::new(rows, k, bytes)
+        {
+            validations[piece.placement] = Some(P2e2Validation::new(geometry));
+        }
+    }
+    validations.into()
+}
+
 /// Acquires the ring before the upload starts: two loans of the ring's piece size for each chain. This is the only
 /// pinned allocation of the upload; once it runs, no chain asks the pool for memory. The waiting allocation is the
 /// startup's.
@@ -384,7 +472,8 @@ pub(crate) fn acquire_loans(core: &Core, ring: &Ring) -> Result<Vec<PooledPinned
 )]
 pub(crate) fn start(
     core: &Arc<Core>,
-    file: Arc<OwnedFile>,
+    files: Arc<[Arc<OwnedFile>]>,
+    file_of: Arc<[usize]>,
     names: Arc<[String]>,
     pieces: Vec<Piece>,
     chains: usize,
@@ -393,9 +482,11 @@ pub(crate) fn start(
     loans: Vec<PooledPinned>,
     done: impl FnOnce(LoadOutcome) + Send + Sync + 'static,
 ) {
+    let p2e2 = p2e2_validations(&pieces);
     let shared = Arc::new(Shared {
         core: Arc::clone(core),
-        file,
+        files,
+        file_of,
         names,
         base: arena.ptr(),
         host,
@@ -409,6 +500,7 @@ pub(crate) fn start(
         arena: Some(arena),
         done: Some(Box::new(done)),
         pieces: pieces.into(),
+        p2e2,
     });
     let mut loans = loans.into_iter();
     for chain in 0..chains {
@@ -444,7 +536,7 @@ fn issue(shared: Arc<Shared>, chain: usize, index: usize, mut loan: PooledPinned
     if let Err(error) = loan.set_len(piece.len) {
         return shared.fail(EngineError::Cuda(error));
     }
-    let raw = raw_file(&shared.file);
+    let raw = raw_file(shared.file(&piece));
     let next = Arc::clone(&shared);
     let then = Box::new(move |done: IoDoneOwned<PooledPinned>| -> Box<dyn Frame> {
         step(Kind::UploadRead, chain, move || read_done(next, chain, index, done))
@@ -471,7 +563,7 @@ fn issue_in_place(shared: Arc<Shared>, chain: usize, index: usize, arena_offset:
             shared.names[piece.placement]
         )));
     };
-    let raw = raw_file(&shared.file);
+    let raw = raw_file(shared.file(&piece));
     let next = Arc::clone(&shared);
     let then = Box::new(move |done: IoDoneOwned<ArenaRange>| -> Box<dyn Frame> {
         step(Kind::UploadRead, chain, move || {
@@ -509,7 +601,7 @@ fn in_place_done(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPi
     }
     let host = Arc::clone(&shared.core);
     let frame = step(Kind::UploadCheck, chain, move || {
-        match check_piece(piece.check, range.as_slice()) {
+        match shared.verify(piece, range.as_slice()) {
             Ok(()) => finish(shared, loan),
             Err(reason) => {
                 let name = shared.names[piece.placement].clone();
@@ -564,7 +656,7 @@ fn read_done(shared: Arc<Shared>, chain: usize, index: usize, done: IoDoneOwned<
     let host = Arc::clone(&shared.core);
     let frame = step(Kind::UploadCheck, chain, move || {
         let bytes = &loan.buffer().as_slice()[..piece.len];
-        match check_piece(piece.check, bytes) {
+        match shared.verify(piece, bytes) {
             Ok(()) => copy(shared, chain, index, loan),
             Err(reason) => {
                 let name = shared.names[piece.placement].clone();
@@ -585,7 +677,7 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
         let destination = shared.base.offset(piece.arena_offset());
         let queued = shared
             .core
-            .lane_table
+            .lane_table()
             .submit_ops(shared.core.transfer_lane(chain), false, |kernels| {
                 // SAFETY: the loan stays alive, and its bytes unmodified, in the frame the completion registers
                 // below, which runs only once the lane has reached the marker, after the copy has run.
@@ -594,9 +686,18 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
         let marker = match queued {
             Ok(((), marker)) => marker,
             Err(SubmitError::Busy) => {
-                // The lane's ring is full of markers that have not completed: nothing was queued, so the loan is
-                // still the copy's and the copy is tried again behind the other work.
-                return copy(shared, chain, index, loan);
+                // Nothing was queued, so the loan is still the copy's. A full ring does not arise in a normal load
+                // (each chain has its own lane and at most two loans against its markers); Busy is an awaiter's
+                // one-call slot pin, or a ring that drained meanwhile. The copy is tried again when the lane's oldest
+                // marker completes, not at once: re-offering it now could only spin a worker.
+                let lane = Arc::clone(shared.core.transfer_lane(chain));
+                let completions = Arc::clone(shared.core.completions());
+                let stages = Arc::clone(&shared.core.stages);
+                let retry = step(Kind::UploadCopy, chain, move || copy(shared, chain, index, loan));
+                retry_or_offer(&*lane, &completions, retry, |frame| {
+                    let _ = stages.offer(frame);
+                });
+                return;
             }
             Err(error) => {
                 // The copy may be queued and no marker will say when it ran: the loan must not return to the pool
@@ -605,7 +706,7 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
                 return shared.fail(EngineError::from(error));
             }
         };
-        let completions = Arc::clone(&shared.core.completions);
+        let completions = Arc::clone(shared.core.completions());
         let chains = shared.chains;
         let done = step(Kind::UploadDone, chain, move || {
             shared.uploaded.fetch_add(piece.len as u64, Ordering::AcqRel);
@@ -615,4 +716,250 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
     });
     // A refused frame is dropped with this chain's handle on the load, which then ends as failed.
     let _ = stages.offer(frame);
+}
+
+/// A lane the loader may wait on: its queue, and its id in the pool.
+trait RetryLane: DeviceQueue {
+    fn lane_id(&self) -> LaneId;
+}
+
+impl RetryLane for CudaQueue {
+    fn lane_id(&self) -> LaneId {
+        Lane::lane(self)
+    }
+}
+
+/// What a copy refused with `Busy` does: `retry` runs once the lane has completed its oldest marker still in flight,
+/// which frees a slot of its ring. Nothing waits and nothing is offered meanwhile. When the lane has no marker in
+/// flight there is no completion to wait for (something else holds the slot) and `retry` goes to `offer` at once, one
+/// offer per call.
+fn retry_or_offer(
+    lane: &dyn RetryLane,
+    completions: &Completions,
+    retry: Box<dyn Frame>,
+    offer: impl FnOnce(Box<dyn Frame>),
+) {
+    let oldest = lane.completed() + 1;
+    if oldest > lane.issued() {
+        return offer(retry);
+    }
+    completions.after_marker(Marker::new(lane.id(), lane.lane_id(), oldest), retry);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use euhedral_core::generics::LatticeSource;
+    use euhedral_graph::{LanePool, QueueId};
+
+    use super::*;
+
+    #[test]
+    fn a_placement_is_read_from_the_file_it_names_and_from_the_base_when_it_names_none() {
+        let file_of = [0, 2, 1];
+        assert_eq!(file_index(&file_of, 1), 2);
+        assert_eq!(file_index(&file_of, 2), 1);
+        assert_eq!(file_index(&file_of, 3), 0);
+        assert_eq!(file_index(&[], 5), 0);
+    }
+
+    /// A lane whose ring holds `slots` markers: it refuses a submission while that many are in flight.
+    #[derive(Debug)]
+    struct Ring {
+        id: QueueId,
+        slots: u64,
+        issued: AtomicU64,
+        completed: AtomicU64,
+    }
+
+    impl Ring {
+        fn submit(&self) -> bool {
+            if self.issued.load(Ordering::Acquire) - self.completed.load(Ordering::Acquire) >= self.slots {
+                return false;
+            }
+            self.issued.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+    }
+
+    impl RetryLane for Ring {
+        fn lane_id(&self) -> LaneId {
+            LaneId(0)
+        }
+    }
+
+    impl DeviceQueue for Ring {
+        fn id(&self) -> QueueId {
+            self.id
+        }
+        fn completed(&self) -> u64 {
+            self.completed.load(Ordering::Acquire)
+        }
+        fn issued(&self) -> u64 {
+            self.issued.load(Ordering::Acquire)
+        }
+        fn name(&self) -> &str {
+            "ring"
+        }
+    }
+
+    /// The loader's copy protocol over a fake lane: an attempt that the ring refuses waits for a completion.
+    struct Copies {
+        ring: Arc<Ring>,
+        completions: Arc<Completions>,
+        attempts: AtomicUsize,
+        done: AtomicUsize,
+        offered: AtomicUsize,
+    }
+
+    fn attempt(copies: Arc<Copies>) {
+        copies.attempts.fetch_add(1, Ordering::AcqRel);
+        if copies.ring.submit() {
+            copies.done.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        let again = Arc::clone(&copies);
+        let retry = step(Kind::UploadCopy, 0, move || attempt(again));
+        retry_or_offer(&*copies.ring, &copies.completions, retry, |_| {
+            copies.offered.fetch_add(1, Ordering::AcqRel);
+        });
+    }
+
+    /// Runs every frame the completions hold ready.
+    fn run_ready(completions: &Completions) -> usize {
+        let mut ran = 0;
+        completions.reap();
+        completions.pull(
+            &mut |mut frame| {
+                frame.execute().expect("the retry runs");
+                ran += 1;
+            },
+            &mut |_| false,
+            u64::MAX,
+        );
+        ran
+    }
+
+    #[test]
+    fn retry_waits_for_a_completion_and_the_load_finishes() {
+        let ring = Arc::new(Ring {
+            id: QueueId::next(),
+            slots: 2,
+            issued: 0.into(),
+            completed: 0.into(),
+        });
+        let queues = Arc::new(LanePool::new(vec![ring.clone()]));
+        let completions = Completions::new(&queues);
+        let copies = Arc::new(Copies {
+            ring: Arc::clone(&ring),
+            completions: Arc::clone(&completions),
+            attempts: 0.into(),
+            done: 0.into(),
+            offered: 0.into(),
+        });
+
+        // Six copies against a ring of two: two are queued, four are refused and wait.
+        for _ in 0..6 {
+            attempt(Arc::clone(&copies));
+        }
+        assert_eq!(copies.done.load(Ordering::Acquire), 2);
+        assert_eq!(copies.attempts.load(Ordering::Acquire), 6);
+        assert_eq!(completions.pending(), 4, "each refused copy is one registration");
+
+        // No completion: the refused copies are not offered again, however long the workers look.
+        for _ in 0..1000 {
+            assert_eq!(run_ready(&completions), 0);
+        }
+        assert_eq!(
+            copies.attempts.load(Ordering::Acquire),
+            6,
+            "no attempt without a completion"
+        );
+
+        // The device completes markers one by one: each frees one slot, and the retries behind it may run.
+        let mut finished = 0;
+        while copies.done.load(Ordering::Acquire) < 6 {
+            finished += 1;
+            assert!(finished <= 6, "the load is finishing");
+            ring.completed.fetch_add(1, Ordering::AcqRel);
+            if finished == 1 {
+                assert!(
+                    run_ready(&completions) > 0,
+                    "the retry runs at the first completion, not at the newest marker's"
+                );
+            }
+            while run_ready(&completions) > 0 {}
+        }
+        assert_eq!(copies.done.load(Ordering::Acquire), 6);
+        assert_eq!(
+            copies.offered.load(Ordering::Acquire),
+            0,
+            "markers were in flight: nothing was offered"
+        );
+        // At most the waiters behind the completed marker retry each time: bounded by waiters per completion.
+        assert!(copies.attempts.load(Ordering::Acquire) <= 6 + 4 * 4);
+    }
+
+    #[test]
+    fn a_lane_with_nothing_in_flight_hands_the_frame_back() {
+        let ring = Arc::new(Ring {
+            id: QueueId::next(),
+            slots: 2,
+            issued: 0.into(),
+            completed: 0.into(),
+        });
+        let queues = Arc::new(LanePool::new(vec![ring.clone()]));
+        let completions = Completions::new(&queues);
+        let retry = step(Kind::UploadCopy, 0, || {});
+        let offered = AtomicUsize::new(0);
+        retry_or_offer(&*ring, &completions, retry, |_| {
+            offered.fetch_add(1, Ordering::AcqRel);
+        });
+        assert_eq!(offered.load(Ordering::Acquire), 1, "offered once");
+        assert_eq!(completions.pending(), 0);
+    }
+
+    fn piece(placement: usize, from: u64, check: impl Fn(u64) -> Check) -> Piece {
+        Piece {
+            file_offset: from,
+            len: 4096,
+            target: Target::Device { arena_offset: from },
+            check: check(from),
+            placement,
+        }
+    }
+
+    #[test]
+    fn the_checks_of_the_p2e2_tensors_exist_before_any_piece_is_read() {
+        let bytes = (1024..)
+            .step_by(4)
+            .find(|bytes| P2e2Geometry::new(2, 1024, *bytes).is_ok())
+            .unwrap();
+        let compressed = |from| Check::P2e2 {
+            from,
+            rows: 2,
+            k: 1024,
+            bytes,
+        };
+        let pieces = [
+            piece(0, 0, |_| Check::None),
+            piece(1, 0, compressed),
+            piece(1, 4096, compressed),
+            piece(1, 8192, compressed),
+            // A tensor whose size does not fit its shape has no check: its pieces are refused when they are read.
+            piece(2, 0, |from| Check::P2e2 {
+                from,
+                rows: 2,
+                k: 1024,
+                bytes: 7,
+            }),
+        ];
+        let validations = p2e2_validations(&pieces);
+        assert_eq!(validations.len(), 3);
+        assert!(validations[0].is_none());
+        assert!(validations[1].is_some());
+        assert!(validations[2].is_none());
+        assert!(p2e2_validations(&[]).is_empty());
+    }
 }

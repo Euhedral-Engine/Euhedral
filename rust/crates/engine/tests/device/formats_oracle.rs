@@ -1,0 +1,134 @@
+//! The library's process-wide exact-numerics switch (`exact_numerics_for_tests`) on the linear formats.
+//! The switch is seen by every launch of the process: a test beside it would run on the reference, so these tests hold the
+//! card alone.
+//! The tests are `#[ignore]`d and run locally in a memory-capped scope:
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored formats_oracle::`.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, waiting calls: a test copies device memory and synchronizes"
+)]
+
+use crate::common;
+use crate::linear_gpu;
+
+use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Nvfp4Linear, Q3Linear, TrellisLinear};
+use linear_gpu::{Artifact, Random, Rig, activations, compressed_head, rig, synthetic_trellis, upload, values};
+
+const PLAIN: LinearMode = LinearMode {
+    row_exact: false,
+    prefill: false,
+};
+
+/// One test runs both checks one after the other: the switch is process-wide, so two tests of this binary would see
+/// each other's selection.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn exact_numerics_run_every_launch_on_the_scalar_reference() {
+    // The exact-numerics switch is process-wide: the test holds the card alone, so no other test runs under it.
+    let _card = common::card();
+    let Some(rig) = rig() else { return };
+    nvfp4_follows_the_switch(&rig);
+    trellis_follows_the_switch(&rig);
+    a_compressed_head_in_chunks_follows_the_switch(&rig);
+}
+
+/// A compressed tensor too large to expand whole is expanded even at 1 to 8 rows under the switch (its fused decode
+/// declines), in chunks, and equals its whole expansion run the same way.
+fn a_compressed_head_in_chunks_follows_the_switch(rig: &Rig) {
+    let (out, k) = (70_016usize, 5120usize);
+    let mut random = Random::new(31);
+    let head = compressed_head(rig, &mut random, out, k);
+    assert!(!rig.library.exact_numerics_for_tests(true), "the switch starts off");
+    let format = Q3Linear::new(&rig.library);
+    for rows in [1usize, 8] {
+        let x = upload(&rig.library, &activations(&mut random, rows, k));
+        let wanted = rig.linear(&format, &head.expanded_weight, &x, 0, k, out, rows, PLAIN);
+        let actual = rig.linear(&format, &head.compressed, &x, 0, k, out, rows, PLAIN);
+        assert!(
+            format.scratch_bytes(&head.compressed, rows, PLAIN) > 0,
+            "{rows} rows: the exact kernels expand it"
+        );
+        assert!(
+            wanted.iter().any(|bits| *bits != wanted[0]),
+            "{rows} rows: the outputs vary"
+        );
+        assert!(
+            wanted == actual,
+            "{rows} rows: the chunks differ from the whole expansion"
+        );
+    }
+    assert!(rig.library.exact_numerics_for_tests(false), "and reports it was on");
+}
+
+fn nvfp4_follows_the_switch(rig: &Rig) {
+    let Some(mut artifact) = Artifact::open() else { return };
+    let (_weights, weight) = artifact.plain(&rig.library, "mtp/layer/attention/output");
+    let (n, k) = (5120usize, 6144usize);
+    let mut random = Random::new(5);
+    let x = upload(&rig.library, &activations(&mut random, 64, k));
+    let production = Nvfp4Linear::new(&rig.library);
+    // The scalar reference computes each output element on its own, so its rows do not depend on how many run: above
+    // 32 rows a device without the native route reaches it without the switch.
+    let portable = Nvfp4Linear::with_native_route(false, 70);
+    let reference = values(&rig.linear(&portable, &weight, &x, 0, k, n, 64, PLAIN));
+    let ordinary: Vec<Vec<f32>> = [1usize, 8, 20, 40]
+        .iter()
+        .map(|rows| values(&rig.linear(&production, &weight, &x, 0, k, n, *rows, PLAIN)))
+        .collect();
+
+    assert!(!rig.library.exact_numerics_for_tests(true), "the switch starts off");
+    let exact: Vec<Vec<f32>> = [1usize, 8, 20, 40]
+        .iter()
+        .map(|rows| values(&rig.linear(&production, &weight, &x, 0, k, n, *rows, PLAIN)))
+        .collect();
+    assert!(rig.library.exact_numerics_for_tests(false), "and reports it was on");
+
+    for ((rows, exact), ordinary) in [1usize, 8, 20, 40].iter().zip(&exact).zip(&ordinary) {
+        assert_eq!(
+            exact[..],
+            reference[..rows * n],
+            "{rows} rows under exact numerics are the reference, bit for bit"
+        );
+        assert_ne!(
+            exact[..],
+            ordinary[..],
+            "{rows} rows differ from the production kernels somewhere"
+        );
+    }
+    // Back off, the production kernels run again.
+    let again = values(&rig.linear(&production, &weight, &x, 0, k, n, 8, PLAIN));
+    assert_eq!(again, ordinary[1]);
+}
+
+fn trellis_follows_the_switch(rig: &Rig) {
+    let mut random = Random::new(13);
+    let object = synthetic_trellis(&rig.library, &mut random, 512, 1024, 56, &[128, 512]);
+    let x = upload(&rig.library, &activations(&mut random, 8, 1024));
+    // A format that was not built for the reference follows the library's selection, as Java's does.
+    let production = TrellisLinear::new(140, 32, 128, 1024);
+    let oracle = TrellisLinear::new(140, 32, 128, 1024).with_exact_numerics();
+    let run = |format: &TrellisLinear| rig.linear(format, &object.weight, &x, 0, 1024, 512, 8, PLAIN);
+    let ordinary = run(&production);
+    let reference = run(&oracle);
+    assert_ne!(
+        ordinary, reference,
+        "the tensor-core route sums in another order than the reference"
+    );
+
+    assert!(!rig.library.exact_numerics_for_tests(true), "the switch starts off");
+    assert!(rig.library.exact_numerics());
+    let selected = run(&production);
+    assert!(rig.library.exact_numerics_for_tests(false), "and reports it was on");
+    assert!(!rig.library.exact_numerics());
+    assert_eq!(
+        selected, reference,
+        "under exact numerics the format runs the reference, bit for bit"
+    );
+    assert_eq!(run(&production), ordinary, "back off, the tensor-core route runs again");
+}

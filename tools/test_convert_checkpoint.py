@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 from pathlib import Path
 import re
 import struct
@@ -321,6 +322,179 @@ class PipelineTest(unittest.TestCase):
                 mock.patch.object(pipeline, "draft_token_ids", lambda path: np.arange(4)):
             return pipeline.convert(Path("/model"), directory / "artifact.edrl", recipe,
                                     draft_ids_from=Path("/ids"), **kwargs)
+
+    def codes_directory(self, directory, manifest):
+        codes = Path(directory) / "codes"
+        codes.mkdir()
+        if manifest is not None:
+            (codes / "calibration.json").write_text(json.dumps(manifest), encoding="utf-8")
+            for name in manifest.get("files", []):
+                (codes / name).write_bytes(b"x")
+        return codes
+
+    def test_codes_without_a_manifest_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codes = self.codes_directory(tmp, None)
+            with self.assertRaisesRegex(ValueError, "no calibration.json"):
+                self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes)
+
+    def test_codes_of_a_run_that_stopped_early_are_refused_naming_the_gap(self):
+        complete = {"key": "k", "layers_done": 64, "layers_total": 64, "heads_done": True, "mtp_done": True, "files": []}
+        for changes, named in (({"layers_done": 9}, "layers 9 of 64"), ({"heads_done": False}, "the heads"),
+                               ({"mtp_done": False}, "the MTP block")):
+            with self.subTest(named), tempfile.TemporaryDirectory() as tmp:
+                codes = self.codes_directory(tmp, {**complete, **changes})
+                with self.assertRaisesRegex(ValueError, named):
+                    self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes)
+                self.assertFalse((Path(tmp) / "artifact.edrl").exists())
+
+    def test_a_fake_quant_export_is_taken_and_a_hand_made_directory_is_not(self):
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = Path(tmp) / "exported"
+            codes.export_state(exported, "text/layers/0/mlp/down", state, "run")
+            codes.export_state(exported, "text/layers/1/mlp/down", state, "run")
+            with tempfile.TemporaryDirectory() as other, self.assertRaisesRegex(ValueError, "did not finish"):
+                self.convert(recipes.Recipe("q3", False), Path(other), codes_from=exported)
+            codes.finish_export(exported, "run")
+            manifest = json.loads((exported / "calibration.json").read_text(encoding="utf-8"))
+            self.assertEqual((manifest["producer"], manifest["objects"], manifest["complete"]),
+                             ("fake_quant", ["text/layers/0/mlp/down", "text/layers/1/mlp/down"], True))
+            self.assertEqual(self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=exported)["codes_from"],
+                             str(exported))
+            by_hand = Path(tmp) / "by-hand"
+            by_hand.mkdir()
+            state.save(codes.state_file(by_hand, "text/layers/0/mlp/down"))
+            with tempfile.TemporaryDirectory() as other, self.assertRaisesRegex(ValueError, "no calibration.json"):
+                self.convert(recipes.Recipe("q3", False), Path(other), codes_from=by_hand)
+
+    def test_an_export_never_overwrites_calibrates_manifest(self):
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        manifest = {"key": "k", "layers_done": 9, "layers_total": 64, "heads_done": False, "mtp_done": False,
+                    "files": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            calibrated = self.codes_directory(tmp, manifest)
+            before = (calibrated / "calibration.json").read_bytes()
+            with self.assertRaisesRegex(ValueError, "another producer"):
+                codes.export_state(calibrated, "text/layers/0/mlp/down", state, "run")
+            self.assertEqual((calibrated / "calibration.json").read_bytes(), before)
+            self.assertEqual(sorted(path.name for path in calibrated.iterdir()), ["calibration.json"])
+
+    def test_an_export_is_incomplete_until_it_is_finished(self):
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        with tempfile.TemporaryDirectory() as tmp:
+            codes.export_state(Path(tmp), "text/layers/0/mlp/down", state, "run")
+            self.assertFalse(json.loads((Path(tmp) / "calibration.json").read_text())["complete"])
+            with self.assertRaisesRegex(ValueError, "did not finish"):
+                codes.require_complete_codes(Path(tmp))
+            codes.finish_export(Path(tmp), "run")
+            codes.require_complete_codes(Path(tmp))
+
+    def test_listed_files_must_be_there_and_every_state_file_must_be_listed_for_both_producers(self):
+        complete = {"key": "k", "layers_done": 64, "layers_total": 64, "heads_done": True, "mtp_done": True,
+                    "files": ["a.npz", "b.npz"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            calibrated = self.codes_directory(tmp, complete)
+            codes.require_complete_codes(calibrated, 64)
+            (calibrated / "b.npz").unlink()
+            with self.assertRaisesRegex(ValueError, "not there: b.npz"):
+                codes.require_complete_codes(calibrated, 64)
+            (calibrated / "b.npz").write_bytes(b"x")
+            (calibrated / "stray.npz").write_bytes(b"x")
+            with self.assertRaisesRegex(ValueError, "does not list: stray.npz"):
+                codes.require_complete_codes(calibrated, 64)
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = Path(tmp)
+            codes.export_state(exported, "text/layers/0/mlp/down", state, "run")
+            codes.finish_export(exported, "run")
+            codes.require_complete_codes(exported)
+            codes.state_file(exported, "text/layers/0/mlp/down").unlink()
+            with self.assertRaisesRegex(ValueError, "not there"):
+                codes.require_complete_codes(exported)
+            state.save(codes.state_file(exported, "text/layers/0/mlp/down"))
+            state.save(codes.state_file(exported, "text/layers/5/mlp/down"))
+            with self.assertRaisesRegex(ValueError, "does not list"):
+                codes.require_complete_codes(exported)
+
+    def test_an_export_into_another_keys_export_is_refused_before_it_writes_and_the_same_key_adds_to_it(self):
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = Path(tmp)
+            codes.export_state(exported, "text/layers/0/mlp/down", state, "run")
+            codes.finish_export(exported, "run")
+            before = {path.name: path.read_bytes() for path in exported.iterdir()}
+            with self.assertRaisesRegex(ValueError, "another run"):
+                codes.export_state(exported, "text/layers/1/mlp/down", state, "other")
+            with self.assertRaisesRegex(ValueError, "another run"):
+                codes.finish_export(exported, "other")
+            self.assertEqual({path.name: path.read_bytes() for path in exported.iterdir()}, before)
+            codes.export_state(exported, "text/layers/1/mlp/down", state, "run")
+            manifest = json.loads((exported / "calibration.json").read_text(encoding="utf-8"))
+            self.assertEqual((manifest["key"], manifest["objects"], manifest["complete"]),
+                             ("run", ["text/layers/0/mlp/down", "text/layers/1/mlp/down"], False))
+
+    def test_an_export_manifest_without_a_key_is_another_runs_and_is_not_taken(self):
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        with tempfile.TemporaryDirectory() as tmp:
+            keyless = self.codes_directory(tmp, {"producer": "fake_quant", "objects": [], "complete": True})
+            with self.assertRaisesRegex(ValueError, "key is None, not str"):
+                codes.require_complete_codes(keyless)
+            with self.assertRaisesRegex(ValueError, "another run"):
+                codes.export_state(keyless, "text/layers/0/mlp/down", state, "run")
+
+    def test_listed_names_that_are_not_plain_file_names_of_the_directory_are_refused(self):
+        complete = {"key": "k", "layers_done": 64, "layers_total": 64, "heads_done": True, "mtp_done": True}
+        for name in (7, None, "../a.npz", "/abs/a.npz", "sub/a.npz", "..\\a.npz", "C:a.npz", "..", "", "calibration.json"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                codes_dir = self.codes_directory(tmp, {**complete, "files": []})
+                (codes_dir / "calibration.json").write_text(json.dumps({**complete, "files": ["a.npz", name]}))
+                with self.assertRaisesRegex(ValueError, "not file names of the directory"):
+                    codes.require_complete_codes(codes_dir, 64)
+        for objects in ([7], ["text\\layers"]):
+            with self.subTest(objects=objects), tempfile.TemporaryDirectory() as tmp:
+                codes_dir = self.codes_directory(tmp, {"producer": "fake_quant", "key": "run", "objects": objects,
+                                                       "complete": True})
+                with self.assertRaisesRegex(ValueError, "not plain names"):
+                    codes.require_complete_codes(codes_dir)
+
+    def test_the_manifests_flags_are_read_strictly_and_its_layers_must_be_the_models(self):
+        manifest = {"key": "k", "layers_done": 64, "layers_total": 64, "heads_done": "false", "mtp_done": True,
+                    "files": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            codes_dir = self.codes_directory(tmp, manifest)
+            with self.assertRaisesRegex(ValueError, "heads_done is 'false', not bool"):
+                codes.require_complete_codes(codes_dir, 64)
+            (codes_dir / "calibration.json").write_text(json.dumps({**manifest, "heads_done": True}))
+            with self.assertRaisesRegex(ValueError, "not 40"):
+                codes.require_complete_codes(codes_dir, 40)
+
+    def test_a_manifest_of_an_unknown_producer_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codes_dir = self.codes_directory(tmp, {"producer": "other", "objects": [], "complete": True})
+            with self.assertRaisesRegex(ValueError, "known producer"):
+                self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes_dir)
+
+    def test_an_unreadable_manifest_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codes = self.codes_directory(tmp, None)
+            (codes / "calibration.json").write_text("{ torn", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unreadable"):
+                self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes)
+
+    def test_codes_of_a_finished_run_are_taken(self):
+        manifest = {"key": "k", "layers_done": 64, "layers_total": 64, "heads_done": True, "mtp_done": True,
+                    "files": ["text.layers.0.mlp.down.npz"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            codes = self.codes_directory(tmp, manifest)
+            self.assertEqual(self.convert(recipes.Recipe("q3", False), Path(tmp), codes_from=codes)["codes_from"],
+                             str(codes))
 
     def test_expand_restores_the_transcoded_artifact_byte_for_byte(self):
         with tempfile.TemporaryDirectory() as tmp:

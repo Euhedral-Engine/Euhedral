@@ -10,8 +10,8 @@ use std::fmt;
 use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::config::{FragmentConfig, IdlePolicy, LatticeConfig};
@@ -22,14 +22,15 @@ use euhedral_gpu::cuda::{CudaGpu, CudaQueue};
 use euhedral_gpu::{Gpu, GpuError, Stream, StreamOptions, open_shared_lanes};
 use euhedral_graph::{Completions, DeviceQueue, Lake, LaneId, LanePool, UnitGuard};
 use euhedral_hardware_utils::util::CpuSet;
-use euhedral_inference_cuda::launch::load::load;
+use euhedral_inference_cuda::launch::load::{KernelTable, load};
 use euhedral_inference_cuda::{CudaLibrary, PinnedPool};
 use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
+use crate::composite::Composite;
 use crate::error::{EngineError, PlanError};
-use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, LogitsSink};
+use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, HiddenSink, LogitsSink};
 use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
 use crate::handoff::Handoff;
 use crate::kernels::kernel_sources;
@@ -37,15 +38,22 @@ use crate::model::{ArtifactProfile, ModelConfig, Speculation, Weights};
 use crate::pass_assembler::PassStatistics;
 use crate::plan::Plan;
 use crate::prefix::PrefixCacheStats;
-use crate::residency::accounting::{MemoryAccount, PlanReservation};
+#[cfg(feature = "test-oracles")]
+use crate::quantum::body_fault::{BodyFault, Defect, HoldEvent, RunSnapshot, Sighting};
+use crate::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
 use crate::residency::disk::DiskReader;
-use crate::residency::planner::{LocationBytes, PlanInputs, ResidencyPlan, pass_rows_limit, sequences_for};
+use crate::residency::planner::{
+    LocationBytes, PlanInputs, ResidencyPlan, forced_rows_of, pass_rows_limit, sequences_for,
+};
 use crate::stages::LaneTable;
 use crate::startup;
 use crate::state::SequenceState;
 use crate::state::released::ReleasedBuffers;
+use crate::summary;
 use crate::warmup::Warmed;
 use crate::workspace::Workspace;
+#[cfg(feature = "test-oracles")]
+use euhedral_gpu::GraphStats;
 
 /// The markers a transfer lane's ring holds: a chain has two copies in flight, and the next waits for the completion of
 /// one of them, so the ring has room beyond them.
@@ -54,7 +62,7 @@ const TRANSFER_RING: usize = 4;
 /// The quanta whose markers a stage lane's ring must hold: those in flight, and the one the owner prepares behind them.
 pub(crate) const STAGE_RING_QUANTA: usize = GREEDY_DEPTH + 1;
 
-/// The events a stage lane's ring holds, sized before the model is read: the most markers of the lane that stay in
+/// The events a stage lane's ring holds for the sequences the plan resolved: the most markers of the lane that stay in
 /// flight, until their last consumer has waited for them. A quantum records one marker per stage it runs, a marker is
 /// waited for by the quantum itself and by the ones admitted behind it, so the ring holds the stages of the biggest view
 /// of the model the engine runs ([`Plan::stage_bound`]) for `quanta_in_flight` quanta, rounded up to a power of two.
@@ -80,12 +88,10 @@ pub fn stage_ring_for(sequences: usize) -> usize {
     stage_ring(quanta_for(sequences))
 }
 
-/// How many sequences the settings size the lanes' rings for: `batching.max-sequences`, and one when it is 0, which
-/// is decided only once the model is read. A count above the rows a pass holds is refused: each sequence keeps its
-/// quanta's markers in the rings, which are created with the lanes, before the model is read, and a verification takes
-/// a row at least.
-fn ringed_sequences(batching: &BatchingSettings) -> Result<usize, EngineError> {
-    let sequences = (batching.max_sequences as usize).max(1);
+/// Refuses a stated `batching.max-sequences` above the rows a pass holds: a verification takes a row at least, so more
+/// sequences could not run at once. Zero (automatic) is bounded by the plan ([`resolve_sequences`]).
+fn check_stated_sequences(batching: &BatchingSettings) -> Result<(), EngineError> {
+    let sequences = batching.max_sequences as usize;
     let rows = pass_rows_limit(batching);
     if sequences > rows {
         return Err(EngineError::Runtime(format!(
@@ -93,7 +99,7 @@ fn ringed_sequences(batching: &BatchingSettings) -> Result<usize, EngineError> {
              (batching.max-tokens-per-pass, at most batching.prefill-chunk-tokens); set it lower"
         )));
     }
-    Ok(sequences)
+    Ok(())
 }
 
 /// The sequences to hold: `batching.max-sequences` when it is at least 1, otherwise (0, automatic) the largest count
@@ -110,16 +116,17 @@ pub fn resolve_sequences(
     if requested >= 1 {
         return Ok(requested);
     }
-    let profile = ArtifactProfile::of(table, config)?;
+    let profile = ArtifactProfile::of(table, config)?.under(settings.speculation.mode);
     if profile.speculation == Speculation::Dflash2 {
         return Ok(1);
     }
     let rows = pass_rows_limit(&settings.batching);
-    let verified = 1 + if profile.speculation == Speculation::Mtp {
+    let drafted = 1 + if profile.speculation == Speculation::Mtp {
         profile.speculative_depth()?
     } else {
         0
     };
+    let verified = drafted.max(forced_rows_of(&settings.batching));
     let cap = (rows / verified).max(1);
     let chosen = sequences_for(config, table, settings, inputs, cap)?;
     log::info!(
@@ -127,6 +134,51 @@ pub fn resolve_sequences(
         settings.context.max_tokens
     );
     Ok(chosen)
+}
+
+/// The lanes of an engine and what watches them, opened once the plan has decided the sequences ([`Core::open_lanes`]).
+pub(crate) struct DeviceLanes {
+    /// The lanes as query queues, which the completions and the graph runtime poll. Its owner and transfer lanes are
+    /// reserved: no graph run is homed on them.
+    lanes: Arc<LanePool>,
+    /// The lanes the stage graphs run on, by lane id: the plan's compute lanes (`0..` [`Plan::lane_width`]), the
+    /// owner's lane (reservations and input records), then the transfer lanes, one per upload chain, the first of
+    /// which also zeroes the sequence state.
+    lane_table: LaneTable,
+    /// The events in the ring of each stage lane ([`stage_ring`]).
+    stage_ring: usize,
+    /// Turns the lanes' progress into frames.
+    completions: Arc<Completions>,
+    /// The device memory the lanes took when they opened, as the free memory falling across the open (0 if unread).
+    bytes: u64,
+}
+
+/// The sequences a startup holds and the ring of the lanes it opens for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneSizing {
+    /// The sequences to plan for.
+    pub sequences: usize,
+    /// The events in the ring of each stage lane: sized for `first`, the count resolved before the lanes opened.
+    pub ring: usize,
+}
+
+/// The ring the lanes open with and the sequences the plan is made for. The lanes open with a ring for `first`, the
+/// count resolved from the free memory before they exist. Their events take device memory, so an automatic count
+/// (`max_sequences` 0) is resolved again (`again`) from the free memory read after they opened, and the plan holds the
+/// smaller: a ring for `first` serves any count below it. A stated count is held as stated.
+pub fn lane_sizing<E>(
+    max_sequences: u32,
+    first: usize,
+    again: impl FnOnce() -> Result<usize, E>,
+) -> Result<LaneSizing, E> {
+    let sequences = match max_sequences {
+        0 => first.min(again()?),
+        _ => first,
+    };
+    Ok(LaneSizing {
+        sequences,
+        ring: stage_ring_for(first),
+    })
 }
 
 /// What the frames of the engine share: the lattice and everything that feeds it, and the device.
@@ -141,18 +193,12 @@ pub(crate) struct Core {
     /// Control: the steps of a startup and of a shutdown.
     pub(crate) control: Arc<Lake>,
     pub(crate) io: Arc<AsyncIo>,
-    pub(crate) completions: Arc<Completions>,
     /// The device RustEE's lanes and kernels are on, kept for as long as they are.
     pub(crate) gpu: Arc<CudaGpu>,
-    /// The lanes as query queues, which the completions and the graph runtime poll. Its owner and transfer lanes are
-    /// reserved: no graph run is homed on them.
-    pub(crate) lanes: Arc<LanePool>,
-    /// The lanes the stage graphs run on, by lane id: the plan's compute lanes (`0..` [`Plan::lane_width`]), the
-    /// owner's lane (reservations and input records), then the transfer
-    /// lanes, one per upload chain, the first of which also zeroes the sequence state.
-    pub(crate) lane_table: LaneTable,
-    /// The events in the ring of each stage lane ([`stage_ring`]).
-    pub(crate) stage_ring: usize,
+    /// The kernels the lanes launch.
+    kernels: Arc<KernelTable>,
+    /// What the lanes own, once they are opened: after the plan, which decides how many sequences their rings carry.
+    device_lanes: OnceLock<DeviceLanes>,
     /// The plan's compute lanes.
     pub(crate) compute: usize,
     pub(crate) pool: Arc<PinnedPool>,
@@ -202,19 +248,69 @@ pub(crate) struct Units {
 }
 
 impl Core {
-    /// `sequences`, or fewer when the lanes' rings, sized before the model was read, cannot hold the quanta that many
-    /// sequences keep in flight. Only an automatic count can exceed them: the rings are sized for the stated count, and
-    /// for one when it is automatic, because a ring's markers are device events created with the lane.
-    pub(crate) fn hold_sequences(&self, sequences: usize) -> usize {
-        let per_sequence = Plan::stage_bound().saturating_mul(STAGE_RING_QUANTA).max(1);
-        let held = sequences.min((self.stage_ring / per_sequence).max(1));
-        if held < sequences {
-            log::warn!(
-                "{sequences} sequences fit the device but the lanes' rings hold the quanta of {held}; set \
-                 batching.max-sequences to hold more"
-            );
-        }
-        held
+    fn device_lanes(&self) -> &DeviceLanes {
+        self.device_lanes
+            .get()
+            .unwrap_or_else(|| unreachable!("the lanes open at the plan, before anything uses them"))
+    }
+
+    /// The lanes as query queues, which the completions and the graph runtime poll.
+    pub(crate) fn lanes(&self) -> &Arc<LanePool> {
+        &self.device_lanes().lanes
+    }
+
+    /// The lanes the stage graphs run on, by lane id.
+    pub(crate) fn lane_table(&self) -> &LaneTable {
+        &self.device_lanes().lane_table
+    }
+
+    /// The events in the ring of each stage lane.
+    pub(crate) fn stage_ring(&self) -> usize {
+        self.device_lanes().stage_ring
+    }
+
+    /// The completions that turn lane progress into frames.
+    pub(crate) fn completions(&self) -> &Arc<Completions> {
+        &self.device_lanes().completions
+    }
+
+    /// The device bytes the lanes took when they opened.
+    pub(crate) fn lane_bytes(&self) -> u64 {
+        self.device_lanes().bytes
+    }
+
+    /// Opens the lanes with rings for `sequences` sequences, and attaches the completions to the lattice. Run in a frame
+    /// of the device lake, after the first resolve of the sequence count and before the plan is made, so that a ring is
+    /// never smaller than the quanta the plan's count keeps in flight. The device memory the events take is the free
+    /// memory falling across the open: the plan is made from the free memory read after it.
+    pub(crate) fn open_lanes(&self, sequences: usize) -> Result<(), EngineError> {
+        let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
+        let chains = startup::transfer_lanes(&self.settings, self.library.max_lanes(), self.compute);
+        let ring = stage_ring(quanta_for(sequences));
+        let before = self.library.free_bytes().map_err(EngineError::from)?;
+        let set = open_lane_set(&self.gpu, self.compute, ring, chains)
+            .map_err(|error| runtime("the lanes would not open", &error))?;
+        let after = self.library.free_bytes().map_err(EngineError::from)?;
+        let bytes = before.saturating_sub(after);
+        log::info!(
+            "lanes opened: rings of {ring} events for {sequences} sequences took {bytes} bytes of device memory"
+        );
+        let lanes = set.queues;
+        let lane_table = LaneTable::new(set.typed, Arc::clone(&self.kernels), Arc::clone(&self.library));
+        let completions = Completions::new(&lanes);
+        self.lattice
+            .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
+            .map_err(|error| runtime("the lattice would not take the completions", &format!("{error:?}")))?;
+        let opened = DeviceLanes {
+            lanes,
+            lane_table,
+            stage_ring: ring,
+            completions,
+            bytes,
+        };
+        self.device_lanes
+            .set(opened)
+            .map_err(|_| EngineError::Runtime("the lanes were opened twice".into()))
     }
 
     /// The owner's lane: the sequence's reservations and its quanta's input records.
@@ -249,11 +345,11 @@ impl Core {
 
     /// The number of transfer lanes.
     pub(crate) fn transfer_lanes(&self) -> usize {
-        self.lane_table.len() - self.compute - 1
+        self.lane_table().len() - self.compute - 1
     }
 
     fn lane(&self, id: LaneId) -> &Arc<CudaQueue> {
-        match self.lane_table.get(id) {
+        match self.lane_table().get(id) {
             Some(lane) => lane,
             None => unreachable!("the runtime opened lane {} and the table holds it", id.0),
         }
@@ -309,6 +405,8 @@ pub struct StartupReport {
     pub admitted: LocationBytes,
     /// Bytes in use on the device when the model became ready (the whole device's, every process).
     pub device_bytes_in_use: u64,
+    /// The device's free bytes when the plan was made, before any allocation of the startup.
+    pub free_at_plan: u64,
     /// Pinned bytes the staging pool holds at ready: the upload's ring and the cache's table staging.
     pub pinned_staging_bytes: u64,
     /// Pinned bytes the pool had to allocate while the upload ran; 0, because the ring is acquired before it.
@@ -674,11 +772,35 @@ impl EngineRuntime {
         library: &Path,
         close_timeout: Option<Duration>,
     ) -> (RuntimeOwner, ReadyHandoff) {
+        Self::start_composite(settings, library, close_timeout, Composite::default())
+    }
+
+    /// [`start_with`](EngineRuntime::start_with) over weights some of whose objects come from other artifacts:
+    /// `composite` names them, and the model loads from the composite table, each payload read from its own file. An
+    /// empty `composite` starts the model of `model.artifact` alone, as `start_with` does.
+    pub fn start_composite(
+        settings: &Settings,
+        library: &Path,
+        close_timeout: Option<Duration>,
+        composite: Composite,
+    ) -> (RuntimeOwner, ReadyHandoff) {
+        let composite = if composite.is_empty() {
+            Composite::default()
+        } else {
+            Composite {
+                replacements: composite
+                    .replacements
+                    .into_iter()
+                    .filter(|replacement| !replacement.objects.is_empty())
+                    .collect(),
+                ..composite
+            }
+        };
         let ready = Handoff::new();
         match build(settings, library, close_timeout) {
             Ok(core) => {
                 let owner = RuntimeOwner::over(Arc::clone(&core.teardown));
-                startup::run(core, Arc::clone(&ready));
+                startup::run(core, Arc::clone(&ready), composite);
                 (owner, ready)
             }
             Err(error) => {
@@ -699,6 +821,10 @@ impl EngineRuntime {
         reservation: PlanReservation,
         report: StartupReport,
     ) -> EngineRuntime {
+        let cache = generations.prefix_cache_stats().map(|stats| stats.capacity_bytes);
+        for line in summary::lines(&summary::Facts::of(&plan, &core.settings, cache)) {
+            log::info!("{line}");
+        }
         EngineRuntime {
             core,
             plan,
@@ -713,6 +839,14 @@ impl EngineRuntime {
     /// The residency plan the model was loaded by.
     pub fn plan(&self) -> &ResidencyPlan {
         &self.plan
+    }
+
+    /// The device bytes of the plan's runtime reserve that no allocation of the startup claimed: what the kernel
+    /// modules and the driver's own use after admission are paid from.
+    pub fn reserve_left_bytes(&self) -> u64 {
+        self.reservation
+            .as_ref()
+            .map_or(0, |reservation| reservation.left(Consumer::RuntimeReserve))
     }
 
     /// The sequences the engine holds, each of which runs one request at a time: the requests that run at once.
@@ -783,6 +917,26 @@ impl EngineRuntime {
         self.generations.generate(request, cancel)
     }
 
+    /// As [`EngineRuntime::generate_cancellable`], and `sink` is handed the hidden state (the output of the final norm,
+    /// which the draft layer reads) of every row the request runs, with the logits row of the rows that select a
+    /// token, as frames on the engine's lattice. The artifact needs a draft layer. The host selects the tokens, as for
+    /// a sampled request, and the request does not speculate, use the prefix cache or run ahead of the rows being
+    /// copied. The sink has heard every row when the listener hears the end.
+    pub fn generate_hidden(
+        &self,
+        request: GenerationRequest,
+        sink: impl HiddenSink + 'static,
+        cancel: CancelHandle,
+    ) -> Result<(), AdmissionError> {
+        self.generations.generate_hidden(request, Box::new(sink), cancel)
+    }
+
+    /// A test oracle: the events in the ring of each stage lane, and the device bytes the lanes took when they opened.
+    #[cfg(feature = "test-oracles")]
+    pub fn lane_rings_for_tests(&self) -> (usize, u64) {
+        (self.core.stage_ring(), self.core.lane_bytes())
+    }
+
     /// A test hook: the sequence's owner panics at the end of the turn in which the next request has admitted `quanta`
     /// quanta. The request ends with a failure and the engine serves the next.
     #[cfg(feature = "test-oracles")]
@@ -819,6 +973,46 @@ impl EngineRuntime {
         self.generations.quantum_admitted(Arc::new(hook));
     }
 
+    /// A test hook: the next quantum of the first sequence whose key is at `sighting` ends as `fault`, after its work
+    /// was queued: a first sighting (a direct run) and a second (the recording pass) in the middle of the body, a later
+    /// one (a replay) after the replay was queued. A body keeps `token` alive in its run's hold; a replay runs none.
+    /// At most one quantum is affected.
+    #[cfg(feature = "test-oracles")]
+    pub fn fail_next_quantum_for_tests(&self, fault: BodyFault, sighting: Sighting, token: Option<&Arc<()>>) {
+        self.generations.fail_body(fault, sighting, token);
+    }
+
+    /// A test hook: the strong handles of the armed token at each event of
+    /// [`body_events_for_tests`](Self::body_events_for_tests), one list for each sequence.
+    #[cfg(feature = "test-oracles")]
+    pub fn body_held_counts_for_tests(&self) -> Vec<Vec<usize>> {
+        self.generations.body_held_counts()
+    }
+
+    /// A test hook: the graph cache around the run of the quantum a fault was applied to, by sequence.
+    #[cfg(feature = "test-oracles")]
+    pub fn run_snapshots_for_tests(&self) -> Vec<Option<RunSnapshot>> {
+        self.generations.run_snapshots()
+    }
+
+    /// A test hook: faults of the hook itself (see [`Defect`]), by sequence. A test expects none.
+    #[cfg(feature = "test-oracles")]
+    pub fn hook_defects_for_tests(&self) -> Vec<Vec<Defect>> {
+        self.generations.hook_defects()
+    }
+
+    /// A test hook: what each sequence's graph cache counted, and how many graphs it holds.
+    #[cfg(feature = "test-oracles")]
+    pub fn graph_counts_for_tests(&self) -> Vec<(GraphStats, usize)> {
+        self.generations.graph_counts()
+    }
+
+    /// A test hook: the events of the hold of the quantum a fault was applied to, one list for each sequence.
+    #[cfg(feature = "test-oracles")]
+    pub fn body_events_for_tests(&self) -> Vec<Vec<HoldEvent>> {
+        self.generations.body_events()
+    }
+
     /// A test hook: the engine records no graphs from now on, so every quantum runs stage by stage. `false` while a
     /// request runs.
     #[cfg(feature = "test-oracles")]
@@ -835,7 +1029,35 @@ impl EngineRuntime {
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
     ) -> Result<(), AdmissionError> {
-        self.generations.teacher_forced(prefix, forced, sink)
+        self.generations.teacher_forced(prefix, forced, 1, sink)
+    }
+
+    /// [`EngineRuntime::teacher_forced`] that feeds up to `rows` forced tokens in one pass, as a verification does, and
+    /// hands the sink the same rows in the same order. The sequences are sized to verify at most `1 + draft depth` rows
+    /// (more with `batching.forced-rows`); concurrent runs share their passes. `rows` of 0 or 1 is the one-row path. A
+    /// sink that wants the hidden state needs one row.
+    pub fn teacher_forced_rows(
+        &self,
+        prefix: Vec<u32>,
+        forced: Vec<u32>,
+        rows: usize,
+        sink: Box<dyn LogitsSink>,
+    ) -> Result<(), AdmissionError> {
+        let rows = rows.max(1);
+        if rows > 1 {
+            if sink.wants_hidden() {
+                return Err(AdmissionError::Engine(
+                    "a teacher-forced run that takes the hidden state decodes one row at a time".to_string(),
+                ));
+            }
+            let sized = self.plan().verified_rows() as usize;
+            if rows > sized {
+                return Err(AdmissionError::Engine(format!(
+                    "the sequences verify at most {sized} rows: {rows} were asked (batching.forced-rows sizes them)"
+                )));
+            }
+        }
+        self.generations.teacher_forced(prefix, forced, rows, sink)
     }
 
     /// What stops the engine, which also keeps the result of the leak check of the memory account once the engine is
@@ -888,7 +1110,7 @@ impl EngineRuntime {
 
     /// The completions that turn lane progress into frames.
     pub fn completions(&self) -> &Arc<Completions> {
-        &self.core.completions
+        self.core.completions()
     }
 
     /// The asynchronous file I/O.
@@ -898,7 +1120,7 @@ impl EngineRuntime {
 
     /// The lanes `completions` watches.
     pub fn lanes(&self) -> &Arc<LanePool> {
-        &self.core.lanes
+        self.core.lanes()
     }
 
     /// The lattice every frame runs on.
@@ -982,15 +1204,12 @@ pub fn lattice_config(settings: &Settings) -> LatticeConfig {
     config
 }
 
-/// The most lanes one RustEE pool holds.
-const MAX_LANES: usize = 64;
-
 /// The device the native library bound, opened through RustEE. The library reports the device's properties and not its
 /// ordinal, so the device is the first whose compute capability is the library's.
 pub fn open_device(library: &CudaLibrary) -> Result<Arc<CudaGpu>, EngineError> {
     let (major, minor) = library.device().compute_capability;
     let wanted = (i32::try_from(major).unwrap_or(0), i32::try_from(minor).unwrap_or(0));
-    for ordinal in 0..MAX_LANES as i32 {
+    for ordinal in 0.. {
         let Ok(candidate) = CudaGpu::open(ordinal) else { break };
         if candidate.arch() == wanted {
             return Ok(candidate);
@@ -1054,11 +1273,12 @@ pub fn open_lane_set<G: Gpu>(
     })
 }
 
-/// Builds the lattice, the lakes, the lanes and the pools of a startup, on the calling thread.
+/// Builds the lattice, the lakes, the device with its kernels and the pools of a startup, on the calling thread. The
+/// lanes are not opened here: their rings depend on the sequences the plan resolves ([`Core::open_lanes`]).
 fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duration>) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
-    // Before anything is opened: the rings the lanes are created with depend on it.
-    let sequences = ringed_sequences(&settings.batching)?;
+    // Before anything is opened: a stated count the passes cannot hold is refused.
+    check_stated_sequences(&settings.batching)?;
     let library = CudaLibrary::load(library_path)?;
     let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
 
@@ -1087,23 +1307,12 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         loading.elapsed().as_secs_f64()
     );
 
-    // The stage graphs' lanes first, so that their ids are the plan's (`0..`), then one transfer lane per upload chain,
-    // the most the settings allow; the startup uses as many as its ring needs.
     let machine = startup::read_machine();
     let compute = Plan::lane_width();
-    let chains = startup::transfer_lanes(settings, MAX_LANES.saturating_sub(compute + 1));
-    let ring = stage_ring(quanta_for(sequences));
-    let set =
-        open_lane_set(&gpu, compute, ring, chains).map_err(|error| runtime("the lanes would not open", &error))?;
-    let lanes = set.queues;
-    let lane_table = LaneTable::new(set.typed, Arc::clone(&kernels), Arc::clone(&library));
-    let completions = Completions::new(&lanes);
+    // The lanes open at the plan: their rings are sized by the sequences it resolves ([`Core::open_lanes`]).
     lattice
         .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
         .map_err(|error| runtime("the lattice would not take the file I/O", &format!("{error:?}")))?;
-    lattice
-        .add_upstream(Arc::clone(&completions) as Arc<dyn LatticeSource>)
-        .map_err(|error| runtime("the lattice would not take the completions", &format!("{error:?}")))?;
     let pool_bytes = startup::pinned_pool_bytes(settings, &machine);
     let pool = PinnedPool::new(&library, pool_bytes);
     let teardown = Teardown::with_cancel_bound(
@@ -1121,11 +1330,9 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         host,
         control,
         io,
-        completions,
         gpu,
-        lanes,
-        lane_table,
-        stage_ring: ring,
+        kernels,
+        device_lanes: OnceLock::new(),
         compute,
         pool,
         released: Arc::new(ReleasedBuffers::new()),
@@ -1167,26 +1374,22 @@ mod tests {
     }
 
     #[test]
-    fn the_rings_are_sized_for_the_stated_count_and_for_one_when_it_is_automatic() {
+    fn a_count_beyond_the_rows_of_a_pass_is_refused_before_anything_opens() {
         let mut settings = BatchingSettings::default();
-        assert_eq!(ringed_sequences(&settings).unwrap(), 1);
+        assert!(check_stated_sequences(&settings).is_ok());
         settings.max_sequences = 0;
-        assert_eq!(ringed_sequences(&settings).unwrap(), 1);
-        settings.max_sequences = 4;
-        assert_eq!(ringed_sequences(&settings).unwrap(), 4);
-    }
-
-    #[test]
-    fn a_count_beyond_the_rows_of_a_pass_is_refused_before_any_ring_is_sized() {
-        let mut settings = BatchingSettings::default();
+        assert!(
+            check_stated_sequences(&settings).is_ok(),
+            "automatic is bounded by the plan"
+        );
         settings.max_sequences = settings.prefill_chunk_tokens;
-        assert_eq!(ringed_sequences(&settings).unwrap(), 512);
+        assert!(check_stated_sequences(&settings).is_ok());
         settings.max_sequences = 100_000;
-        let error = ringed_sequences(&settings).unwrap_err().to_string();
+        let error = check_stated_sequences(&settings).unwrap_err().to_string();
         assert!(error.contains("batching.max-sequences"), "{error}");
         settings.max_sequences = 5;
         settings.max_tokens_per_pass = Auto::Value(4);
-        assert!(ringed_sequences(&settings).is_err());
+        assert!(check_stated_sequences(&settings).is_err());
     }
 
     /// A stand-in for the runtime that counts its drops.
@@ -1206,8 +1409,8 @@ mod tests {
     fn a_close_that_spends_the_window_skips_the_free_drops_nothing_and_says_what_is_left() {
         let freed = Cell::new(false);
         let drops = Rc::new(Cell::new(0));
+        // Timing-based on purpose: the window is wall time and the closer must really overrun it (the sleep is longer).
         let window = Duration::from_millis(20);
-        let begun = Instant::now();
         let result = stop_within(
             window,
             Counted(Rc::clone(&drops)),
@@ -1218,7 +1421,6 @@ mod tests {
             },
             |_| "7 bytes stay".to_owned(),
         );
-        assert!(begun.elapsed() < Duration::from_secs(5));
         assert!(!freed.get());
         assert_eq!(drops.get(), 0, "the runtime is left undropped");
         match result {

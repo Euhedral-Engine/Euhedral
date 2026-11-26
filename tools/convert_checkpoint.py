@@ -19,7 +19,9 @@ a calibration text). The formats and layouts are unchanged.
 
 --codes-from DIR writes the quantized objects DIR holds pre-rounded codes for (one file per object, written by
 euhedral_artifacts/fake_quant.py or a training tool) instead of rounding them; the other objects are rounded as
-usual. A file must match the object's format, layout and shape in the chosen artifact.
+usual. A file must match the object's format, layout and shape in the chosen artifact. DIR must hold
+calibration.json, the manifest `quantization calibrate` writes, and it must say every layer, both heads and the
+MTP block are written: the conversion refuses a directory of a run that stopped early or has no manifest.
 
 --trellis-from DIR (required with, and only valid for, --quantization trellis) packs the linears of the EXL3
 checkpoint calibrate --format trellis wrote into DIR: the engine's objects, each with its input scales, output

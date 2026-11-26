@@ -31,6 +31,10 @@ disallowed-methods = [
     { path = "std::fs::OpenOptions::open", reason = "blocking I/O: use AsyncIo" },
     { path = "std::fs::read_dir", reason = "blocking I/O: use AsyncIo" },
     { path = "std::fs::metadata", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::File::metadata", reason = "blocking I/O: use AsyncIo::file_len" },
+    { path = "std::fs::File::sync_data", reason = "blocking I/O: the durability barrier is euhedral_inference_quantization::durable::sync" },
+    { path = "std::fs::File::set_len", reason = "blocking I/O: truncation is euhedral_inference_quantization::durable::truncate" },
+    { path = "std::fs::remove_file", reason = "blocking I/O: removal is euhedral_inference_quantization::durable::remove" },
     { path = "std::io::stdin", reason = "blocking I/O: a read from standard input waits" },
     { path = "std::net::TcpStream::connect", reason = "blocking I/O: use AsyncIo" },
     { path = "std::net::TcpStream::connect_timeout", reason = "blocking I/O: use AsyncIo" },
@@ -51,7 +55,6 @@ disallowed-methods = [
     { path = "euhedral_inference_cuda::DeviceBuffer::copy_to_host", reason = "a synchronous copy waits for the device: queue KernelOps::copy_device_to_readback on a lane", allow-invalid = true },
     { path = "euhedral_inference_cuda::PinnedPool::trim", reason = "freeing pinned memory waits for the device: trim at startup and shutdown only", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_synchronize", reason = "nothing waits on the device: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
-    { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_stream_synchronize", reason = "nothing waits on a stream: poll the lane's completion word (startup, shutdown and tests only)", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_copy_host_to_device", reason = "a synchronous copy waits for the device: queue euhedral_cuda_copy_upload_to_device on a lane", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_copy_device_to_host", reason = "a synchronous copy waits for the device: queue euhedral_cuda_copy_device_to_readback on a lane", allow-invalid = true },
     { path = "euhedral_inference_cuda::sys::EuhedralCuda::euhedral_cuda_free", reason = "cudaFree waits for the device: free at shutdown, or use euhedral_cuda_free_async on a lane", allow-invalid = true },
@@ -83,6 +86,6 @@ absolute-paths-max-segments = 2
 
 # Tests may unwrap, expect and print; library code may not (the unwrap_used, expect_used, print_stdout and
 # print_stderr lints).
-allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-print-in-tests = true
+allow-unwrap-in-tests = true

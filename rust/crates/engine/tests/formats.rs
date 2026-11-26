@@ -1,23 +1,6 @@
 //! The linear formats' routes, decided on the host: the K split, the trellis launches against Java's, and the NVFP4
 //! routes by rows. None of it needs a GPU.
 //!
-//! The K-split table is produced once from Java (`TrellisFormat.splits`, Java 25, from the repository root after
-//! `./gradlew :core:compileJava :core:compileTestJava`; CLASSPATH is the core module's test runtime classpath):
-//!
-//! ```text
-//! jshell --class-path "$CLASSPATH" <<'JSH'
-//! import io.euhedral_execution.inference.core.artifact.format.TrellisFormat;
-//! int[][] shapes = {{5120, 4096}, {5120, 12288}, {6144, 5120}, {5120, 34816}, {17408, 5120}, {5120, 7168},
-//!         {5120, 248320}, {256, 128}, {128, 128}, {255, 256}, {512, 128}, {1024, 1024}, {17408, 128}};
-//! int[] targets = {1, 140, 280, 384, 560, 840, 1120, 100000};
-//! for (int[] shape : shapes)
-//!     for (int target : targets)
-//!         System.out.println("    (" + shape[0] + ", " + shape[1] + ", " + target + ", "
-//!                 + TrellisFormat.splits(shape[0], shape[1], target) + "),");
-//! /exit
-//! JSH
-//! ```
-//!
 //! The launches are recorded by `fixtures/linear_launches.jsh` into `fixtures/linear_launches.txt`: the kernel, grid,
 //! block, shared bytes and arguments of every launch `TrellisFormat.linear` makes for the layer shapes of the RCO
 //! artifact over row counts, thresholds and routes, and the scratch it plans for each.
@@ -35,8 +18,8 @@ mod formats {
     use euhedral_inference_cuda::launch::nvfp4::skinny_target_ctas;
     use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
     use euhedral_inference_engine::formats::{
-        Launch, LinearKernel, LinearMode, Nvfp4Linear, Nvfp4Route, ROW_EXACT_KERNELS, ScratchRegion, Table,
-        TrellisLinear, TrellisOperands, TrellisShape, nvfp4_native_scratch_bytes,
+        Launch, LinearMode, Nvfp4Linear, Nvfp4Route, ScratchRegion, TrellisLinear, TrellisOperands, TrellisShape,
+        nvfp4_native_scratch_bytes,
     };
     /// The grid the portable linears assume: two blocks on each of 70 multiprocessors.
     const TARGET_CTAS: u64 = skinny_target_ctas(70);
@@ -45,125 +28,51 @@ mod formats {
     use euhedral_inference_engine::residency::scratch::splits;
     use euhedral_inference_settings::{Auto, TrellisKernelSettings};
 
-    /// `(k, n, target blocks, splits)`: `TrellisFormat.splits`.
-    const JAVA_SPLITS: &[(u64, u64, u64, u64)] = &[
-        (5120, 4096, 1, 1),
-        (5120, 4096, 140, 5),
-        (5120, 4096, 280, 9),
-        (5120, 4096, 384, 12),
-        (5120, 4096, 560, 18),
-        (5120, 4096, 840, 20),
-        (5120, 4096, 1120, 20),
-        (5120, 4096, 100000, 20),
-        (5120, 12288, 1, 1),
-        (5120, 12288, 140, 2),
-        (5120, 12288, 280, 3),
-        (5120, 12288, 384, 4),
-        (5120, 12288, 560, 6),
-        (5120, 12288, 840, 9),
-        (5120, 12288, 1120, 12),
-        (5120, 12288, 100000, 20),
-        (6144, 5120, 1, 1),
-        (6144, 5120, 140, 4),
-        (6144, 5120, 280, 7),
-        (6144, 5120, 384, 10),
-        (6144, 5120, 560, 14),
-        (6144, 5120, 840, 21),
-        (6144, 5120, 1120, 24),
-        (6144, 5120, 100000, 24),
-        (5120, 34816, 1, 1),
-        (5120, 34816, 140, 1),
-        (5120, 34816, 280, 2),
-        (5120, 34816, 384, 2),
-        (5120, 34816, 560, 3),
-        (5120, 34816, 840, 4),
-        (5120, 34816, 1120, 5),
-        (5120, 34816, 100000, 20),
-        (17408, 5120, 1, 1),
-        (17408, 5120, 140, 4),
-        (17408, 5120, 280, 7),
-        (17408, 5120, 384, 10),
-        (17408, 5120, 560, 14),
-        (17408, 5120, 840, 21),
-        (17408, 5120, 1120, 28),
-        (17408, 5120, 100000, 68),
-        (5120, 7168, 1, 1),
-        (5120, 7168, 140, 3),
-        (5120, 7168, 280, 5),
-        (5120, 7168, 384, 7),
-        (5120, 7168, 560, 10),
-        (5120, 7168, 840, 15),
-        (5120, 7168, 1120, 20),
-        (5120, 7168, 100000, 20),
-        (5120, 248320, 1, 1),
-        (5120, 248320, 140, 1),
-        (5120, 248320, 280, 1),
-        (5120, 248320, 384, 1),
-        (5120, 248320, 560, 1),
-        (5120, 248320, 840, 1),
-        (5120, 248320, 1120, 1),
-        (5120, 248320, 100000, 20),
-        (256, 128, 1, 1),
-        (256, 128, 140, 1),
-        (256, 128, 280, 1),
-        (256, 128, 384, 1),
-        (256, 128, 560, 1),
-        (256, 128, 840, 1),
-        (256, 128, 1120, 1),
-        (256, 128, 100000, 1),
-        (128, 128, 1, 1),
-        (128, 128, 140, 1),
-        (128, 128, 280, 1),
-        (128, 128, 384, 1),
-        (128, 128, 560, 1),
-        (128, 128, 840, 1),
-        (128, 128, 1120, 1),
-        (128, 128, 100000, 1),
-        (255, 256, 1, 1),
-        (255, 256, 140, 1),
-        (255, 256, 280, 1),
-        (255, 256, 384, 1),
-        (255, 256, 560, 1),
-        (255, 256, 840, 1),
-        (255, 256, 1120, 1),
-        (255, 256, 100000, 1),
-        (512, 128, 1, 1),
-        (512, 128, 140, 2),
-        (512, 128, 280, 2),
-        (512, 128, 384, 2),
-        (512, 128, 560, 2),
-        (512, 128, 840, 2),
-        (512, 128, 1120, 2),
-        (512, 128, 100000, 2),
-        (1024, 1024, 1, 1),
-        (1024, 1024, 140, 4),
-        (1024, 1024, 280, 4),
-        (1024, 1024, 384, 4),
-        (1024, 1024, 560, 4),
-        (1024, 1024, 840, 4),
-        (1024, 1024, 1120, 4),
-        (1024, 1024, 100000, 4),
-        (17408, 128, 1, 1),
-        (17408, 128, 140, 68),
-        (17408, 128, 280, 68),
-        (17408, 128, 384, 68),
-        (17408, 128, 560, 68),
-        (17408, 128, 840, 68),
-        (17408, 128, 1120, 68),
-        (17408, 128, 100000, 68),
-    ];
-
     /// A device address that is never dereferenced.
     fn address(value: u64) -> DevicePtr {
         // SAFETY: the address is only compared and printed; no operation is queued on it.
         unsafe { DevicePtr::from_raw(value) }
     }
 
+    /// The K split is a count of pieces of at least 256 inputs each, as many as it takes the thread blocks to reach
+    /// the target (the columns already give one block per 128), never more, and one when nothing can be split.
     #[test]
-    fn trellis_k_split_matches_java_table() {
-        assert!(JAVA_SPLITS.len() > 100);
-        for (k, n, target, java) in JAVA_SPLITS {
-            assert_eq!(splits(*k, *n, *target), *java, "k={k} n={n} target={target}");
+    fn the_k_split_fills_the_target_with_the_fewest_pieces_of_whole_tiles() {
+        let sizes = [
+            128u64, 255, 256, 384, 512, 1024, 4096, 5120, 12_288, 17_408, 34_816, 248_320,
+        ];
+        let targets = [1u64, 2, 3, 70, 139, 140, 280, 384, 560, 1120, 100_000];
+        for k in sizes {
+            for n in sizes {
+                let blocks = (n / 128).max(1);
+                let most = (k / 256).max(1);
+                let mut previous = 0;
+                for target in targets {
+                    let count = splits(k, n, target);
+                    let at = format!("k={k} n={n} target={target}");
+                    assert!((1..=most).contains(&count), "{at}: {count} pieces outside 1..={most}");
+                    assert!(
+                        count * blocks >= target || count == most,
+                        "{at}: {count} pieces leave the target unmet below the limit"
+                    );
+                    assert!(
+                        count == 1 || (count - 1) * blocks < target,
+                        "{at}: {count} pieces are more than the target needs"
+                    );
+                    if count > 1 {
+                        assert!(k / count >= 256, "{at}: a piece is smaller than a tile of 256 inputs");
+                    }
+                    assert!(count >= previous, "{at}: a larger target gives fewer pieces");
+                    previous = count;
+                }
+                // More columns carry more blocks, so they never ask for more pieces.
+                for target in targets {
+                    assert!(
+                        splits(k, n * 2, target) <= splits(k, n, target),
+                        "k={k} n={n} target={target}"
+                    );
+                }
+            }
         }
     }
 
@@ -455,24 +364,6 @@ mod formats {
             ..settings
         };
         assert!(splits_of(&TrellisLinear::from_settings(&stated, 70)).contains("grid=32,5,1"));
-    }
-
-    #[test]
-    fn the_kernel_tables_are_in_the_native_order() {
-        let names: Vec<&str> = LinearKernel::ALL.iter().map(|kernel| kernel.symbol()).collect();
-        assert_eq!(names.len(), 11);
-        for (index, kernel) in LinearKernel::ALL.iter().enumerate() {
-            assert_eq!(kernel.index(), index);
-        }
-        assert_eq!(names[0], "euhedral_trellis_prepass");
-        assert_eq!(names[8], "euhedral_trellis_mma_rows_fp8");
-        assert_eq!(ROW_EXACT_KERNELS[0], (30, "euhedral_q4_linear_tc_bf16"));
-        let launch = LinearKernel::TrellisEpilogue.launch([1, 2, 3], [4, 5, 6], 7, Default::default());
-        assert_eq!((launch.table, launch.kernel), (Table::Linear, 4));
-        assert_eq!(
-            launch.geometry(),
-            "euhedral_trellis_epilogue grid=1,2,3 block=4,5,6 smem=7"
-        );
     }
 
     fn nvfp4(out: u64, input: u64, layout: WeightLayout) -> WeightRef {

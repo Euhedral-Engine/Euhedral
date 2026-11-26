@@ -1,0 +1,706 @@
+# CI for Linux (ARM and the Intel SDE step stay on GitHub, which runs them for the main pushes that forge-mirror sends;
+# the Windows build of a pull request runs there too, dispatched by the `windows` job below). One workflow, so
+# `rollover promote` finds one run per commit (require_run = ["ci.yaml"]).
+#
+# It fails fast: the first job that fails cancels the whole run (the last step of each job, `.gitea/actions/fail-fast`;
+# the two Bazel jobs are reusable workflows with no steps of ours, so `gate-failed` and `windows-failed` do it for them).
+# A cancelled run is never green: the checks to require are `rust`, `native-package`, `device`, `gate-ok` and `windows`,
+# and the last four are cancelled with it.
+#
+# The runner labels are listed below with the jobs that use them.
+# Runs for a pull request that touches a path below, for a push to main or to an integration branch (rust/next*), and by hand.
+# A push to any other branch starts nothing: the runner is shared, and the branch's pull request runs the same jobs.
+# On an integration branch the jobs run whenever anything since main touched their paths, so a later push that touches none
+# of them cannot hide a failed earlier one. A push to a rust/next* branch that is not vars.INTEGRATION_BRANCH fails at once.
+#
+# Job labels are the runner's (arbiter-docker for the cheap job, arbiter-docker-unconfined for the heavy ones, which need
+# seccomp off, arbiter-gpu for the device test jobs, which get the card; the device build runs unconfined without it). No docker job sets timeout-minutes: the arbiter's hold limit (ARBITER_EST + 60 s from the grant) is its limit.
+# No job asks for more than --mem 32G, and none uses a cpu form (scripts/lint-workflows.py checks both).
+#
+# The artifact actions (v4) work against Gitea's artifact store and need Node in the image.
+name: ci
+
+on:
+  pull_request:
+    paths:
+      - "rust/**"
+      - "native/**"
+      - "api/**"
+      - "core/**"
+      - "benchmark/**"
+      - "gradle/**"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - "native.gradle.kts"
+      - "build.gradle.kts"
+      - "mise.toml"
+      - ".gitea/workflows/**"
+      - "scripts/lint-workflows.py"
+      - "scripts/test_lint_workflows.py"
+      - "MODULE.bazel"
+      - "MODULE.bazel.lock"
+      - ".bazelrc"
+      - ".bazelversion"
+      - ".bazelignore"
+      - "BUILD.bazel"
+      - "bazel/**"
+      - ".gitattributes"
+      - ".github/workflows/ci.yml"
+  push:
+    branches: [main, "rust/next*"]
+  workflow_dispatch:
+
+# `actions: write` is for the cancel call of the fail-fast step, and nothing else.
+permissions:
+  contents: read
+  actions: write
+
+# The event is part of the group, so a manual run on the integration branch never cancels the push run that
+# `rollover promote` requires for that commit. Each push to main has its own group (its sha), so no main run is
+# cancelled or replaced by a newer one: each main run diffs against the previous push.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    name: changes
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--mem 1G"
+      ARBITER_EST: "60"
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+      native: ${{ steps.diff.outputs.native }}
+      bazel: ${{ steps.diff.outputs.bazel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test the workflow lint
+        run: python3 -m unittest scripts/test_lint_workflows.py
+      - name: Lint the memory asked by the workflows
+        run: python3 scripts/lint-workflows.py .gitea/workflows
+      - name: Decide which groups changed
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          INTEGRATION_BRANCH: ${{ vars.INTEGRATION_BRANCH }}
+        run: |
+          set -euo pipefail
+          zero=0000000000000000000000000000000000000000
+
+          # The path groups of each job. mise.toml and rust/** are in every group.
+          rust_paths=(
+            ':(glob)rust/**' ':(glob)native/include/**' ':(glob)mise.toml' ':(glob).gitea/workflows/ci.yaml'
+          )
+          native_paths=(
+            ':(glob)api/**' ':(glob)core/**' ':(glob)benchmark/**' ':(glob)gradle/**' ':(glob)settings.gradle.kts'
+            ':(glob)gradle.properties' ':(glob)native/**' ':(glob)native.gradle.kts' ':(glob)build.gradle.kts'
+            ':(glob)mise.toml' ':(glob)rust/**' ':(glob).gitea/workflows/ci.yaml'
+          )
+
+          # The Bazel gate: the workspace, the Bazel files, and the GitHub workflow the Windows leg runs.
+          bazel_paths=(
+            ':(glob)rust/**' ':(glob)MODULE.bazel' ':(glob)MODULE.bazel.lock' ':(glob).bazelrc' ':(glob).bazelversion'
+            ':(glob).bazelignore' ':(glob)BUILD.bazel' ':(glob)bazel/**' ':(glob).gitattributes' ':(glob)mise.toml'
+            ':(glob).gitea/workflows/ci.yaml' ':(glob).github/workflows/ci.yml'
+          )
+
+          # Guard: an integration branch other than the current one runs nothing heavy.
+          if [ "$EVENT" = push ]; then
+            case "$REF_NAME" in
+              rust/next*)
+                if [ -z "$INTEGRATION_BRANCH" ]; then
+                  echo "::error::INTEGRATION_BRANCH is empty, so $REF_NAME is not the integration branch (rollover promote sets it)"
+                  exit 1
+                fi
+                if [ "$INTEGRATION_BRANCH" != "$REF_NAME" ]; then
+                  echo "::error::$REF_NAME is not the integration branch ($INTEGRATION_BRANCH is; rollover promote sets it)"
+                  exit 1
+                fi
+                ;;
+            esac
+          fi
+
+          # Base: what the groups are compared with.
+          #   pull request       the merge base with the target branch
+          #   integration branch the merge base with main, so a later push cannot hide an earlier failure
+          #   main               the previous push; everything when it is unknown (new branch, forced push)
+          #   dispatch           everything
+          all=false
+          range=
+          case "$EVENT" in
+            pull_request)
+              range="origin/${BASE_REF#refs/heads/}...HEAD"
+              ;;
+            push)
+              if [ "$REF_NAME" = main ]; then
+                if [ -z "$BEFORE" ] || [ "$BEFORE" = "$zero" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                  all=true
+                else
+                  range="$BEFORE..HEAD"
+                fi
+              else
+                range="origin/main...HEAD"
+              fi
+              ;;
+            *)
+              all=true
+              ;;
+          esac
+
+          # git diff --quiet: 0 means no difference, 1 a difference; anything else is an error and fails the job.
+          changed() {
+            local rc=0
+            if [ "$all" = true ]; then echo true; return; fi
+            git diff --quiet "$range" -- "$@" || rc=$?
+            case "$rc" in
+              0) echo false ;;
+              1) echo true ;;
+              *) echo "::error::git diff $range failed ($rc)" >&2; return 1 ;;
+            esac
+          }
+          rust=$(changed "${rust_paths[@]}")
+          native=$(changed "${native_paths[@]}")
+          bazel=$(changed "${bazel_paths[@]}")
+          echo "event=$EVENT ref=$REF_NAME all=$all range=${range:-none} rust=$rust native=$native bazel=$bazel"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "native=$native" >> "$GITHUB_OUTPUT"
+          echo "bazel=$bazel" >> "$GITHUB_OUTPUT"
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  rust:
+    name: rust
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: arbiter-docker-unconfined
+    env:
+      ARBITER_ARGS: "--mem 12G"
+      ARBITER_EST: "1800"
+      # local/ci-base trusts only its own build directory.
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Rust toolchain
+        run: mise install rust >/dev/null
+      - name: Install bindgen
+        # bindgen loads libclang, which local/ci-base carries.
+        run: |
+          eval "$(mise env -s bash)"
+          cargo install bindgen-cli --version 0.72.1 --locked
+      - name: Check the CUDA bindings are current
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo xtask bindings --check
+      - name: Layers
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          scripts/check-layers.sh --self-test
+      - name: Check formatting
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo fmt --all --check
+      - name: Lint
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo clippy --workspace --all-targets -- -D warnings
+      # A build of the server alone, which does not turn on the engine's test-only features that the workspace build does.
+      - name: Check the server crates alone
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo check -p euhedral-inference-server -p euhedral-inference-api-server -p euhedral-inference-bench
+      - name: Check the aarch64 kernels
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          rustup target add aarch64-unknown-linux-gnu
+          cargo check --target aarch64-unknown-linux-gnu -p euhedral-inference-host-gemv
+      - name: Test
+        working-directory: rust
+        run: |
+          eval "$(mise env -s bash)"
+          cargo test --workspace
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  # The ignored device tests of the workspace, on the card, in groups that each ask the arbiter for what their own tests need.
+  # `device-build` builds the native library and the test binaries once, without the card, and uploads them as one artifact.
+  # Each `device-*` job downloads it and runs one group of `scripts/ci-device.py`, with no build: a failing group is red
+  # when it ends and the others still run. The binaries carry the paths of the build, so the build and the test jobs run
+  # in the same workspace path (the script refuses otherwise). `device` is the one check to require: it fails unless every
+  # group passed, a skipped group included. Every location comes from the Actions variables below; the jobs write none.
+  # EUHEDRAL_NVRTC_DIR (the directory holding libnvrtc) is required. The optional ones are passed to the tests only when set,
+  # and a test whose data is missing prints a skip line and passes (each group lists them at its end):
+  #   EUHEDRAL_TEST_QWEN_RCO_ARTIFACT              the model artifact
+  #   EUHEDRAL_TEST_RUST_GOLDENS                   the goldens directory
+  #   EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES    the directory with the CUDA math libraries
+  # The card holds one engine of the model at a time per process; the arbiter runs groups side by side when their asks fit.
+  device-build:
+    name: device-build
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-docker-unconfined
+    env:
+      ARBITER_ARGS: "--mem 16G"
+      ARBITER_EST: "900"
+      APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/native/.zig-global-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: |
+          # shellcheck disable=SC2086 # APT_OPTS is a list of options
+          apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq llvm xz-utils python3-pip gcc libc6-dev >/dev/null
+      - name: Install the toolchains
+        run: mise install >/dev/null
+      - name: Build the native library
+        run: mise exec -- gradle -q nativeBuildLinuxX64
+      # The device profile is the release profile with debug assertions and overflow checks on: the tests run at the speed
+      # of the product and still trip on what the debug build would. The quantization crate's other device tests fail,
+      # not skip, without their settings: only its kernel tests are built for the groups.
+      - name: Build the device tests
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          mise exec -- cargo test --profile device --workspace --exclude euhedral-inference-quantization --no-run \
+            --message-format=json > "$RUNNER_TEMP/build-workspace.json"
+          mise exec -- cargo test --profile device -p euhedral-inference-quantization --test kernels_gpu --no-run \
+            --message-format=json > "$RUNNER_TEMP/build-quantization.json"
+      - name: Pack the test binaries
+        run: |
+          set -euo pipefail
+          # The native library finds the CUDA runtime, the grammar library and the kernel sources beside it: the whole
+          # native directory goes along.
+          test -f build/native/linux-x64/lib/libeuhedral_cuda.so
+          mkdir -p "$RUNNER_TEMP/device-tests"
+          python3 scripts/ci-device.py pack "$RUNNER_TEMP/build-workspace.json" "$RUNNER_TEMP/build-quantization.json" \
+            --native build/native/linux-x64 --out "$RUNNER_TEMP/device-tests/device-tests.tar"
+      - name: Upload the device tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests/*
+          if-no-files-found: error
+          retention-days: 2
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  # The CUDA crate kernels and the quantization kernels.
+  device-kernels:
+    name: device-kernels
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # The engine sizes its host memory from the container headroom, so a learned cap starves it: limit to the full ask.
+      # Measured: 0.5 GB on the card, 0.5 GB of host memory, 114 s.
+      ARBITER_ARGS: "--gpu shared:1.5 --mem 2G --no-learned-cap"
+      ARBITER_EST: "240"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, kernels
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-device.py run kernels --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Skipped tests
+        if: always()
+        run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  # The server, API server, benchmark and tokenizer tests: each starts its own engine.
+  device-servers:
+    name: device-servers
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # Measured: 12.7 GB on the card (one engine at a time), 5.4 GB of host memory; 185 s alone on the card, and past
+      # 280 s when other jobs share it, so the estimate leaves room for a shared card.
+      ARBITER_ARGS: "--gpu shared:13.5 --mem 8G --no-learned-cap"
+      ARBITER_EST: "480"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, servers and benchmarks
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-device.py run servers --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Skipped tests
+        if: always()
+        run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  # The engine binary, the tests that run on a reduced model: no engine of the model.
+  device-engine-rig:
+    name: device-engine-rig
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # Measured: 5.4 GB on the card (a reduced model), 12.2 GB of host memory, 140 s.
+      ARBITER_ARGS: "--gpu shared:6 --mem 14G --no-learned-cap"
+      ARBITER_EST: "300"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, engine, reduced model
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-device.py run engine-rig --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Skipped tests
+        if: always()
+        run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  # The engine binary, the modules whose engines have a short context.
+  device-engine-small:
+    name: device-engine-small
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # Measured: 13.1 GB on the card (a 512 and an 8192 token engine), 2.6 GB of host memory, 57 to 141 s.
+      ARBITER_ARGS: "--gpu shared:14 --mem 6G --no-learned-cap"
+      ARBITER_EST: "300"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, engine, short context
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-device.py run engine-small --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Skipped tests
+        if: always()
+        run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  # The engine binary, the modules that start the 4096-token engine and the loader.
+  device-engine-big:
+    name: device-engine-big
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # Measured: 22.1 GB on the card, 23.4 GB of host memory, 53 model loads, 582 s.
+      ARBITER_ARGS: "--gpu shared:22.5 --mem 28G --no-learned-cap"
+      ARBITER_EST: "700"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, engine, long context
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-device.py run engine-big --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Skipped tests
+        if: always()
+        run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  # The one check to require: the groups above all passed. A group that did not run (an earlier job failed, or it was
+  # cancelled) is a failure here, not a pass; only a run that touched no native path skips everything.
+  device:
+    name: device
+    needs: [changes, device-build, device-kernels, device-servers, device-engine-rig, device-engine-small, device-engine-big]
+    if: always()
+    runs-on: arbiter-docker
+    steps:
+      - name: Every device group passed
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        env:
+          PATH: /usr/bin:/bin
+          CHANGES: ${{ needs.changes.result }}
+          NATIVE: ${{ needs.changes.outputs.native }}
+          RESULTS: >-
+            ${{ needs.device-build.result }} ${{ needs.device-kernels.result }} ${{ needs.device-servers.result }}
+            ${{ needs.device-engine-rig.result }} ${{ needs.device-engine-small.result }} ${{ needs.device-engine-big.result }}
+        run: |
+          test "$CHANGES" = success
+          if test "$NATIVE" != true; then
+            exit 0
+          fi
+          for result in $RESULTS; do
+            test "$result" = success || { echo "::error::a device job ended $result"; exit 1; }
+          done
+
+  native-package:
+    name: native-package
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-docker-unconfined
+    env:
+      ARBITER_ARGS: "--mem 12G"
+      ARBITER_EST: "1800"
+      APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/native/.zig-global-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: |
+          # shellcheck disable=SC2086 # APT_OPTS is a list of options
+          apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq llvm xz-utils python3-pip gcc libc6-dev >/dev/null
+      - name: Install the toolchains
+        run: mise install >/dev/null
+      - name: Build both CUDA products and package Spring Boot
+        run: mise exec -- gradle nativeVerify :api:bootJar build
+      # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources and the registry.
+      - name: Native host tests
+        working-directory: native/tests
+        run: python3 -m unittest test_pdl_wait test_pdl_registry
+      # The Rust server bundle for linux-x64, from the native product just built.
+      - name: Bundle the Rust server (linux-x64)
+        working-directory: rust
+        run: mise exec -- cargo xtask bundle --product linux-x64
+      - name: Upload the test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: api/build/test-results/test/*.xml
+          retention-days: 2
+      - name: Upload the server bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-server-linux-x64
+          path: build/bundle/euhedral-server-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 2
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
+  # The Bazel gate of the Rust workspace, beside the Cargo jobs: `bazel test //... --config=ci` on Linux, the BUILD files'
+  # staleness check, and forge's repo check. The reusable workflows are pinned by the protected tag, by its full ref.
+  gate:
+    needs: changes
+    if: needs.changes.outputs.bazel == 'true'
+    uses: euhedral/ci/.gitea/workflows/bazel-gate.yml@refs/tags/v10
+    with:
+      stale-build: gazelle
+      bazel-mem: 16
+      bazel-est: 1200
+    secrets:
+      # Also read by the repo check's pin alignment (C5).
+      forge-read-token: ${{ secrets.FORGE_READ_TOKEN }}
+
+  # The same test on the Windows platform: GitHub runs it, dispatched by the proxy, for a pull request only.
+  windows:
+    needs: changes
+    if: needs.changes.outputs.bazel == 'true'
+    uses: euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v10
+    with:
+      repo: Euhedral-Engine/Euhedral
+      permissions: contents:write,actions:write,workflows:write
+    secrets:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
+      GH_APP_PRIVATE_KEY_B64: ${{ secrets.GH_APP_PRIVATE_KEY_B64 }}
+
+  # A reusable-workflow job has no step of ours to end with, so these two cancel the run when the job they follow fails.
+  gate-failed:
+    name: gate-failed
+    needs: gate
+    if: always() && needs.gate.result == 'failure'
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--mem 1G"
+      ARBITER_EST: "60"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.gitea/actions/fail-fast
+
+  windows-failed:
+    name: windows-failed
+    needs: windows
+    if: always() && needs.windows.result == 'failure'
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--mem 1G"
+      ARBITER_EST: "60"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.gitea/actions/fail-fast
+
+  # The one check to require for Bazel: a skipped gate (a caller's `if:`) is a failure here, not a pass, unless no Bazel
+  # path changed. The Windows workflow runs only for a pull request, so on a push or a manual run its result is `skipped`,
+  # and only then (or when no Bazel path changed) is that accepted.
+  gate-ok:
+    name: gate-ok
+    needs: [changes, gate, windows]
+    if: always()
+    runs-on: arbiter-docker
+    steps:
+      # The image's PATH starts with directories an earlier job can write: a planted `bash` could pass this step.
+      - name: The gate ran and passed
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        env:
+          PATH: /usr/bin:/bin
+          EVENT: ${{ github.event_name }}
+          CHANGES: ${{ needs.changes.result }}
+          BAZEL: ${{ needs.changes.outputs.bazel }}
+          GATE: ${{ needs.gate.result }}
+          WINDOWS: ${{ needs.windows.result }}
+        run: |
+          test "$CHANGES" = success
+          if test "$BAZEL" != true; then
+            exit 0
+          fi
+          test "$GATE" = success
+          if test "$EVENT" = pull_request; then
+            test "$WINDOWS" = success
+          else
+            test "$WINDOWS" = success -o "$WINDOWS" = skipped
+          fi

@@ -2,19 +2,29 @@
 
 #![allow(dead_code, reason = "each test file uses some of these helpers")]
 #![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    reason = "the tests of one binary take turns on the card: a lock of the test harness, no engine state"
+)]
+#![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "a test helper: a failed unwrap is the failure"
 )]
+#![allow(clippy::print_stdout, reason = "the log counts the engine loads")]
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::process;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use euhedral_inference_cuda::CudaLibrary;
 use euhedral_inference_engine::error::PlanError;
+use euhedral_inference_engine::residency::budget;
 use euhedral_inference_engine::residency::offload::{EMBEDDING, mapped};
 use euhedral_inference_engine::residency::planner::{PlanInputs, plan_with};
 use euhedral_inference_settings::{Auto, ByteSize};
@@ -42,7 +52,25 @@ pub fn put_u64(out: &mut Vec<u8>, value: u64) {
 
 /// The RCO artifact's table, rebuilt in the container's binary form with synthetic offsets, and parsed.
 pub fn rco_table_without(skip: impl Fn(&str) -> bool) -> TensorTable {
-    let rows: Vec<Vec<&str>> = fixture()
+    table_of(fixture(), skip)
+}
+
+/// The table of a Q3 artifact (`compressed`: its P2E2 form), rebuilt the same way.
+pub fn q3_table(compressed: bool) -> TensorTable {
+    table_of(
+        if compressed {
+            include_str!("../fixtures/q3_compressed_table.tsv")
+        } else {
+            include_str!("../fixtures/q3_table.tsv")
+        },
+        |_| false,
+    )
+}
+
+/// A tensor table listed in a fixture's rows (`name`, `shape`, ordinals of dtype, format and layout, bytes), rebuilt in
+/// the container's binary form with synthetic offsets, and parsed.
+pub fn table_of(fixture: &str, skip: impl Fn(&str) -> bool) -> TensorTable {
+    let rows: Vec<Vec<&str>> = fixture
         .lines()
         .filter(|line| !line.starts_with('#'))
         .map(|line| line.split('\t').collect::<Vec<_>>())
@@ -157,6 +185,11 @@ impl Closer {
         }
     }
 
+    /// A handle to the engine.
+    pub fn runtime(&self) -> Arc<EngineRuntime> {
+        Arc::clone(self.runtime.as_ref().expect("the engine is not shut down yet"))
+    }
+
     /// Shuts the engine down: the test's `runtime` is the last handle.
     pub fn shutdown(mut self, runtime: Arc<EngineRuntime>) -> Result<(), EngineError> {
         drop(self.runtime.take());
@@ -180,8 +213,408 @@ impl Drop for Closer {
     fn drop(&mut self) {
         // Reached with the engine still up only when the test unwound.
         if let (Some(owner), Some(runtime)) = (self.owner.take(), self.runtime.take()) {
-            let _ = owner.shutdown(runtime);
+            let _shutting = doing("shutting down its engine after the test unwound");
+            if let Err(error) = owner.shutdown(runtime) {
+                mark_unfreed(&error.to_string());
+            }
         }
+    }
+}
+
+/// Set when an engine's device memory could not be freed (another handle to it was alive): the card is then full, and no
+/// test loads a second model on top of it.
+static UNFREED: Mutex<Option<String>> = Mutex::new(None);
+
+fn mark_unfreed(why: &str) {
+    let name = thread::current().name().unwrap_or("?").to_owned();
+    *UNFREED.lock().unwrap_or_else(PoisonError::into_inner) = Some(format!("found by {name}, {why}"));
+}
+
+/// Fails the test that would load a model on a card an earlier engine still fills.
+fn require_free_card() {
+    if let Some(why) = UNFREED.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        panic!("an engine of an earlier test still holds the card, so no model is loaded on top of it ({why})");
+    }
+}
+
+/// What the card holds between tests: the engine the last test left running, under the key of the settings it started
+/// with, and how many tests use the card without an engine.
+struct State {
+    engine: Option<(String, Closer)>,
+    /// The test that held the card last, for the failure of a shutdown it left unclean.
+    last: String,
+    light: usize,
+    exclusive: bool,
+    /// The tests waiting for the card, oldest first, with the key of the engine each one wants (none: an empty card).
+    waiting: Vec<(u64, Option<String>)>,
+    tickets: u64,
+    /// The tests inside the card now, by thread name, for the message of a hang.
+    holders: Vec<String>,
+}
+
+/// How long the run may go with no test taking or leaving the card, starting or shutting an engine down, or waiting
+/// for one of those, before the watchdog ends it naming what every live test is doing. The longest test is about two
+/// minutes.
+const HANG_GUARD: Duration = Duration::from_secs(5 * 60);
+
+fn thread_name() -> String {
+    thread::current().name().unwrap_or("?").to_owned()
+}
+
+/// Counts the steps the run has made; the watchdog compares it with what it saw before.
+static PROGRESS: AtomicU64 = AtomicU64::new(0);
+
+fn progress() {
+    PROGRESS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What each test thread is waiting on or doing now, outside the card's lock, so that the watchdog can read it when
+/// the lock itself is held by a start or a shutdown that does not end.
+static ACTIVITY: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Records what the thread does until the guard drops.
+struct Doing(String);
+
+fn doing(what: impl Into<String>) -> Doing {
+    let name = thread_name();
+    ACTIVITY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((name.clone(), what.into()));
+    progress();
+    Doing(name)
+}
+
+impl Drop for Doing {
+    fn drop(&mut self) {
+        let mut all = ACTIVITY.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = all.iter().rposition(|(name, _)| *name == self.0) {
+            all.remove(at);
+        }
+        drop(all);
+        progress();
+    }
+}
+
+/// Starts the thread that ends the process, naming every live test and what it does, when [`PROGRESS`] does not move
+/// for [`HANG_GUARD`]: whatever the tests wait on, a hung job then fails in minutes with the names.
+fn watchdog() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        thread::Builder::new()
+            .name("device-test-watchdog".to_owned())
+            .spawn(|| {
+                let mut seen = PROGRESS.load(Ordering::Relaxed);
+                let mut since = Instant::now();
+                loop {
+                    thread::sleep(Duration::from_secs(5));
+                    let now = PROGRESS.load(Ordering::Relaxed);
+                    if now != seen {
+                        seen = now;
+                        since = Instant::now();
+                    } else if since.elapsed() >= HANG_GUARD {
+                        hang_report();
+                    }
+                }
+            })
+            .expect("the watchdog thread starts");
+    });
+}
+
+fn hang_report() -> ! {
+    let activity = ACTIVITY
+        .try_lock()
+        .map_or_else(|_| "the activity list is locked".to_owned(), |all| format!("{all:#?}"));
+    let card = STATE.try_lock().map_or_else(
+        |_| {
+            "the card's lock is held by a thread that does not release it (an engine start or shutdown under it)"
+                .to_owned()
+        },
+        |state| {
+            format!(
+                "holders {:?}, exclusive {}, light {}, waiting {} tests, engine kept {:?}, last to keep it {}",
+                state.holders,
+                state.exclusive,
+                state.light,
+                state.waiting.len(),
+                state
+                    .engine
+                    .as_ref()
+                    .map(|(key, _)| key.chars().take(60).collect::<String>()),
+                state.last,
+            )
+        },
+    );
+    println!(
+        "HANG: no test took or left the card, started or shut an engine down for {} s; {} loads so far.\n\
+         what each test thread is doing: {activity}\nthe card: {card}",
+        HANG_GUARD.as_secs(),
+        LOADS.load(Ordering::Relaxed),
+    );
+    process::abort()
+}
+
+/// Waits for a change of the card.
+fn wait_for_change<'a>(state: MutexGuard<'a, State>, wanted: &str) -> MutexGuard<'a, State> {
+    let _waiting = doing(format!("waiting for {wanted}"));
+    CHANGED.wait(state).unwrap_or_else(PoisonError::into_inner)
+}
+
+static STATE: Mutex<State> = Mutex::new(State {
+    engine: None,
+    last: String::new(),
+    light: 0,
+    exclusive: false,
+    waiting: Vec::new(),
+    tickets: 0,
+    holders: Vec::new(),
+});
+static CHANGED: Condvar = Condvar::new();
+static LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// The longest an engine start waits for its latch.
+const START_WAIT: Duration = Duration::from_secs(5 * 60);
+
+fn lock() -> MutexGuard<'static, State> {
+    watchdog();
+    // A test that failed holding the card leaves it usable: the next one starts from what is left.
+    STATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The host memory the process holds and the machine can still spare, for the log: engines read the second at start to
+/// size their host budget, so a test process that keeps memory across engines starves the later ones.
+fn host_memory() -> String {
+    let read = |path: &str, key: &str| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(key).map(|rest| rest.trim().to_owned()))
+            })
+            .unwrap_or_default()
+    };
+    format!(
+        "process {}, machine available {}; {}",
+        read("/proc/self/status", "VmRSS:"),
+        read("/proc/meminfo", "MemAvailable:"),
+        cgroup_budget()
+    )
+}
+
+/// The figures an engine start reads to size its host budget, from the process's cgroup and its parents, with the
+/// budget they give (the engine's own rule, from its public parts): one line per group, `max`, `current`, the
+/// reclaimable page cache (`-` when `memory.stat` is unreadable, which counts the cache as used) and the headroom.
+pub fn cgroup_budget() -> String {
+    let root = Path::new("/sys/fs/cgroup");
+    let own = fs::read_to_string("/proc/self/cgroup").ok();
+    let mut group = own
+        .as_deref()
+        .and_then(budget::cgroup_path)
+        .map(|path| root.join(path.trim_start_matches('/')));
+    let mut least: Option<u64> = None;
+    let mut lines = Vec::new();
+    while let Some(path) = group.take().filter(|path| path.starts_with(root)) {
+        let read = |name: &str| fs::read_to_string(path.join(name));
+        let (max, current) = (read("memory.max").ok(), read("memory.current").ok());
+        let stat = read("memory.stat").ok();
+        let headroom = max.as_deref().zip(current.as_deref()).and_then(|(max, current)| {
+            let stat = (max.trim() != "max").then_some(stat.as_deref()).flatten();
+            budget::cgroup_headroom(max, current, stat)
+        });
+        least = match (least, headroom) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        lines.push(format!(
+            "[{} max {} current {} reclaimable {} headroom {}]",
+            path.display(),
+            max.as_deref().map_or("-", str::trim),
+            current.as_deref().map_or("-", str::trim),
+            stat.as_deref()
+                .and_then(budget::reclaimable_file_bytes)
+                .map_or_else(|| "-".to_owned(), |bytes| bytes.to_string()),
+            headroom.map_or_else(|| "-".to_owned(), |bytes| bytes.to_string()),
+        ));
+        if path != root {
+            group = path.parent().map(Path::to_path_buf);
+        }
+    }
+    let meminfo = fs::read_to_string("/proc/meminfo").ok();
+    let available = budget::available_bytes(meminfo.as_deref().and_then(budget::mem_available), least);
+    let host = available.map(|bytes| budget::HostBudget::of_available(bytes, Auto::Auto).pinnable_bytes);
+    format!("cgroups {}; spare {available:?}; host budget {host:?}", lines.join(" "))
+}
+
+/// Counts one model load in the log: a test that starts an engine itself, to see how the start ends, calls this.
+pub fn note_load() {
+    require_free_card();
+    let loads = LOADS.fetch_add(1, Ordering::Relaxed) + 1;
+    println!("ENGINE LOAD {loads} ({})", host_memory());
+}
+
+/// Starts an engine and waits for its latch, as `main` does, and counts the start: every engine of the device tests
+/// is started here, so the count in the log (`ENGINE LOAD n`) is the number of model loads of the run.
+pub fn start_engine(settings: &Settings, library: &Path) -> (Closer, Arc<EngineRuntime>) {
+    require_free_card();
+    let _starting = doing("starting an engine");
+    let (owner, ready) = EngineRuntime::start(settings, library);
+    let runtime = ready
+        .wait(START_WAIT)
+        .unwrap_or_else(|_| {
+            panic!(
+                "test {} waited {} s for its engine to report its start; the card is held by {:?}",
+                thread_name(),
+                START_WAIT.as_secs(),
+                lock().holders,
+            )
+        })
+        .expect("the engine starts");
+    note_load();
+    (Closer::new(owner, &runtime), runtime)
+}
+
+/// The card, held by one test at a time unless the tests need no engine. Every engine of the model fills the card, so
+/// two engines never exist side by side: a test takes the card, then either runs on the engine the tests before it left
+/// running ([`engine`]), or starts one of its own after `card()` and shuts it down.
+pub struct Card {
+    held: Option<(String, Closer)>,
+    /// The test that held the engine before.
+    before: String,
+}
+
+/// Waits for the card, alone. When the card is free the next test is the oldest one that wants the engine already
+/// running, so that tests with the same settings follow each other whatever the order they arrived in; with none, the
+/// oldest.
+fn acquire_exclusive(wanted: Option<&str>) -> Card {
+    let mut state = lock();
+    let ticket = state.tickets;
+    state.tickets += 1;
+    state.waiting.push((ticket, wanted.map(str::to_owned)));
+    loop {
+        if !state.exclusive && state.light == 0 {
+            let running = state.engine.as_ref().map(|(key, _)| key.as_str());
+            let next = state
+                .waiting
+                .iter()
+                .find(|(_, key)| running.is_some() && key.as_deref() == running)
+                .or_else(|| state.waiting.first())
+                .map(|(next, _)| *next);
+            if next == Some(ticket) {
+                break;
+            }
+        }
+        state = wait_for_change(state, wanted.unwrap_or("an empty card"));
+    }
+    state.waiting.retain(|(waiting, _)| *waiting != ticket);
+    state.exclusive = true;
+    state.holders.push(thread_name());
+    progress();
+    Card {
+        held: state.engine.take(),
+        before: state.last.clone(),
+    }
+}
+
+/// Shuts the engine of `held` down, which must end clean: the leak check of a shared engine is made here, where it ends.
+fn retire((_, closer): (String, Closer), before: &str) {
+    let _shutting = doing(format!("shutting down the engine the test {before} left"));
+    let runtime = closer.runtime();
+    closer.shutdown(runtime).unwrap_or_else(|error| {
+        mark_unfreed(&format!("the engine the test {before} left: {error}"));
+        panic!("the engine the test {before} left shuts down clean: {error}")
+    });
+}
+
+/// Takes the card for a test that starts its own engine (a shutdown, a fault, a failed start), or that needs the card
+/// empty. Waits for the tests that hold it, then shuts the cached engine down.
+pub fn card() -> Card {
+    let mut card = acquire_exclusive(None);
+    if let Some(held) = card.held.take() {
+        retire(held, &card.before);
+    }
+    card
+}
+
+/// Takes the card for a test that runs on an engine started with `settings`: the one the tests before it left running
+/// when their settings are these, else a new one, after the old one is shut down. The test runs alone against it: a
+/// request starts each sequence from nothing, and the tests read the first sequence and expect it idle, so tests do not
+/// interleave on one engine. The test keeps no handle past its end, and leaves the engine as a request leaves it.
+pub fn engine(settings: &Settings, library: &Path) -> (Card, Arc<EngineRuntime>) {
+    let key = format!("{settings:?} {}", library.display());
+    let mut card = acquire_exclusive(Some(&key));
+    if card.held.as_ref().is_some_and(|(held, _)| *held != key) {
+        {
+            let held = card.held.take().expect("checked");
+            retire(held, &card.before);
+        }
+    }
+    let runtime = match card.held.as_ref() {
+        Some((_, closer)) => closer.runtime(),
+        None => {
+            let (closer, runtime) = start_engine(settings, library);
+            card.held = Some((key, closer));
+            runtime
+        }
+    };
+    (card, runtime)
+}
+
+impl Drop for Card {
+    fn drop(&mut self) {
+        let mut state = lock();
+        // A test that failed may have left the engine in a state the next test would trip on: it is shut down, not kept.
+        let held = self.held.take();
+        if thread::panicking() {
+            drop(state);
+            drop(held);
+            state = lock();
+        } else {
+            state.engine = held;
+            state.last = thread_name();
+        }
+        state.exclusive = false;
+        let name = thread_name();
+        state.holders.retain(|holder| *holder != name);
+        progress();
+        drop(state);
+        CHANGED.notify_all();
+    }
+}
+
+/// A test that uses the card without an engine, beside others that do the same.
+pub struct Light(());
+
+/// Takes the card for a test of kernels alone: it waits for the test that holds an engine and shuts the cached one
+/// down, then runs beside the other tests of this kind.
+pub fn light() -> Light {
+    let mut state = lock();
+    loop {
+        if state.exclusive {
+            state = wait_for_change(state, "the card, for a test without an engine");
+        } else if let Some(held) = state.engine.take() {
+            let before = state.last.clone();
+            retire(held, &before);
+        } else {
+            break;
+        }
+    }
+    state.light += 1;
+    state.holders.push(thread_name());
+    progress();
+    Light(())
+}
+
+impl Drop for Light {
+    fn drop(&mut self) {
+        let mut state = lock();
+        state.light -= 1;
+        let name = thread_name();
+        if let Some(at) = state.holders.iter().position(|holder| *holder == name) {
+            state.holders.remove(at);
+        }
+        progress();
+        drop(state);
+        CHANGED.notify_all();
     }
 }
 
@@ -224,6 +657,7 @@ pub fn limit_below_need(library: &Path, settings: &Settings, below: u64) -> u64 
     let inputs = PlanInputs {
         device_free: 64 << 30,
         multiprocessors: Some(loaded.device().sm_count),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
     };
@@ -268,6 +702,7 @@ pub fn limit_to_stage(library: &Path, settings: &Settings, staged: u64) -> u64 {
     let inputs = PlanInputs {
         device_free: 64 << 30,
         multiprocessors: Some(loaded.device().sm_count),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: settings.batching.max_sequences as usize,
     };
@@ -325,6 +760,7 @@ pub fn limit_to_disk(library: &Path, settings: &Settings, gpu_limit: u64, on_dis
     let inputs = PlanInputs {
         device_free: 64 << 30,
         multiprocessors: Some(loaded.device().sm_count),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: settings.batching.max_sequences as usize,
     };

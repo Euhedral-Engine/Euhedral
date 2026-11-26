@@ -1,0 +1,1713 @@
+//! Greedy and sampled generation on a GPU: the sequence's accounting, stops, cancellation, concurrency and staging. The
+//! tests are `#[ignore]`d. Each loads the 12 GB artifact, so a run is queued on the card.
+//!
+//! The prompt is a chat prompt's token ids, the first line of `greedy-rco.txt` in the directory named by
+//! `euhedral.rust.goldens` (`EUHEDRAL_TEST_RUST_GOLDENS`); a test skips with a message when it is absent. The tokens a
+//! test expects are the engine's own greedy tokens for that prompt, taken first on the engine under test.
+//!
+//! The artifact comes from `euhedral.qwen.rco-artifact` and the library from `euhedral.cuda.library`.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test file: a failed unwrap is the failure"
+)]
+#![allow(
+    clippy::print_stdout,
+    reason = "a test reports the speeds and the counts it measured"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O and waiting calls: a test reads files and waits on hand-offs"
+)]
+
+use std::env;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
+use std::mem;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
+use crate::common;
+use euhedral_inference_edrl::{ReadPlan, Region, TokenizerFooter, TokenizerSection};
+
+use common::Card;
+use euhedral_inference_engine::generation::{
+    AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, LogitsSink,
+    QuantumEvent, Speculation, Verification,
+};
+use euhedral_inference_engine::runtime::stage_ring_for;
+use euhedral_inference_engine::sampling::{SamplingConfig, TokenSampler};
+use euhedral_inference_engine::stages::QuantumKind;
+use euhedral_inference_engine::{EngineRuntime, Handoff};
+
+/// The longest a device test waits for one hand-off; past it the test fails.
+const WAIT: Duration = Duration::from_secs(20 * 60);
+use euhedral_inference_settings::{ModelSettings, Settings};
+use euhedral_inference_tokenizer::Tokenizer;
+
+struct Machine {
+    artifact: PathBuf,
+    library: PathBuf,
+    goldens: PathBuf,
+}
+
+fn machine() -> Option<Machine> {
+    let library = PathBuf::from(test_support::require_property("euhedral.cuda.library")?);
+    let artifact = PathBuf::from(test_support::require_property("euhedral.qwen.rco-artifact")?);
+    let goldens = PathBuf::from(test_support::require_property("euhedral.rust.goldens")?);
+    if !artifact.is_file() {
+        println!("skipped: euhedral.qwen.rco-artifact names no file");
+        return None;
+    }
+    if !goldens.is_dir() {
+        println!("skipped: euhedral.rust.goldens names no directory");
+        return None;
+    }
+    Some(Machine {
+        artifact,
+        library,
+        goldens,
+    })
+}
+
+fn settings(artifact: &Path, max_tokens: u32) -> Settings {
+    let mut settings = Settings::with_model(ModelSettings {
+        artifact: artifact.to_path_buf(),
+        name: "test".to_string(),
+    });
+    settings.context.max_tokens = max_tokens;
+    settings.kernels.graphs.captures_per_view = 8;
+    settings
+}
+
+/// Starts the engine and waits for the latch, as `main` does.
+/// The engine the tests that need no other configuration run on, one at a time.
+fn shared_engine(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
+    start(machine, 4096)
+}
+
+/// The engine of `max_tokens` of context: the one a test before left running when it has these settings.
+fn start(machine: &Machine, max_tokens: u32) -> (Card, Arc<EngineRuntime>) {
+    common::engine(&settings(&machine.artifact, max_tokens), &machine.library)
+}
+
+fn read_range(file: &mut File, range: Range<u64>) -> Vec<u8> {
+    file.seek(SeekFrom::Start(range.start)).unwrap();
+    let mut bytes = vec![0; (range.end - range.start) as usize];
+    file.read_exact(&mut bytes).unwrap();
+    bytes
+}
+
+/// The tokenizer the artifact packages.
+fn tokenizer(artifact: &Path) -> Tokenizer {
+    let mut file = File::open(artifact).unwrap();
+    let length = file.metadata().unwrap().len();
+    let probe = ReadPlan::probe(length).unwrap();
+    let footer = TokenizerFooter::parse(
+        read_range(&mut file, probe.range(Region::TokenizerFooter).unwrap())
+            .as_slice()
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap()
+    .expect("the artifact carries its tokenizer");
+    let body = read_range(&mut file, footer.body_range(length).unwrap());
+    Tokenizer::from_section(&TokenizerSection::parse(body, &footer).unwrap()).unwrap()
+}
+
+/// Bytes the device is short of the resident need in the staged runs: projections leave the device through a ring.
+const STAGED_SHORT: u64 = 1 << 30;
+
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
+
+/// A prompt, and the 128 tokens the engine selects after it greedily.
+struct Greedy {
+    prompt: Vec<u32>,
+    generated: Vec<u32>,
+}
+
+/// The token ids of the chat prompt the tests use.
+fn prompt_of(machine: &Machine) -> Vec<u32> {
+    let text = fs::read_to_string(machine.goldens.join("greedy-rco.txt")).unwrap();
+    let line = text.lines().next().unwrap();
+    line.strip_prefix("prompt ")
+        .unwrap_or_else(|| panic!("a `prompt` line, found `{line}`"))
+        .split_whitespace()
+        .map(|id| id.parse().unwrap())
+        .collect()
+}
+
+/// The prompt and the 128 tokens `runtime` selects after it, with no stop token.
+fn greedy_reference(machine: &Machine, runtime: &EngineRuntime) -> Greedy {
+    let prompt = prompt_of(machine);
+    let recording = generate(runtime, &prompt, 128, &[]);
+    assert_eq!(recording.outcome.reason, FinishReason::Length);
+    assert_eq!(recording.tokens.len(), 128);
+    Greedy {
+        prompt,
+        generated: recording.tokens,
+    }
+}
+
+/// What a generation told its listener.
+#[derive(Debug)]
+struct Recording {
+    tokens: Vec<u32>,
+    token_times: Vec<Instant>,
+    events: Vec<QuantumEvent>,
+    verifications: Vec<Verification>,
+    prefill_done: Option<Instant>,
+    outcome: GenerationOutcome,
+    began: Instant,
+}
+
+struct Recorder {
+    tokens: Vec<u32>,
+    token_times: Vec<Instant>,
+    events: Vec<QuantumEvent>,
+    verifications: Vec<Verification>,
+    prefill_done: Option<Instant>,
+    began: Instant,
+    done: Option<Arc<Handoff<Recording>>>,
+    /// Cancels the request once it has reported this many tokens.
+    cancel_after: Option<(CancelHandle, usize)>,
+    /// Cancels the request when one of its verifications retires after the engine has run this many batched passes:
+    /// the request's next step is then offered, with the others', to a pass it is a member of.
+    cancel_in_pass: Option<(CancelHandle, Weak<EngineRuntime>, u64)>,
+}
+
+impl GenerationListener for Recorder {
+    fn prefill_done(&mut self, at: Instant) {
+        assert!(self.prefill_done.replace(at).is_none(), "the prefill is done once");
+    }
+
+    fn token(&mut self, id: u32, at: Instant) {
+        self.tokens.push(id);
+        self.token_times.push(at);
+        if let Some((cancel, _)) = self
+            .cancel_after
+            .as_ref()
+            .filter(|(_, after)| self.tokens.len() >= *after)
+        {
+            cancel.cancel();
+        }
+    }
+
+    fn quantum(&mut self, event: QuantumEvent) {
+        self.events.push(event);
+    }
+
+    fn verification(&mut self, event: Verification) {
+        self.verifications.push(event);
+        if let Some((cancel, runtime, passes)) = &self.cancel_in_pass
+            && runtime
+                .upgrade()
+                .is_some_and(|runtime| runtime.pass_statistics().batched >= *passes)
+        {
+            cancel.cancel();
+        }
+    }
+
+    fn finished(&mut self, outcome: GenerationOutcome) {
+        let done = self.done.take().expect("a generation finishes once");
+        done.send(Recording {
+            tokens: mem::take(&mut self.tokens),
+            token_times: mem::take(&mut self.token_times),
+            events: mem::take(&mut self.events),
+            verifications: mem::take(&mut self.verifications),
+            prefill_done: self.prefill_done,
+            outcome,
+            began: self.began,
+        });
+    }
+}
+
+impl Drop for Recorder {
+    /// A listener dropped before its generation finished reports it as failed, so the test fails at once.
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            done.send(Recording {
+                tokens: mem::take(&mut self.tokens),
+                token_times: mem::take(&mut self.token_times),
+                events: mem::take(&mut self.events),
+                verifications: mem::take(&mut self.verifications),
+                prefill_done: self.prefill_done,
+                outcome: dropped_outcome(),
+                began: self.began,
+            });
+        }
+    }
+}
+
+fn dropped_outcome() -> GenerationOutcome {
+    GenerationOutcome {
+        reason: FinishReason::Failed("the listener was dropped before the generation finished".to_string()),
+        prompt_tokens: 0,
+        generated: 0,
+        elapsed: Duration::ZERO,
+        cached_prompt_tokens: 0,
+    }
+}
+
+/// Runs a greedy generation and waits for its listener's hand-off.
+fn generate(runtime: &EngineRuntime, prompt: &[u32], max_tokens: u32, stop_tokens: &[u32]) -> Recording {
+    generate_sampled(runtime, prompt, max_tokens, stop_tokens, SamplingConfig::greedy(0))
+}
+
+/// Runs a generation with `sampling` and waits for its listener's hand-off.
+fn generate_sampled(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    max_tokens: u32,
+    stop_tokens: &[u32],
+    sampling: SamplingConfig,
+) -> Recording {
+    submit(
+        runtime,
+        prompt,
+        max_tokens,
+        stop_tokens,
+        Speculation::Off,
+        sampling,
+        None,
+    )
+    .expect("the request is admitted")
+    .wait(WAIT)
+    .expect("the generation reports")
+}
+
+/// Starts a generation and returns the hand-off its listener reports on, or why it was refused. With `cancel`, the
+/// request is cancelled by its own listener after that many tokens.
+fn submit(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    max_tokens: u32,
+    stop_tokens: &[u32],
+    speculation: Speculation,
+    sampling: SamplingConfig,
+    cancel: Option<usize>,
+) -> Result<Arc<Handoff<Recording>>, AdmissionError> {
+    submit_with(
+        runtime,
+        prompt,
+        max_tokens,
+        stop_tokens,
+        speculation,
+        sampling,
+        cancel,
+        None,
+    )
+}
+
+/// [`submit`], and with `in_pass` the engine and the number of batched passes after which a verification of the
+/// request cancels it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the arguments of a request, as the test helpers pass them"
+)]
+fn submit_with(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    max_tokens: u32,
+    stop_tokens: &[u32],
+    speculation: Speculation,
+    sampling: SamplingConfig,
+    cancel: Option<usize>,
+    in_pass: Option<(Weak<EngineRuntime>, u64)>,
+) -> Result<Arc<Handoff<Recording>>, AdmissionError> {
+    let done = Handoff::new();
+    let handle = CancelHandle::default();
+    let began = Instant::now();
+    runtime.generate_cancellable(
+        GenerationRequest {
+            prompt: prompt.to_vec(),
+            max_tokens,
+            stop_tokens: stop_tokens.to_vec(),
+            speculation,
+            sampling,
+            constraint: None,
+            listener: Box::new(Recorder {
+                tokens: Vec::new(),
+                token_times: Vec::new(),
+                events: Vec::new(),
+                verifications: Vec::new(),
+                prefill_done: None,
+                began,
+                done: Some(Arc::clone(&done)),
+                cancel_after: cancel.map(|after| (handle.clone(), after)),
+                cancel_in_pass: in_pass.map(|(runtime, passes)| (handle.clone(), runtime, passes)),
+            }),
+        },
+        handle,
+    )?;
+    Ok(done)
+}
+
+/// Starts the engine with `sequences` sequences, as `batching.max-sequences` states.
+fn start_with_sequences(machine: &Machine, sequences: u32) -> (Card, Arc<EngineRuntime>) {
+    let mut settings = settings(&machine.artifact, 4096);
+    settings.batching.max_sequences = sequences;
+    if sequences == 0 {
+        // An automatic count takes every byte the card has free, more than the share a device job is given.
+        common::limit_gpu(&mut settings, AUTOMATIC_DEVICE_BUDGET);
+    }
+    common::engine(&settings, &machine.library)
+}
+
+/// The device budget of an engine whose sequence count is automatic: the count is what fits in it.
+const AUTOMATIC_DEVICE_BUDGET: u64 = 22 << 30;
+
+fn micros(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e6
+}
+
+/// The rows of the sequence's caches after a generation: committed rows, quanta in flight, selections leased.
+fn sequence_state(runtime: &EngineRuntime) -> (u64, usize, usize) {
+    runtime
+        .inspect_sequence(|sequence| {
+            (
+                sequence.kv.committed(),
+                sequence.in_flight(),
+                sequence.selections.leased(),
+            )
+        })
+        .expect("the generation gave the sequence back")
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn greedy_tokens_repeat_on_a_reset_sequence_and_replay_the_graphs() {
+    let Some(machine) = machine() else { return };
+    let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
+    let (_card, runtime) = shared_engine(&machine);
+    let reference = greedy_reference(&machine, &runtime);
+
+    // Twice on one engine: the second request resets the sequence and replays the graphs the first recorded.
+    for round in 0..2 {
+        let recording = generate(&runtime, &reference.prompt, 128, &eos);
+        assert_eq!(recording.outcome.reason, FinishReason::Length, "round {round}");
+        assert_eq!(recording.outcome.prompt_tokens, reference.prompt.len());
+        assert_eq!(recording.outcome.generated, 128);
+        assert_eq!(
+            recording.tokens, reference.generated,
+            "round {round}: the greedy tokens repeat"
+        );
+        let decodes: Vec<&QuantumEvent> = recording
+            .events
+            .iter()
+            .filter(|event| event.kind == QuantumKind::Decode)
+            .collect();
+        assert_eq!(decodes.len(), 127, "one decode quantum per token after the first");
+        assert_eq!(
+            recording
+                .events
+                .iter()
+                .filter(|event| event.kind == QuantumKind::Prefill)
+                .count(),
+            1
+        );
+        let replayed = decodes.iter().filter(|event| event.replayed).count();
+        assert!(replayed >= 100, "the decode quanta replay graphs, saw {replayed}");
+        // The sequence holds the prompt and the 127 rows decoded; the last token was selected, not fed.
+        assert_eq!(
+            sequence_state(&runtime),
+            (reference.prompt.len() as u64 + 127, 0, 0),
+            "committed rows, quanta in flight, selections leased"
+        );
+        let first = recording.token_times[0];
+        let last = *recording.token_times.last().unwrap();
+        println!(
+            "round {round}: {} prompt tokens, prefill {:.1} ms, first token {:.1} ms after the request, then {:.1} tok/s \
+             over {} tokens ({} decode quanta replayed, {} recorded)",
+            reference.prompt.len(),
+            micros(recording.prefill_done.unwrap() - recording.began) / 1e3,
+            micros(first - recording.began) / 1e3,
+            (recording.tokens.len() - 1) as f64 / (last - first).as_secs_f64(),
+            recording.tokens.len(),
+            decodes.iter().filter(|event| event.replayed).count(),
+            decodes.iter().filter(|event| event.recorded).count(),
+        );
+    }
+}
+
+/// The greedy tokens of the short prompt with projections staged through the ring: those of an engine that holds every
+/// weight, and the same on a second request.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn greedy_tokens_when_staged_equal_those_of_a_resident_engine() {
+    let Some(machine) = machine() else { return };
+    let reference = {
+        let (_resident, runtime) = start(&machine, 2048);
+        greedy_reference(&machine, &runtime)
+    };
+    let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
+    let mut engine = settings(&machine.artifact, 2048);
+    let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
+    common::limit_gpu(&mut engine, limit);
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    if !common::staged_through_a_ring(&runtime, limit) {
+        return;
+    }
+    for round in 0..2 {
+        let recording = generate(&runtime, &reference.prompt, 128, &eos);
+        assert_eq!(recording.outcome.reason, FinishReason::Length, "round {round}");
+        assert_eq!(
+            recording.tokens, reference.generated,
+            "round {round}: the staged greedy tokens are the resident engine's"
+        );
+        assert_eq!(
+            sequence_state(&runtime),
+            (reference.prompt.len() as u64 + 127, 0, 0),
+            "committed rows, quanta in flight, selections leased"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
+    let Some(machine) = machine() else { return };
+    let (_card, runtime) = shared_engine(&machine);
+    let reference = greedy_reference(&machine, &runtime);
+    let prompt_rows = reference.prompt.len() as u64;
+
+    // The token selected sixth ends the generation when it is a stop token: the quantum that already
+    // follows it (it feeds the stop token) runs to its end, and its row never reaches the cache.
+    let stop = reference.generated[5];
+    assert!(
+        !reference.generated[..5].contains(&stop),
+        "the sixth token is the first of its kind"
+    );
+    let recording = generate(&runtime, &reference.prompt, 128, &[stop]);
+    assert_eq!(recording.outcome.reason, FinishReason::Stop);
+    assert_eq!(recording.tokens, reference.generated[..6]);
+    assert_eq!(sequence_state(&runtime), (prompt_rows + 5, 0, 0));
+
+    // A request for no tokens prefills the prompt and ends.
+    let recording = generate(&runtime, &reference.prompt, 0, &[]);
+    assert_eq!(recording.outcome.reason, FinishReason::Length);
+    assert!(recording.tokens.is_empty());
+    assert!(recording.prefill_done.is_some());
+    assert_eq!(sequence_state(&runtime), (prompt_rows, 0, 0));
+
+    // One token comes from the prompt alone.
+    let recording = generate(&runtime, &reference.prompt, 1, &[]);
+    assert_eq!(recording.tokens, reference.generated[..1]);
+    assert_eq!(sequence_state(&runtime), (prompt_rows, 0, 0));
+
+    // The engine's sequence takes one request at a time, and refuses what cannot run.
+    let nothing = |prompt: Vec<u32>| {
+        runtime.generate(GenerationRequest {
+            prompt,
+            max_tokens: 1,
+            stop_tokens: Vec::new(),
+            speculation: Speculation::Off,
+            sampling: SamplingConfig::greedy(0),
+            constraint: None,
+            listener: Box::new(Recorder {
+                tokens: Vec::new(),
+                token_times: Vec::new(),
+                events: Vec::new(),
+                verifications: Vec::new(),
+                prefill_done: None,
+                began: Instant::now(),
+                done: None,
+                cancel_after: None,
+                cancel_in_pass: None,
+            }),
+        })
+    };
+    assert_eq!(nothing(Vec::new()), Err(AdmissionError::EmptyPrompt));
+    assert!(matches!(
+        nothing(vec![u32::MAX]),
+        Err(AdmissionError::TokenOutsideVocabulary { .. })
+    ));
+    assert!(matches!(
+        nothing(vec![1; 5000]),
+        Err(AdmissionError::PromptTooLong { capacity: 4096, .. })
+    ));
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn context_end_stops_cleanly() {
+    let Some(machine) = machine() else { return };
+    let context = 600u32;
+    let (_card, runtime) = start(&machine, context);
+    let reference = greedy_reference(&machine, &runtime);
+    let capacity = u64::from(context);
+    assert_eq!(runtime.plan().max_context_tokens as u64, capacity);
+    let prompt_rows = reference.prompt.len() as u64;
+
+    // The request wants far more than the context holds: the cache fills, the last row is decoded, and the generation
+    // ends with the reason that says so. One token comes from the prompt and one from each row decoded after it.
+    let recording = generate(&runtime, &reference.prompt, 100_000, &[]);
+    assert_eq!(recording.outcome.reason, FinishReason::ContextFull);
+    assert_eq!(recording.tokens.len() as u64, capacity - prompt_rows + 1);
+    assert_eq!(
+        recording.tokens[..128],
+        reference.generated[..],
+        "the tokens before the end are those of the first request"
+    );
+    assert_eq!(sequence_state(&runtime), (capacity, 0, 0));
+
+    // A prompt that fills the context gives its one token and stops.
+    let full: Vec<u32> = reference
+        .prompt
+        .iter()
+        .copied()
+        .cycle()
+        .take(context as usize)
+        .collect();
+    let recording = generate(&runtime, &full, 10, &[]);
+    assert_eq!(recording.outcome.reason, FinishReason::ContextFull);
+    assert_eq!(recording.tokens.len(), 1);
+    assert_eq!(sequence_state(&runtime), (capacity, 0, 0));
+
+    // And the engine still serves: the same prompt as the first request, from a reset sequence.
+    let recording = generate(&runtime, &reference.prompt, 128, &[]);
+    assert_eq!(recording.tokens, reference.generated);
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn a_panic_in_the_owner_ends_the_request_with_a_failure_and_the_engine_serves_the_next() {
+    let Some(machine) = machine() else { return };
+    // The engine is the test's own: its owner panics, and the next test starts from a clean one.
+    let _card = common::card();
+    let (owner, runtime) = common::start_engine(&settings(&machine.artifact, 4096), &machine.library);
+    let reference = greedy_reference(&machine, &runtime);
+
+    // The owner panics in the turn that has admitted a third quantum, with two in flight: the request fails, the quanta
+    // in flight run to their end and are discarded, and the listener is told as the last call.
+    runtime.panic_after_admissions_for_tests(3);
+    let recording = generate(&runtime, &reference.prompt, 128, &[]);
+    match &recording.outcome.reason {
+        FinishReason::Failed(why) => assert!(why.contains("panicked"), "{why}"),
+        other => panic!("the request should have failed, ended with {other:?}"),
+    }
+    assert!(recording.tokens.len() < 128);
+    assert_eq!(recording.tokens, reference.generated[..recording.tokens.len()]);
+    assert_eq!(sequence_state(&runtime).1, 0, "no quantum is left in flight");
+    assert_eq!(sequence_state(&runtime).2, 0, "no selection is left leased");
+
+    // The engine serves the next request, from a reset sequence, with the tokens of the first request.
+    let recording = generate(&runtime, &reference.prompt, 128, &[]);
+    assert_eq!(recording.outcome.reason, FinishReason::Length);
+    assert_eq!(recording.tokens, reference.generated);
+    owner.shutdown(runtime).unwrap();
+}
+
+/// A sampled configuration: temperature 1, the given `top_k`, no nucleus cut, and the seed.
+fn sampled(top_k: u32, seed: u64) -> SamplingConfig {
+    SamplingConfig::new(1.0, top_k, 1.0, seed, false).unwrap()
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn sampled_requests_select_on_the_host_and_agree_with_greedy_at_top_k_one() {
+    let Some(machine) = machine() else { return };
+    let tokens = 32;
+    let (_card, runtime) = shared_engine(&machine);
+    let reference = greedy_reference(&machine, &runtime);
+    let expected = &reference.generated[..tokens as usize];
+
+    // Temperature 0 is greedy: the device selects, no row is copied.
+    let zero = SamplingConfig::new(0.0, 0, 1.0, 5, false).unwrap();
+    let greedy_path = generate_sampled(&runtime, &reference.prompt, tokens, &[], zero);
+    assert_eq!(greedy_path.outcome.reason, FinishReason::Length);
+    assert_eq!(greedy_path.tokens, expected, "temperature 0 equals greedy");
+
+    // Top-k 1 samples on the host and must choose the greedy token every time.
+    let top_one = generate_sampled(&runtime, &reference.prompt, tokens, &[], sampled(1, 11));
+    assert_eq!(top_one.outcome.reason, FinishReason::Length);
+    assert_eq!(top_one.tokens, expected, "top-k 1 equals greedy token for token");
+    assert_eq!(top_one.outcome.generated, tokens as usize);
+    let (_, in_flight, leased) = sequence_state(&runtime);
+    assert_eq!((in_flight, leased), (0, 0), "nothing left in flight or leased");
+
+    // The same seed gives the same tokens; a different seed is allowed to differ.
+    let first = generate_sampled(&runtime, &reference.prompt, tokens, &[], sampled(40, 21));
+    let second = generate_sampled(&runtime, &reference.prompt, tokens, &[], sampled(40, 21));
+    assert_eq!(first.outcome.reason, FinishReason::Length);
+    assert_eq!(first.tokens.len(), tokens as usize);
+    assert_eq!(first.tokens, second.tokens, "the same seed gives the same output");
+    let other = generate_sampled(&runtime, &reference.prompt, tokens, &[], sampled(40, 22));
+    assert_eq!(other.tokens.len(), tokens as usize);
+    println!("seeds 21 and 22 differ: {}", other.tokens != first.tokens);
+
+    let leased = runtime
+        .inspect_sequence(|sequence| sequence.row_readbacks.leased())
+        .expect("the generation gave the sequence back");
+    assert_eq!(leased, 0, "no row left leased");
+}
+
+/// Collects the logits rows of a teacher-forced run.
+struct Rows {
+    rows: Vec<Vec<u8>>,
+    done: Option<Arc<Handoff<Vec<Vec<u8>>>>>,
+}
+
+impl LogitsSink for Rows {
+    fn row(&mut self, step: usize, _forced: u32, logits: &[u8]) {
+        assert_eq!(step, self.rows.len(), "the rows arrive in order");
+        self.rows.push(logits.to_vec());
+    }
+
+    fn finished(&mut self, _outcome: GenerationOutcome) {
+        let done = self.done.take().expect("a run finishes once");
+        done.send(mem::take(&mut self.rows));
+    }
+}
+
+/// The logits row that predicts each of `forced` after `prompt`.
+fn forced_rows(runtime: &EngineRuntime, prompt: &[u32], forced: &[u32]) -> Vec<Vec<u8>> {
+    let done = Handoff::new();
+    runtime
+        .teacher_forced(
+            prompt.to_vec(),
+            forced.to_vec(),
+            Box::new(Rows {
+                rows: Vec::new(),
+                done: Some(Arc::clone(&done)),
+            }),
+        )
+        .expect("the run is admitted");
+    done.wait(WAIT).expect("the run reports")
+}
+
+/// The position of each sampled token is the length of what precedes it: the prompt's for the first, one more for
+/// each after it. Checked with a configuration in which the position changes the token (a flattened distribution, not top-k 1):
+/// each token the engine sampled is the one a fresh sampler draws from the same row at that position, and not the one
+/// it draws at the next, over a prompt of one chunk and of several.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn sampled_tokens_are_drawn_at_the_position_they_follow() {
+    let Some(machine) = machine() else { return };
+    let reference = Greedy {
+        prompt: prompt_of(&machine),
+        generated: Vec::new(),
+    };
+    let config = SamplingConfig::new(50.0, 40, 1.0, 77, false).unwrap();
+    let tokens = 24;
+    let mut settings = settings(&machine.artifact, 4096);
+    settings.batching.prefill_chunk_tokens = 256;
+    let (_card, runtime) = common::engine(&settings, &machine.library);
+    let prompts = [
+        reference.prompt.clone(),
+        reference.prompt.iter().copied().cycle().take(700).collect::<Vec<u32>>(),
+    ];
+    for prompt in prompts {
+        let recording = generate_sampled(&runtime, &prompt, tokens, &[], config);
+        assert_eq!(recording.tokens.len(), tokens as usize);
+        let rows = forced_rows(&runtime, &prompt, &recording.tokens);
+        assert_eq!(rows.len(), tokens as usize);
+        let vocabulary = rows[0].len() / 2;
+        let mut sampler = TokenSampler::new(config, vocabulary).unwrap();
+        let mut shifted_differs = false;
+        for (index, row) in rows.iter().enumerate() {
+            let position = (prompt.len() + index) as u64;
+            let chosen = sampler.select_bf16(row, position, None).unwrap();
+            assert_eq!(
+                chosen,
+                recording.tokens[index],
+                "token {index} of a {}-token prompt is drawn at position {position}",
+                prompt.len()
+            );
+            shifted_differs |= sampler.select_bf16(row, position + 1, None).unwrap() != chosen;
+        }
+        assert!(shifted_differs, "the position matters in this configuration");
+    }
+}
+
+/// A stop token as the first sampled token ends the request after reporting it, as for a greedy request; a budget of
+/// one ends it after one token; neither leaves a quantum in flight or a row leased.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn a_sampled_first_token_can_be_the_stop_token_or_the_whole_budget() {
+    let Some(machine) = machine() else { return };
+    let reference = Greedy {
+        prompt: prompt_of(&machine),
+        generated: Vec::new(),
+    };
+    let config = SamplingConfig::new(50.0, 40, 1.0, 5, false).unwrap();
+    let (_card, runtime) = shared_engine(&machine);
+    let full = generate_sampled(&runtime, &reference.prompt, 8, &[], config);
+    assert_eq!(full.tokens.len(), 8);
+    let first = full.tokens[0];
+
+    let one = generate_sampled(&runtime, &reference.prompt, 1, &[], config);
+    assert_eq!(one.outcome.reason, FinishReason::Length);
+    assert_eq!(one.tokens, [first], "a budget of one is the first token");
+    assert_eq!(sequence_state(&runtime), (reference.prompt.len() as u64, 0, 0));
+
+    let stopped = generate_sampled(&runtime, &reference.prompt, 8, &[first], config);
+    assert_eq!(stopped.outcome.reason, FinishReason::Stop);
+    assert_eq!(stopped.tokens, [first], "the stop token is reported, and is the last");
+    assert_eq!(stopped.outcome.generated, 1);
+    let leased = runtime
+        .inspect_sequence(|sequence| sequence.row_readbacks.leased())
+        .expect("the generation gave the sequence back");
+    assert_eq!(leased, 0);
+
+    // The same stop token, when it is a later token, ends the run there.
+    let later = full.tokens[3];
+    if !full.tokens[..3].contains(&later) {
+        let stopped = generate_sampled(&runtime, &reference.prompt, 8, &[later], config);
+        assert_eq!(stopped.outcome.reason, FinishReason::Stop);
+        assert_eq!(stopped.tokens, full.tokens[..4]);
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn two_sequences_start_hold_a_spare_generate_the_same_tokens_and_shut_down_clean() {
+    let Some(machine) = machine() else { return };
+    let prompt = prompt_of(&machine);
+    let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
+
+    let one = {
+        let (_card, runtime) = start_with_sequences(&machine, 1);
+        assert_eq!(runtime.plan().sequences, 1);
+        assert_eq!(runtime.sequences(), 1);
+        generate(&runtime, &prompt, 16, &eos)
+    };
+
+    let (_card, runtime) = start_with_sequences(&machine, 2);
+    assert_eq!(runtime.plan().sequences, 2);
+    assert_eq!(runtime.sequences(), 2, "every sequence has an owner");
+    let two = generate(&runtime, &prompt, 16, &eos);
+    assert_eq!(two.outcome.reason, FinishReason::Length);
+    assert_eq!(two.tokens, one.tokens, "two sequences change no token of the first");
+}
+
+/// Four requests at once on four sequences: each produces the tokens it produces alone.
+const SEQUENCES: usize = 4;
+const CONCURRENT_TOKENS: u32 = 48;
+const CONCURRENT_PROMPTS: [&str; SEQUENCES] = [
+    "The capital of France is",
+    "Write a short poem about the sea and the lighthouse keeper.",
+    "List the planets of the solar system, from the sun outward, with one fact about each of them.",
+    "Explain in a few sentences how a heat pump moves thermal energy from a cold source to a warm sink.",
+];
+
+/// The tokens of a recording per second, from its first token to its last.
+fn decode_rate(recording: &Recording) -> f64 {
+    let (Some(first), Some(last)) = (recording.token_times.first(), recording.token_times.last()) else {
+        return 0.0;
+    };
+    (recording.tokens.len() - 1) as f64 / last.duration_since(*first).as_secs_f64().max(1e-9)
+}
+
+/// Starts every prompt at once and waits for all of them, with `cancel` and the sampling of each.
+fn together(
+    runtime: &EngineRuntime,
+    prompts: &[Vec<u32>],
+    speculation: Speculation,
+    sampling: &[SamplingConfig],
+    cancel: &[Option<usize>],
+) -> (Vec<Recording>, Duration) {
+    together_with(runtime, prompts, speculation, sampling, cancel, None)
+}
+
+/// [`together`], and with `in_pass` the request (by index) a verification of which cancels it once the engine has run
+/// that many batched passes more than it had.
+fn together_with(
+    runtime: &EngineRuntime,
+    prompts: &[Vec<u32>],
+    speculation: Speculation,
+    sampling: &[SamplingConfig],
+    cancel: &[Option<usize>],
+    in_pass: Option<(usize, &Arc<EngineRuntime>, u64)>,
+) -> (Vec<Recording>, Duration) {
+    // The requests fill every sequence: one more is refused.
+    assert_eq!(
+        prompts.len(),
+        runtime.sequences(),
+        "the requests fill the sequences held"
+    );
+    together_some(runtime, prompts, speculation, sampling, cancel, in_pass)
+}
+
+/// [`together_with`] for requests that need not fill every sequence: nothing is refused for lack of one.
+fn together_some(
+    runtime: &EngineRuntime,
+    prompts: &[Vec<u32>],
+    speculation: Speculation,
+    sampling: &[SamplingConfig],
+    cancel: &[Option<usize>],
+    in_pass: Option<(usize, &Arc<EngineRuntime>, u64)>,
+) -> (Vec<Recording>, Duration) {
+    let began = Instant::now();
+    let running: Vec<_> = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            submit_with(
+                runtime,
+                prompt,
+                CONCURRENT_TOKENS,
+                &[],
+                speculation,
+                sampling[index],
+                cancel[index],
+                in_pass
+                    .filter(|(victim, _, _)| *victim == index)
+                    .map(|(_, engine, passes)| (Arc::downgrade(engine), passes)),
+            )
+            .expect("a sequence is idle for the request")
+        })
+        .collect();
+    // When every sequence runs a generation, one more request is refused, and only that one.
+    if prompts.len() == runtime.sequences() {
+        let refused = submit(
+            runtime,
+            &prompts[0],
+            CONCURRENT_TOKENS,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            None,
+        );
+        assert_eq!(
+            refused.err(),
+            Some(AdmissionError::Busy),
+            "the fifth request finds every sequence running"
+        );
+    }
+    let recordings = running
+        .into_iter()
+        .map(|done| done.wait(WAIT).expect("the generation reports"))
+        .collect();
+    (recordings, began.elapsed())
+}
+
+/// Sampled generation with the published settings gives the same tokens with speculation off and on (with drafts
+/// partly rejected among the verifications), and the same tokens when it shares passes with other sessions as when it
+/// runs alone; the seed is used.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn sampled_tokens_do_not_depend_on_speculation_or_on_the_sequences_sharing_a_pass() {
+    const NEW_TOKENS: u32 = 64;
+    let Some(machine) = machine() else { return };
+    let tokenizer = tokenizer(&machine.artifact);
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
+        .iter()
+        .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
+        .collect();
+    let (_card, runtime) = start_with_sequences(&machine, SEQUENCES as u32);
+    let depth = runtime.plan().draft_depth;
+    assert!(depth > 0, "the artifact drafts");
+    let published = |seed: u64| SamplingConfig::new(1.0, 20, 0.95, seed, false).unwrap();
+    // Three sampled sessions and one greedy.
+    let settings: Vec<SamplingConfig> = (0..SEQUENCES)
+        .map(|index| {
+            if index < 3 {
+                published(11 + index as u64)
+            } else {
+                SamplingConfig::greedy(7)
+            }
+        })
+        .collect();
+    let run = |index: usize, speculation: Speculation, sampling: SamplingConfig| {
+        submit(&runtime, &prompts[index], NEW_TOKENS, &[], speculation, sampling, None)
+            .expect("the request is admitted")
+    };
+
+    let mut alone = Vec::new();
+    let (mut verified, mut accepted, mut partial) = (0, 0, 0);
+    for (index, sampling) in settings.iter().enumerate() {
+        let (sampling, index) = (*sampling, index);
+        let plain = run(index, Speculation::Off, sampling).wait(WAIT).unwrap();
+        let speculative = run(index, Speculation::Artifact, sampling).wait(WAIT).unwrap();
+        assert_eq!(
+            plain.tokens, speculative.tokens,
+            "request {index}: speculation changed the tokens"
+        );
+        if index < 3 {
+            verified += speculative.verifications.len();
+            accepted += speculative.verifications.iter().map(|v| v.accepted).sum::<usize>();
+            partial += speculative
+                .verifications
+                .iter()
+                .filter(|v| v.accepted > 0 && v.accepted < v.drafted)
+                .count();
+        }
+        alone.push(speculative);
+    }
+    println!(
+        "SAMPLED_PASSES depth {depth}: {verified} sampled verifications accepted {accepted} drafts, {partial} partly"
+    );
+    assert!(accepted > 0, "no sampled verification accepted a draft");
+    assert!(partial > 0, "no sampled verification was partially rejected");
+
+    // The seed is used.
+    let other = run(0, Speculation::Artifact, published(99)).wait(WAIT).unwrap();
+    assert_ne!(other.tokens, alone[0].tokens, "another seed gave the same tokens");
+
+    // Sharing passes changes no session's tokens.
+    let before = runtime.pass_statistics();
+    let together: Vec<_> = (0..SEQUENCES)
+        .map(|index| run(index, Speculation::Artifact, settings[index]))
+        .collect();
+    for (index, done) in together.into_iter().enumerate() {
+        let together = done.wait(WAIT).expect("the generation reports");
+        assert_eq!(
+            together.tokens, alone[index].tokens,
+            "session {index} changed when it shared passes"
+        );
+    }
+    let after = runtime.pass_statistics();
+    println!(
+        "SAMPLED_PASSES together: {} passes, {} verifications, {} batched passes, {} rows",
+        after.passes - before.passes,
+        after.segments - before.segments,
+        after.batched - before.batched,
+        after.rows - before.rows
+    );
+    assert!(after.batched > before.batched, "no verification was batched");
+    assert!(after.segments - before.segments > after.passes - before.passes);
+}
+
+/// The decode rates of speculative requests of 512 prompt tokens and 512 new tokens: one request on an engine of one
+/// sequence, one request alone on an engine of four, and four at once. Run it in a release build; it prints the rates.
+#[test]
+#[ignore = "a measurement: needs a GPU, the native library and the RCO artifact"]
+fn speculative_decode_rates_of_one_and_of_four_requests() {
+    const PROMPT_TOKENS: usize = 512;
+    const NEW_TOKENS: u32 = 512;
+    let Some(machine) = machine() else { return };
+    // `EUHEDRAL_RATES_SEQUENCES` picks the engine (1 or 4 sequences) so that each measurement is a run of its own; a
+    // run without it measures nothing and is skipped.
+    let Some(only) = env::var("EUHEDRAL_RATES_SEQUENCES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        println!("skipped: set EUHEDRAL_RATES_SEQUENCES to 1 or 4 to measure the decode rates");
+        return;
+    };
+    let tokenizer = tokenizer(&machine.artifact);
+    // Four different prompts of 512 tokens, from the texts the concurrent test uses.
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let text = format!("{text} {}", CONCURRENT_PROMPTS[(index + 1) % SEQUENCES]);
+            let seed = tokenizer.encode_with_model_special_tokens(&text).unwrap();
+            seed.iter().copied().cycle().take(PROMPT_TOKENS).collect()
+        })
+        .collect();
+    let sampling = SamplingConfig::greedy(0);
+    let rate_of = |recordings: &[Recording]| -> f64 {
+        let first = recordings
+            .iter()
+            .map(|r| *r.token_times.first().unwrap())
+            .min()
+            .unwrap();
+        let last = recordings.iter().map(|r| *r.token_times.last().unwrap()).max().unwrap();
+        let tokens: usize = recordings.iter().map(|r| r.tokens.len() - 1).sum();
+        tokens as f64 / last.duration_since(first).as_secs_f64().max(1e-9)
+    };
+    let run = |runtime: &EngineRuntime, count: usize| -> Vec<Recording> {
+        let running: Vec<_> = prompts[..count]
+            .iter()
+            .map(|prompt| {
+                submit(runtime, prompt, NEW_TOKENS, &[], Speculation::Artifact, sampling, None)
+                    .expect("a sequence is idle for the request")
+            })
+            .collect();
+        running.into_iter().map(|done| done.wait(WAIT).unwrap()).collect()
+    };
+    for sequences in [1, SEQUENCES].into_iter().filter(|count| only == *count) {
+        let (_card, runtime) = start_with_sequences(&machine, sequences as u32);
+        assert!(runtime.plan().draft_depth > 0, "the artifact drafts");
+        let _ = run(&runtime, 1);
+        let alone = run(&runtime, 1);
+        println!(
+            "RATES engine of {sequences} sequence(s), one request alone: {:.1} tok/s",
+            decode_rate(&alone[0])
+        );
+        if sequences > 1 {
+            let _ = run(&runtime, SEQUENCES);
+            let before = runtime.pass_statistics();
+            let together = run(&runtime, SEQUENCES);
+            let after = runtime.pass_statistics();
+            let each: Vec<String> = together.iter().map(|r| format!("{:.1}", decode_rate(r))).collect();
+            println!(
+                "RATES {SEQUENCES} requests at once: {} tok/s each, {:.1} tok/s in all; {} passes held {} verifications, \
+                 {} batched passes",
+                each.join(" / "),
+                rate_of(&together),
+                after.passes - before.passes,
+                after.segments - before.segments,
+                after.batched - before.batched
+            );
+        }
+    }
+}
+
+/// The lanes' cost with one sequence: the rings and the device bytes they take, and the time of the startup, to set
+/// beside the automatic count's.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn the_lanes_of_one_sequence_hold_one_sequence() {
+    let Some(machine) = machine() else { return };
+    let began = Instant::now();
+    let (_card, runtime) = start_with_sequences(&machine, 1);
+    let (ring, lane_bytes) = runtime.lane_rings_for_tests();
+    println!(
+        "LANES one: rings of {ring} events, {lane_bytes} device bytes, started in {:.2} s",
+        began.elapsed().as_secs_f64()
+    );
+    assert_eq!(runtime.sequences(), 1);
+    assert_eq!(ring, stage_ring_for(1), "the rings are sized for the one sequence");
+}
+
+/// An automatic count (`batching.max-sequences` 0) is held whole: the lanes open once the plan has resolved it, so its
+/// requests run at once and each one's tokens are those it has alone.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn automatic_sequences_run_concurrently_and_match_alone() {
+    let Some(machine) = machine() else { return };
+    let tokenizer = tokenizer(&machine.artifact);
+    let began = Instant::now();
+    let (_card, runtime) = start_with_sequences(&machine, 0);
+    let held = runtime.sequences();
+    assert!(
+        held > 1,
+        "the plan resolved {held} sequences, the lanes' rings held one"
+    );
+    // The rings hold the quanta of the count the lanes opened for, which the plan's count does not exceed.
+    let (ring, lane_bytes) = runtime.lane_rings_for_tests();
+    assert!(
+        ring >= stage_ring_for(held),
+        "the rings of {ring} events do not hold {held} sequences"
+    );
+    println!(
+        "LANES automatic: {held} sequences, rings of {ring} events, {lane_bytes} device bytes, started in {:.2} s",
+        began.elapsed().as_secs_f64()
+    );
+    let count = held.min(SEQUENCES);
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS[..count]
+        .iter()
+        .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
+        .collect();
+    let sampling = vec![SamplingConfig::greedy(0); count];
+    let alone: Vec<Recording> = prompts
+        .iter()
+        .zip(&sampling)
+        .map(|(prompt, sampling)| {
+            submit(
+                &runtime,
+                prompt,
+                CONCURRENT_TOKENS,
+                &[],
+                Speculation::Off,
+                *sampling,
+                None,
+            )
+            .expect("the request is admitted")
+            .wait(WAIT)
+            .expect("the generation reports")
+        })
+        .collect();
+    let (both, _) = together_some(
+        &runtime,
+        &prompts,
+        Speculation::Off,
+        &sampling,
+        &vec![None; count],
+        None,
+    );
+    for (index, (alone, both)) in alone.iter().zip(&both).enumerate() {
+        assert_eq!(alone.tokens.len(), CONCURRENT_TOKENS as usize, "request {index} alone");
+        assert_eq!(both.tokens, alone.tokens, "request {index} changed when run together");
+    }
+    let first_of_all = both.iter().map(|r| *r.token_times.first().unwrap()).max().unwrap();
+    let first_to_end = both.iter().map(|r| *r.token_times.last().unwrap()).min().unwrap();
+    assert!(first_of_all < first_to_end, "the requests did not overlap");
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn concurrent_sequences_match_alone() {
+    let Some(machine) = machine() else { return };
+    let tokenizer = tokenizer(&machine.artifact);
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
+        .iter()
+        .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
+        .collect();
+    let (_card, runtime) = start_with_sequences(&machine, SEQUENCES as u32);
+    assert_eq!(runtime.sequences(), SEQUENCES);
+    let greedy = [SamplingConfig::greedy(0); SEQUENCES];
+    let seeded: Vec<SamplingConfig> = (0..SEQUENCES).map(|index| sampled(40, 7 + index as u64)).collect();
+
+    let modes: [(&str, Speculation, &[SamplingConfig]); 4] = [
+        ("greedy", Speculation::Off, &greedy),
+        ("sampled", Speculation::Off, &seeded),
+        ("greedy+speculation", Speculation::Artifact, &greedy),
+        ("sampled+speculation", Speculation::Artifact, &seeded),
+    ];
+    let mut alone_greedy = Vec::new();
+    let mut alone_speculative = Vec::new();
+    for (name, speculation, sampling) in modes {
+        let speculation = if speculation == Speculation::Artifact && runtime.plan().draft_depth == 0 {
+            println!("{name}: skipped, the artifact has no draft layer");
+            continue;
+        } else {
+            speculation
+        };
+        // Each request alone, in turn.
+        let alone: Vec<Recording> = prompts
+            .iter()
+            .zip(sampling)
+            .map(|(prompt, sampling)| {
+                submit(&runtime, prompt, CONCURRENT_TOKENS, &[], speculation, *sampling, None)
+                    .expect("the request is admitted")
+                    .wait(WAIT)
+                    .expect("the generation reports")
+            })
+            .collect();
+        // A round that is not measured: it records the graphs of the sequences that have not run yet.
+        let _ = together(&runtime, &prompts, speculation, sampling, &[None; SEQUENCES]);
+        let before = runtime.pass_statistics();
+        let (both, wall) = together(&runtime, &prompts, speculation, sampling, &[None; SEQUENCES]);
+        let passes = runtime.pass_statistics();
+        if speculation == Speculation::Artifact {
+            // The verifications of concurrent requests ran as shared passes.
+            let (ran, held, batched) = (
+                passes.passes - before.passes,
+                passes.segments - before.segments,
+                passes.batched - before.batched,
+            );
+            println!("PASSES {name}: {ran} passes held {held} verifications, {batched} batched passes");
+            assert!(batched > 0, "{name}: no verification was batched");
+            assert!(held > ran, "{name}: every pass held one verification");
+        }
+        for (index, (alone, both)) in alone.iter().zip(&both).enumerate() {
+            assert_eq!(both.outcome.reason, FinishReason::Length, "{name}: request {index}");
+            assert_eq!(
+                alone.tokens.len(),
+                CONCURRENT_TOKENS as usize,
+                "{name}: request {index} alone"
+            );
+            assert_eq!(
+                both.tokens, alone.tokens,
+                "{name}: request {index} changed when run together"
+            );
+        }
+        // The requests really ran side by side: every one had its first token before any had its last.
+        let first_of_all = both.iter().map(|r| *r.token_times.first().unwrap()).max().unwrap();
+        let first_to_end = both.iter().map(|r| *r.token_times.last().unwrap()).min().unwrap();
+        assert!(first_of_all < first_to_end, "{name}: the requests did not overlap");
+        let alone_rate = alone.iter().map(decode_rate).sum::<f64>() / SEQUENCES as f64;
+        let each_rate = both.iter().map(decode_rate).sum::<f64>() / SEQUENCES as f64;
+        let all_tokens = both.iter().map(|r| r.tokens.len()).sum::<usize>() as f64;
+        println!(
+            "CONCURRENT {name}: alone {alone_rate:.1} tok/s each; together {each_rate:.1} tok/s each, {:.1} tok/s in all \
+             ({:.0} ms for {all_tokens} tokens)",
+            all_tokens / wall.as_secs_f64(),
+            wall.as_secs_f64() * 1e3
+        );
+        if name == "greedy" {
+            alone_greedy = alone;
+        } else if name == "greedy+speculation" {
+            alone_speculative = alone;
+        }
+    }
+
+    // One of the four is cancelled mid-decode: the others' tokens stay what they are alone.
+    let cancelled_at = 12;
+    let (cancelled, _) = together(
+        &runtime,
+        &prompts,
+        Speculation::Off,
+        &greedy,
+        &[None, Some(cancelled_at), None, None],
+    );
+    assert_eq!(cancelled[1].outcome.reason, FinishReason::Cancelled);
+    assert!(
+        cancelled[1].tokens.len() >= cancelled_at && cancelled[1].tokens.len() < CONCURRENT_TOKENS as usize,
+        "the cancelled request stopped mid-decode, after {} tokens",
+        cancelled[1].tokens.len()
+    );
+    assert_eq!(cancelled[1].tokens, alone_greedy[1].tokens[..cancelled[1].tokens.len()]);
+    for index in [0, 2, 3] {
+        assert_eq!(cancelled[index].outcome.reason, FinishReason::Length, "request {index}");
+        assert_eq!(
+            cancelled[index].tokens, alone_greedy[index].tokens,
+            "request {index} next to a cancel"
+        );
+    }
+
+    // The same with speculation on: the cancelled member leaves its pass, and the others' verifications go on batched.
+    if !alone_speculative.is_empty() {
+        let before = runtime.pass_statistics();
+        // The request is cancelled by the retirement of a verification of one of its batched passes, once three more
+        // batched passes have run: its next step is offered to a pass with the others' and stops there.
+        let (cancelled, _) = together_with(
+            &runtime,
+            &prompts,
+            Speculation::Artifact,
+            &greedy,
+            &[None; SEQUENCES],
+            Some((1, &runtime, before.batched + 3)),
+        );
+        assert_eq!(cancelled[1].outcome.reason, FinishReason::Cancelled);
+        assert!(
+            cancelled[1].tokens.len() < CONCURRENT_TOKENS as usize,
+            "the cancelled request stopped mid-decode"
+        );
+        assert_eq!(
+            cancelled[1].tokens,
+            alone_speculative[1].tokens[..cancelled[1].tokens.len()]
+        );
+        for index in [0, 2, 3] {
+            assert_eq!(cancelled[index].outcome.reason, FinishReason::Length, "request {index}");
+            assert_eq!(
+                cancelled[index].tokens, alone_speculative[index].tokens,
+                "speculative request {index} next to a cancel"
+            );
+        }
+        assert!(runtime.pass_statistics().batched > before.batched);
+    }
+
+    // One of the four fails (its owner panics at the third admission, the hook that takes the first request): the
+    // others' tokens stay what they are alone.
+    runtime.panic_after_admissions_for_tests(3);
+    let (failed, _) = together(&runtime, &prompts, Speculation::Off, &greedy, &[None; SEQUENCES]);
+    match &failed[0].outcome.reason {
+        FinishReason::Failed(why) => assert!(why.contains("panicked"), "{why}"),
+        other => panic!("the first request should have failed, ended with {other:?}"),
+    }
+    assert_eq!(failed[0].tokens, alone_greedy[0].tokens[..failed[0].tokens.len()]);
+    for index in [1, 2, 3] {
+        assert_eq!(failed[index].outcome.reason, FinishReason::Length, "request {index}");
+        assert_eq!(
+            failed[index].tokens, alone_greedy[index].tokens,
+            "request {index} next to a failure"
+        );
+    }
+
+    // Every sequence went back to the pool: all four are idle, and each is clean.
+    for index in 0..SEQUENCES {
+        let state = runtime
+            .inspect_sequence_at(index, |sequence| sequence.row_readbacks.leased())
+            .expect("the sequence is idle");
+        assert_eq!(state, 0, "sequence {index} holds no row readback");
+    }
+    let (after, _) = together(&runtime, &prompts, Speculation::Off, &greedy, &[None; SEQUENCES]);
+    for (index, recording) in after.iter().enumerate() {
+        assert_eq!(
+            recording.tokens, alone_greedy[index].tokens,
+            "request {index} after the failure"
+        );
+    }
+}
+
+/// The bytes of the host arena a disk-tier test leaves in the artifact file: about 0.6 GiB.
+const ON_DISK: u64 = 600 << 20;
+
+/// The settings that leave about [`ON_DISK`] bytes in the artifact file, and the device limit they were made with.
+fn disk_settings(machine: &Machine, sequences: u32) -> (Settings, u64) {
+    let mut engine = settings(&machine.artifact, 4096);
+    engine.batching.max_sequences = sequences;
+    let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
+    common::limit_gpu(&mut engine, limit);
+    let host = common::limit_to_disk(&machine.library, &engine, limit, ON_DISK);
+    common::limit_host_weights(&mut engine, host);
+    (engine, limit)
+}
+
+/// The prompt and the tokens a resident engine selects after it: what a run with weights in the file must also give.
+fn resident_reference(machine: &Machine) -> Greedy {
+    let (_card, runtime) = shared_engine(machine);
+    greedy_reference(machine, &runtime)
+}
+
+/// The logits rows of 64 teacher-forced steps with part of the weights read from the artifact file through the window
+/// are those of the resident engine, byte for byte: what is read from disk is what the host would have held.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn disk_backed_weights_compute_what_host_backed_ones_do() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let forced = &reference.generated[..64];
+    let resident = {
+        let (_card, runtime) = shared_engine(&machine);
+        forced_rows(&runtime, &reference.prompt, forced)
+    };
+    let (engine, limit) = disk_settings(&machine, 1);
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    if !common::read_through_the_window(&runtime, limit) {
+        return;
+    }
+    let from_disk = forced_rows(&runtime, &reference.prompt, forced);
+    assert_eq!(from_disk.len(), resident.len());
+    for (step, (disk, host)) in from_disk.iter().zip(&resident).enumerate() {
+        assert!(
+            disk == host,
+            "step {step}: the logits read through the window differ from the resident ones"
+        );
+    }
+}
+
+/// The engine closes with a request admitted and its reads in flight: the shutdown ends within its bound, frees nothing
+/// under a read and leaves no handle to the runtime.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn closing_with_reads_in_flight_frees_after_them_only() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let (engine, limit) = disk_settings(&machine, 1);
+    let _card = common::card();
+    let (closer, runtime) = common::start_engine(&engine, &machine.library);
+    if !common::read_through_the_window(&runtime, limit) {
+        closer.shutdown(runtime).unwrap();
+        return;
+    }
+    let done = submit(
+        &runtime,
+        &reference.prompt,
+        512,
+        &[],
+        Speculation::Off,
+        SamplingConfig::greedy(0),
+        None,
+    )
+    .expect("the request is admitted");
+    closer
+        .shutdown_within(runtime, Duration::from_secs(120))
+        .expect("the engine closes within its bound");
+    drop(done);
+}
+
+/// Two loads in a row, each generating the tokens of the reference and each closing with no memory left claimed: the
+/// window and the reader of one load are gone before the next begins (the second start's allocation and the leak check
+/// of the shutdown fail otherwise).
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn every_load_generates_within_its_bound() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let (engine, limit) = disk_settings(&machine, 1);
+    let _card = common::card();
+    for cycle in 0..2 {
+        let (closer, runtime) = common::start_engine(&engine, &machine.library);
+        if !common::read_through_the_window(&runtime, limit) {
+            closer.shutdown(runtime).unwrap();
+            return;
+        }
+        let recording = generate(&runtime, &reference.prompt, 128, &[]);
+        assert_eq!(recording.outcome.reason, FinishReason::Length, "cycle {cycle}");
+        assert_eq!(recording.tokens, reference.generated, "cycle {cycle}");
+        closer
+            .shutdown_within(runtime, Duration::from_secs(120))
+            .unwrap_or_else(|error| panic!("cycle {cycle}: the engine closes clean within its bound: {error}"));
+    }
+}
+
+/// A request cancelled while the reader has reads for its quanta ends, and the next request on the same engine
+/// generates the reference tokens: the cancelled quanta gave their slots back. A slot never given back hangs the
+/// next request, which the bounded waits report.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn cancel_during_a_disk_read_ends_cleanly() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let (engine, limit) = disk_settings(&machine, 1);
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    if !common::read_through_the_window(&runtime, limit) {
+        return;
+    }
+    for after in [1, 5] {
+        let cancelled = submit(
+            &runtime,
+            &reference.prompt,
+            512,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            Some(after),
+        )
+        .expect("the request is admitted")
+        .wait(Duration::from_secs(5 * 60))
+        .expect("the cancelled request never reported: a read or a held slot of a cancelled quantum was never freed");
+        assert_eq!(
+            cancelled.outcome.reason,
+            FinishReason::Cancelled,
+            "after {after} tokens"
+        );
+        assert!(cancelled.tokens.len() < 512);
+        let again = submit(
+            &runtime,
+            &reference.prompt,
+            128,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            None,
+        )
+        .expect("the next request is admitted")
+        .wait(Duration::from_secs(5 * 60))
+        .expect("the next request never reported: the cancelled one left a slot held");
+        assert_eq!(again.tokens, reference.generated, "after a cancel at {after} tokens");
+    }
+}
+
+/// Two sequences with their draft layer on, projections staged through the one ring: each request's tokens are what
+/// they are alone. The waits are bounded.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn concurrent_sequences_match_alone_when_staged() {
+    let Some(machine) = machine() else { return };
+    concurrent_through(&machine, 2, false);
+}
+
+/// Sequences started together on the disk tier, with their draft layer on, each request's tokens are what they are
+/// alone: the reads of the quanta of several sequences are registered in the order the quanta start, and one slot of
+/// the window is never the copy of two quanta at once.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn sessions_started_together_on_the_disk_tier_match_running_alone() {
+    let Some(machine) = machine() else { return };
+    for count in [2, 4] {
+        concurrent_through(&machine, count, true);
+    }
+}
+
+/// `count` sequences generate alone and then together (the draft layer on when the artifact has one) under a forced
+/// plan: staged through the ring, or, with `disk`, with part of the weights left in the artifact file.
+fn concurrent_through(machine: &Machine, count: usize, disk: bool) {
+    let tokenizer = tokenizer(&machine.artifact);
+    let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
+        .iter()
+        .take(count)
+        .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
+        .collect();
+    let mut engine = settings(&machine.artifact, 2048);
+    engine.batching.max_sequences = count as u32;
+    let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
+    common::limit_gpu(&mut engine, limit);
+    if disk {
+        let host = common::limit_to_disk(&machine.library, &engine, limit, ON_DISK);
+        common::limit_host_weights(&mut engine, host);
+    }
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    assert_eq!(runtime.sequences(), count, "the engine holds {count} sequences");
+    let forced = if disk {
+        common::read_through_the_window(&runtime, limit)
+    } else {
+        common::staged_through_a_ring(&runtime, limit)
+    };
+    if !forced {
+        return;
+    }
+    let wait = Duration::from_secs(10 * 60);
+    let greedy = SamplingConfig::greedy(0);
+    for speculation in [Speculation::Off, Speculation::Artifact] {
+        if speculation == Speculation::Artifact && runtime.plan().draft_depth == 0 {
+            println!("speculation: skipped, the artifact has no draft layer");
+            continue;
+        }
+        let alone: Vec<Recording> = prompts
+            .iter()
+            .map(|prompt| {
+                submit(&runtime, prompt, CONCURRENT_TOKENS, &[], speculation, greedy, None)
+                    .expect("the request is admitted")
+                    .wait(wait)
+                    .expect("the generation reports")
+            })
+            .collect();
+        let running: Vec<_> = prompts
+            .iter()
+            .map(|prompt| {
+                submit(&runtime, prompt, CONCURRENT_TOKENS, &[], speculation, greedy, None)
+                    .expect("a sequence is idle for the request")
+            })
+            .collect();
+        let refused = submit(
+            &runtime,
+            &prompts[0],
+            CONCURRENT_TOKENS,
+            &[],
+            Speculation::Off,
+            greedy,
+            None,
+        );
+        assert_eq!(
+            refused.err(),
+            Some(AdmissionError::Busy),
+            "the third request finds both sequences running"
+        );
+        let both: Vec<Recording> = running
+            .into_iter()
+            .map(|done| done.wait(wait).expect("the generation reports"))
+            .collect();
+        for (index, (alone, both)) in alone.iter().zip(&both).enumerate() {
+            assert_eq!(
+                both.outcome.reason,
+                FinishReason::Length,
+                "{speculation:?}: request {index}"
+            );
+            assert_eq!(
+                alone.tokens.len(),
+                CONCURRENT_TOKENS as usize,
+                "{speculation:?}: request {index} alone"
+            );
+            assert_eq!(
+                both.tokens, alone.tokens,
+                "{speculation:?}: request {index} changed when run together"
+            );
+        }
+        let first_of_all = both.iter().map(|r| *r.token_times.first().unwrap()).max().unwrap();
+        let first_to_end = both.iter().map(|r| *r.token_times.last().unwrap()).min().unwrap();
+        assert!(
+            first_of_all < first_to_end,
+            "{speculation:?}: the requests did not overlap"
+        );
+    }
+}
+
+/// The rows of a forced run and how it ended.
+type ForcedDelivery = (Vec<Vec<u8>>, GenerationOutcome);
+
+/// The rows of a teacher-forced run, kept one by one.
+struct ForcedRows {
+    rows: Vec<Vec<u8>>,
+    done: Option<Arc<Handoff<ForcedDelivery>>>,
+}
+
+impl LogitsSink for ForcedRows {
+    fn row(&mut self, step: usize, _forced: u32, logits: &[u8]) {
+        assert_eq!(step, self.rows.len(), "the rows arrive in order");
+        self.rows.push(logits.to_vec());
+    }
+
+    fn finished(&mut self, outcome: GenerationOutcome) {
+        let done = self.done.take().expect("a run finishes once");
+        done.send((mem::take(&mut self.rows), outcome));
+    }
+}
+
+/// Starts a forced run of `rows` rows per step; the handoff gives its rows and outcome.
+fn run_forced(
+    runtime: &EngineRuntime,
+    prefix: &[u32],
+    forced: &[u32],
+    rows: usize,
+) -> Result<Arc<Handoff<ForcedDelivery>>, AdmissionError> {
+    let done = Handoff::new();
+    runtime.teacher_forced_rows(
+        prefix.to_vec(),
+        forced.to_vec(),
+        rows,
+        Box::new(ForcedRows {
+            rows: Vec::new(),
+            done: Some(Arc::clone(&done)),
+        }),
+    )?;
+    Ok(done)
+}
+
+/// A sink that wants the hidden state.
+struct WantsHidden;
+
+impl LogitsSink for WantsHidden {
+    fn wants_hidden(&self) -> bool {
+        true
+    }
+
+    fn row(&mut self, _step: usize, _forced: u32, _logits: &[u8]) {}
+
+    fn finished(&mut self, _outcome: GenerationOutcome) {}
+}
+
+/// Runs the forced comparison on an engine whose sequences are sized as `forced_rows` says (0: by the draft depth
+/// alone): `rows` rows per step, alone and with two sequences at once, give the rows of the one-row path byte for byte,
+/// and the two sequences share passes.
+fn forced_rows_equal_the_one_row_path(forced_rows: u32, rows_of: impl Fn(usize) -> usize) {
+    let Some(machine) = machine() else { return };
+    let mut engine = settings(&machine.artifact, 4096);
+    engine.batching.max_sequences = 2;
+    engine.batching.forced_rows = forced_rows;
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    let tokenizer = tokenizer(&machine.artifact);
+    let document =
+        fs::read_to_string(repository_root().join("rust/resources/bench/chat-corpus-v1-document.md")).unwrap();
+    let document = tokenizer.encode(&document).unwrap();
+    let (prefix, steps) = (96, 37);
+    let first = &document[..prefix];
+    let forced_a = &document[prefix..prefix + steps];
+    let second = &document[prefix + steps..prefix + steps + prefix];
+    let forced_b = &document[2 * prefix + steps..2 * prefix + 2 * steps];
+
+    let one = |prefix: &[u32], forced: &[u32]| {
+        let (rows, outcome) = run_forced(&runtime, prefix, forced, 1).unwrap().wait(WAIT).unwrap();
+        assert_eq!(outcome.reason, FinishReason::Length);
+        rows
+    };
+    let reference_a = one(first, forced_a);
+    let reference_b = one(second, forced_b);
+    assert_eq!(reference_a.len(), steps);
+
+    let widest = rows_of(runtime.plan().draft_depth);
+    assert!(widest >= 2, "the sequences verify several rows");
+    assert_eq!(runtime.plan().verified_rows() as usize, widest);
+    for rows in [2, widest] {
+        let (got, outcome) = run_forced(&runtime, first, forced_a, rows).unwrap().wait(WAIT).unwrap();
+        assert_eq!(outcome.reason, FinishReason::Length);
+        assert_eq!(outcome.generated, steps);
+        assert!(got == reference_a, "{rows} rows alone differ from the one-row path");
+    }
+    // Two sequences at once: their verifications share passes.
+    let before = runtime.pass_statistics();
+    let a = run_forced(&runtime, first, forced_a, widest).unwrap();
+    let b = run_forced(&runtime, second, forced_b, widest).unwrap();
+    assert!(
+        a.wait(WAIT).unwrap().0 == reference_a,
+        "batched run a differs from the one-row path"
+    );
+    assert!(
+        b.wait(WAIT).unwrap().0 == reference_b,
+        "batched run b differs from the one-row path"
+    );
+    let after = runtime.pass_statistics();
+    println!(
+        "FORCED_ROWS {widest} rows: {} passes, {} batched",
+        after.passes - before.passes,
+        after.batched - before.batched
+    );
+    assert!(after.batched > before.batched, "the two runs never shared a pass");
+
+    // More rows than the sequences verify is refused, by name, not run; so is a sink that wants the hidden state.
+    match run_forced(&runtime, first, forced_a, widest + 1) {
+        Err(AdmissionError::Engine(text)) => assert!(text.contains("verify at most"), "{text}"),
+        other => panic!("too many rows were not refused: {:?}", other.err()),
+    }
+    match runtime.teacher_forced_rows(first.to_vec(), forced_a.to_vec(), 2, Box::new(WantsHidden)) {
+        Err(AdmissionError::Engine(text)) => assert!(text.contains("hidden state"), "{text}"),
+        other => panic!("a hidden-state sink was not refused: {:?}", other.err()),
+    }
+    // The sequences are idle again and take the one-row path.
+    assert!(one(first, forced_a) == reference_a);
+}
+
+/// The rows the artifact's draft depth sizes the verification for, alone and batched, equal the one-row path.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn multi_row_teacher_forcing_matches_the_one_row_path_alone_and_batched() {
+    forced_rows_equal_the_one_row_path(0, |depth| 1 + depth);
+}
+
+/// `batching.forced-rows` of 8 sizes the sequences for 8 rows, more than the draft depth gives.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn eight_forced_rows_sized_by_the_setting_equal_the_one_row_path_alone_and_batched() {
+    forced_rows_equal_the_one_row_path(8, |depth| (1 + depth).max(8));
+}

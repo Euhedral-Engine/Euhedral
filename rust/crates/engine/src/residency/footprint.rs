@@ -147,9 +147,13 @@ pub fn first_state_bytes(
 /// `ResidencyPlan::extra_sequence_bytes` is for each one beyond it, without the MTP layer's cache
 /// ([`mtp_cache_bytes_of`]). The runtime reserve pays for it.
 pub fn first_sequence_bytes(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
-    let drafts = plan.draft_depth > 0;
-    let verified_rows = if drafts { 1 + plan.draft_depth as u64 } else { 0 };
-    first_state_bytes(config, plan.kv_format, verified_rows, drafts, plan.rows.rows)
+    first_state_bytes(
+        config,
+        plan.kv_format,
+        plan.verified_rows(),
+        plan.draft_depth > 0,
+        plan.rows.rows,
+    )
 }
 
 /// The MTP layer's cache of the plan's first sequence at `max_context_tokens`: 0 without a drafter. The runtime

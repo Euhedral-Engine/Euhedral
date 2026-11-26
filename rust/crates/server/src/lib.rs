@@ -35,9 +35,9 @@ use std::fmt::{self, Debug, Formatter};
 use std::io;
 use std::io::{Write, stderr};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
-use std::sync::Arc;
 use std::sync::mpsc::channel;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_inference_api_server::{ApiConfig, Backend, Limits, RequestDefaults, once, start_on};
@@ -208,6 +208,10 @@ fn listen(port: u16) -> io::Result<TcpListener> {
         socket.listen(1024)?;
         Ok(socket.into())
     };
+    // Windows lets a dual-stack socket take a port another program holds on IPv4 only, so the IPv4 side is tried first
+    // (and released at once): the start fails with the same address-in-use error as elsewhere.
+    #[cfg(windows)]
+    drop(bind(Domain::IPV4, IpAddr::V4(Ipv4Addr::UNSPECIFIED))?);
     match bind(Domain::IPV6, IpAddr::V6(Ipv6Addr::UNSPECIFIED)) {
         Err(error) if error.kind() != io::ErrorKind::AddrInUse => {
             log::info!("listening on IPv6 is not possible ({error}): IPv4 only");
@@ -215,6 +219,14 @@ fn listen(port: u16) -> io::Result<TcpListener> {
         }
         other => other,
     }
+}
+
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+/// Marks the start of the process, which the start time of the log is counted from. The first call counts; `main` makes
+/// it before it reads anything.
+pub fn mark_process_start() {
+    PROCESS_START.get_or_init(Instant::now);
 }
 
 /// Starts the backend with `start`, serves the API on `settings.server.port`, calls `wait_for_stop` with the address
@@ -227,6 +239,18 @@ fn listen(port: u16) -> io::Result<TcpListener> {
 pub fn serve(
     settings: &Settings,
     windows: StopWindows,
+    start_backend: impl FnOnce(&Settings) -> Result<Started, StartError>,
+    wait_for_stop: impl FnOnce(SocketAddr) -> u8,
+) -> u8 {
+    serve_waiting(settings, windows, None, start_backend, wait_for_stop)
+}
+
+/// As [`serve`], with how long the stop waits for the server's report that it stopped: `None` is the two windows plus
+/// a margin for admission's own timer to report first. A test that must not race that margin gives a long time.
+pub fn serve_waiting(
+    settings: &Settings,
+    windows: StopWindows,
+    report_wait: Option<Duration>,
     start_backend: impl FnOnce(&Settings) -> Result<Started, StartError>,
     wait_for_stop: impl FnOnce(SocketAddr) -> u8,
 ) -> u8 {
@@ -251,6 +275,7 @@ pub fn serve(
         created_at: now_seconds(),
         defaults: defaults(settings),
         io: None,
+        clock: None,
     };
     let patience = windows.drain.saturating_add(windows.shutdown);
     let timeout = settings.server.shutdown_timeout;
@@ -267,6 +292,9 @@ pub fn serve(
         "Listening on port {}, serving model {model}",
         server.local_addr().port()
     );
+    if let Some(start) = PROCESS_START.get() {
+        log::info!("Started in {:.3} seconds", start.elapsed().as_secs_f64());
+    }
     let code = wait_for_stop(server.local_addr());
     log::info!("{}: shutting down", signal_name(code));
     let (stopped, reported) = channel();
@@ -275,7 +303,8 @@ pub fn serve(
     }));
     // Admission waits for the generations up to the shutdown limit and then tells them to give up; the margin lets its
     // own timer report before this wait gives up first.
-    match reported.recv_timeout(patience.saturating_add(patience.max(Duration::from_secs(1)))) {
+    let wait = report_wait.unwrap_or_else(|| patience.saturating_add(patience.max(Duration::from_secs(1))));
+    match reported.recv_timeout(wait) {
         Ok(()) => server.release(),
         Err(_) => log::error!("the server did not report that it stopped; closing the backend anyway"),
     }

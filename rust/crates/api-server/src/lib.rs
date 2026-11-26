@@ -8,6 +8,7 @@
 pub mod admission;
 pub mod answer;
 pub mod backend;
+pub mod clock;
 pub mod engine_backend;
 mod frames;
 pub mod health;
@@ -27,6 +28,7 @@ pub use backend::{
     Backend, BackendError, EncodedPrompt, EngineReport, Generation, GenerationConfig, GenerationResult, Next,
     OutputSpec, PrefixCacheReport, TextListener,
 };
+pub use clock::{Clock, Timers};
 pub use engine_backend::{Codec, Engine, EngineBackend, EngineHost, EngineStarting, StartError, TextStream};
 pub use frames::once;
 pub use limits::Limits;

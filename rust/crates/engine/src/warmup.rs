@@ -16,6 +16,7 @@ use euhedral_graph::Marker;
 use euhedral_inference_cuda::{CudaError, KernelOps};
 use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 
+use crate::formats::TokenEmbedding;
 use crate::model::{LayerIndex, ModelConfig, NormKind, Role, WeightRef, Weights};
 use crate::runtime::Core;
 use crate::workspace::{BufferSlot, Workspace};
@@ -54,7 +55,7 @@ pub(crate) fn run(
     workspace: &Workspace,
 ) -> (Warmed, Option<Marker>) {
     let mut warmed = Warmed::default();
-    let submitted = core.lane_table.submit_ops(core.transfer_lane(0), false, |lane| {
+    let submitted = core.lane_table().submit_ops(core.transfer_lane(0), false, |lane| {
         warmed = warm(core, config, weights, workspace, lane);
         Ok::<(), CudaError>(())
     });
@@ -144,6 +145,20 @@ fn warm(
                 config.vocab_size as u32,
                 hidden,
                 embedding.bytes,
+            )
+        });
+    }
+    if let Some(embedding) = weights
+        .get(LayerIndex::GLOBAL, Role::Embedding)
+        .filter(|weight| weight.format == WeightFormat::Nvfp4 && TokenEmbedding::check(weight).is_ok())
+    {
+        launcher.launch("nvfp4 embedding", |kernels| {
+            TokenEmbedding.submit(
+                kernels,
+                embedding,
+                slot(BufferSlot::TokenIds),
+                slot(BufferSlot::HiddenState),
+                1,
             )
         });
     }

@@ -39,6 +39,11 @@ impl KernelArguments {
         Self(self.0.u32(value))
     }
 
+    /// A 64-bit value (a byte offset the kernel adds to a pointer).
+    pub fn int64(self, value: u64) -> Self {
+        Self(self.0.u64(value))
+    }
+
     /// How many arguments were added.
     pub fn count(&self) -> usize {
         self.0.count()

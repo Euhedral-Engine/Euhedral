@@ -35,9 +35,7 @@ const STANDALONE_TASKS: [&str; TASKS] = [
 ];
 
 /// The frozen document, read from the Java benchmark's resources so the two engines quote the same text.
-pub const DOCUMENT: &str = include_str!(
-    "../../../../../benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md"
-);
+pub const DOCUMENT: &str = include_str!("../../../../resources/bench/chat-corpus-v1-document.md");
 
 /// Builds every task's prompt text for `target_tokens`, in task order, as Java's `ChatPromptCorpus.build` does: the
 /// target is refused when any task's standalone prompt is above it, not only the one an iteration runs.

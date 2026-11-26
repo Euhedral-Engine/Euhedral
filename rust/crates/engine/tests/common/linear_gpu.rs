@@ -1,7 +1,7 @@
 //! What the linear format tests on a GPU share: the library and a lane, objects uploaded from the RCO artifact or made
 //! synthetic, activations, and one linear run and read back.
 //!
-//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or
+//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, in `~/.config/euhedral/test.properties`, or
 //! `gradle.properties`) and the artifact from `euhedral.qwen.rco-artifact`; a test skips with a message when it is
 //! absent.
 
@@ -24,6 +24,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use euhedral_inference_cuda::launch::q3::q3_byte_size;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, LaneOps};
 use euhedral_inference_edrl::{
     Header, ReadPlan, Region, TensorDataType, TensorTable, TokenizerFooter, TrellisCompanions, WeightFormat,
@@ -296,6 +297,66 @@ impl Artifact {
             trellis: None,
         };
         (buffer, weight)
+    }
+}
+
+/// A compressed Q3 tensor on the device, with the same tensor expanded whole.
+pub struct CompressedHead {
+    pub compressed: WeightRef,
+    pub expanded_weight: WeightRef,
+    pub expanded: u64,
+    _buffers: [DeviceBuffer; 2],
+}
+
+/// A valid compressed stream of `out` rows of `k` (the geometry of `q3_p2e2_geometry.h`): codes of -1, 0 and +1 (no
+/// BIG symbol, so no payload units and every row's base is 0), FP16 scales, and the zero padding words behind the
+/// empty payload; and its expansion, as a plain Q3 weight.
+pub fn compressed_head(rig: &Rig, random: &mut Random, out: usize, k: usize) -> CompressedHead {
+    let expanded = q3_byte_size(out as u32, k as u32);
+    let align = |value: usize| value.next_multiple_of(256);
+    let base = align(out * k / 4);
+    let scales = align(base + 4 * out);
+    let payload = align(scales + out * k / 32);
+    let bytes = (payload + 4 * 80) as u64;
+    let mut words = vec![0u8; bytes as usize];
+    for word in words[..out * k / 4].as_chunks_mut::<4>().0 {
+        let symbols = random.next_u64() as u32;
+        let big = symbols & (symbols >> 1) & 0x5555_5555;
+        *word = (symbols & !(big | (big << 1))).to_le_bytes();
+    }
+    for scale in words[scales..scales + out * k / 32].as_chunks_mut::<2>().0 {
+        *scale = fp16(0.01 + 0.02 * random.uniform()).to_le_bytes();
+    }
+    let compressed = upload(&rig.library, &words);
+    let whole = empty(&rig.library, expanded as usize);
+    rig.run(|ops| {
+        ops.q3_p2e2_expand(
+            compressed.ptr(),
+            bytes,
+            out as u32,
+            k as u32,
+            0,
+            out as u32,
+            whole.ptr(),
+            expanded,
+        )
+    });
+    let weight = |name: &str, layout, ptr, bytes| WeightRef {
+        name: name.to_string(),
+        shape: vec![out as u64, k as u64],
+        dtype: TensorDataType::Bf16,
+        format: WeightFormat::Q3G64Fp16,
+        layout,
+        ptr,
+        bytes,
+        residence: Residence::Device,
+        trellis: None,
+    };
+    CompressedHead {
+        compressed: weight("head", WeightLayout::RowSplitP2e2V1, compressed.ptr(), bytes),
+        expanded_weight: weight("head-expanded", WeightLayout::RowSplitK128V1, whole.ptr(), expanded),
+        expanded,
+        _buffers: [compressed, whole],
     }
 }
 

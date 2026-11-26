@@ -30,10 +30,12 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `prefix-cache.checkpoint-tokens` | 2048 | Prompt tokens between stored checkpoints, a multiple of 512. |
 | `prefix-cache.copy-piece-bytes` | 16MiB | The most bytes one prefix-cache copy moves at a time. Only the Rust engine reads it. |
 | `context.kv-cache-format` | the artifact's (`nvfp4`) | The attention cache format: `nvfp4` (144 bytes per head row) or `bf16` (512 bytes, the keys and values as computed). The engine sizes the context's device memory by it ([ATTENTION_DECODE.md](kernels/ATTENTION_DECODE.md#cache-formats)). |
+| `speculation.mode` | `artifact` | `artifact` drafts as the artifact's draft layer allows; `none` loads no draft layer, draft head or draft state and never drafts. Only the Rust engine reads it (`quantize reference` and `quantize score` set `none`). |
 | `batching.max-sequences` | 1 | Generations that run at once, each with its own sequence state (KV cache, recurrent state, workspace) in device memory. Requests beyond it wait in the queue below. `0` takes as many as fit without holding back more weights in host memory than one sequence does; `1` or more is planned exactly as asked, and weights leave the device to make room. Flash-Next artifacts always run one sequence, and `0` yields 1 without a speculation profile or on DFlash2. |
 | `context.kv-cache-on-gpu-tokens` | 65536 | Tokens of each sequence's attention cache that stay in device memory. When the weights and every sequence's whole cache do not fit, the pages past this many tokens move to pinned host memory before any weight leaves the GPU, and each attention layer copies them in before it reads them ([ATTENTION_DECODE.md](kernels/ATTENTION_DECODE.md#cache-pages-in-host-memory)). Raise it to keep more of the cache on the GPU at the price of weights in host memory; lower it to fit longer contexts or more sequences. |
 | `batching.max-tokens-per-pass` | the prefill chunk | The most rows one shared decode or verification pass holds; lower it to bound a pass. It also caps the sequence count `batching.max-sequences: 0` chooses. |
 | `batching.max-sequences-per-pass` | unlimited (1 with DFlash2) | The most sequences one shared pass serves; with DFlash2 a pass serves one. |
+| `batching.forced-rows` | 0 | The rows one step of a teacher-forced run takes at a time (scoring a context against a reference). Every sequence is sized to verify that many rows, so a larger value costs device memory; 0 or 1 sizes nothing for it and forces one row a step. Only the Rust engine reads it. |
 | `batching.prefill-chunk-tokens` | 512 | The rows the workspace holds per pass, the longest prefill chunk it runs. |
 | `memory.host-limit` | automatic | Host memory the engine may use (pinned weights, the expert tier): by default what the machine can spare (90% of the available memory, never closer than 4 GiB to exhaustion, or as `memory.host-margin` says; no runtime reserve is subtracted). |
 | `memory.host-margin` | the larger of 4 GiB and 10% of the available memory | Host memory kept for the system when the host budget is derived from what the machine can spare; `0` keeps none. It also covers the runtime's own use of host memory: the Rust engine subtracts no separate runtime reserve. Where the engine cannot learn the available memory (Windows today), nothing spills to the host unless `memory.host-limit` or `memory.host-weights-limit` is set, and a plan that needs host memory is refused naming them; the prefix cache keeps its `prefix-cache.size`. Read by the Rust engine; the Java engine checks the value and ignores it. |
@@ -42,11 +44,13 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `memory.host-weights-limit` | the host limit's pinnable part | Pinned host memory for host-backed weights and the disk window. |
 | `memory.gpu-limit` | the free device memory | Device memory the residency plan may use, at most what is free. |
 | `memory.gpu-reserve` | 700MiB | Device memory a Flash-Next plan leaves free for other programs on the GPU. The dense Qwen3.8 plan does not use it: its budget is the free memory, at most `memory.gpu-limit`. |
+| `memory.runtime-headroom` | 320MiB | Device memory the Rust engine's plan keeps above what the workspace, the decode scratch, the first sequence's state and the MTP cache need, for what the driver takes after the plan is admitted: the code and local memory of each kernel family, loaded at its first launch. Counted where that demand raises `memory.runtime-reserve` above its value; below it the reserve's own slack pays. Read by the Rust engine; the Java engine checks the value. |
 | `memory.runtime-reserve` | 1280MiB | Device memory the dense Qwen3.8 plan keeps beside the weights and the cache for the first sequence's GDN state, the execution workspaces, the shared scratch and the kernel modules loaded after the model. A floor: the plan raises the reserve to what the workspace, the decode scratch, the first sequence's state and the MTP cache need at the given settings (a larger `batching.prefill-chunk-tokens` or a longer context), and logs the raise. Read by the Rust engine; the Java engine checks the value and uses 1280MiB. |
 | `memory.pinned-buffer-pool` | 1/256 of the machine's memory, at least 64 MiB | Released pinned staging buffers kept for reuse. |
 | `memory.weight-streaming.*` | 8, 1, 4, 2 | Flash-Next expert streaming: `concurrent-reads` (records read from the artifact at once), `read-split` (parts one record read is split into), `copy-streams` (CUDA streams copying experts to the GPU), `gpu-streams` (device lanes a step spreads over). |
 | `host.task-parallelism` | 8 | Ingest sinks of each pool of ready host work: more spread the contention of the workers that publish and take frames. |
 | `host.max-batch-size` | auto | Most frames a lattice worker takes from its cache at once (auto is the runtime's default). `1` or `2` makes the workers poll their caches one frame at a time, so other workers can steal what waits behind a heavy frame. Read by the Rust engine; the Java engine checks the value and ignores it. |
+| `host.copy-chunk-bytes` | 16MiB | The most bytes one read and write of a file copy moves; the quantization tools copy an artifact's content in pieces this size (`package-tokenizer --out`). Read by the Rust quantization tools; the Java engine checks the value and ignores it. An in-place `package-tokenizer` cuts the artifact back to its content before it writes the tokenizer section: a run that fails after the cut leaves the artifact without a section, and running the command again writes it. |
 | `host.idle-release` | 1s | Idle time before the workers stop polling an idle pool of work; `0` never releases them. |
 | `kernels.graphs.captures-per-view` | 0 | CUDA graphs a sequence keeps for each of decode, verification and draft, counted together (the cache holds this many times the number of views and releases the graph used least recently, of any view, when it is full); The default `0` captures nothing and every quantum runs stage by stage; a positive value turns captures on (8 is a usual choice). Read by the Rust engine; the Java engine checks the value and ignores it. |
 | `kernels.compile.stack` | 256MiB | Stack of the thread that compiles a kernel module at load; the compiler recurses deeply on the largest modules. Applies when the Rust engine loads its kernels through RustEE, which it does not do yet; the Java engine checks the value and ignores it. |
@@ -106,15 +110,18 @@ chain of Spring beans around them: worker CPUs this process may not run on, a co
 or than the GPU can hold with every weight in host memory, a GPU that is missing or not a Blackwell, a CUDA runtime
 the native library cannot load. A port in use is reported by Spring Boot, after the weights have loaded.
 
-A successful start logs the context and how it fits (RTX 5070 Ti, `qwen3_8_27b_q3`, the default context):
+A successful start logs the context and how it fits, the prefix cache, and the time from the process's start to the open
+port (the Rust server, RTX 5070 Ti, `qwen3_8_27b_nvfp4_trellis_rco`, the default context; the first start also compiles
+the kernels, which is most of the time):
 
 ```text
-Context 32768 tokens: 13854 MiB of the 15100 MiB free on the GPU, 0 MiB of weights in host memory
-Prefix cache: 4096 MiB pinned, a checkpoint every 2048 tokens
-Started EuhedralInferenceApplication in 7.761 seconds (process running for 7.951)
+Context 32768 tokens x 1 sequence: 13465 MiB of the 15083 MiB available on the GPU, 0 MiB of weights in host memory
+Prefix cache: 4095 MiB pinned, a checkpoint every 2048 tokens
+Listening on port 1738, serving model qwen3_8_27b_nvfp4_trellis_rco
+Started in 128.440 seconds
 ```
 
-With `qwen3_8_27b_nvfp4` and a context of 131072 the same card keeps 3485 MiB of weights in host memory.
+"Available" is the device's free memory, at most `memory.gpu-limit`. A cache that is off logs `Prefix cache: off`.
 
 The port opens only after the engine has loaded, so a server that answers is ready.
 
@@ -122,6 +129,33 @@ The port opens only after the engine has loaded, so a server that answers is rea
 
 `GET /health` answers `200 {"status":"up","engine":"ready","model":"..."}`, and `503` with `"engine":"closed"` once the
 engine has closed. The image's Docker health check calls it.
+
+## Container images
+
+The root `Dockerfile` builds the Java server's image. `rust/Dockerfile` builds the Rust server's, in the same
+distroless `cc` base with the same default settings file (`/etc/euhedral/config.yaml`, also `EUHEDRAL_CONFIG`), the NVIDIA
+environment, the `nonroot` user and the same health check timing. Build it from the repository root; the build compiles
+the native library with the pinned toolchains, so it needs network access and takes a while:
+
+```bash
+docker build -f rust/Dockerfile -t euhedral-rust .
+docker run --rm --gpus all --security-opt seccomp=unconfined -p 1738:1738 \
+    -v /path/to/model.edrl:/models/model.edrl:ro -e EUHEDRAL_MODEL_NAME=qwen --stop-timeout 45 euhedral-rust
+```
+
+The engine reads model files through io_uring, and Docker's default seccomp profile blocks the io_uring system
+calls. Without `seccomp=unconfined`, the server stops at startup with `Loading the inference engine failed: the
+asynchronous file I/O would not open: Operation not permitted (os error 1)`. A custom profile that is Docker's
+default plus `io_uring_setup`, `io_uring_enter` and `io_uring_register` also works. The host's
+`kernel.io_uring_disabled` must be 0. If it is 1 or 2, the same error appears, and a container cannot change it.
+
+The image holds the linux-x64 server bundle (`cargo xtask bundle --product linux-x64`, see `rust/README.md`) under
+`/opt/euhedral`: `bin/euhedral-server` is the entry point and finds `lib/` beside it. Settings are given as for the
+Java image: `--config <mounted file>`, or variables (`docker run -e`, `--env-file`). The distroless base has no shell
+or curl, so the health check is `bin/euhedral-health-probe`, which asks `GET /health` of `127.0.0.1` on
+`EUHEDRAL_SERVER_PORT`, else `PORT`, else 1738, allows two seconds each to connect, to send the request and to read the answer, and exits 1 unless the answer is `200`. A
+server that listens on another port through a settings file needs the same port in one of those variables for the
+check to follow it.
 
 ## Shutting down
 
@@ -203,8 +237,14 @@ Absent when the cache is off ([PREFIX_CACHE.md](PREFIX_CACHE.md)).
 | `euhedral_engine_device_free_bytes` | gauge | Free device memory the driver reports |
 | `euhedral_engine_host_backed_weight_bytes` | gauge | Weights held in pinned host memory and streamed in |
 
-The JVM's and the process's metrics (`jvm_*`, `process_*`, `process_uptime_seconds`), Tomcat's and HTTP server
-request timings (`http_server_requests_seconds`) come from Micrometer.
+The process's metrics (`process_uptime_seconds`, `process_start_time_seconds`, `process_cpu_time_ns_total`,
+`process_cpu_usage`, `process_files_open_files`, `process_files_max_files`) come from the operating system; a value the
+platform cannot report is left out rather than written as zero. On Windows the file limit has no series. The time of
+every request (`http_server_requests_seconds`, with `_count`, `_sum` and `_max`) is labelled by route template (`uri`,
+for example `/v1/models/{model}`), method, status and outcome; every path that is no route is `uri="/**"`. A request is
+timed from the moment the router has it (its head and body already read) to the last byte handed to the connection; a
+stream cut after its head is timed to the moment it was cut, as a `200`. The JVM's metrics (`jvm_*`) and
+`http_server_requests_active_seconds` belong to the Java server: the Rust server has none.
 
 ### Examples
 

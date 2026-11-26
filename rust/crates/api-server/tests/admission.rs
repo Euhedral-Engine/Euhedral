@@ -10,16 +10,14 @@
 mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::{spawn, yield_now};
+use std::thread::{sleep, spawn, yield_now};
 use std::time::{Duration, Instant};
 
-use common::{Fixture, PATIENCE, lattice, small_limits};
+use common::{Fixture, HANG_GUARD, ManualClock, lattice, small_limits};
 use euhedral_core::control_plane::ControlPlaneLattice;
-use euhedral_core::generics::LatticeSource;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
-use euhedral_graph::Completions;
 use euhedral_inference_api_protocol::ApiError;
 use euhedral_inference_api_server::scripted::{Script, ScriptedBackend};
 use euhedral_inference_api_server::{
@@ -27,8 +25,8 @@ use euhedral_inference_api_server::{
     Interruption, Limits, OutputSpec, Slot, TextListener, once,
 };
 
-/// How long a test waits to be sure that something does not happen.
-const QUIET: Duration = Duration::from_millis(300);
+/// The ways a test gives a limit time to pass.
+const LIMIT: Duration = Duration::from_millis(150);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
@@ -109,7 +107,7 @@ struct Rig {
     lattice: Arc<ControlPlaneLattice>,
     backend: Arc<ScriptedBackend>,
     sink: Arc<QueueIngestSink>,
-    timers: Arc<Completions>,
+    clock: Arc<ManualClock>,
     admission: Admission,
     events: Receiver<Event>,
     sender: Sender<Event>,
@@ -130,16 +128,16 @@ impl Rig {
         let backend = ScriptedBackend::on(&lattice);
         backend.set_max_active(max_active);
         let sink = Arc::new(QueueIngestSink::new());
-        let timers = Completions::without_lanes();
         lattice.add_upstream(sink.delegate()).expect("the sink is attached");
-        lattice.add_upstream(timers.clone()).expect("the timers are attached");
-        let admission = Admission::new(backend.clone(), &limits, sink.clone(), timers.clone());
+        let clock = ManualClock::new();
+        clock.attach(&lattice);
+        let admission = Admission::with_clock(backend.clone(), &limits, sink.clone(), clock.clone());
         let (sender, events) = channel();
         Rig {
             lattice,
             backend,
             sink,
-            timers,
+            clock,
             admission,
             events,
             sender,
@@ -171,7 +169,7 @@ impl Rig {
     }
 
     fn next(&self) -> Event {
-        self.events.recv_timeout(PATIENCE).expect("an event")
+        self.events.recv_timeout(HANG_GUARD).expect("an event")
     }
 
     /// The next `count` events, sorted by entry: events of separate frames arrive in either order.
@@ -183,18 +181,38 @@ impl Rig {
         events
     }
 
-    fn assert_quiet(&self) {
-        match self.events.recv_timeout(QUIET) {
-            Err(RecvTimeoutError::Timeout) => {}
-            other => panic!("nothing should have happened, got {other:?}"),
+    /// Waits until `condition` holds, for as long as the test may take.
+    fn until(&self, what: &str, condition: impl Fn(&Rig) -> bool) {
+        let end = Instant::now() + HANG_GUARD;
+        while !condition(self) {
+            assert!(Instant::now() < end, "never: {what}; {:?}", self.admission.counts());
+            sleep(Duration::from_millis(1));
         }
     }
 
+    /// Waits until a turn left `active` entries running and `waiting` waiting.
+    fn until_counts(&self, active: usize, waiting: usize) {
+        self.until(&format!("{active} running and {waiting} waiting"), |rig| {
+            rig.admission.counts() == euhedral_inference_api_server::Counts { active, waiting }
+        });
+    }
+
+    /// Waits until the earliest timer armed is the one for `after` on the clock.
+    fn until_armed_for(&self, after: Duration) {
+        self.until("the timer to be armed for the deadline", |rig| {
+            rig.clock.next_deadline() == Some(rig.clock.at_offset(after))
+        });
+    }
+
+    /// Closes the lattice, which carries out every frame published before, and asserts that no event was left over:
+    /// what the test did not expect to happen, did not.
     fn finish(self) {
-        self.timers.complete();
+        self.clock.complete();
         self.sink.complete_gracefully();
         self.backend.release();
         self.lattice.close();
+        let strays: Vec<_> = self.events.try_iter().collect();
+        assert!(strays.is_empty(), "events nobody expected: {strays:?}");
     }
 }
 
@@ -203,7 +221,6 @@ fn entries_start_in_the_order_they_were_offered_and_never_exceed_the_slots() {
     let rig = Rig::new(2, limits(8));
     let probes: Vec<_> = (0..6).map(|name| rig.offer(name).0).collect();
     assert_eq!(rig.next_set(2), vec![Event::Started(0), Event::Started(1)]);
-    rig.assert_quiet();
     assert_eq!(rig.admission.counts().active, 2);
     assert_eq!(rig.admission.counts().waiting, 4);
     for (finished, started) in [(0, 2), (1, 3), (2, 4), (3, 5)] {
@@ -288,20 +305,22 @@ fn a_request_that_waits_longer_than_the_request_limit_is_refused_with_the_timeou
     let rig = Rig::new(
         1,
         Limits {
-            request_limit: Duration::from_millis(150),
+            request_limit: LIMIT,
             ..limits(4)
         },
     );
-    let begun = Instant::now();
     let (first, _) = rig.offer(0);
     rig.offer(1);
     assert_eq!(rig.next(), Event::Started(0));
+    rig.until_counts(1, 1);
+    // The timer is armed for the request limit from the arrival, and the limit passes when the clock reaches it.
+    rig.until_armed_for(LIMIT);
+    rig.clock.advance(LIMIT);
     // The running one is interrupted too, and the waiting one is refused: both limits are the same instant.
     let mut seen = [rig.next(), rig.next()];
     seen.sort_by_key(|event| matches!(event, Event::Refused(..)));
     assert_eq!(seen[0], Event::Interrupted(0, Interruption::TimedOut));
     assert_eq!(seen[1], Event::Refused(1, ApiError::timeout()));
-    assert!(begun.elapsed() >= Duration::from_millis(150));
     let error = ApiError::timeout();
     assert_eq!(
         (error.status, error.code, error.message.as_str()),
@@ -320,12 +339,14 @@ fn a_running_request_over_the_request_limit_is_interrupted_once_and_frees_its_sl
     let rig = Rig::new(
         1,
         Limits {
-            request_limit: Duration::from_millis(100),
+            request_limit: LIMIT,
             ..limits(4)
         },
     );
     rig.offer(0);
     assert_eq!(rig.next(), Event::Started(0));
+    rig.until_armed_for(LIMIT);
+    rig.clock.advance(LIMIT);
     assert_eq!(rig.next(), Event::Interrupted(0, Interruption::TimedOut));
     rig.offer(1);
     assert_eq!(rig.next(), Event::Started(1));
@@ -337,15 +358,19 @@ fn the_queue_limit_refuses_a_waiting_request_and_leaves_a_running_one_alone() {
     let rig = Rig::new(
         1,
         Limits {
-            queue_limit: Some(Duration::from_millis(100)),
+            queue_limit: Some(LIMIT),
             ..limits(4)
         },
     );
     rig.offer(0);
     rig.offer(1);
     assert_eq!(rig.next(), Event::Started(0));
+    rig.until_counts(1, 1);
+    rig.until_armed_for(LIMIT);
+    rig.clock.advance(LIMIT);
     assert_eq!(rig.next(), Event::Refused(1, ApiError::timeout()));
-    rig.assert_quiet();
+    // The running request is left alone: the limit that passed is the queue's, and the request limit is far off.
+    rig.until_counts(1, 0);
     rig.finish();
 }
 
@@ -361,7 +386,6 @@ fn a_cancelled_waiting_request_never_starts_and_takes_no_slot() {
     assert_eq!(rig.admission.counts().waiting, 1);
     first.finish();
     assert_eq!(rig.next(), Event::Started(2));
-    rig.assert_quiet();
     rig.finish();
 }
 
@@ -376,7 +400,6 @@ fn a_cancelled_running_request_is_interrupted_and_its_slot_goes_to_the_next() {
     assert_eq!(rig.next(), Event::Started(1));
     // Cancelling what already ended does nothing.
     rig.admission.cancel(first);
-    rig.assert_quiet();
     rig.finish();
 }
 
@@ -401,7 +424,7 @@ fn stop_refuses_the_waiting_interrupts_the_running_and_completes_when_they_end()
             Event::Refused(2, ApiError::shutting_down()),
         ]
     );
-    stopped.recv_timeout(PATIENCE).expect("the stop completed");
+    stopped.recv_timeout(HANG_GUARD).expect("the stop completed");
     // After the stop nothing is admitted.
     rig.offer(3);
     assert_eq!(rig.next(), Event::Refused(3, ApiError::shutting_down()));
@@ -415,7 +438,7 @@ fn stop_with_nothing_running_completes_at_once_and_a_second_stop_too() {
     for _ in 0..2 {
         let (done, stopped) = channel();
         rig.admission.stop(move || done.send(()).unwrap_or_default());
-        stopped.recv_timeout(PATIENCE).expect("the stop completed");
+        stopped.recv_timeout(HANG_GUARD).expect("the stop completed");
     }
     rig.finish();
 }
@@ -425,23 +448,28 @@ fn stop_with_a_generation_that_never_ends_completes_at_the_shutdown_limit() {
     let rig = Rig::new(
         1,
         Limits {
-            shutdown_limit: Duration::from_millis(200),
+            shutdown_limit: LIMIT,
             ..limits(4)
         },
     );
     let stubborn = rig.probe_with(0, OnInterrupt::Ignore);
     rig.admission.offer(stubborn.clone());
     assert_eq!(rig.next(), Event::Started(0));
-    let begun = Instant::now();
     let (done, stopped) = channel();
     rig.admission.stop(move || done.send(()).unwrap_or_default());
     assert_eq!(rig.next(), Event::Interrupted(0, Interruption::Shutdown));
-    assert!(matches!(
-        stopped.recv_timeout(Duration::from_millis(50)),
-        Err(RecvTimeoutError::Timeout)
-    ));
-    stopped.recv_timeout(PATIENCE).expect("the stop completed at the limit");
-    assert!(begun.elapsed() >= Duration::from_millis(200));
+    // The clock has not moved, so the limit has not passed: the generation still holds its slot and the stop waits.
+    rig.until_armed_for(LIMIT);
+    assert_eq!(
+        stopped.try_recv(),
+        Err(TryRecvError::Empty),
+        "the stop completed before the limit"
+    );
+    rig.clock.advance(LIMIT);
+    stopped
+        .recv_timeout(HANG_GUARD)
+        .expect("the stop completed at the limit");
+    assert_eq!(rig.next(), Event::Interrupted(0, Interruption::Abandoned));
     stubborn.finish();
     rig.finish();
 }
@@ -537,14 +565,14 @@ fn stop_interrupts_running_generations_and_completes_when_they_ended() {
     }
     // Two generations run and the third waits.
     for _ in 0..2 {
-        begins.recv_timeout(PATIENCE).expect("a generation began");
+        begins.recv_timeout(HANG_GUARD).expect("a generation began");
     }
     assert_eq!(rig.admission.counts().waiting, 1);
     let (done, stopped) = channel();
     rig.admission.stop(move || done.send(()).unwrap_or_default());
-    stopped.recv_timeout(PATIENCE).expect("the stop completed");
+    stopped.recv_timeout(HANG_GUARD).expect("the stop completed");
     for _ in 0..2 {
-        let result = ends.recv_timeout(PATIENCE).expect("a generation ended");
+        let result = ends.recv_timeout(HANG_GUARD).expect("a generation ended");
         assert!(!result.expect("an ended generation").stop_token_reached);
     }
     let generations = rig.backend.generations();
@@ -578,11 +606,11 @@ fn a_stop_with_nothing_in_flight_stops_admission_at_once() {
         .server
         .admission()
         .offer(standalone(1, &events, OnInterrupt::Release));
-    assert_eq!(seen.recv_timeout(PATIENCE).expect("an event"), Event::Started(0));
+    assert_eq!(seen.recv_timeout(HANG_GUARD).expect("an event"), Event::Started(0));
     fixture.stop();
     let mut after = [
-        seen.recv_timeout(PATIENCE).expect("an event"),
-        seen.recv_timeout(PATIENCE).expect("an event"),
+        seen.recv_timeout(HANG_GUARD).expect("an event"),
+        seen.recv_timeout(HANG_GUARD).expect("an event"),
     ];
     after.sort_by_key(|event| matches!(event, Event::Refused(..)));
     assert_eq!(
@@ -614,26 +642,31 @@ fn stop_with_drain_limit(drain: Duration) {
         .server
         .admission()
         .offer(standalone(1, &events, OnInterrupt::Release));
-    assert_eq!(seen.recv_timeout(PATIENCE).expect("an event"), Event::Started(0));
+    assert_eq!(seen.recv_timeout(HANG_GUARD).expect("an event"), Event::Started(0));
+    let reports = Arc::new(AtomicUsize::new(0));
     let (tx, stopped) = channel();
-    fixture.server.stop(once(move || tx.send(()).unwrap_or_default()));
+    let counted = reports.clone();
+    fixture.server.stop(once(move || {
+        counted.fetch_add(1, Ordering::AcqRel);
+        tx.send(()).unwrap_or_default();
+    }));
     let mut after = [
-        seen.recv_timeout(PATIENCE).expect("an event"),
-        seen.recv_timeout(PATIENCE).expect("an event"),
+        seen.recv_timeout(HANG_GUARD).expect("an event"),
+        seen.recv_timeout(HANG_GUARD).expect("an event"),
     ];
     after.sort_by_key(|event| matches!(event, Event::Refused(..)));
     assert_eq!(after[0], Event::Interrupted(0, Interruption::Shutdown));
     assert_eq!(after[1], Event::Refused(1, ApiError::shutting_down()));
-    stopped.recv_timeout(PATIENCE).expect("the server stopped");
-    assert!(
-        stopped.recv_timeout(Duration::from_millis(300)).is_err(),
-        "the stop was reported twice"
-    );
-    assert!(
-        seen.recv_timeout(Duration::from_millis(100)).is_err(),
-        "an entry was told twice"
-    );
+    stopped.recv_timeout(HANG_GUARD).expect("the server stopped");
+    // The lattice closes after every frame published before ran: what was reported or told twice has been by then.
     fixture.finish_after_stop();
+    assert_eq!(
+        reports.load(Ordering::Acquire),
+        1,
+        "the stop was reported more than once"
+    );
+    let told: Vec<_> = seen.try_iter().collect();
+    assert!(told.is_empty(), "an entry was told twice: {told:?}");
 }
 
 #[test]
@@ -664,17 +697,15 @@ fn a_generation_that_never_ends_does_not_keep_the_server_from_stopping() {
     let (events, seen) = channel();
     let stubborn = standalone(0, &events, OnInterrupt::ReleaseWhenAbandoned);
     fixture.server.admission().offer(stubborn);
-    assert_eq!(seen.recv_timeout(PATIENCE).expect("an event"), Event::Started(0));
-    let begun = Instant::now();
+    assert_eq!(seen.recv_timeout(HANG_GUARD).expect("an event"), Event::Started(0));
+    // `stop` returns once the server reported the stop: it does, whatever the generation does.
     fixture.stop();
-    assert!(begun.elapsed() >= limit);
-    assert!(begun.elapsed() < limit + Duration::from_secs(5));
     assert_eq!(
-        seen.recv_timeout(PATIENCE).expect("an event"),
+        seen.recv_timeout(HANG_GUARD).expect("an event"),
         Event::Interrupted(0, Interruption::Shutdown)
     );
     assert_eq!(
-        seen.recv_timeout(PATIENCE).expect("an event"),
+        seen.recv_timeout(HANG_GUARD).expect("an event"),
         Event::Interrupted(0, Interruption::Abandoned)
     );
     fixture.finish_after_stop();
@@ -685,7 +716,7 @@ fn at_the_shutdown_limit_a_running_entry_is_told_to_give_up_once() {
     let rig = Rig::new(
         1,
         Limits {
-            shutdown_limit: Duration::from_millis(150),
+            shutdown_limit: LIMIT,
             ..limits(4)
         },
     );
@@ -695,10 +726,11 @@ fn at_the_shutdown_limit_a_running_entry_is_told_to_give_up_once() {
     let (done, stopped) = channel();
     rig.admission.stop(move || done.send(()).unwrap_or_default());
     assert_eq!(rig.next(), Event::Interrupted(0, Interruption::Shutdown));
+    rig.until_armed_for(LIMIT);
+    rig.clock.advance(LIMIT);
     assert_eq!(rig.next(), Event::Interrupted(0, Interruption::Abandoned));
-    stopped.recv_timeout(PATIENCE).expect("the stop completed");
-    rig.assert_quiet();
-    assert_eq!(rig.admission.counts().active, 0);
+    stopped.recv_timeout(HANG_GUARD).expect("the stop completed");
+    rig.until_counts(0, 0);
     rig.finish();
 }
 
@@ -717,11 +749,14 @@ fn a_shutdown_limit_too_long_to_count_is_never_reached() {
     let (done, stopped) = channel();
     rig.admission.stop(move || done.send(()).unwrap_or_default());
     assert_eq!(rig.next(), Event::Interrupted(0, Interruption::Shutdown));
-    assert!(matches!(stopped.recv_timeout(QUIET), Err(RecvTimeoutError::Timeout)));
-    rig.assert_quiet();
+    assert_eq!(
+        stopped.try_recv(),
+        Err(TryRecvError::Empty),
+        "the stop completed with a slot held"
+    );
     first.finish();
     stopped
-        .recv_timeout(PATIENCE)
+        .recv_timeout(HANG_GUARD)
         .expect("the stop completed once the slot was free");
     rig.finish();
 }
@@ -731,7 +766,7 @@ fn a_second_stop_while_the_first_waits_completes_with_it() {
     let rig = Rig::new(
         1,
         Limits {
-            shutdown_limit: Duration::from_millis(200),
+            shutdown_limit: LIMIT,
             ..limits(4)
         },
     );
@@ -742,11 +777,12 @@ fn a_second_stop_while_the_first_waits_completes_with_it() {
     let (second_done, second) = channel();
     rig.admission.stop(move || first_done.send(()).unwrap_or_default());
     rig.admission.stop(move || second_done.send(()).unwrap_or_default());
-    first.recv_timeout(PATIENCE).expect("the first stop completed");
-    second.recv_timeout(PATIENCE).expect("the second stop completed");
     assert_eq!(rig.next(), Event::Interrupted(0, Interruption::Shutdown));
+    rig.until_armed_for(LIMIT);
+    rig.clock.advance(LIMIT);
+    first.recv_timeout(HANG_GUARD).expect("the first stop completed");
+    second.recv_timeout(HANG_GUARD).expect("the second stop completed");
     assert_eq!(rig.next(), Event::Interrupted(0, Interruption::Abandoned));
-    rig.assert_quiet();
     rig.finish();
 }
 
@@ -755,16 +791,18 @@ fn a_timer_armed_for_a_request_that_ended_fires_without_effect() {
     let rig = Rig::new(
         1,
         Limits {
-            request_limit: Duration::from_millis(100),
+            request_limit: LIMIT,
             ..limits(4)
         },
     );
     let (first, _) = rig.offer(0);
     assert_eq!(rig.next(), Event::Started(0));
+    rig.until_armed_for(LIMIT);
     first.finish();
-    // The timer for the first request fires here and finds nothing due.
-    rig.assert_quiet();
-    rig.assert_quiet();
+    rig.until_counts(0, 0);
+    // The timer for the first request fires here and finds nothing due: no event follows, which the end of the test
+    // checks.
+    rig.clock.advance(LIMIT);
     let (second, _) = rig.offer(1);
     assert_eq!(rig.next(), Event::Started(1));
     second.finish();
@@ -811,7 +849,11 @@ fn flood(rig: &Rig, threads: usize, each: usize, meanwhile: impl FnOnce()) -> Ve
         })
         .collect();
     let began = Instant::now();
-    while offered.load(Ordering::Acquire) < threads * each / 4 && began.elapsed() < PATIENCE {
+    while offered.load(Ordering::Acquire) < threads * each / 4 {
+        assert!(
+            began.elapsed() < HANG_GUARD,
+            "a quarter of the entries were never offered"
+        );
         yield_now();
     }
     meanwhile();
@@ -830,8 +872,7 @@ fn no_wake_up_is_lost_when_many_threads_offer_and_slots_free_at_once() {
     let rig = Rig::new(2, limits(1000));
     let events = flood(&rig, 4, 200, || {});
     assert!(events.iter().all(|event| matches!(event, Event::Started(_))));
-    rig.assert_quiet();
-    assert_eq!(rig.admission.counts(), euhedral_inference_api_server::Counts::default());
+    rig.until_counts(0, 0);
     rig.finish();
 }
 
@@ -853,8 +894,7 @@ fn a_stop_racing_concurrent_offers_gives_every_entry_a_start_or_a_refusal() {
             Event::Interrupted(..) => panic!("quick entries are never interrupted"),
         }
     }
-    stopped.recv_timeout(PATIENCE).expect("the stop completed");
-    rig.assert_quiet();
+    stopped.recv_timeout(HANG_GUARD).expect("the stop completed");
     rig.finish();
 }
 
@@ -863,20 +903,25 @@ fn a_request_that_arrived_earlier_counts_its_limit_from_its_arrival() {
     let rig = Rig::new(
         1,
         Limits {
-            request_limit: Duration::from_millis(600),
+            request_limit: Duration::from_secs(6),
             ..limits(4)
         },
     );
     rig.offer(0);
     assert_eq!(rig.next(), Event::Started(0));
-    let begun = Instant::now();
-    let arrived = begun
-        .checked_sub(Duration::from_millis(500))
+    rig.until_armed_for(Duration::from_secs(6));
+    let arrived = rig
+        .clock
+        .at_offset(Duration::ZERO)
+        .checked_sub(Duration::from_secs(5))
         .expect("an earlier instant");
     rig.admission.offer_at(rig.probe_with(1, OnInterrupt::Release), arrived);
-    // Refused at 600 ms after its arrival (about 100 ms from now); offered now it would wait the whole 600 ms.
+    // The second request's limit ends one second from now, 6 s after its arrival; counted from the offer it would end
+    // 6 s from now and the clock moving one second would refuse nobody.
+    rig.until_counts(1, 1);
+    rig.until_armed_for(Duration::from_secs(1));
+    rig.clock.advance(Duration::from_secs(1));
     assert_eq!(rig.next(), Event::Refused(1, ApiError::timeout()));
-    assert!(begun.elapsed() < Duration::from_millis(450));
     rig.finish();
 }
 
@@ -885,13 +930,14 @@ fn a_running_entry_may_count_its_limit_from_its_start() {
     let rig = Rig::new(
         1,
         Limits {
-            request_limit: Duration::from_millis(300),
+            request_limit: Duration::from_secs(3),
             ..limits(4)
         },
     );
-    let begun = Instant::now();
-    let arrived = begun
-        .checked_sub(Duration::from_millis(250))
+    let arrived = rig
+        .clock
+        .at_offset(Duration::ZERO)
+        .checked_sub(Duration::from_secs(2))
         .expect("an earlier instant");
     let streaming = Arc::new(Probe {
         name: 0,
@@ -904,10 +950,9 @@ fn a_running_entry_may_count_its_limit_from_its_start() {
     });
     rig.admission.offer_at(streaming, arrived);
     assert_eq!(rig.next(), Event::Started(0));
+    // Counted from the start, not from the arrival (which would be one second from now).
+    rig.until_armed_for(Duration::from_secs(3));
+    rig.clock.advance(Duration::from_secs(3));
     assert_eq!(rig.next(), Event::Interrupted(0, Interruption::TimedOut));
-    assert!(
-        begun.elapsed() >= Duration::from_millis(290),
-        "counted from the start, not the arrival"
-    );
     rig.finish();
 }

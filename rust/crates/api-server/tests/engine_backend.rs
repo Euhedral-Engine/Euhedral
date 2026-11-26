@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::spawn;
 use std::time::{Duration, Instant};
 
-use common::{CREATED, PATIENCE, lattice, text};
+use common::{CREATED, HANG_GUARD, lattice, text};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_inference_api_server::backend::{
@@ -327,6 +327,8 @@ struct Rig {
     lattice: Arc<ControlPlaneLattice>,
     engine: Arc<FakeEngine>,
     backend: Arc<EngineBackend>,
+    /// What each run's listener heard: once the lattice is closed, nothing more can come to it.
+    runs: Mutex<Vec<Arc<Mutex<Heard>>>>,
 }
 
 impl Rig {
@@ -342,6 +344,7 @@ impl Rig {
             lattice,
             engine,
             backend,
+            runs: Mutex::default(),
         }
     }
 
@@ -354,6 +357,7 @@ impl Rig {
     /// Runs one generation of the prompt `abc` to the listener's end, returning what it heard and how often it ended.
     fn run(&self, generation: &Arc<dyn Generation>) -> (Arc<Mutex<Heard>>, Receiver<()>) {
         let heard = Arc::new(Mutex::new(Heard::default()));
+        locked(&self.runs).push(heard.clone());
         let (tx, rx) = channel();
         generation.generate(
             EncodedPrompt {
@@ -366,18 +370,18 @@ impl Rig {
         (heard, rx)
     }
 
+    /// Closes the backend and the lattice, then checks that every listener was told its end once and no more.
     fn finish(self) {
         self.backend.close();
         self.lattice.close();
+        for heard in locked(&self.runs).iter() {
+            assert_eq!(locked(heard).results.len(), 1, "the end was not told exactly once");
+        }
     }
 }
 
 fn ended(rx: &Receiver<()>) {
-    rx.recv_timeout(PATIENCE).expect("the listener was told the end");
-    assert!(
-        rx.recv_timeout(Duration::from_millis(100)).is_err(),
-        "the end was told twice"
-    );
+    rx.recv_timeout(HANG_GUARD).expect("the listener was told the end");
 }
 
 #[test]
@@ -822,13 +826,13 @@ fn a_prompt_is_encoded_on_the_lattice_and_refused_once_the_sink_closes() {
     let first = tx.clone();
     rig.backend
         .encode_prompt("hi".to_owned(), Box::new(move |encoded| drop(first.send(encoded))));
-    let encoded = rx.recv_timeout(PATIENCE).expect("encoded").expect("an encoding");
+    let encoded = rx.recv_timeout(HANG_GUARD).expect("encoded").expect("an encoding");
     assert_eq!(encoded.token_ids, vec![104, 105]);
     assert_eq!(encoded.text, "hi");
     rig.backend.close();
     rig.backend
         .encode_prompt("hi".to_owned(), Box::new(move |encoded| drop(tx.send(encoded))));
-    let refused = rx.recv_timeout(PATIENCE).expect("told");
+    let refused = rx.recv_timeout(HANG_GUARD).expect("told");
     assert!(matches!(refused, Err(BackendError::Unavailable(_))), "{refused:?}");
     rig.finish();
 }
@@ -851,6 +855,7 @@ impl Served {
             backend: rig.backend.clone(),
             defaults: RequestDefaults::default(),
             io: None,
+            clock: None,
             created_at: CREATED,
         };
         let server = start(&rig.lattice, config).expect("a started server");
@@ -875,7 +880,7 @@ impl Served {
             .with_body(body);
         let (tx, rx) = channel();
         let config = ClientConfig {
-            time_limit: Some(PATIENCE),
+            time_limit: Some(HANG_GUARD),
             ..ClientConfig::default()
         };
         request(
@@ -889,7 +894,7 @@ impl Served {
                 once(|| {})
             }),
         );
-        rx.recv_timeout(PATIENCE + Duration::from_secs(5))
+        rx.recv_timeout(HANG_GUARD + Duration::from_secs(5))
             .expect("the client reported")
             .expect("an answer")
     }
@@ -898,7 +903,7 @@ impl Served {
         let get = Request::new(Method::Get, target).header("Host", "t");
         let (tx, rx) = channel();
         let config = ClientConfig {
-            time_limit: Some(PATIENCE),
+            time_limit: Some(HANG_GUARD),
             ..ClientConfig::default()
         };
         request(
@@ -912,7 +917,7 @@ impl Served {
                 once(|| {})
             }),
         );
-        rx.recv_timeout(PATIENCE + Duration::from_secs(5))
+        rx.recv_timeout(HANG_GUARD + Duration::from_secs(5))
             .expect("the client reported")
             .expect("an answer")
     }
@@ -922,7 +927,7 @@ impl Served {
         self.server.stop(once(move || {
             tx.send(()).ok();
         }));
-        rx.recv_timeout(PATIENCE).expect("the server stopped");
+        rx.recv_timeout(HANG_GUARD).expect("the server stopped");
         self.server.release();
         self.client.complete_gracefully();
         self.rig.finish();

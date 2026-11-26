@@ -23,14 +23,14 @@ use euhedral_inference_engine::error::PlanError;
 use euhedral_inference_engine::model::{ArtifactProfile, Quantization, Speculation};
 use euhedral_inference_engine::residency::footprint;
 use euhedral_inference_engine::residency::planner::{
-    ARENA_ALIGNMENT, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs, ResidencyPlan, plan, plan_closest,
-    plan_with, sequences_for,
+    ARENA_ALIGNMENT, DEFAULT_RUNTIME_HEADROOM_BYTES, DEFAULT_RUNTIME_RESERVE_BYTES, PlacementSource, PlanInputs,
+    ResidencyPlan, auto_runtime_headroom, plan, plan_closest, plan_with, sequences_for,
 };
 use euhedral_inference_engine::runtime::resolve_sequences;
 use euhedral_inference_engine::workspace::{
     BufferSlot, WorkspaceError, WorkspaceRows, input_records, slot_bytes, workspace_bytes, workspace_bytes_with_records,
 };
-use euhedral_inference_settings::{Auto, ByteSize, KvFormat, Settings};
+use euhedral_inference_settings::{Auto, ByteSize, KvFormat, Settings, SpeculationMode};
 
 mod common;
 
@@ -54,6 +54,7 @@ fn inputs(device_free: u64) -> PlanInputs {
     PlanInputs {
         device_free,
         multiprocessors: Some(70),
+        exact_numerics: false,
         host_pinned_bytes: Some(u64::MAX),
         sequences: 1,
     }
@@ -406,6 +407,7 @@ fn reserve_demand(plan: &ResidencyPlan) -> u64 {
         + plan.decode_scratch_bytes
         + footprint::first_sequence_bytes(plan, &config)
         + footprint::mtp_cache_bytes_of(plan, &config)
+        + DEFAULT_RUNTIME_HEADROOM_BYTES
 }
 
 /// The device bytes that hold `big` with the reserve at its default: `big`'s bytes less what the reserve was raised by.
@@ -453,6 +455,74 @@ fn the_mtp_cache_of_a_long_bf16_context_is_counted_and_a_device_it_overflows_is_
 }
 
 #[test]
+fn a_raised_reserve_keeps_the_headroom_above_the_claims_so_a_device_of_the_plans_bytes_still_starts() {
+    let mut long = settings(262_144);
+    long.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
+    long.context.kv_cache_on_gpu_tokens = 262_144;
+    let with_headroom = |headroom: Option<u64>, device_free: u64| {
+        let mut stated = long.clone();
+        stated.memory.runtime_headroom = headroom.map_or(Auto::Auto, |bytes| Auto::Value(ByteSize(bytes)));
+        let mut inputs = inputs(device_free);
+        inputs.host_pinned_bytes = Some(0);
+        plan_with(&config(), &rco_table(), &stated, inputs)
+    };
+    let bare = with_headroom(Some(0), 64 * GIB).unwrap();
+    let plan = with_headroom(None, 64 * GIB).unwrap();
+    // What the startup's claims take is the demand without the headroom; the raised reserve leaves the headroom.
+    let claims = reserve_demand(&plan) - DEFAULT_RUNTIME_HEADROOM_BYTES;
+    assert_eq!(bare.runtime_reserve_bytes, claims);
+    assert_eq!(plan.runtime_reserve_bytes - claims, DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(plan.device_bytes - bare.device_bytes, DEFAULT_RUNTIME_HEADROOM_BYTES);
+    // A device of exactly the bytes the plan made without the headroom is refused once it is kept.
+    assert!(with_headroom(Some(0), bare.device_bytes).is_ok());
+    assert!(with_headroom(None, bare.device_bytes).is_err());
+    assert!(with_headroom(None, plan.device_bytes).is_ok());
+    // The headroom is a setting.
+    let small = with_headroom(Some(64 * MIB), 64 * GIB).unwrap();
+    assert_eq!(small.runtime_reserve_bytes - claims, 64 * MIB);
+}
+
+#[test]
+fn the_automatic_headroom_grows_with_the_device_multiprocessors_and_never_falls_below_the_default() {
+    assert_eq!(auto_runtime_headroom(Some(70)), DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(auto_runtime_headroom(Some(140)), 2 * DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(auto_runtime_headroom(None), DEFAULT_RUNTIME_HEADROOM_BYTES);
+    // A narrower device keeps the measured figure; an odd count rounds up.
+    assert_eq!(auto_runtime_headroom(Some(10)), DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(
+        auto_runtime_headroom(Some(71)),
+        (DEFAULT_RUNTIME_HEADROOM_BYTES * 71).div_ceil(70)
+    );
+    // The plan resolves `auto` from its inputs' count.
+    let mut long = settings(262_144);
+    long.context.kv_cache_format = Auto::Value(KvFormat::Bf16);
+    long.context.kv_cache_on_gpu_tokens = 262_144;
+    // Other terms follow the count too, so the headroom is what `auto` adds to the same plan with none.
+    let headroom_on = |multiprocessors: Option<u32>| {
+        let reserve = |headroom: Auto<ByteSize>| {
+            let mut stated = long.clone();
+            stated.memory.runtime_headroom = headroom;
+            let mut inputs = inputs(64 * GIB);
+            inputs.multiprocessors = multiprocessors;
+            plan_with(&config(), &rco_table(), &stated, inputs)
+                .unwrap()
+                .runtime_reserve_bytes
+        };
+        reserve(Auto::Auto) - reserve(Auto::Value(ByteSize(0)))
+    };
+    assert_eq!(headroom_on(Some(70)), DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(headroom_on(Some(140)), 2 * DEFAULT_RUNTIME_HEADROOM_BYTES);
+    assert_eq!(headroom_on(None), DEFAULT_RUNTIME_HEADROOM_BYTES);
+}
+
+#[test]
+fn a_reserve_the_setting_already_covers_is_not_raised_by_the_headroom() {
+    let plan = plan_with(&config(), &rco_table(), &settings(8192), inputs(64 * GIB)).unwrap();
+    assert_eq!(plan.runtime_reserve_bytes, DEFAULT_RUNTIME_RESERVE_BYTES);
+    assert!(reserve_demand(&plan) <= DEFAULT_RUNTIME_RESERVE_BYTES);
+}
+
+#[test]
 fn a_plan_without_the_mtp_layer_counts_no_mtp_cache() {
     let table = rco_table_without(|name| name.starts_with("mtp/"));
     let mut config = config();
@@ -465,6 +535,47 @@ fn a_plan_without_the_mtp_layer_counts_no_mtp_cache() {
     assert_eq!(footprint::mtp_cache_bytes_of(&plan, &config), 0);
     assert_eq!(plan.runtime_reserve_bytes, DEFAULT_RUNTIME_RESERVE_BYTES);
     assert!(reserve_demand(&plan) < DEFAULT_RUNTIME_RESERVE_BYTES);
+}
+
+fn names_a_draft_object(plan: &ResidencyPlan) -> bool {
+    plan.device
+        .iter()
+        .any(|placed| placed.name.starts_with("mtp/") || placed.name.starts_with("text/draft_head"))
+}
+
+#[test]
+fn speculation_none_plans_no_drafts_and_no_draft_tensors_on_an_mtp_artifact() {
+    let mut none = settings(8192);
+    none.speculation.mode = SpeculationMode::None;
+    let plan = plan_with(&config(), &rco_table(), &none, inputs(64 * GIB)).unwrap();
+    assert_eq!(plan.draft_depth, 0);
+    assert_eq!(plan.profile.speculation, Speculation::None);
+    assert!(!names_a_draft_object(&plan));
+    assert_eq!(footprint::mtp_cache_bytes_of(&plan, &config()), 0);
+}
+
+#[test]
+fn speculation_follows_the_artifact_unless_the_setting_says_none() {
+    let plan = plan_with(&config(), &rco_table(), &settings(8192), inputs(64 * GIB)).unwrap();
+    assert_eq!(plan.draft_depth, 4);
+    assert_eq!(plan.profile.speculation, Speculation::Mtp);
+    assert!(names_a_draft_object(&plan));
+    assert_eq!(SpeculationMode::default(), SpeculationMode::Artifact);
+}
+
+#[test]
+fn an_artifact_with_heads_and_no_stored_depth_loads_with_none_and_is_refused_without_it() {
+    let mixed = ArtifactProfile {
+        quantization: Quantization::Mixed,
+        compressed: false,
+        speculation: Speculation::Mtp,
+        draft_depth: None,
+    };
+    assert!(matches!(mixed.speculative_depth(), Err(PlanError::Inventory(_))));
+    let none = mixed.under(SpeculationMode::None);
+    assert_eq!(none.speculative_depth().unwrap(), 0);
+    assert!(!none.uploads("mtp/layer/mlp/down") && !none.uploads("text/draft_head"));
+    assert_eq!(mixed.under(SpeculationMode::Artifact), mixed);
 }
 
 #[test]
@@ -560,6 +671,7 @@ fn a_plan_of_one_sequence_is_the_plan_that_knew_none() {
     let one = plan_with(&config, &table, &settings(131_072), with_sequences(16 * GIB, 1)).unwrap();
     let unaware = PlanInputs {
         multiprocessors: None,
+        exact_numerics: false,
         ..with_sequences(16 * GIB, 1)
     };
     assert_eq!(

@@ -62,6 +62,8 @@ pub struct Settings {
     pub context: ContextSettings,
     /// The prompt prefix cache.
     pub prefix_cache: PrefixCacheSettings,
+    /// Whether the load drafts.
+    pub speculation: SpeculationSettings,
     /// How sequences share passes.
     pub batching: BatchingSettings,
     /// Memory limits and where layers run.
@@ -81,6 +83,7 @@ impl Settings {
             server: ServerSettings::default(),
             context: ContextSettings::default(),
             prefix_cache: PrefixCacheSettings::default(),
+            speculation: SpeculationSettings::default(),
             batching: BatchingSettings::default(),
             memory: MemorySettings::default(),
             host: HostSettings::default(),
@@ -216,6 +219,23 @@ impl Default for PrefixCacheSettings {
     }
 }
 
+/// Whether the load drafts tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpeculationMode {
+    /// Drafts as the artifact's draft layer allows.
+    #[default]
+    Artifact,
+    /// Never drafts: the load takes no draft layer, draft head or draft state.
+    None,
+}
+
+/// Speculative decoding (`speculation`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeculationSettings {
+    /// Whether the engine drafts; a run that only scores given tokens sets `none` to keep the memory.
+    pub mode: SpeculationMode,
+}
+
 /// How sequences share passes (`batching`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchingSettings {
@@ -227,6 +247,9 @@ pub struct BatchingSettings {
     pub max_tokens_per_pass: Auto<u32>,
     /// Rows of the longest prefill chunk.
     pub prefill_chunk_tokens: u32,
+    /// Rows of one step of a teacher-forced run that takes several rows at a time; every sequence is sized to verify
+    /// that many rows. 0 (or 1) keeps teacher-forced runs at one row a step and sizes nothing for them.
+    pub forced_rows: u32,
 }
 
 impl Default for BatchingSettings {
@@ -236,6 +259,7 @@ impl Default for BatchingSettings {
             max_sequences_per_pass: Auto::Auto,
             max_tokens_per_pass: Auto::Auto,
             prefill_chunk_tokens: 512,
+            forced_rows: 0,
         }
     }
 }
@@ -261,6 +285,11 @@ pub struct MemorySettings {
     /// Device memory the dense model's plan keeps beside the weights and the cache for the first sequence's state, the
     /// workspaces and the kernel modules; `auto` is 1280 MiB.
     pub runtime_reserve: Auto<ByteSize>,
+    /// Device memory the plan keeps above what the workspace, the decode scratch, the first sequence's state and the
+    /// MTP cache need, for what the driver takes after the plan is admitted: the code and the local memory of the
+    /// kernels, loaded when each is first launched. Counted only where the demand raises the reserve; below that the
+    /// reserve's own slack pays for it. `auto` is 320 MiB.
+    pub runtime_headroom: Auto<ByteSize>,
     /// Released pinned buffers kept for reuse.
     pub pinned_buffer_pool: Auto<ByteSize>,
     /// Streaming of weights from disk.
@@ -280,6 +309,7 @@ impl Default for MemorySettings {
             gpu_limit: Auto::Auto,
             gpu_reserve: ByteSize::mib(700),
             runtime_reserve: Auto::Auto,
+            runtime_headroom: Auto::Auto,
             pinned_buffer_pool: Auto::Auto,
             weight_streaming: WeightStreamingSettings::default(),
             host_layers: HostLayersSettings::default(),
@@ -382,6 +412,9 @@ pub struct HostSettings {
     pub max_batch_size: Auto<u32>,
     /// Where native files are unpacked; `auto` is the user's cache directory.
     pub native_cache: Auto<PathBuf>,
+    /// The most bytes one read and write of a file copy moves (the quantization tools copy an artifact in pieces this
+    /// size).
+    pub copy_chunk_bytes: ByteSize,
 }
 
 impl Default for HostSettings {
@@ -392,6 +425,7 @@ impl Default for HostSettings {
             idle_release: Duration::from_secs(1),
             max_batch_size: Auto::Auto,
             native_cache: Auto::Auto,
+            copy_chunk_bytes: ByteSize::mib(16),
         }
     }
 }

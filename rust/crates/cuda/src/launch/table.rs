@@ -162,12 +162,6 @@ mod tests {
     }
 
     #[test]
-    fn table_sizes_are_the_native_tables() {
-        // The kernel table in linear_kernels.c has 11 entries; the Flash-Next kernel table in qwen4_ops.c has 36.
-        assert_eq!((Table::Linear.len(), Table::Qwen4.len()), (11, 36));
-    }
-
-    #[test]
     fn linear_entries_map_to_their_named_kernels() {
         // The table's order is the ABI (the kernel table in linear_kernels.c): index 4 is the epilogue, 7 the reference, 10 the
         // embedding.

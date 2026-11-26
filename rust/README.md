@@ -8,7 +8,7 @@ and the CPU tests; CI runs the same on Linux and Windows (the layer check on Lin
 The rules are enforced by the compiler toolchain, not by review. Each is checked in one of three places:
 
 - **clippy ban**: `clippy-no-wait.toml` lists the banned calls and types. Every library crate has a `clippy.toml` that
-  is byte-identical to it. A library crate is every crate except `xtask` and the binaries (`bench`), whose main thread
+  is byte-identical to it. A library crate is every crate except `xtask` and the binaries (`bench`, `quantize`), whose main thread
   may block. `test-support` counts as a library: it keeps the same file and excepts itself in its source.
 - **lint**: `[workspace.lints]` in `Cargo.toml`, inherited by every crate through `[lints] workspace = true`.
 - **layer check**: `scripts/check-layers.sh` reads `cargo metadata` (no build). `--self-test` plants a violation of each
@@ -29,9 +29,9 @@ The rules are enforced by the compiler toolchain, not by review. Each is checked
 | Libraries do not print | `print_stdout`, `print_stderr` lints |
 | No `dbg!`, `todo!`, `unwrap()` or `expect()` in library code (tests may unwrap and expect) | `dbg_macro`, `todo`, `unwrap_used`, `expect_used` lints; `allow-unwrap-in-tests`, `allow-expect-in-tests` |
 | Every `unsafe` block states why it is sound | `undocumented_unsafe_blocks` lint |
-| Dependencies point one way (settings, edrl, host-gemv, test-support: none; tokenizer: edrl; cuda: none; engine: all of them; bench: engine and the leaves) | layer check |
+| Dependencies point one way (settings, edrl, host-gemv, test-support: none; tokenizer: edrl; cuda: none; engine: all of them; quantization: the leaves, the engine and the API protocol; quantize: quantization, settings, engine and cuda; bench: engine, the leaves and quantization) | layer check |
 | Configuration is parsed in one place: only the settings crate depends on `serde_yaml_ng` | layer check |
-| Only the engine, bench and cuda depend on `euhedral-core` or `euhedral-graph`; cuda depends on nothing of ours and externally only on `euhedral-gpu`, `euhedral-graph`, `libloading` and `thiserror` | layer check |
+| Only the engine, bench, quantization, quantize and cuda depend on `euhedral-core` or `euhedral-graph`; cuda depends on nothing of ours and externally only on `euhedral-gpu`, `euhedral-graph`, `libloading` and `thiserror` | layer check |
 | No crate depends on `level-zero*`, `opencl3`, `ocl` (hardware agnosticism) or `core_affinity` (worker CPUs are never pinned) | layer check |
 | `test-support` is a dev-dependency only | layer check |
 | Every library crate's `clippy.toml` equals `clippy-no-wait.toml` | layer check |
@@ -75,10 +75,49 @@ planned launch the family files produce. Two files turn a plan into work on a Ru
 The device tests `kernels_gpu` (ignored by default) check that every catalog kernel resolves with parameters a
 plan can pass and print the module compile and load times.
 
+## Server bundle
+
+`cargo xtask bundle --product linux-x64` (or `windows-x64`, on Windows) builds `euhedral-server` in release and
+assembles a runnable directory from it and the native product the Gradle build leaves in `build/native/<product>`
+(run `gradle nativeVerify` first; `--native <dir>` and `--out <dir>` override the product and output directories). The
+result is `build/bundle/euhedral-server-<product>/` and an archive of it (`.tar.gz` on Linux, `.zip` on Windows):
+
+```text
+bin/euhedral-server
+lib/                  the CUDA library, CUDA runtime, NVRTC and llguidance
+share/euhedral_cuda/  the kernel sources
+cuda/include/         the CUDA headers
+files.sha256          the manifest of the kernel sources
+```
+
+Unpack it anywhere and run `bin/euhedral-server --config <file>`: with no `host.native-cache` set, the server finds
+`lib/` beside `bin/`. CI builds and uploads the linux-x64 archive next to the server jar.
+
+`docker build -f rust/Dockerfile .` (from the repository root) puts the linux-x64 bundle and `euhedral-health-probe`, the
+image's health check, into the distroless image; see `docs/OPERATIONS.md`.
+
+## Quantization
+
+`euhedral-inference-quantization` (`crates/quantization`) is the library behind the quantization tools: seeded `Random` and
+`SplittableRandom` generators in the style of Java's (`java_random`), and the `.npy` and `.npz` formats (`npy`,
+`npz`). `euhedral-inference-quantize` (`crates/quantize`) is the command line, a binary called `quantization` that
+dispatches the commands of the Java tool. A command whose work is not wired yet exits with code 3; `train-blocks`,
+`train-model` and `rotate` are not part of this tool.
+
+## cuBLAS and cuSOLVER
+
+`crates/cuda/src/math.rs` loads NVIDIA's cuBLAS, cuSOLVER, cuSPARSE and nvJitLink libraries from a directory the caller
+names (`MathLibraries::load`), and gives each lane one `LaneHandles` whose calls (BF16 and FP32 GEMM, the Cholesky
+factor, inverse and solve) enqueue on the stream the lane lends. Nothing waits; the `info` word of a factorisation is
+read after the queue retires the work. The device tests (`math_gpu`) take the directory from
+`euhedral.quantization.cuda-libraries` (`EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES`) and skip without it.
+
+Test settings are looked up in this order: `EUHEDRAL_TEST_<KEY>` in the environment, then `~/.config/euhedral/test.properties` (or the file named by `EUHEDRAL_TEST_CONFIG`), then `gradle.properties` in the Gradle user home.
+
 ## Benchmark
 
 `euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
-files (`benchmark/configs`) and writes rows in its result schema (`euhedral-inference.benchmark-result` version 1,
+files (`rust/resources/bench/configs`) and writes rows in its result schema (`euhedral-inference.benchmark-result` version 1,
 `implementation` `rust`):
 
 ```text
@@ -86,8 +125,10 @@ cargo run --release -p euhedral-inference-bench -- run CONFIG.json [--fork-id ID
 cargo run --release -p euhedral-inference-bench -- dump --artifact FILE --prefix N --steps N --out FILE
 ```
 
-A configuration that asks for what the engine does not do is refused with the reason: `prefixCacheBytes` above 0,
-`cpus` other than `all`, `excludeCpus` / `excludeCores`, and `generation.mode` `sample`. The binary is a thin `main.rs`
+A configuration that asks for something this engine does not do is refused with the reason, never run with the request
+dropped: `prefixCacheBytes` above 0 (the prefix cache is on only for prefix scenarios), a negative value, unknown fields,
+and `temperature`, `topK` or `topP` without `generation.mode` `sample`. `cpus`, `excludeCpus` and `excludeCores` resolve
+to the set of processors the engine's workers may use, and `sample` runs the seeded sampler. The binary is a thin `main.rs`
 over the library: the library prints and exits nowhere, and its few blocking file calls are scoped exceptions; `main.rs`
 carries the print exceptions and starts, then waits for, each request. The decode rate runs from the first token found to
 the last token found.
@@ -112,7 +153,7 @@ exits 1 when the mean KL reaches 1e-2, when more than 2% of the steps flip top-1
 median peak 32-step hidden error reaches 12%, or when the median late/early hidden error is above 1.5.
 
 `tools/rust_gate.py` runs the Java and the Rust benchmark alternately, one process each per fork, each through the system
-launcher (`system-run --gpu exclusive --cpu exclusive`: exclusive GPU and CPU grant, memory cap, with `timeout` for the
+launcher (`system-run --system`: whole-machine exclusive grant on every resource, memory cap, with `timeout` for the
 time limit inside the grant), with the prefix cache off, and prints a per-row table of the output hashes of the two
 engines and the absolute medians of each. It is a timing run, so it takes the card exclusively.
 

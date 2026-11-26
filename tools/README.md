@@ -89,6 +89,16 @@ FP16 group scales of a Q3/Q4/Q5 object, or the E2M1 codes, E4M3 block scales (SD
 FP32 tensor scale of an NVFP4 object. It must match the object's format, layout and shape in the chosen artifact;
 the manifest records DIR and how many objects it supplied.
 
+DIR must hold `calibration.json`, and the converter refuses a directory without it. `quantization calibrate` writes it
+with the file names it saved (its resume file `hidden.bin` among them), the layers done of the model's, and whether
+the heads and the MTP block are written; the conversion needs all of them, the model's layer count to match, every
+listed file present, every listed name a plain file name of DIR and no state file unlisted.
+`fake_quant.py`'s export (`codes.export_state` per object, then `codes.finish_export`; `fake_quant_parity.py --export`
+does both) writes `{"producer": "fake_quant", "key": ..., "objects": [...], "complete": ...}`, where the key names the
+run (the model, the artifact, the recipe and the importance matrix) and `complete` is true only once the export is
+finished. It refuses a directory that holds calibrate's manifest or another key's export, so two runs never mix. The objects it lists are taken from it and
+the rest are rounded as usual. A hand-made directory needs that file written the same way.
+
 `euhedral_artifacts/fake_quant.py` holds the same rounding as PyTorch modules for training: built from an object's
 weights with the converter's own scale selection, a module's codes and scales are the converter's byte for byte, its
 forward pass returns exactly the weights they decode to, and gradients reach the master weights and the scales

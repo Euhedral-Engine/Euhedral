@@ -424,6 +424,11 @@ impl RowReadbackPool {
         self.readbacks.len()
     }
 
+    /// The rows each readback of the pool holds; 0 for a pool with none.
+    pub fn rows(&self) -> usize {
+        self.readbacks.first().map_or(0, |readback| readback.capacity())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.readbacks.is_empty()
     }

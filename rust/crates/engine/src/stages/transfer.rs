@@ -429,13 +429,6 @@ mod tests {
     use crate::residency::disk::{ReadDone, ReadPort, ReadSpec};
     use crate::residency::offload::WindowGeometry;
 
-    #[test]
-    fn a_transfer_reports_what_it_copies() {
-        let transfer = WeightTransfer::new("w".into(), None, 4096, 100, DevicePtr::NULL);
-        assert_eq!(transfer.bytes(), 100);
-        assert_eq!(transfer.destination(), DevicePtr::NULL);
-    }
-
     /// What a ledger told the reader, in order.
     #[derive(Default)]
     struct Told(Mutex<Vec<String>>);

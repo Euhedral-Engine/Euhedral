@@ -11,7 +11,7 @@ mod common;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use common::{Fixture, PATIENCE, Raw};
+use common::{Fixture, HANG_GUARD, Raw};
 use euhedral_inference_api_server::answer::{owner_fault_is_held, release_owner_fault};
 use euhedral_inference_api_server::scripted::{LaunchFault, MODEL_ID, Script};
 use euhedral_inference_api_server::{Counts, Generation, Limits};
@@ -21,6 +21,9 @@ const MESSAGES: &str = "/v1/messages";
 const RESPONSES: &str = "/v1/responses";
 const BIG_OUTPUT: &str = r#","max_output_tokens":100000000"#;
 const BIG: &str = r#","max_tokens":100000000"#;
+
+/// The limit a test makes pass by moving its clock.
+const LIMIT: Duration = Duration::from_millis(500);
 
 fn limits() -> Limits {
     let mut limits = common::small_limits();
@@ -151,7 +154,7 @@ fn call(name: &str, parameters: &[(&str, &str)]) -> String {
 }
 
 fn settle(fx: &Fixture) {
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while fx.server.admission().counts() != Counts::default() {
         assert!(Instant::now() < end, "slots held: {:?}", fx.server.admission().counts());
         sleep(Duration::from_millis(5));
@@ -159,7 +162,7 @@ fn settle(fx: &Fixture) {
 }
 
 fn until(what: &str, check: impl Fn() -> bool) {
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while !check() {
         assert!(Instant::now() < end, "never: {what}");
         sleep(Duration::from_millis(5));
@@ -1005,9 +1008,9 @@ fn errors_before_the_head_are_json_replies() {
 #[test]
 fn time_limit_while_queued_is_a_json_503() {
     let mut limits = limits();
-    limits.request_limit = Duration::from_secs(15);
-    limits.queue_limit = Some(Duration::from_millis(300));
-    let fx = Fixture::with(limits, Some(2));
+    limits.request_limit = Duration::from_secs(3600);
+    limits.queue_limit = Some(LIMIT);
+    let (fx, clock) = Fixture::timed(limits);
     fx.backend.set_max_active(1);
     hung(&fx);
     let mut first = Raw::connect(fx.addr);
@@ -1015,6 +1018,8 @@ fn time_limit_while_queued_is_a_json_503() {
     until("launched", || launched(&fx));
     let mut second = Raw::connect(fx.addr);
     second.send(&post_raw(CHAT, &chat_body(BIG)));
+    until("queued", || fx.server.admission().counts().waiting == 1);
+    clock.advance(LIMIT);
     let seen = second.read_until(r#""code":"timeout""#);
     assert!(seen.starts_with("HTTP/1.1 503"), "{seen}");
     assert!(!seen.contains("text/event-stream"), "{seen}");
@@ -1070,10 +1075,10 @@ fn disconnect_while_generating_cancels() {
     fx.finish();
 }
 
-/// Feeds a hung generation 64 KiB pieces until `stop` holds, within the patience of a test.
+/// Feeds a hung generation 64 KiB pieces until `stop` holds, within the hang guard.
 fn feed(fx: &Fixture, stop: impl Fn() -> bool) {
     let piece = "a".repeat(64 << 10);
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while !stop() {
         assert!(
             Instant::now() < end,
@@ -1101,7 +1106,6 @@ fn disconnect_during_a_write_cancels() {
     for _ in 0..200 {
         assert!(fx.backend.generations()[0].emit_held(&"a".repeat(64 << 10)));
     }
-    sleep(Duration::from_millis(200));
     drop(raw);
     until("cancelled", || fx.backend.generations()[0].is_cancelled());
     assert!(fx.backend.generations()[0].finish_held_ok(1, true));
@@ -1124,7 +1128,7 @@ fn a_reader_too_slow_for_the_held_bound_ends_the_request() {
     assert!(fx.backend.generations()[0].finish_held_ok(1, true));
     // The stream is cut: whatever the client reads, it never gets the closing chunk.
     let mut seen = String::new();
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while Instant::now() < end {
         match raw.read_for(Duration::from_millis(200)) {
             Some(more) => seen.push_str(&more),
@@ -1139,11 +1143,9 @@ fn a_reader_too_slow_for_the_held_bound_ends_the_request() {
 
 #[test]
 fn time_limit_while_generating_ends_the_stream_with_an_error() {
-    // The limit is long next to what a loaded machine takes to launch a generation, and both requests wait for it
-    // together; nothing below depends on how soon the limit comes, only on its coming after the launch.
     let mut limits = limits();
-    limits.request_limit = Duration::from_secs(4);
-    let fx = Fixture::with(limits, Some(2));
+    limits.request_limit = LIMIT;
+    let (fx, clock) = Fixture::timed(limits);
     fx.backend.set_max_active(2);
     fx.backend.set_script(Script::Hung);
     let mut raws = Vec::new();
@@ -1162,6 +1164,8 @@ fn time_limit_while_generating_ends_the_stream_with_an_error() {
         });
         raws.push((target, raw, head));
     }
+    // Both generations run; their limit passes now.
+    clock.advance(LIMIT);
     for (index, (target, mut raw, head)) in raws.into_iter().enumerate() {
         let seen = head + &raw.read_until(END);
         assert!(seen.starts_with(HEAD), "{seen}");
@@ -1316,9 +1320,7 @@ fn a_half_closed_client_gets_the_whole_stream() {
     raw.half_close();
     let generation = fx.backend.generations()[0].clone();
     assert!(generation.emit_held("one "));
-    sleep(Duration::from_millis(200));
     assert!(generation.emit_held("two"));
-    sleep(Duration::from_millis(200));
     assert!(!generation.is_cancelled());
     assert!(generation.finish_held_ok(2, true));
     let events = rest(&mut raw, head);

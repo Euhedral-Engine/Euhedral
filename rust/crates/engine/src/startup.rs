@@ -17,8 +17,10 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
+use std::iter;
 use std::mem;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -33,6 +35,7 @@ use euhedral_inference_settings::Settings;
 use euhedral_io::{IoBuf, IoDone, OpenSpec, OwnedFile};
 use euhedral_memory::Claim;
 
+use crate::composite::{Composed, Composite, compose, composed_depth, refuse_replaced_on_disk};
 use crate::error::{EngineError, PlanError};
 use crate::frames::{Kind, step};
 use crate::generation::{Generation, Generations};
@@ -48,16 +51,18 @@ use crate::residency::footprint;
 use crate::residency::loader::{self, LoadOutcome, Ring};
 use crate::residency::offload::{self, Offload, WindowGeometry};
 use crate::residency::planner::{LocationBytes, Placement, PlanInputs, ResidencyPlan, Tier, plan_with};
-use crate::runtime::resolve_sequences;
 use crate::runtime::{Core, EngineRuntime, ReadyHandoff, StartupReport, Units, free_arrival, raw_file};
+use crate::runtime::{lane_sizing, resolve_sequences};
 use crate::stages::transfer::DiskTier;
 use crate::state::SequenceState;
 use crate::warmup;
 use crate::workspace::{Workspace, input_records_for};
 
 /// The transfer lanes a startup makes: `host.task-parallelism`, the workers that take host work at once, at least 2
-/// and at most half of the library's lanes, which leaves the other half to the stage graphs.
-pub(crate) fn transfer_lanes(settings: &Settings, library_lanes: usize) -> usize {
+/// and at most half of the lanes the library's limit (`max_lanes`) leaves after the `compute` stage-graph lanes and one
+/// more, which leaves the other half to the stage graphs.
+pub(crate) fn transfer_lanes(settings: &Settings, max_lanes: usize, compute: usize) -> usize {
+    let library_lanes = max_lanes.saturating_sub(compute + 1);
     (settings.host.task_parallelism as usize).clamp(2, (library_lanes / 2).max(2))
 }
 
@@ -93,8 +98,8 @@ pub(crate) fn host_pinned_bytes(settings: &Settings, machine: &Machine) -> Optio
     HostBudget::of(stated, machine.available, settings.memory.host_margin, 0).pinned_bytes()
 }
 
-/// Reads the machine's memory: what it can spare now (`HostBudget.availableBytes`: `MemAvailable`, or the least headroom
-/// of the process's cgroup and its ancestors when that is less) and what it has.
+/// Reads the machine's memory: what it can spare now (`MemAvailable`, or the least headroom of the process's cgroup and its
+/// ancestors when that is less; headroom counts the cgroup's reclaimable page cache as free) and what it has.
 #[cfg(target_os = "linux")]
 #[allow(
     clippy::disallowed_methods,
@@ -113,10 +118,24 @@ pub(crate) fn read_machine() -> Machine {
     if let Some(path) = own.as_deref().and_then(budget::cgroup_path) {
         let mut group = root.join(path.trim_start_matches('/'));
         while group.starts_with(root) {
+            let stat_path = group.join("memory.stat");
             let headroom = fs::read_to_string(group.join("memory.max"))
                 .ok()
                 .zip(fs::read_to_string(group.join("memory.current")).ok())
-                .and_then(|(max, current)| budget::cgroup_headroom(&max, &current));
+                .and_then(|(max, current)| {
+                    // Limited groups only: an unlimited one needs no stat and no warning.
+                    let limited = max.trim() != "max" && !max.trim().is_empty();
+                    let stat = limited.then(|| fs::read_to_string(&stat_path)).and_then(|read| {
+                        read.map_err(|error| {
+                            log::warn!(
+                                "{} could not be read ({error}): the page cache counts as used memory",
+                                stat_path.display()
+                            );
+                        })
+                        .ok()
+                    });
+                    budget::cgroup_headroom(&max, &current, stat.as_deref())
+                });
             least = match (least, headroom) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -145,6 +164,10 @@ struct Startup {
     /// The plan's admitted reservation, once it is made: the allocations take their claims from it, and the engine
     /// keeps what is left of it.
     reservation: Option<PlanReservation>,
+    /// The device's free bytes when the plan was made.
+    free_at_plan: u64,
+    /// The objects taken from other artifacts; empty for a model loaded from its artifact alone.
+    composite: Composite,
     _units: Units,
 }
 
@@ -213,7 +236,7 @@ fn device(core: &Core) -> &Arc<Lake> {
 }
 
 /// Begins the startup: the rest runs as frames.
-pub(crate) fn run(core: Arc<Core>, ready: ReadyHandoff) {
+pub(crate) fn run(core: Arc<Core>, ready: ReadyHandoff, composite: Composite) {
     let units = match core.admit() {
         Ok(units) => units,
         Err(error) => return ready.send(Err(error)),
@@ -222,6 +245,8 @@ pub(crate) fn run(core: Arc<Core>, ready: ReadyHandoff) {
         core,
         ready: Some(ready),
         reservation: None,
+        free_at_plan: 0,
+        composite,
         _units: units,
     };
     startup.then(control, open);
@@ -233,7 +258,10 @@ type Staged = (Option<(DeviceBuffer, Claim)>, Option<(Arc<DiskTier>, Claim)>);
 
 /// What the steps after the index need of the artifact.
 struct Artifact {
-    file: Arc<OwnedFile>,
+    /// The files payloads are read from: the artifact first, then the source of each replacement of a composite.
+    files: Vec<Arc<OwnedFile>>,
+    /// The file (an index into `files`) of each entry a replacement supplies; every other entry is in the first.
+    source_of: HashMap<String, usize>,
     table: TensorTable,
     config: ModelConfig,
 }
@@ -242,13 +270,14 @@ struct Artifact {
 fn read_range(
     startup: Startup,
     file: &Arc<OwnedFile>,
+    path: &Path,
     range: Range<u64>,
     what: &'static str,
     next: impl FnOnce(Startup, Vec<u8>) + Send + 'static,
 ) {
     let core = Arc::clone(&startup.core);
     let length = (range.end - range.start) as usize;
-    let path = core.settings.model.artifact.clone();
+    let path = path.to_path_buf();
     let then = Box::new(move |done: IoDone| -> Box<dyn Frame> {
         step(Kind::Startup, 0, move || match done.result {
             Ok(read) if read == length => {
@@ -277,27 +306,62 @@ fn read_range(
     let _ = core.io.read(raw_file(file), range.start, buf, then);
 }
 
-/// Step 1: opens the artifact.
+/// An artifact file opened, with the regions its index is read from.
+struct Indexed {
+    path: PathBuf,
+    file: Arc<OwnedFile>,
+    header: Header,
+    end: u64,
+    metadata: Vec<u8>,
+    table: Vec<u8>,
+}
+
+/// Step 1: opens the artifact, then the source of each replacement of the composite, one after the other.
 fn open(startup: Startup) {
+    let path = startup.core.settings.model.artifact.clone();
+    open_index(startup, path, true, |startup, base| sources(startup, base, Vec::new()));
+}
+
+/// Opens the next source of the composite, or goes on to parse when each is open.
+fn sources(startup: Startup, base: Indexed, mut opened: Vec<Indexed>) {
+    let Some(replacement) = startup.composite.replacements.get(opened.len()) else {
+        return startup.then(host, move |startup| parse(startup, base, opened));
+    };
+    let path = replacement.source.clone();
+    open_index(startup, path, false, move |startup, part| {
+        opened.push(part);
+        sources(startup, base, opened);
+    });
+}
+
+/// Opens `path`, reads its header and footer, then the metadata (only when `with_metadata`: a replacement's is never
+/// used) and the table they locate; `next` gets them.
+fn open_index(
+    startup: Startup,
+    path: PathBuf,
+    with_metadata: bool,
+    next: impl FnOnce(Startup, Indexed) + Send + 'static,
+) {
     let core = Arc::clone(&startup.core);
-    let path = core.settings.model.artifact.clone();
+    let named = path.clone();
     let then = Box::new(move |opened: io::Result<OwnedFile>| -> Box<dyn Frame> {
         step(Kind::Startup, 0, move || match opened {
-            Ok(file) => indexed(startup, file),
+            Ok(file) => indexed(startup, path, file, with_metadata, next),
             Err(error) => {
-                let what = format!(
-                    "opening the artifact {}",
-                    startup.core.settings.model.artifact.display()
-                );
+                let what = format!("opening the artifact {}", path.display());
                 startup.fail(EngineError::io(what, error));
             }
         })
     });
-    let _ = core.io.open_path(&path, OpenSpec::default(), then);
+    let _ = core.io.open_path(&named, OpenSpec::default(), then);
 }
 
 /// The length of `file`, and the file back.
 #[cfg(unix)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: one fstat at startup, before any frame runs"
+)]
 fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
     let file = File::from(file);
     (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))
@@ -305,14 +369,23 @@ fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
 
 /// The length of `file`, and the file back.
 #[cfg(windows)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "no-wait, blocking I/O: one fstat at startup, before any frame runs"
+)]
 fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
     let file = File::from(file);
     (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))
 }
 
 /// Reads the header and the footer, then the metadata and the table they locate.
-fn indexed(startup: Startup, file: OwnedFile) {
-    let path = startup.core.settings.model.artifact.clone();
+fn indexed(
+    startup: Startup,
+    path: PathBuf,
+    file: OwnedFile,
+    with_metadata: bool,
+    next: impl FnOnce(Startup, Indexed) + Send + 'static,
+) {
     let (length, file) = file_len(file);
     let length = match length {
         Ok(length) => length,
@@ -328,60 +401,131 @@ fn indexed(startup: Startup, file: OwnedFile) {
         return startup.fail(EngineError::Runtime("the read plan names no header".to_string()));
     };
     let handle = Arc::clone(&file);
-    read_range(startup, &file, header_range, "header", move |startup, header| {
-        let file = Arc::clone(&handle);
-        read_range(startup, &handle, footer_range, "footer", move |startup, footer| {
-            let path = startup.core.settings.model.artifact.clone();
-            let parsed = (|| {
-                let header_bytes: [u8; HEADER_BYTES] = header.as_slice().try_into().map_err(|_| {
-                    EngineError::Runtime("the header read returned the wrong number of bytes".to_string())
-                })?;
-                let footer_bytes: [u8; 24] = footer.as_slice().try_into().map_err(|_| {
-                    EngineError::Runtime("the footer read returned the wrong number of bytes".to_string())
-                })?;
-                let header = Header::parse(&header_bytes).map_err(|error| EngineError::artifact(&path, error))?;
-                let footer =
-                    TokenizerFooter::parse(&footer_bytes).map_err(|error| EngineError::artifact(&path, error))?;
-                let end = content_end(length, footer.as_ref()).map_err(|error| EngineError::artifact(&path, error))?;
-                let plan = ReadPlan::new(&header, length, footer.as_ref())
-                    .map_err(|error| EngineError::artifact(&path, error))?;
-                let (Some(metadata), Some(table)) = (plan.range(Region::Metadata), plan.range(Region::Table)) else {
-                    return Err(EngineError::Runtime("the read plan names no metadata".to_string()));
-                };
-                Ok((header, end, metadata, table))
-            })();
-            let (header, end, metadata_range, table_range) = match parsed {
-                Ok(parsed) => parsed,
-                Err(error) => return startup.fail(error),
-            };
-            let handle = Arc::clone(&file);
-            read_range(startup, &file, metadata_range, "metadata", move |startup, metadata| {
-                let file = Arc::clone(&handle);
-                read_range(startup, &handle, table_range, "tensor table", move |startup, table| {
-                    startup.then(host, move |startup| parse(startup, file, header, end, metadata, table));
-                });
-            });
-        });
-    });
+    let named = path.clone();
+    read_range(
+        startup,
+        &file,
+        &named,
+        header_range,
+        "header",
+        move |startup, header| {
+            let file = Arc::clone(&handle);
+            let named = path.clone();
+            read_range(
+                startup,
+                &handle,
+                &named,
+                footer_range,
+                "footer",
+                move |startup, footer| {
+                    let parsed = (|| {
+                        let header_bytes: [u8; HEADER_BYTES] = header.as_slice().try_into().map_err(|_| {
+                            EngineError::Runtime("the header read returned the wrong number of bytes".to_string())
+                        })?;
+                        let footer_bytes: [u8; 24] = footer.as_slice().try_into().map_err(|_| {
+                            EngineError::Runtime("the footer read returned the wrong number of bytes".to_string())
+                        })?;
+                        let header =
+                            Header::parse(&header_bytes).map_err(|error| EngineError::artifact(&path, error))?;
+                        let footer = TokenizerFooter::parse(&footer_bytes)
+                            .map_err(|error| EngineError::artifact(&path, error))?;
+                        let end = content_end(length, footer.as_ref())
+                            .map_err(|error| EngineError::artifact(&path, error))?;
+                        let plan = ReadPlan::new(&header, length, footer.as_ref())
+                            .map_err(|error| EngineError::artifact(&path, error))?;
+                        let (Some(metadata), Some(table)) = (plan.range(Region::Metadata), plan.range(Region::Table))
+                        else {
+                            return Err(EngineError::Runtime("the read plan names no metadata".to_string()));
+                        };
+                        Ok((header, end, metadata, table))
+                    })();
+                    let (header, end, metadata_range, table_range) = match parsed {
+                        Ok(parsed) => parsed,
+                        Err(error) => return startup.fail(error),
+                    };
+                    let index = Indexed {
+                        path,
+                        file,
+                        header,
+                        end,
+                        metadata: Vec::new(),
+                        table: Vec::new(),
+                    };
+                    if !with_metadata {
+                        return read_table(startup, index, table_range, next);
+                    }
+                    let handle = Arc::clone(&index.file);
+                    let named = index.path.clone();
+                    read_range(
+                        startup,
+                        &handle,
+                        &named,
+                        metadata_range,
+                        "metadata",
+                        move |startup, metadata| {
+                            read_table(startup, Indexed { metadata, ..index }, table_range, next);
+                        },
+                    );
+                },
+            );
+        },
+    );
+}
+
+/// Reads the tensor table of `index`, then hands it on.
+fn read_table(
+    startup: Startup,
+    index: Indexed,
+    range: Range<u64>,
+    next: impl FnOnce(Startup, Indexed) + Send + 'static,
+) {
+    let handle = Arc::clone(&index.file);
+    let named = index.path.clone();
+    read_range(
+        startup,
+        &handle,
+        &named,
+        range,
+        "tensor table",
+        move |startup, table| {
+            next(startup, Indexed { table, ..index });
+        },
+    );
 }
 
 /// Step 2: parses the index, checks it against the model, and reads the trellis segment companions.
-fn parse(startup: Startup, file: Arc<OwnedFile>, header: Header, end: u64, metadata: Vec<u8>, table: Vec<u8>) {
-    let path = startup.core.settings.model.artifact.clone();
+fn parse(startup: Startup, base: Indexed, parts: Vec<Indexed>) {
+    let path = base.path.clone();
     let parsed = (|| {
-        let metadata = Metadata::parse(&metadata).map_err(|error| EngineError::artifact(&path, error))?;
-        let table = TensorTable::parse(&table, &header, end).map_err(|error| EngineError::artifact(&path, error))?;
-        let config = ModelConfig::from(&metadata);
+        let metadata = Metadata::parse(&base.metadata).map_err(|error| EngineError::artifact(&path, error))?;
+        let mut table = TensorTable::parse(&base.table, &base.header, base.end)
+            .map_err(|error| EngineError::artifact(&path, error))?;
+        let mut source_of = HashMap::new();
+        if startup.composite.has_objects() {
+            let tables = parts
+                .iter()
+                .map(|part| {
+                    TensorTable::parse(&part.table, &part.header, part.end)
+                        .map_err(|error| EngineError::artifact(&part.path, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Composed { table, source_of } = compose(&table, &startup.composite, &tables)?;
+        }
+        let mut config = ModelConfig::from(&metadata);
+        config.draft_depth = composed_depth(config.draft_depth, &table, &startup.composite)?;
         config.check_supported()?;
         validate_inventory(&config, &table)?;
-        Ok::<_, EngineError>((table, config))
+        Ok::<_, EngineError>((table, config, source_of))
     })();
-    let (table, config) = match parsed {
+    let (table, config, source_of) = match parsed {
         Ok(parsed) => parsed,
         Err(error) => return startup.fail(error),
     };
+    let files: Vec<Arc<OwnedFile>> = iter::once(base.file)
+        .chain(parts.into_iter().map(|part| part.file))
+        .collect();
     // Every trellis object's `.segments`: a few bytes each, read and checked before the device is touched.
-    let objects: Vec<(String, u64, u64, Range<u64>)> = table
+    let objects: Vec<(String, u64, u64, Range<u64>, usize)> = table
         .entries()
         .iter()
         .filter(|entry| entry.format() == WeightFormat::Trellis && entry.layout() == WeightLayout::TrellisTile16V1)
@@ -389,18 +533,30 @@ fn parse(startup: Startup, file: Arc<OwnedFile>, header: Header, end: u64, metad
             let (n, _) = trellis_logical(entry.shape())?;
             let suh = table.get(&companion_name(entry.name(), ".suh"))?;
             let segments = table.get(&companion_name(entry.name(), ".segments"))?;
-            Some((entry.name().to_string(), n, *suh.shape().first()?, segments.range()))
+            let file = source_of.get(segments.name()).copied().unwrap_or(0);
+            Some((
+                entry.name().to_string(),
+                n,
+                *suh.shape().first()?,
+                segments.range(),
+                file,
+            ))
         })
         .collect();
-    let reader = Arc::clone(&file);
-    let artifact = Artifact { file, table, config };
+    let readers = files.clone();
+    let artifact = Artifact {
+        files,
+        source_of,
+        table,
+        config,
+    };
     if objects.is_empty() {
         return startup.then(host, move |startup| plan(startup, artifact, HashMap::new()));
     }
     let core = Arc::clone(&startup.core);
     let names: Vec<(String, u64, u64)> = objects
         .iter()
-        .map(|(name, n, rows, _)| (name.clone(), *n, *rows))
+        .map(|(name, n, rows, _, _)| (name.clone(), *n, *rows))
         .collect();
     let reads = SegmentReads::new(objects.len(), move |parts| {
         let checked = check_segments(&names, parts);
@@ -409,7 +565,7 @@ fn parse(startup: Startup, file: Arc<OwnedFile>, header: Header, end: u64, metad
             Err(error) => startup.fail(error),
         });
     });
-    for (part, (_, _, _, range)) in objects.into_iter().enumerate() {
+    for (part, (_, _, _, range, file)) in objects.into_iter().enumerate() {
         let length = (range.end - range.start) as usize;
         let arrival = Arrival::new(&reads, part);
         let then = Box::new(move |done: IoDone| -> Box<dyn Frame> {
@@ -426,7 +582,7 @@ fn parse(startup: Startup, file: Arc<OwnedFile>, header: Header, end: u64, metad
             filled: 0,
         };
         // A refused read drops `then` and its arrival without running them, which counts the part as arrived.
-        let _ = core.io.read(raw_file(&reader), range.start, buf, then);
+        let _ = core.io.read(raw_file(&readers[file]), range.start, buf, then);
     }
 }
 
@@ -519,42 +675,83 @@ fn check_segments(
     Ok(ends)
 }
 
-/// Step 3: plans residency against the device and the host. Failing here has allocated nothing on the device.
-fn plan(mut startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>) {
+/// Step 3a: resolves the sequence count from the free device memory, which is read after the kernels are loaded and
+/// before the lanes exist. Allocates nothing on the device. The lanes open next, in a device frame.
+fn plan(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>) {
     let core = Arc::clone(&startup.core);
-    let planned = core
-        .library
-        .free_bytes()
-        .map_err(EngineError::from)
-        .and_then(|device_free| {
-            let inputs = PlanInputs {
-                device_free,
-                multiprocessors: Some(core.library.device().sm_count),
-                host_pinned_bytes: core.host_pinned_bytes,
-                sequences: 1,
-            };
-            let sequences = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
-            let sequences = core.hold_sequences(sequences);
-            plan_with(
-                &artifact.config,
-                &artifact.table,
-                &core.settings,
-                PlanInputs { sequences, ..inputs },
-            )
-            .map_err(EngineError::from)
-        })
-        .and_then(|plan| refuse_offload(&plan.offload).map(|()| plan).map_err(EngineError::from))
-        // The plan is admitted by the account: its allocations take their claims from the reservation.
-        .and_then(|plan| {
-            let reservation = core.account.admit(&plan)?;
-            let admitted = reservation.admitted();
-            log::info!(
-                "memory admitted: {} bytes on the device, {} bytes of pinned host memory",
-                admitted.device,
-                admitted.host
-            );
-            Ok((plan, reservation))
-        });
+    let first = device_inputs(&core).and_then(|inputs| {
+        let first = resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)?;
+        Ok(first)
+    });
+    match first {
+        Ok(first) => startup.then(device, move |startup| open_lanes(startup, artifact, ends, first)),
+        Err(error) => startup.fail(error),
+    }
+}
+
+/// What the plan reads of the device now: the free memory (a failed read is an error, not zero).
+fn device_inputs(core: &Core) -> Result<PlanInputs, EngineError> {
+    let device_free = core.library.free_bytes().map_err(EngineError::from)?;
+    Ok(PlanInputs {
+        device_free,
+        multiprocessors: Some(core.library.device().sm_count),
+        exact_numerics: core.library.exact_numerics(),
+        host_pinned_bytes: core.host_pinned_bytes,
+        sequences: 1,
+    })
+}
+
+/// Step 3b, in a frame of the device lake: opens the lanes with rings for the first count, whose events take device
+/// memory, then reads the free memory again, which is the figure the plan is made from, and resolves an automatic count
+/// again ([`lane_sizing`]).
+fn open_lanes(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>, first: usize) {
+    let core = Arc::clone(&startup.core);
+    let sized = core.open_lanes(first).and_then(|()| {
+        let inputs = device_inputs(&core)?;
+        let sizing = lane_sizing(core.settings.batching.max_sequences, first, || {
+            resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)
+        })?;
+        Ok((inputs, sizing))
+    });
+    match sized {
+        Ok((inputs, sizing)) => startup.then(host, move |startup| {
+            plan_residency(startup, artifact, ends, inputs, sizing.sequences)
+        }),
+        Err(error) => startup.fail(error),
+    }
+}
+
+/// Step 3c: plans residency against the device (as the lanes left it) and the host. Allocates nothing on the device.
+fn plan_residency(
+    mut startup: Startup,
+    artifact: Artifact,
+    ends: HashMap<String, Arc<[u32]>>,
+    inputs: PlanInputs,
+    sequences: usize,
+) {
+    let core = Arc::clone(&startup.core);
+    // The figure the plan is made from: the free memory after the lanes opened.
+    startup.free_at_plan = inputs.device_free;
+    let planned = plan_with(
+        &artifact.config,
+        &artifact.table,
+        &core.settings,
+        PlanInputs { sequences, ..inputs },
+    )
+    .map_err(EngineError::from)
+    .and_then(|plan| refuse_offload(&plan.offload).map(|()| plan).map_err(EngineError::from))
+    .and_then(|plan| refuse_replaced_on_disk(&plan.device, &artifact.source_of).map(|()| plan))
+    // The plan is admitted by the account: its allocations take their claims from the reservation.
+    .and_then(|plan| {
+        let reservation = core.account.admit(&plan)?;
+        let admitted = reservation.admitted();
+        log::info!(
+            "memory admitted: {} bytes on the device, {} bytes of pinned host memory",
+            admitted.device,
+            admitted.host
+        );
+        Ok((plan, reservation))
+    });
     match planned {
         Ok((plan, reservation)) => {
             startup.reservation = Some(reservation);
@@ -649,7 +846,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
             Workspace::allocate_with_records(&core.library, &artifact.config, plan.rows, &regions, records)?;
         workspace.hold(scratch_claim);
         workspace.hold(reserve_claim);
-        let (sequences, marker) = core.lane_table.submit_ops(core.transfer_lane(0), false, |kernels| {
+        let (sequences, marker) = core.lane_table().submit_ops(core.transfer_lane(0), false, |kernels| {
             // The first sequence's state and the MTP layer's cache at the longest context, which its pages grow to.
             let first = footprint::first_sequence_bytes(&plan, &artifact.config)
                 + footprint::mtp_cache_bytes_of(&plan, &artifact.config);
@@ -708,7 +905,7 @@ fn allocate(mut startup: Startup, artifact: Artifact, plan: ResidencyPlan, ends:
                     sequences,
                 )
             });
-            core.completions.after_marker(marker, frame);
+            core.completions().after_marker(marker, frame);
         }
         Err(error) => startup.fail(error),
     }
@@ -734,7 +931,7 @@ fn disk_tier(
     let port = FilePort::new(Arc::clone(&core.io), Arc::new(file), window);
     let reader = DiskReader::new(Arc::new(port), geometry, Generation::spawner(core));
     core.teardown.hold_disk(reader.clone());
-    let tier = DiskTier::new(reader, buffer, geometry, Arc::clone(&core.completions));
+    let tier = DiskTier::new(reader, buffer, geometry, Arc::clone(core.completions()));
     Ok((tier, claim))
 }
 
@@ -759,8 +956,17 @@ fn load(
 ) {
     let core = Arc::clone(&startup.core);
     let pieces = loader::pieces(&plan, ring.piece_bytes);
-    let file = Arc::clone(&artifact.file);
+    let files: Arc<[Arc<OwnedFile>]> = artifact.files.iter().cloned().collect();
     let names: Arc<[String]> = plan.device.iter().map(|placement| placement.name.clone()).collect();
+    // A model of one file has no table of files: every piece reads from the first.
+    let file_of: Arc<[usize]> = if artifact.source_of.is_empty() {
+        Arc::from([])
+    } else {
+        names
+            .iter()
+            .map(|name| artifact.source_of.get(name).copied().unwrap_or(0))
+            .collect()
+    };
     let chains = ring.depth;
     let (host_arena, host_claim) = match pinned {
         Some((arena, claim)) => (Some(arena), Some(claim)),
@@ -783,7 +989,9 @@ fn load(
             )
         });
     };
-    loader::start(&core, file, names, pieces, chains, arena, host_arena, loans, done);
+    loader::start(
+        &core, files, file_of, names, pieces, chains, arena, host_arena, loans, done,
+    );
 }
 
 /// Step 6: assembles the tensors by layer and role, warms the kernel modules and sets the latch.
@@ -870,7 +1078,8 @@ fn assemble(
         };
         let (warmed, marker) = warmup::run(&startup.core, &artifact.config, &weights, &workspace);
         let core = Arc::clone(&startup.core);
-        let (completions, stages) = (Arc::clone(&core.completions), Arc::clone(&core.stages));
+        let free_at_plan = startup.free_at_plan;
+        let (completions, stages) = (Arc::clone(core.completions()), Arc::clone(&core.stages));
         // The report and the latch wait for the lane to reach the warm-up's last launch: a completion, not a wait.
         let ready = step(Kind::Startup, 0, move || {
             let in_use = core
@@ -911,6 +1120,7 @@ fn assemble(
                 allocated_bytes: allocated,
                 admitted,
                 device_bytes_in_use: in_use,
+                free_at_plan,
                 pinned_staging_bytes: core.pool.allocated_bytes(),
                 pinned_growth_during_load: stats.pinned_growth,
                 warmed,
@@ -1039,7 +1249,7 @@ impl DraftIds {
             source,
             bytes,
         } = self;
-        let queued = core.lane_table.submit_ops(core.owner_lane(), false, |kernels| {
+        let queued = core.lane_table().submit_ops(core.owner_lane(), false, |kernels| {
             // SAFETY: the loan is held by the frame that follows the copy, which runs once the lane has reached the
             // marker; nothing reads or writes the bytes before.
             unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, source, bytes) }
@@ -1055,7 +1265,7 @@ impl DraftIds {
                         .collect();
                     finish.run(Some(ids));
                 });
-                core.completions.after_marker(marker, frame);
+                core.completions().after_marker(marker, frame);
             }
             Err(error) => {
                 // The copy may have been queued before the call failed: the lane may still write the buffer, so it is
@@ -1212,8 +1422,19 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use euhedral_inference_settings::ModelSettings;
+
     use super::*;
     use crate::residency::offload::{StagingGeometry, WindowGeometry};
+
+    #[test]
+    fn the_transfer_lane_cap_follows_the_librarys_lane_limit() {
+        let mut settings = Settings::with_model(ModelSettings::default());
+        settings.host.task_parallelism = 1000;
+        assert_eq!(transfer_lanes(&settings, 64, 4), (64 - 5) / 2);
+        assert_eq!(transfer_lanes(&settings, 32, 4), (32 - 5) / 2);
+        assert_eq!(transfer_lanes(&settings, 8, 4), 2);
+    }
 
     #[test]
     fn a_plan_with_weights_outside_the_device_is_refused_naming_the_host_bytes() {

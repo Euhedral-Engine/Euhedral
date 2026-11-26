@@ -320,6 +320,9 @@ public final class SettingsLoader {
         m.put("context.kv-cache-format", optional(SettingsLoader::kvFormat));
         m.put("context.kv-cache-on-gpu-tokens", fixed(integer(0, Integer.MAX_VALUE)));
 
+        // Read only by the Rust engine; accepted so the shared example file loads here.
+        m.put("speculation.mode", fixed(SettingsLoader::speculationMode));
+
         m.put("prefix-cache.size", fixed(size(0)));
         m.put("prefix-cache.checkpoint-tokens", fixed(SettingsLoader::checkpoint));
         // Read only by the Rust engine; accepted so the shared example file loads here.
@@ -329,6 +332,8 @@ public final class SettingsLoader {
         m.put("batching.max-sequences-per-pass", optional(integer(1, Integer.MAX_VALUE)));
         m.put("batching.max-tokens-per-pass", optional(integer(1, Integer.MAX_VALUE)));
         m.put("batching.prefill-chunk-tokens", fixed(integer(1, Integer.MAX_VALUE)));
+        // Read only by the Rust engine; accepted so the shared example file loads here.
+        m.put("batching.forced-rows", fixed(integer(0, Integer.MAX_VALUE)));
 
         m.put("memory.host-limit", optional(size(0)));
         m.put("memory.host-weights-limit", optional(size(1)));
@@ -342,6 +347,9 @@ public final class SettingsLoader {
         // Read by the Rust engine, whose planner sizes the dense model's runtime reserve with it (Java uses 1280 MiB);
         // this engine checks the value and does not use it.
         m.put("memory.runtime-reserve", optional(size(0)));
+        // Read by the Rust engine, whose planner keeps it above the demand that raises the runtime reserve; this
+        // engine checks the value and does not use it.
+        m.put("memory.runtime-headroom", optional(size(0)));
         m.put("memory.weight-streaming.concurrent-reads", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("memory.weight-streaming.read-split", fixed(integer(1, Integer.MAX_VALUE)));
         m.put("memory.weight-streaming.copy-streams", fixed(integer(1, Integer.MAX_VALUE)));
@@ -359,6 +367,9 @@ public final class SettingsLoader {
         // Read by the Rust engine, which sizes its lattice's batches with it; this engine checks the value and does not
         // use it.
         m.put("host.max-batch-size", optional(integer(1, Integer.MAX_VALUE)));
+        // Read by the Rust quantization tools, which copy a file in pieces of this size; this engine checks the value
+        // and does not use it.
+        m.put("host.copy-chunk-bytes", fixed(size(1)));
 
         m.put("kernels.rms-norm-decode-slices", optional(integer(1, KernelSettings.MAX_RMS_NORM_DECODE_SLICES)));
         m.put("kernels.fused-verify-from", optional(SettingsLoader::fusedVerifyFrom));
@@ -455,6 +466,13 @@ public final class SettingsLoader {
             case "nvfp4" -> KvFormat.NVFP4;
             case "bf16" -> KvFormat.BF16;
             default -> throw new IllegalArgumentException("must be nvfp4, bf16 or auto: " + text);
+        };
+    }
+
+    private static Object speculationMode(String text) {
+        return switch (text.toLowerCase(Locale.ROOT)) {
+            case "artifact", "none" -> text.toLowerCase(Locale.ROOT);
+            default -> throw new IllegalArgumentException("must be artifact or none: " + text);
         };
     }
 

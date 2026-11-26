@@ -28,8 +28,8 @@ pub use loader::{SettingsError, SettingsErrors, known_keys, variable_name};
 pub use model::{
     Auto, BatchingSettings, ContextSettings, CpuList, FUSED_VERIFY_ROWS, FusedVerifyFrom, GraphKernelSettings,
     HostLayerCompute, HostLayersSettings, HostSettings, KernelSettings, KvFormat, MIN_TENSOR_CORE_ROWS, MemorySettings,
-    ModelSettings, PrefixCacheSettings, RequestSettings, SamplingSettings, ServerSettings, Settings,
-    TrellisKernelSettings, WeightStreamingSettings,
+    ModelSettings, PrefixCacheSettings, RequestSettings, SamplingSettings, ServerSettings, Settings, SpeculationMode,
+    SpeculationSettings, TrellisKernelSettings, WeightStreamingSettings,
 };
 pub use retired::{key_message as retired_key_message, message as retired_message};
 pub use sizes::{ByteSize, parse_duration};
@@ -62,14 +62,21 @@ pub fn locate(args: &[OsString], env: &dyn Fn(&str) -> Option<String>) -> Result
 /// Reports every problem found.
 pub fn load(args: &[OsString], env: &dyn Fn(&str) -> Option<String>) -> Result<Settings, SettingsErrors> {
     let file = locate(args, env)?;
-    loader::load_optional(file.as_deref(), env)
+    loader::load_optional(file.as_deref(), env, true)
+}
+
+/// Loads the settings of a tool that serves no model, as [`load`] does but without requiring `model.artifact` and
+/// `model.name`.
+pub fn load_for_tool(args: &[OsString], env: &dyn Fn(&str) -> Option<String>) -> Result<Settings, SettingsErrors> {
+    let file = locate(args, env)?;
+    loader::load_optional(file.as_deref(), env, false)
 }
 
 /// Loads the settings from `path`, then the environment, then validation.
 ///
 /// Reports every problem found.
 pub fn load_file(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Settings, SettingsErrors> {
-    loader::load_optional(Some(path), env)
+    loader::load_optional(Some(path), env, true)
 }
 
 /// The process environment, for [`load`]. A variable that is not valid Unicode reads as absent.

@@ -1725,24 +1725,38 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_refuses_nothing_or_an_empty_part() {
-        assert_eq!(lay_out(&[], RECORD), Err(QuantumError::EmptyBatch));
-        assert_eq!(
-            lay_out(&[shape(0, 2), shape(1, 0)], RECORD),
-            Err(QuantumError::EmptyPart { part: 1 })
-        );
-    }
-
-    #[test]
-    fn a_batch_refuses_one_sequence_twice() {
-        assert_eq!(
-            lay_out(&[shape(3, 2), shape(5, 2), shape(3, 1)], RECORD),
-            Err(QuantumError::DuplicateSequence {
-                sequence: SequenceId(3),
-                first: 0,
-                second: 2
-            })
-        );
+    fn a_batch_refuses_what_cannot_be_laid_out() {
+        let bf16 = Shape {
+            kv_format: Some(KvFormat::Bf16),
+            ..shape(1, 2)
+        };
+        let same_buffer = Shape {
+            selection: shape(0, 2).selection,
+            ..shape(1, 2)
+        };
+        let refusals = [
+            (vec![], QuantumError::EmptyBatch),
+            (vec![shape(0, 2), shape(1, 0)], QuantumError::EmptyPart { part: 1 }),
+            (
+                vec![shape(3, 2), shape(5, 2), shape(3, 1)],
+                QuantumError::DuplicateSequence {
+                    sequence: SequenceId(3),
+                    first: 0,
+                    second: 2,
+                },
+            ),
+            (
+                vec![shape(0, 2), bf16],
+                QuantumError::KvFormatMismatch { first: 0, other: 1 },
+            ),
+            (
+                vec![shape(0, 2), same_buffer],
+                QuantumError::SharedLogitsBuffer { first: 0, second: 1 },
+            ),
+        ];
+        for (parts, refusal) in refusals {
+            assert_eq!(lay_out(&parts, RECORD), Err(refusal));
+        }
     }
 
     #[test]
@@ -1767,30 +1781,6 @@ mod tests {
             Err(QuantumError::MixedLogits { first: 0, other: 2 })
         );
         assert!(lay_out(&[host(0, 2), host(1, 2)], RECORD).is_ok());
-    }
-
-    #[test]
-    fn a_batch_refuses_caches_of_different_formats() {
-        let bf16 = Shape {
-            kv_format: Some(KvFormat::Bf16),
-            ..shape(1, 2)
-        };
-        assert_eq!(
-            lay_out(&[shape(0, 2), bf16], RECORD),
-            Err(QuantumError::KvFormatMismatch { first: 0, other: 1 })
-        );
-    }
-
-    #[test]
-    fn a_batch_refuses_parts_that_score_into_one_buffer() {
-        let same = Shape {
-            selection: shape(0, 2).selection,
-            ..shape(1, 2)
-        };
-        assert_eq!(
-            lay_out(&[shape(0, 2), same], RECORD),
-            Err(QuantumError::SharedLogitsBuffer { first: 0, second: 1 })
-        );
     }
 
     #[test]

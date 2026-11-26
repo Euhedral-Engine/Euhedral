@@ -14,6 +14,7 @@ use serde_yaml_ng::{Mapping, Value};
 
 use crate::model::{
     Auto, CpuList, FusedVerifyFrom, HostLayerCompute, KvFormat, MIN_TENSOR_CORE_ROWS, ModelSettings, Settings,
+    SpeculationMode,
 };
 use crate::retired;
 use crate::sizes::{ByteSize, parse_duration};
@@ -144,9 +145,13 @@ pub fn known_keys() -> Vec<&'static str> {
 }
 
 /// Loads the file (if any), applies the environment, validates, and builds the settings.
+///
+/// `with_model` is whether `model.artifact` and `model.name` are required: a tool that serves no model leaves them
+/// unset.
 pub(crate) fn load_optional(
     file: Option<&Path>,
     env: &dyn Fn(&str) -> Option<String>,
+    with_model: bool,
 ) -> Result<Settings, SettingsErrors> {
     let leaves = leaves();
     let mut problems = Vec::new();
@@ -161,7 +166,7 @@ pub(crate) fn load_optional(
     let mut settings = Settings::with_model(ModelSettings::default());
     for leaf in &leaves {
         let Some(text) = raw.get(leaf.key) else {
-            if leaf.kind == Kind::Required && !blank.contains(leaf.key) {
+            if leaf.kind == Kind::Required && with_model && !blank.contains(leaf.key) {
                 problems.push(SettingsError {
                     key: Some(leaf.key.to_owned()),
                     variable: Some(variable_name(leaf.key)),
@@ -404,6 +409,14 @@ fn kv_format(text: &str) -> Result<KvFormat, String> {
     }
 }
 
+fn speculation_mode(text: &str) -> Result<SpeculationMode, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "artifact" => Ok(SpeculationMode::Artifact),
+        "none" => Ok(SpeculationMode::None),
+        _ => Err(format!("must be artifact or none: {text}")),
+    }
+}
+
 fn host_layer_compute(text: &str) -> Result<HostLayerCompute, String> {
     match text.to_ascii_lowercase().as_str() {
         "cpu" => Ok(HostLayerCompute::Cpu),
@@ -499,6 +512,9 @@ fn leaves() -> Vec<Leaf> {
         fixed("context.kv-cache-on-gpu-tokens", |s, t| {
             assign!(s.context.kv_cache_on_gpu_tokens, int(t, 0, COUNT_MAX))
         }),
+        fixed("speculation.mode", |s, t| {
+            assign!(s.speculation.mode, speculation_mode(t))
+        }),
         fixed("prefix-cache.size", |s, t| assign!(s.prefix_cache.size, size(t, 0))),
         fixed("prefix-cache.checkpoint-tokens", |s, t| {
             assign!(s.prefix_cache.checkpoint_tokens, checkpoint(t))
@@ -517,6 +533,9 @@ fn leaves() -> Vec<Leaf> {
         }),
         fixed("batching.prefill-chunk-tokens", |s, t| {
             assign!(s.batching.prefill_chunk_tokens, int(t, 1, COUNT_MAX))
+        }),
+        fixed("batching.forced-rows", |s, t| {
+            assign!(s.batching.forced_rows, int(t, 0, COUNT_MAX))
         }),
         optional("memory.host-limit", |s, t| {
             assign!(s.memory.host_limit, auto_or(t, |t| size(t, 0)))
@@ -539,6 +558,9 @@ fn leaves() -> Vec<Leaf> {
         fixed("memory.gpu-reserve", |s, t| assign!(s.memory.gpu_reserve, size(t, 0))),
         optional("memory.runtime-reserve", |s, t| {
             assign!(s.memory.runtime_reserve, auto_or(t, |t| size(t, 0)))
+        }),
+        optional("memory.runtime-headroom", |s, t| {
+            assign!(s.memory.runtime_headroom, auto_or(t, |t| size(t, 0)))
         }),
         optional("memory.pinned-buffer-pool", |s, t| {
             assign!(s.memory.pinned_buffer_pool, auto_or(t, |t| size(t, 0)))
@@ -576,6 +598,9 @@ fn leaves() -> Vec<Leaf> {
         }),
         optional("host.native-cache", |s, t| {
             assign!(s.host.native_cache, auto_or(t, |t| Ok(PathBuf::from(t))))
+        }),
+        fixed("host.copy-chunk-bytes", |s, t| {
+            assign!(s.host.copy_chunk_bytes, size(t, 1))
         }),
         optional("kernels.rms-norm-decode-slices", |s, t| {
             assign!(

@@ -99,6 +99,10 @@ pub enum AdmissionError {
     TokenOutsideVocabulary { id: u32, index: usize, vocabulary: usize },
     #[error("the artifact has no draft layer to speculate with")]
     SpeculationUnavailable,
+    #[error("a request that hands out hidden rows does not speculate")]
+    HiddenWithSpeculation,
+    #[error("the artifact has no draft layer, whose seed rows hold the hidden rows")]
+    HiddenUnavailable,
     #[error("{0}")]
     Engine(String),
 }

@@ -53,6 +53,7 @@ use euhedral_gpu::Ran;
 use euhedral_graph::{Marker, QuantumOutcome};
 use euhedral_inference_cuda::{DevicePtr, PooledPinned, SubmitMode};
 
+use super::hidden::{Hidden, HiddenRows, HiddenSink, delivery_frame};
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
 use super::mtp::{Joining, Speculating, Verifying};
@@ -96,6 +97,10 @@ const ALTERNATING_RECORDS: u64 = 2;
 pub(crate) enum Message {
     /// A quantum retired.
     Retired(Box<Retired>),
+    /// The hidden rows of a quantum reached pinned memory.
+    HiddenCopied(Box<HiddenRows>),
+    /// The sink of a hidden request is free again: a delivery to it ended.
+    HiddenDelivered(Box<dyn HiddenSink>),
     /// The logits row of a teacher-forced step reached pinned memory.
     Logits(LogitsCopied),
     /// The host selected the token of a sampled request (or could not).
@@ -145,6 +150,8 @@ impl fmt::Debug for Message {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Message::Retired(_) => formatter.write_str("Message::Retired"),
+            Message::HiddenCopied(rows) => write!(formatter, "Message::HiddenCopied(position {})", rows.first_position),
+            Message::HiddenDelivered(_) => formatter.write_str("Message::HiddenDelivered"),
             Message::Logits(copied) => write!(formatter, "Message::Logits(step {})", copied.step),
             Message::Sampled(sampled) => write!(formatter, "Message::Sampled(step {})", sampled.step),
             Message::Prepared(prepared) => write!(formatter, "Message::Prepared(step {})", prepared.step),
@@ -329,6 +336,8 @@ pub(super) enum Step {
     /// A speculative step of `drafts` drafts: the catch-up (which makes the first), the recursive drafts and the
     /// verification of the current token and the drafts.
     Speculate { drafts: usize },
+    /// A verification of `rows` forced rows of a teacher-forced run, which hands every row's logits to its sink.
+    Forced { rows: usize },
     /// The decode that feeds the last token of a speculative request (a test hook).
     #[cfg_attr(
         not(feature = "test-oracles"),
@@ -412,6 +421,9 @@ pub(super) enum Mode {
     Forced {
         forced: Vec<u32>,
         sink: Box<dyn LogitsSink>,
+        /// Rows of one step after the prompt: 1 decodes a row at a time, more verifies that many rows at once
+        /// (`teacher_forced.rs`).
+        rows: usize,
     },
 }
 
@@ -461,6 +473,21 @@ impl Mode {
     }
 }
 
+/// Why a request that asks for its hidden states is refused: it speculates (its drafts' rows are not the rows of the
+/// tokens it commits), or the artifact has no draft layer whose state the rows come from.
+fn hidden_refusal(hidden: bool, speculation: &Speculation, drafts: bool) -> Option<AdmissionError> {
+    if !hidden {
+        return None;
+    }
+    if !matches!(speculation, Speculation::Off) {
+        return Some(AdmissionError::HiddenWithSpeculation);
+    }
+    if !drafts {
+        return Some(AdmissionError::HiddenUnavailable);
+    }
+    None
+}
+
 /// `count` samplers of `config` for rows of `vocabulary` logits, all made when the request begins.
 fn samplers(config: SamplingConfig, vocabulary: usize, count: usize) -> Result<Vec<TokenSampler>, SamplingError> {
     (0..count).map(|_| TokenSampler::new(config, vocabulary)).collect()
@@ -479,7 +506,7 @@ pub(super) enum Role {
     CatchUp,
     /// A recursive draft of a step.
     Draft,
-    /// The verification of a step.
+    /// The verification of a step, or of several forced rows.
     Verify,
     /// The decode that feeds the last token of a speculative request.
     Settle,
@@ -557,6 +584,8 @@ pub(super) struct Run {
     cancel: CancelHandle,
     /// A teacher-forced step's logits row is being copied.
     pub(super) waiting_logits: bool,
+    /// The sink the request hands every row's hidden state to; `None` for a request that does not.
+    pub(super) hidden: Option<Hidden>,
     /// Turns of the owner that panicked during this request.
     pub(super) panics: u32,
     pub(super) began: Instant,
@@ -593,6 +622,15 @@ impl Run {
                 last: self.offset + rows == self.prompt.len(),
             });
         }
+        if let Mode::Forced { rows, forced, .. } = &self.mode
+            && *rows > 1
+        {
+            // The rows still to be fed: the last forced token is only predicted.
+            let left = forced.len().saturating_sub(1 + self.decodes);
+            let room = self.capacity.saturating_sub(self.position) as usize;
+            let rows = left.min(*rows).min(room);
+            return (rows > 0).then_some(Step::Forced { rows });
+        }
         // Decode `k` takes token `k` and selects token `k + 1`: it is wanted while a token after it is.
         if self.wanted > 0 && self.decodes + 1 < self.wanted && self.position < self.capacity {
             Some(Step::Decode)
@@ -609,7 +647,7 @@ impl Run {
                 usize::from(last && self.wanted > 0 && !self.copies_rows(Role::Prefill { last }))
             }
             Step::Decode => usize::from(!self.copies_rows(Role::Decode)),
-            Step::PromptCatchUp { .. } | Step::Settle => 0,
+            Step::PromptCatchUp { .. } | Step::Settle | Step::Forced { .. } => 0,
             // The drafts are always selected on the device; the verification only when the host does not.
             Step::Speculate { drafts } => drafts + usize::from(!self.copies_rows(Role::Verify)),
         }
@@ -624,7 +662,8 @@ impl Run {
             Mode::Speculative { state, .. } => {
                 state.samples() && matches!(role, Role::Prefill { .. } | Role::Decode | Role::Verify)
             }
-            Mode::Greedy { .. } | Mode::Forced { .. } => false,
+            Mode::Forced { rows, .. } => *rows > 1 && role == Role::Verify,
+            Mode::Greedy { .. } => false,
         }
     }
 
@@ -848,6 +887,20 @@ impl Owner {
         cancel: CancelHandle,
         lease: Lease,
     ) -> Result<(), Rejected> {
+        self.begin_with(units, request, cancel, lease, None)
+    }
+
+    /// Starts a request, which hands the hidden state of every row it runs to `hidden` when there is a sink. Such a
+    /// request has the host select its tokens (as a sampled one), runs one quantum at a time, does not speculate and
+    /// does not use the prefix cache, whose restored rows would have no hidden state to hand out.
+    pub(crate) fn begin_with(
+        &mut self,
+        units: Result<Units, AdmissionError>,
+        request: GenerationRequest,
+        cancel: CancelHandle,
+        lease: Lease,
+        hidden: Option<Box<dyn HiddenSink>>,
+    ) -> Result<(), Rejected> {
         let GenerationRequest {
             prompt,
             max_tokens,
@@ -861,9 +914,12 @@ impl Owner {
             Ok(units) => units,
             Err(error) => return Err(Rejected::new(error, Audience::Greedy(listener))),
         };
+        if let Some(error) = hidden_refusal(hidden.is_some(), &speculation, self.shared.drafts.is_some()) {
+            return Err(Rejected::new(error, Audience::Greedy(listener)));
+        }
         let mode = match speculation {
             // The host selects the tokens: its drafts, if it speculates, stay greedy.
-            _ if !sampling.is_greedy() || constraint.is_some() => {
+            _ if hidden.is_some() || !sampling.is_greedy() || constraint.is_some() => {
                 if self.sequence.row_readbacks.is_exhausted() {
                     // Refused before the prompt prefills: the last chunk would find no row to copy its logits to.
                     let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
@@ -931,6 +987,9 @@ impl Owner {
             }
         };
         self.start_run(units, lease, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
+        if let Some(run) = self.run.as_mut() {
+            run.hidden = hidden.map(Hidden::new);
+        }
         self.look_up_prompt();
         // The first mask is prepared while the prompt prefills.
         self.prepare_constraint();
@@ -946,6 +1005,9 @@ impl Owner {
             return;
         };
         let Some(run) = self.run.as_mut() else { return };
+        if run.hidden.is_some() {
+            return;
+        }
         let kind = match &run.mode {
             Mode::Greedy { .. } | Mode::Sampled { .. } => None,
             Mode::Speculative { state, .. } => state.drafting().then_some(CheckpointKind::Mtp),
@@ -964,6 +1026,7 @@ impl Owner {
         units: Result<Units, AdmissionError>,
         prefix: Vec<u32>,
         forced: Vec<u32>,
+        step_rows: usize,
         sink: Box<dyn LogitsSink>,
         lease: Lease,
     ) -> Result<(), Rejected> {
@@ -971,6 +1034,9 @@ impl Owner {
             Ok(units) => units,
             Err(error) => return Err(Rejected::new(error, Audience::Forced(sink))),
         };
+        if let Some(error) = self.forced_rows_refusal(step_rows, sink.as_ref()) {
+            return Err(Rejected::new(error, Audience::Forced(sink)));
+        }
         let vocabulary = self.shared.config.vocab_size;
         if let Some((index, id)) = forced.iter().enumerate().find(|(_, id)| **id as usize >= vocabulary) {
             let error = AdmissionError::TokenOutsideVocabulary {
@@ -996,7 +1062,11 @@ impl Owner {
         self.start_run(
             units,
             lease,
-            Mode::Forced { forced, sink },
+            Mode::Forced {
+                forced,
+                sink,
+                rows: step_rows,
+            },
             prefix,
             wanted,
             Vec::new(),
@@ -1070,6 +1140,7 @@ impl Owner {
             stopping: None,
             cancel,
             waiting_logits: false,
+            hidden: None,
             panics: 0,
             began: Instant::now(),
             capacity,
@@ -1096,7 +1167,9 @@ impl Owner {
     fn admissible(&self) -> Option<Step> {
         let run = self.run.as_ref()?;
         // The tokens the host is selecting decide the next step.
-        if run.waiting_logits || run.selecting() || run.in_flight.len() >= run.depth {
+        // A hidden request's next quantum overwrites the rows being copied, and waits for a sink that is far behind.
+        let copying = run.hidden.as_ref().is_some_and(Hidden::full);
+        if run.waiting_logits || copying || run.selecting() || run.in_flight.len() >= run.depth {
             return None;
         }
         // The prefix cache first: the lookup's answer, the restore's job, or a capture of the state the next chunk would
@@ -1218,6 +1291,8 @@ impl Owner {
                 }
             }
             Message::Logits(copied) => self.deliver_row(copied),
+            Message::HiddenCopied(rows) => self.hidden_copied(*rows),
+            Message::HiddenDelivered(sink) => self.hidden_delivered(sink),
             Message::Sampled(sampled) => self.deliver_sample(sampled),
             Message::Prepared(prepared) => self.deliver_prepared(prepared),
             // The turn's `reap` is what the message is for.
@@ -1262,9 +1337,18 @@ impl Owner {
         let position = u64::from(hit.position());
         let reset = mem::take(&mut self.used);
         let drafting = self.drafts();
+        // The draft's last row of the checkpoint was paired with the token the stored prompt had at the position: with
+        // the same token here it is the row a cold run computes, and is restored with the others.
+        let whole = drafting
+            && hit.paired().is_some()
+            && self
+                .run
+                .as_ref()
+                .and_then(|run| run.prompt.get(position as usize).copied())
+                == hit.paired();
         let mut retained = KvRetained::default();
         let (_, reserved) = core
-            .lane_table
+            .lane_table()
             .submit_ops(core.owner_lane(), false, |lane| {
                 if reset {
                     self.sequence.reset(lane).map_err(why("resetting the sequence"))?;
@@ -1277,9 +1361,9 @@ impl Owner {
                 // The rows are part of the sequence from here: the copy's job is ordered before everything that reads them.
                 cache.commit(position).map_err(why("the cache's frontier"))?;
                 if drafting {
-                    // The draft's cache holds the rows below the checkpoint's last position: the pair of that row's
-                    // hidden row and the token after it belongs to whichever prompt resumes here.
-                    let rows = position - 1;
+                    // The draft's cache holds the rows below the checkpoint's last position, and the last too when the
+                    // prompt has the token the checkpoint paired it with: otherwise that row is recomputed.
+                    let rows = if whole { position } else { position - 1 };
                     let mtp = self.sequence.mtp_kv.as_mut().ok_or("the sequence has no MTP cache")?;
                     mtp.reserve(lane, &core.pool, 0, rows, &mut retained)
                         .map_err(why("reserving the restored draft rows"))?;
@@ -1293,7 +1377,7 @@ impl Owner {
             .sequence
             .refs(KvSource::Base)
             .map_err(why("the sequence's references"))?
-            .ordered_after(reserved, &core.lanes);
+            .ordered_after(reserved, core.lanes());
         if drafting {
             // The draft cache's reservation is claimed too; the references above hold its view.
             self.sequence
@@ -1326,8 +1410,9 @@ impl Owner {
         if let Mode::Speculative { state, .. } = &mut run.mode
             && drafting
         {
-            // The draft pairs the hidden row it was restored with and the token at the position, before the chunks do.
-            state.resumed_at(position as u32);
+            // Unless the last row came whole, the draft pairs the hidden row it was restored with and the token at the
+            // position, before the chunks do.
+            state.resumed_at(position as u32, whole);
         }
         Ok(())
     }
@@ -1458,7 +1543,7 @@ impl Owner {
     fn deliver_row(&mut self, copied: LogitsCopied) {
         let Some(run) = self.run.as_mut() else { return };
         let vocabulary = self.shared.config.vocab_size;
-        if let Mode::Forced { forced, sink } = &mut run.mode {
+        if let Mode::Forced { forced, sink, .. } = &mut run.mode {
             let all = copied.loan.buffer().as_slice();
             let bytes = &all[..vocabulary * 2];
             if let Some(next) = forced.get(copied.step) {
@@ -1567,7 +1652,7 @@ impl Owner {
         let frame = prepare_frame(self.id.0, step, constraint, move |prepared| {
             address.post(Message::Prepared(prepared))
         });
-        self.shared.core.completions.at(Instant::now(), frame);
+        self.shared.core.completions().at(Instant::now(), frame);
     }
 
     /// Takes in the preparation of the constraint's next mask. A row that retired meanwhile is selected from now; a
@@ -1621,7 +1706,7 @@ impl Owner {
         if core.released.is_empty() {
             return;
         }
-        let freed = core.lane_table.submit_ops(core.owner_lane(), false, |ops| {
+        let freed = core.lane_table().submit_ops(core.owner_lane(), false, |ops| {
             let mut first_error = None;
             core.released.drain(|buffer| {
                 if let Err(error) = ops.free_async(buffer) {
@@ -1638,7 +1723,7 @@ impl Owner {
 
     /// Lets go of the quanta whose owner-lane work has run.
     fn reap(&mut self) {
-        let lanes = &self.shared.core.lanes;
+        let lanes = self.shared.core.lanes();
         self.parked.retain(|parked| !lanes.reached(parked.marker));
     }
 
@@ -1654,7 +1739,7 @@ impl Owner {
     /// Keeps `quantum` and `retained` until the lane has reached `marker`, as `park` does for a quantum.
     fn keep(&mut self, marker: Marker, quantum: Option<Kept>, retained: KvRetained) {
         let core = &self.shared.core;
-        if core.lanes.reached(marker) {
+        if core.lanes().reached(marker) {
             return;
         }
         self.parked.push(Parked {
@@ -1663,7 +1748,7 @@ impl Owner {
             _retained: retained,
         });
         let address = Arc::clone(&self.shared.address);
-        core.completions.after_marker(
+        core.completions().after_marker(
             marker,
             step(Kind::Reaped, self.id.0, move || address.post(Message::Reaped)),
         );
@@ -1692,7 +1777,7 @@ impl Owner {
     }
 
     /// Ends the request with a failure.
-    fn fail(&mut self, why: String) {
+    pub(super) fn fail(&mut self, why: String) {
         if let Some(run) = self.run.as_mut() {
             run.stop(FinishReason::Failed(why));
         }
@@ -1781,7 +1866,11 @@ impl Owner {
         let Some(run) = self.run.as_mut() else { return };
         let ran = retired.ran;
         let event = QuantumEvent {
-            kind: flying.kind,
+            kind: if flying.role == Role::Decode {
+                QuantumKind::Decode
+            } else {
+                flying.kind
+            },
             rows: flying.rows,
             start_position: flying.start,
             admitted: flying.admitted,
@@ -1797,10 +1886,18 @@ impl Owner {
                 listener.prefill_done(now);
             }
         }
+        if run.hidden.is_some()
+            && matches!(flying.role, Role::Prefill { .. } | Role::Decode)
+            && let Err(why) = self.copy_hidden(flying)
+        {
+            return self.fail(why);
+        }
+        let Some(run) = self.run.as_mut() else { return };
         match flying.role {
             Role::Settle => return,
             Role::PromptCatchUp => return,
             Role::CatchUp | Role::Draft => return self.drafted(flying),
+            Role::Verify if matches!(run.mode, Mode::Forced { .. }) => return self.forced_rows_retired(flying),
             Role::Verify if run.copies_rows(Role::Verify) => return self.sample(flying),
             Role::Verify => return self.verified(flying),
             Role::Prefill { .. } | Role::Decode => {}
@@ -1935,7 +2032,7 @@ impl Owner {
                 LeasedRow::new(Arc::clone(&lease), row),
                 move |sampled| address.post(Message::Sampled(sampled)),
             );
-            shared.core.completions.at(Instant::now(), frame);
+            shared.core.completions().at(Instant::now(), frame);
         }
     }
 
@@ -1950,7 +2047,7 @@ impl Owner {
         let total = if wants_hidden { bytes + hidden_bytes } else { bytes };
         let mut loan = core.pool.acquire(total).map_err(why("the pinned row for the logits"))?;
         let (_, marker) = core
-            .lane_table
+            .lane_table()
             .submit_ops(core.owner_lane(), false, |kernels| {
                 // SAFETY: the loan is held by the message that follows the copy, which is offered only once the lane
                 // has reached the marker; nothing reads or writes the bytes before.
@@ -1979,8 +2076,102 @@ impl Owner {
         let frame = step_frame(self.id.0, move || {
             address.post(Message::Logits(LogitsCopied { step, loan }))
         });
-        core.completions.after_marker(marker, frame);
+        core.completions().after_marker(marker, frame);
         Ok(())
+    }
+
+    /// Queues the copy of the rows a retired quantum seeded, and of its logits row when it selected, to pinned memory on
+    /// the owner's lane. The next quantum is admitted once the lane has reached the copy ([`Owner::hidden_copied`]).
+    fn copy_hidden(&mut self, flying: &Flying) -> Result<(), String> {
+        // The seed rows are the sequence's own, whether the quantum ran alone or as a part of a pass: each segment
+        // normalizes into its own sequence's rows.
+        let seeds = self
+            .sequence
+            .device
+            .scratch
+            .draft()
+            .ok_or_else(|| "the sequence has no draft buffers to hold the hidden rows".to_string())?
+            .seed_rows
+            .ptr();
+        let core = &self.shared.core;
+        let hidden_bytes = flying.rows * self.shared.config.hidden_size * 2;
+        let logits_bytes = if flying.row.is_some() {
+            self.shared.config.vocab_size * 2
+        } else {
+            0
+        };
+        let mut loan = core
+            .pool
+            .acquire(hidden_bytes + logits_bytes)
+            .map_err(why("the pinned rows for the hidden state"))?;
+        if logits_bytes > 0 {
+            // The logits row is the one the quantum copied in-stream to its row readback, which only this request's
+            // quantum wrote: the workspace's logits are shared by every sequence and may be another's by now.
+            let row = flying
+                .row
+                .as_ref()
+                .and_then(|lease| lease.readback().row(0))
+                .ok_or_else(|| "a hidden request's quantum retired with no logits row in its readback".to_string())?;
+            if row.len() != logits_bytes {
+                return Err("the logits row's readback has the wrong size".to_string());
+            }
+            loan.buffer_mut().as_mut_slice()[hidden_bytes..hidden_bytes + logits_bytes].copy_from_slice(row);
+        }
+        // One device copy is queued, so a failure to queue it leaves nothing pending on the loan.
+        let (_, marker) = core
+            .lane_table()
+            .submit_ops(core.owner_lane(), false, |kernels| {
+                // SAFETY: the loan is held by the message that follows the copy, which is offered only once the lane has
+                // reached the marker, and the next quantum, which overwrites the sources, is admitted after that message.
+                unsafe { kernels.copy_device_to_readback(loan.buffer_mut(), 0, seeds, hidden_bytes) }
+                    .map_err(why("queueing the hidden rows' copy"))
+            })
+            .map_err(why("the hidden rows' copy"))?;
+        let rows = HiddenRows {
+            first_position: flying.start,
+            rows: flying.rows,
+            hidden_bytes,
+            logits_bytes,
+            loan,
+        };
+        if let Some(hidden) = self.run.as_mut().and_then(|run| run.hidden.as_mut()) {
+            hidden.copying = true;
+        }
+        let address = Arc::clone(&self.shared.address);
+        let frame = step_frame(self.id.0, move || address.post(Message::HiddenCopied(Box::new(rows))));
+        core.completions().after_marker(marker, frame);
+        Ok(())
+    }
+
+    /// The rows of a quantum reached pinned memory: they go to the sink, as a frame, when it is free.
+    fn hidden_copied(&mut self, rows: HiddenRows) {
+        if let Some(hidden) = self.run.as_mut().and_then(|run| run.hidden.as_mut()) {
+            hidden.arrived(rows);
+        }
+        self.deliver_hidden();
+    }
+
+    /// A delivery ended: the sink is back, and the rows that waited for it go.
+    fn hidden_delivered(&mut self, sink: Box<dyn HiddenSink>) {
+        if let Some(hidden) = self.run.as_mut().and_then(|run| run.hidden.as_mut()) {
+            hidden.returned(sink);
+        }
+        self.deliver_hidden();
+    }
+
+    /// Publishes the frame that hands the oldest waiting rows to the sink, when the sink is free.
+    fn deliver_hidden(&mut self) {
+        let Some((sink, rows)) = self
+            .run
+            .as_mut()
+            .and_then(|run| run.hidden.as_mut())
+            .and_then(Hidden::next_delivery)
+        else {
+            return;
+        };
+        let address = Arc::clone(&self.shared.address);
+        let frame = delivery_frame(self.id.0, address, sink, rows);
+        self.shared.core.completions().at(Instant::now(), frame);
     }
 
     /// Admits quanta while the request has steps and room for them.
@@ -1993,9 +2184,19 @@ impl Owner {
                 return;
             }
         }
-        if let Some(run) = self.run.as_mut().filter(|run| run.next_step(chunk).is_none()) {
-            // Nothing will be chained behind the last quantum: let it retire.
-            run.end_chain();
+        if let Some(run) = self.run.as_mut() {
+            let ended = run.next_step(chunk).is_none();
+            if ended {
+                // Nothing will be chained behind the last quantum: let it retire.
+                run.end_chain();
+            }
+            // A hidden request that offers no step soon (its sink is far behind, or its context is full) must not hold
+            // the passes of the other sequences, which wait for each member of the last pass to offer or leave.
+            // Only with nothing in flight: a step still pending would be withdrawn.
+            let sink_behind = run.hidden.as_ref().map(Hidden::behind);
+            if passes_choice(sink_behind, ended, run.in_flight.len()) == PassesChoice::Leave {
+                run.leave_passes();
+            }
         }
     }
 
@@ -2006,6 +2207,7 @@ impl Owner {
             Step::PromptCatchUp { rows } => self.admit_prompt_catch_up(rows),
             Step::Speculate { drafts } => self.admit_speculation(drafts),
             Step::Settle => self.admit_settle(),
+            Step::Forced { rows } => self.admit_forced_rows(rows),
         }
     }
 
@@ -2015,6 +2217,7 @@ impl Owner {
         let start = run.position;
         let speculative = matches!(run.mode, Mode::Speculative { .. });
         let drafting = matches!(&run.mode, Mode::Speculative { state, .. } if state.drafting());
+        let hidden = run.hidden.is_some();
         // A chunk that ends at a checkpoint has nothing chained behind it: it retires, and the state it leaves is captured
         // before the next chunk starts (see `PromptCheckpoints`).
         let end = run.offset + next_rows(next);
@@ -2090,7 +2293,7 @@ impl Owner {
                     Some(previous) => quantum.token_from(previous)?,
                     None => quantum.with_tokens(tokens)?,
                 };
-                if drafting && matches!(next, Step::Prefill { .. }) {
+                if hidden || (drafting && matches!(next, Step::Prefill { .. })) {
                     quantum.seeding_draft()
                 } else {
                     Ok(quantum)
@@ -2161,8 +2364,13 @@ impl Owner {
         if run.in_flight.is_empty() {
             run.cursor = 0;
         }
-        // A step that is not part of a speculative one is not offered: the passes do not wait for the request.
-        if matches!(role, Role::Decode | Role::Settle | Role::Prefill { .. }) {
+        // A hidden request's decode runs as a one-row verification: row-exact, as the corpus's reference is, and offered
+        // to the workspace's passes so that concurrent requests read the weights once. It stays a decode for the
+        // request: its row commits at once, and its listener hears a decode.
+        let hidden_decode = role == Role::Decode && run.hidden.is_some();
+        let kind = if hidden_decode { QuantumKind::Verify } else { kind };
+        // A step that is not a verification is not offered: the passes do not wait for the request.
+        if !hidden_decode && matches!(role, Role::Decode | Role::Settle | Role::Prefill { .. }) {
             run.leave_passes();
         }
 
@@ -2171,7 +2379,7 @@ impl Owner {
         let mut retained = mem::take(&mut run.carried);
         run.carried_marker = None;
         let (_, reserved) = core
-            .lane_table
+            .lane_table()
             .submit_ops(core.owner_lane(), false, |lane| {
                 if run.admitted == 0 && self.used {
                     self.sequence.reset(lane).map_err(why("resetting the sequence"))?;
@@ -2195,7 +2403,7 @@ impl Owner {
             .sequence
             .refs(source)
             .map_err(why("the sequence's references"))?
-            .ordered_after(reserved, &core.lanes)
+            .ordered_after(reserved, core.lanes())
             .with_replay_rows(replay);
         let taken = take.then(|| refs.clone());
         let mode = SubmitMode {
@@ -2214,7 +2422,7 @@ impl Owner {
             refs,
             mode,
             Arc::clone(&shared.config),
-            core.lane_table.clone(),
+            core.lane_table().clone(),
         )
         .map_err(why("the quantum"))?
         .with_input_record(shared.order.record(self.id, record));
@@ -2237,10 +2445,10 @@ impl Owner {
         // after that would free the pinned record under the copy.
         quantum.validate().map_err(why("the quantum"))?;
         // A verification is offered for a pass, whose start uploads its record (its own, or the pass's).
-        let offered = role == Role::Verify;
+        let offered = role == Role::Verify || hidden_decode;
         if !offered {
             let (_, prepared) = core
-                .lane_table
+                .lane_table()
                 .submit_ops(core.owner_lane(), false, |kernels| {
                     quantum.prepare(&core.pool, kernels).map_err(why("the input record"))
                 })
@@ -2249,8 +2457,9 @@ impl Owner {
         }
 
         let selection = quantum.selection().cloned();
-        // The restore's flag goes to the first chunk. On a restore of a drafting request the first quantum is the one-row
-        // catch-up that precedes the chunk: it shares the flag (clones it) and the chunk takes it, so a failed copy stops both.
+        // The restore's flag goes to the first chunk. On a restore of a drafting request that has to re-pair the
+        // checkpoint's last row, the first quantum is the one-row catch-up that precedes the chunk: it shares the flag
+        // (clones it) and the chunk takes it, so a failed copy stops both.
         let kill = if kind == QuantumKind::Draft {
             run.first_kill.clone()
         } else {
@@ -2319,7 +2528,9 @@ impl Owner {
             return;
         }
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
-        if !run.in_flight.is_empty() || run.waiting_logits || run.selecting() || run.preparing() || !ended {
+        let delivering = run.hidden.as_ref().is_some_and(Hidden::busy);
+        if !run.in_flight.is_empty() || run.waiting_logits || delivering || run.selecting() || run.preparing() || !ended
+        {
             return;
         }
         // A restore's reservation that no chunk took (the request ended first) has its table upload queued on the owner's
@@ -2367,6 +2578,25 @@ impl Owner {
 /// it says no, the drop of the last guard wakes the owner.
 pub(super) fn may_end(parked: usize, flight: &Flight) -> bool {
     parked == 0 && flight.settled()
+}
+
+/// What a request does about the shared passes when it has no step to offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassesChoice {
+    /// Keep offering to the passes.
+    Offer,
+    /// Leave the passes, so that the other sequences need not wait for this one.
+    Leave,
+}
+
+/// Whether a request leaves the shared passes: only a hidden request (`sink_behind` is its sink's state, `None` for
+/// any other request) whose sink is behind or that has no next step (`ended`), and only with nothing in flight, since
+/// a step still pending would be withdrawn.
+fn passes_choice(sink_behind: Option<bool>, ended: bool, in_flight: usize) -> PassesChoice {
+    match sink_behind {
+        Some(behind) if (behind || ended) && in_flight == 0 => PassesChoice::Leave,
+        _ => PassesChoice::Offer,
+    }
 }
 
 /// The prompt rows a prefill step takes: 0 for any other.
@@ -2436,6 +2666,43 @@ impl Turn for Owner {
 }
 
 #[cfg(test)]
+mod passes_choice_tests {
+    use super::*;
+
+    #[test]
+    fn a_sink_behind_with_nothing_in_flight_leaves() {
+        assert_eq!(passes_choice(Some(true), false, 0), PassesChoice::Leave);
+    }
+
+    #[test]
+    fn a_sink_behind_with_a_step_in_flight_stays() {
+        assert_eq!(passes_choice(Some(true), false, 1), PassesChoice::Offer);
+    }
+
+    #[test]
+    fn no_next_step_with_nothing_in_flight_leaves() {
+        assert_eq!(passes_choice(Some(false), true, 0), PassesChoice::Leave);
+    }
+
+    #[test]
+    fn no_next_step_with_a_step_in_flight_stays() {
+        assert_eq!(passes_choice(Some(false), true, 2), PassesChoice::Offer);
+    }
+
+    #[test]
+    fn a_sink_that_keeps_up_with_a_next_step_offers() {
+        assert_eq!(passes_choice(Some(false), false, 0), PassesChoice::Offer);
+    }
+
+    #[test]
+    fn a_request_without_a_hidden_sink_never_leaves() {
+        for ended in [false, true] {
+            assert_eq!(passes_choice(None, ended, 0), PassesChoice::Offer);
+        }
+    }
+}
+
+#[cfg(test)]
 mod routing_tests {
     use super::*;
 
@@ -2454,6 +2721,20 @@ mod routing_tests {
             hash(step_frame(2, || {})),
             hash(step_frame(2, || {})),
             "one sequence keeps its chain"
+        );
+    }
+
+    #[test]
+    fn hidden_states_are_refused_with_speculation_or_without_a_draft_layer() {
+        assert_eq!(hidden_refusal(false, &Speculation::Artifact, false), None);
+        assert_eq!(hidden_refusal(true, &Speculation::Off, true), None);
+        assert_eq!(
+            hidden_refusal(true, &Speculation::Artifact, true),
+            Some(AdmissionError::HiddenWithSpeculation)
+        );
+        assert_eq!(
+            hidden_refusal(true, &Speculation::Off, false),
+            Some(AdmissionError::HiddenUnavailable)
         );
     }
 }

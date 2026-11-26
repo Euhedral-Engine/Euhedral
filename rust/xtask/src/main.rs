@@ -4,7 +4,11 @@
 //! `bindgen` command, which must be exactly version 0.72.1 (`cargo install bindgen-cli --version 0.72.1 --locked`) so
 //! the output does not drift. bindgen also needs libclang; its version is not pinned (the generated declarations do
 //! not depend on it for this header). With `--check` it regenerates into `target/` and fails when the checked-in file
-//! differs.
+//! differs. Only the entry points and constants listed in `xtask/bindings-allowlist.txt` are bound; a new native entry
+//! point is added to that list in the same change that first calls it.
+//!
+//! `cargo xtask bundle --product <linux-x64|windows-x64> [--native <dir>] [--out <dir>]` builds `euhedral-server` in
+//! release and assembles a runnable bundle (see [`bundle`]).
 
 // A build tool, not a library crate: it has no clippy.toml of the no-wait bans, and its output, its `expect` and its
 // exit are its interface.
@@ -15,6 +19,8 @@
     reason = "a binary: it reports on the terminal and may abort"
 )]
 
+mod bundle;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,6 +30,7 @@ const HEADER: &str = "native/include/euhedral_cuda.h";
 const OUTPUT: &str = "rust/crates/cuda/src/sys.rs";
 const CHECK_OUTPUT: &str = "rust/target/xtask/sys.rs";
 const LIBRARY_STRUCT: &str = "EuhedralCuda";
+const ALLOWLIST: &str = "rust/xtask/bindings-allowlist.txt";
 const BINDGEN_VERSION: &str = "0.72.1";
 
 fn main() -> ExitCode {
@@ -31,7 +38,8 @@ fn main() -> ExitCode {
     let result = match arguments.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["bindings"] => bindings(false),
         ["bindings", "--check"] => bindings(true),
-        _ => Err("usage: cargo xtask bindings [--check]".to_string()),
+        ["bundle", rest @ ..] => bundle::run(rest),
+        _ => Err("usage: cargo xtask bindings [--check] | bundle --product <linux-x64|windows-x64> [--native <dir>] [--out <dir>]".to_string()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -43,7 +51,7 @@ fn main() -> ExitCode {
 }
 
 /// The repository root: this crate sits at `<root>/rust/xtask`.
-fn repository_root() -> PathBuf {
+pub(crate) fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
@@ -82,10 +90,11 @@ fn bindings(check: bool) -> Result<(), String> {
 /// Runs bindgen over the public header into `output`.
 ///
 /// Every declared function must be exported by the library (`--dynamic-link-require-all`), so a library that lacks one
-/// fails to load with the symbol's name. `euhedral_cuda_submission_stream` is declared for the library's own sources
-/// and is not exported.
+/// fails to load with the symbol's name. The allowlist leaves out `euhedral_cuda_submission_stream`, which is declared
+/// for the library's own sources and is not exported.
 fn generate(root: &Path, output: &Path) -> Result<(), String> {
     require_bindgen_version()?;
+    let allowlist = read_allowlist(root)?;
     let status = Command::new("bindgen")
         .current_dir(root)
         .arg(HEADER)
@@ -100,9 +109,7 @@ fn generate(root: &Path, output: &Path) -> Result<(), String> {
             "prettyplease",
         ])
         .args(["--dynamic-loading", LIBRARY_STRUCT, "--dynamic-link-require-all"])
-        .args(["--allowlist-function", "euhedral_cuda_.*"])
-        .args(["--blocklist-function", "euhedral_cuda_submission_stream"])
-        .args(["--allowlist-var", "EUHEDRAL_CUDA_.*"])
+        .args(allowlist)
         .args(["--no-doc-comments", "--no-layout-tests"])
         .status()
         .map_err(|error| {
@@ -115,6 +122,32 @@ fn generate(root: &Path, output: &Path) -> Result<(), String> {
     } else {
         Err(format!("bindgen failed: {status}"))
     }
+}
+
+/// The bindgen arguments of the allowlist file: each `function`, `type` or `var` line allows that whole name.
+fn read_allowlist(root: &Path) -> Result<Vec<String>, String> {
+    let text = fs::read_to_string(root.join(ALLOWLIST)).map_err(|error| format!("cannot read {ALLOWLIST}: {error}"))?;
+    let mut arguments = Vec::new();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let flag = match line.split_once(' ') {
+            Some(("function", _)) => "--allowlist-function",
+            Some(("type", _)) => "--allowlist-type",
+            Some(("var", _)) => "--allowlist-var",
+            _ => {
+                return Err(format!(
+                    "{ALLOWLIST}: expected `function|type|var NAME`, found `{line}`"
+                ));
+            }
+        };
+        let name = line.split_once(' ').map_or("", |(_, name)| name.trim());
+        arguments.push(flag.to_string());
+        arguments.push(format!("^{name}$"));
+    }
+    Ok(arguments)
 }
 
 /// Fails unless `bindgen --version` reports [`BINDGEN_VERSION`].
