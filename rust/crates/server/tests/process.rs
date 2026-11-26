@@ -9,7 +9,7 @@
 mod common;
 
 use std::fs::{create_dir, write};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio, id};
@@ -339,22 +339,35 @@ fn the_server_answers_on_both_loopback_addresses() {
 const WAVE: usize = 16;
 const WAVES: usize = 4;
 
-/// Starts one scripted server and makes its first connection as soon as the port accepts: the outcome of that one
-/// exchange. No retry after a connection was made.
+/// Starts one scripted server, waits for its own record that it listens and makes its first connection: the outcome of
+/// that one exchange. No retry, and no clock: how long the start takes under load is not what is asked.
 fn first_exchange(directory: &Path, start: usize) -> Result<(), String> {
     let port = free_port();
     let file = config(&directory.join(start.to_string()), port, "");
-    let mut server = spawn(&["--config", file.to_str().expect("a path"), "--scripted-backend=hello"]);
+    let mut server = spawn_with(
+        &["--config", file.to_str().expect("a path"), "--scripted-backend=hello"],
+        Stdio::piped(),
+    );
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let deadline = Instant::now() + PATIENCE;
-    let outcome = loop {
-        match try_exchange(addr, "GET", "/health", None) {
-            Err(error) if error.starts_with("connecting") && Instant::now() < deadline => {
-                sleep(Duration::from_millis(1 + (start % 10) as u64));
-            }
-            other => break other,
+    // Held until the end so that the server's log keeps a reader. The read ends at the record, or at the end of the
+    // stream when the process exits without it.
+    let mut log = BufReader::new(server.0.stdout.take().expect("a piped stdout"));
+    let mut line = String::new();
+    let listening = loop {
+        line.clear();
+        match log.read_line(&mut line) {
+            Ok(0) | Err(_) => break false,
+            Ok(_) if line.contains("Listening on port") => break true,
+            Ok(_) => {}
         }
     };
+    if !listening {
+        return Err(format!(
+            "port {port}: the server ended without announcing that it listens; the process {:?}",
+            server.0.wait().expect("a status")
+        ));
+    }
+    let outcome = try_exchange(addr, "GET", "/health", None);
     match outcome {
         Ok(answer) if status(&answer) == 200 => Ok(()),
         other => Err(format!(
