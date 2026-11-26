@@ -16,6 +16,7 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads the device and waits on hand-offs"
 )]
 
+use std::env;
 use std::iter;
 use std::mem;
 use std::path::PathBuf;
@@ -62,6 +63,11 @@ fn shared_engine(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
 }
 
 fn start(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
+    start_with(machine, 1)
+}
+
+/// An engine of `sequences` sequences.
+fn start_with(machine: &Machine, sequences: usize) -> (Card, Arc<EngineRuntime>) {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -69,6 +75,7 @@ fn start(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
     settings.context.max_tokens = 512;
     settings.kernels.graphs.captures_per_view = 8;
     settings.batching.prefill_chunk_tokens = CHUNK;
+    settings.batching.max_sequences = sequences as u32;
     common::engine(&settings, &machine.library)
 }
 
@@ -105,6 +112,8 @@ impl Gate {
 struct Recorder {
     /// Cancels the generation once its prompt has prefilled, when set.
     cancel_after_prefill: Option<CancelHandle>,
+    /// Cancels the generation once this many quanta have retired, when set.
+    cancel_after_quanta: Option<(usize, CancelHandle)>,
     /// Opens the gate once this many quanta have retired, when set.
     open_after_quanta: Option<(usize, Arc<Gate>)>,
     quanta: usize,
@@ -125,6 +134,11 @@ impl GenerationListener for Recorder {
 
     fn quantum(&mut self, _event: QuantumEvent) {
         self.quanta += 1;
+        if let Some((count, cancel)) = &self.cancel_after_quanta
+            && self.quanta == *count
+        {
+            cancel.cancel();
+        }
         if let Some((count, gate)) = &self.open_after_quanta
             && self.quanta == *count
         {
@@ -195,6 +209,7 @@ fn request(
         constraint: None,
         listener: Box::new(Recorder {
             cancel_after_prefill: None,
+            cancel_after_quanta: None,
             open_after_quanta: None,
             quanta: 0,
             tokens: Vec::new(),
@@ -236,24 +251,33 @@ fn hidden(
     hidden_held(runtime, prompt, max_tokens, sampling, None)
 }
 
-/// As [`hidden`], with a sink whose first call waits at `hold` (the listener opens it, when it has a count).
-fn hidden_held(
+/// A hidden generation under way: what it told its listener and its sink is waited for with [`Running::wait`].
+struct Running {
+    done: Arc<Handoff<Recording>>,
+    heard: Arc<Handoff<Vec<Delivered>>>,
+}
+
+impl Running {
+    fn wait(self) -> (Recording, Vec<Delivered>) {
+        let recording = self.done.wait(WAIT).expect("the generation reports");
+        let rows = self.heard.wait(WAIT).expect("the sink is let go of");
+        (recording, rows)
+    }
+}
+
+/// Starts a hidden generation of `generation`, with a sink whose first call waits at `gate`, and a listener of its own.
+fn begin_hidden(
     runtime: &EngineRuntime,
-    prompt: &[u32],
-    max_tokens: u32,
-    sampling: SamplingConfig,
-    hold: Option<(usize, Arc<Gate>)>,
-) -> (Recording, Vec<Delivered>) {
+    mut generation: GenerationRequest,
+    listener: Recorder,
+    gate: Option<Arc<Gate>>,
+    cancel: CancelHandle,
+) -> Running {
     let done = Handoff::new();
     let heard = Handoff::new();
-    let mut generation = request(prompt, max_tokens, Speculation::Off, sampling, &done);
-    let gate = hold.as_ref().map(|(_, gate)| Arc::clone(gate));
     generation.listener = Box::new(Recorder {
-        cancel_after_prefill: None,
-        open_after_quanta: hold,
-        quanta: 0,
-        tokens: Vec::new(),
         done: Some(Arc::clone(&done)),
+        ..listener
     });
     runtime
         .generate_hidden(
@@ -263,12 +287,31 @@ fn hidden_held(
                 heard: Vec::new(),
                 done: Some(Arc::clone(&heard)),
             },
-            CancelHandle::default(),
+            cancel,
         )
         .expect("the request is admitted");
-    let recording = done.wait(WAIT).expect("the generation reports");
-    let rows = heard.wait(WAIT).expect("the sink is let go of");
-    (recording, rows)
+    Running { done, heard }
+}
+
+/// As [`hidden`], with a sink whose first call waits at `hold` (the listener opens it, when it has a count).
+fn hidden_held(
+    runtime: &EngineRuntime,
+    prompt: &[u32],
+    max_tokens: u32,
+    sampling: SamplingConfig,
+    hold: Option<(usize, Arc<Gate>)>,
+) -> (Recording, Vec<Delivered>) {
+    let generation = request(prompt, max_tokens, Speculation::Off, sampling, &Handoff::new());
+    let gate = hold.as_ref().map(|(_, gate)| Arc::clone(gate));
+    let listener = Recorder {
+        cancel_after_prefill: None,
+        cancel_after_quanta: None,
+        open_after_quanta: hold,
+        quanta: 0,
+        tokens: Vec::new(),
+        done: None,
+    };
+    begin_hidden(runtime, generation, listener, gate, CancelHandle::default()).wait()
 }
 
 /// The sequence's draft seed rows: the rows the draft layer's catch-up reads, `rows` of them.
@@ -320,6 +363,7 @@ fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     let mut cancelled = request(&ids, 8, Speculation::Artifact, greedy(), &done);
     cancelled.listener = Box::new(Recorder {
         cancel_after_prefill: Some(cancel.clone()),
+        cancel_after_quanta: None,
         open_after_quanta: None,
         quanta: 0,
         tokens: Vec::new(),
@@ -453,4 +497,191 @@ fn a_held_sink_holds_the_request_back_and_hears_every_row_in_order() {
     let positions: Vec<u64> = heard.iter().map(|call| call.first_position).collect();
     let expected: Vec<u64> = iter::once(0).chain(20..31).collect();
     assert_eq!(positions, expected, "every quantum's rows, once, in order");
+}
+
+/// Prompts of `length` token ids that differ from one `index` to the next.
+fn prompt_of(index: usize, length: usize) -> Vec<u32> {
+    (0..length)
+        .map(|position| 1000 + ((position + index * 11) as u32 * 37) % 5000)
+        .collect()
+}
+
+/// What a hidden generation told its sink and listener, compared whole.
+fn assert_same(name: &str, together: &(Recording, Vec<Delivered>), alone: &(Recording, Vec<Delivered>)) {
+    assert_eq!(together.0.tokens, alone.0.tokens, "{name}: the tokens");
+    assert_eq!(together.1.len(), alone.1.len(), "{name}: the deliveries");
+    for (call, (together, alone)) in together.1.iter().zip(&alone.1).enumerate() {
+        assert_eq!(
+            together.first_position, alone.first_position,
+            "{name}: delivery {call}'s position"
+        );
+        assert_eq!(together.rows, alone.rows, "{name}: delivery {call}'s rows");
+        assert_eq!(together.hidden, alone.hidden, "{name}: delivery {call}'s hidden rows");
+        assert_eq!(together.logits, alone.logits, "{name}: delivery {call}'s logits");
+    }
+}
+
+/// Starts one hidden generation for each of `prompts` at once; the last is cancelled after `cancel_last` quanta (the
+/// prompt's chunk and then decode rows, which run in shared passes) when it is set.
+fn together(
+    runtime: &EngineRuntime,
+    prompts: &[Vec<u32>],
+    new_tokens: u32,
+    cancel_last: Option<usize>,
+) -> Vec<(Recording, Vec<Delivered>)> {
+    let running: Vec<Running> = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, ids)| {
+            let cancel = CancelHandle::default();
+            let cancelled = cancel_last.filter(|_| index + 1 == prompts.len());
+            let listener = Recorder {
+                cancel_after_prefill: None,
+                cancel_after_quanta: cancelled.map(|quanta| (quanta, cancel.clone())),
+                open_after_quanta: None,
+                quanta: 0,
+                tokens: Vec::new(),
+                done: None,
+            };
+            let generation = request(ids, new_tokens, Speculation::Off, greedy(), &Handoff::new());
+            begin_hidden(runtime, generation, listener, None, cancel)
+        })
+        .collect();
+    running.into_iter().map(Running::wait).collect()
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn concurrent_hidden_requests_share_passes_and_each_hears_what_it_would_alone() {
+    const REQUESTS: usize = 3;
+    let Some(machine) = machine() else { return };
+    let (_card, runtime) = start_with(&machine, REQUESTS);
+
+    let prompts: Vec<Vec<u32>> = (0..REQUESTS).map(|index| prompt_of(index, 40 + index * 9)).collect();
+    let alone: Vec<_> = prompts.iter().map(|ids| hidden(&runtime, ids, 24, greedy())).collect();
+    let before = runtime.pass_statistics();
+    let shared = together(&runtime, &prompts, 24, None);
+    let after = runtime.pass_statistics();
+    for (index, (shared, alone)) in shared.iter().zip(&alone).enumerate() {
+        assert_same(&format!("request {index}"), shared, alone);
+    }
+    println!(
+        "HIDDEN_PASSES: {} passes, {} segments, {} batched, {} rows",
+        after.passes - before.passes,
+        after.segments - before.segments,
+        after.batched - before.batched,
+        after.rows - before.rows
+    );
+    assert!(
+        after.batched > before.batched,
+        "no pass held the decode rows of several hidden requests"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_hidden_request_cancelled_among_others_leaves_their_rows_intact() {
+    const REQUESTS: usize = 3;
+    let Some(machine) = machine() else { return };
+    let (_card, runtime) = start_with(&machine, REQUESTS);
+
+    let prompts: Vec<Vec<u32>> = (0..REQUESTS).map(|index| prompt_of(index, 40 + index * 9)).collect();
+    let alone: Vec<_> = prompts[..REQUESTS - 1]
+        .iter()
+        .map(|ids| hidden(&runtime, ids, 24, greedy()))
+        .collect();
+    let shared = together(&runtime, &prompts, 24, Some(8));
+    assert_eq!(shared[REQUESTS - 1].0.outcome.reason, FinishReason::Cancelled);
+    assert!(
+        shared[REQUESTS - 1].0.tokens.len() < 24,
+        "the request was cancelled while it decoded"
+    );
+    for (index, alone) in alone.iter().enumerate() {
+        assert_same(&format!("request {index}"), &shared[index], alone);
+    }
+}
+
+/// The aggregate hidden-generation rate of `EUHEDRAL_HIDDEN_SEQUENCES` concurrent requests of 256 prompt tokens and 128
+/// new tokens, which a run of its own measures (a run without the variable measures nothing).
+#[test]
+#[ignore = "a measurement: needs a GPU, the native library and the RCO artifact"]
+fn hidden_generation_rate_of_concurrent_requests() {
+    const NEW_TOKENS: u32 = 128;
+    let Some(machine) = machine() else { return };
+    let Some(requests) = env::var("EUHEDRAL_HIDDEN_SEQUENCES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        println!("skipped: set EUHEDRAL_HIDDEN_SEQUENCES to the number of concurrent requests");
+        return;
+    };
+    let (_card, runtime) = start_with(&machine, requests);
+    let prompts: Vec<Vec<u32>> = (0..requests).map(|index| prompt_of(index, 256)).collect();
+    // The first run warms the kernels and the graphs.
+    together(&runtime, &prompts, 8, None);
+    let before = runtime.pass_statistics();
+    let start = Instant::now();
+    let runs = together(&runtime, &prompts, NEW_TOKENS, None);
+    let seconds = start.elapsed().as_secs_f64();
+    let after = runtime.pass_statistics();
+    let tokens: usize = runs.iter().map(|(recording, _)| recording.tokens.len()).sum();
+    println!(
+        "HIDDEN_RATE: {requests} requests, {tokens} tokens in {seconds:.2} s (prefill included): {:.1} tokens/s; {} passes, {} segments",
+        tokens as f64 / seconds,
+        after.passes - before.passes,
+        after.segments - before.segments
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn a_hidden_request_shares_passes_with_a_sampled_speculative_one() {
+    const NEW_TOKENS: u32 = 48;
+    let Some(machine) = machine() else { return };
+    let (_card, runtime) = start_with(&machine, 2);
+
+    let hidden_ids = prompt_of(0, 40);
+    let speculative_ids = prompt_of(1, 60);
+    let hidden_alone = hidden(&runtime, &hidden_ids, NEW_TOKENS, greedy());
+    let speculative_alone = plain(&runtime, &speculative_ids, NEW_TOKENS, Speculation::Artifact, sampled());
+
+    let before = runtime.pass_statistics();
+    let done = Handoff::new();
+    runtime
+        .generate(request(
+            &speculative_ids,
+            NEW_TOKENS,
+            Speculation::Artifact,
+            sampled(),
+            &done,
+        ))
+        .expect("the request is admitted");
+    let listener = Recorder {
+        cancel_after_prefill: None,
+        cancel_after_quanta: None,
+        open_after_quanta: None,
+        quanta: 0,
+        tokens: Vec::new(),
+        done: None,
+    };
+    let generation = request(&hidden_ids, NEW_TOKENS, Speculation::Off, greedy(), &Handoff::new());
+    let hidden_together = begin_hidden(&runtime, generation, listener, None, CancelHandle::default()).wait();
+    let speculative_together = done.wait(WAIT).expect("the generation reports");
+    let after = runtime.pass_statistics();
+
+    assert_same("the hidden request", &hidden_together, &hidden_alone);
+    assert_eq!(
+        speculative_together.tokens, speculative_alone.tokens,
+        "the speculative request's tokens"
+    );
+    println!(
+        "MIXED_PASSES: {} passes, {} segments, {} batched",
+        after.passes - before.passes,
+        after.segments - before.segments,
+        after.batched - before.batched
+    );
+    assert!(
+        after.batched > before.batched,
+        "no pass held a hidden row next to a speculative verification"
+    );
 }

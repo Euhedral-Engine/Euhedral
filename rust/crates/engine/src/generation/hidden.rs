@@ -61,6 +61,11 @@ impl Hidden {
         self.copying || !self.queue.is_empty() || self.sink.is_none()
     }
 
+    /// Whether the sink has left a full queue of rows undelivered: the request offers no step until it drains.
+    pub(super) fn behind(&self) -> bool {
+        self.queue.len() >= MAX_QUEUED
+    }
+
     /// Whether the sink is so far behind that no further rows are copied: the next quantum waits.
     pub(super) fn full(&self) -> bool {
         self.copying || self.queue.len() >= MAX_QUEUED
