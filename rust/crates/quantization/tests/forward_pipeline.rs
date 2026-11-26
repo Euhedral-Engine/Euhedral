@@ -15,12 +15,13 @@ mod checkpoint_support;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use checkpoint_support::World;
 use euhedral_core::frames::Frame;
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_quantization::forward::ForwardError;
-use euhedral_inference_quantization::forward::pipeline::{Attempt, Scheduler, Stages};
+use euhedral_inference_quantization::forward::pipeline::{Attempt, LaneRef, Scheduler, Stages};
 
 const LONGEST: Duration = Duration::from_secs(8);
 
@@ -41,6 +42,12 @@ enum Event {
         count: u32,
         waited: Vec<u64>,
         mark: Option<u64>,
+        /// Whether the gate of the held sequence was open when the tail ran.
+        open: bool,
+    },
+    /// A slot lane's fence mark claimed.
+    FenceMark {
+        lane: u32,
     },
     Fence,
     Retire {
@@ -49,18 +56,28 @@ enum Event {
 }
 
 /// A device that is a log: every call is recorded and answered with the next mark. What `after` is given waits in a
-/// cell for the test to release, as the lanes' completions would emit it when the marker is reached.
+/// cell for the test to release, as the lanes' completions would emit it when the marker is reached. A call that
+/// answers Busy has its retry parked until the test completes it, as a lane's completion would.
 struct Fake {
     log: Mutex<Vec<Event>>,
     marks: AtomicU64,
+    slots: u32,
     /// The sequence that fails, if any.
     failing: Option<u32>,
-    /// Calls of `head` that answer Busy before one is taken.
+    /// Calls of `head` that answer Busy before one is taken, and the calls made.
     busy_heads: AtomicU32,
+    head_calls: AtomicU32,
+    /// A sequence that answers Busy until `gate` is opened.
+    held: Option<u32>,
+    gate: AtomicBool,
     /// Sequence 0 answers Busy until sequence 1 has been called: they must be separate frames.
     overlap: bool,
     sequence_one_ran: AtomicBool,
-    spins: AtomicU32,
+    /// The fence answers Busy once on slot lane 1.
+    fence_busy: AtomicBool,
+    /// `after` refuses its frame.
+    refuse_after: bool,
+    parked: Mutex<Vec<(LaneRef, Box<dyn Frame>)>>,
     ended: Handoff<(u64, Box<dyn Frame>)>,
 }
 
@@ -69,11 +86,17 @@ impl Default for Fake {
         Fake {
             log: Mutex::new(Vec::new()),
             marks: AtomicU64::new(0),
+            slots: 2,
             failing: None,
             busy_heads: AtomicU32::new(0),
+            head_calls: AtomicU32::new(0),
+            held: None,
+            gate: AtomicBool::new(false),
             overlap: false,
             sequence_one_ran: AtomicBool::new(false),
-            spins: AtomicU32::new(0),
+            fence_busy: AtomicBool::new(false),
+            refuse_after: false,
+            parked: Mutex::new(Vec::new()),
             ended: Handoff::empty(),
         }
     }
@@ -91,6 +114,20 @@ impl Fake {
     fn events(&self) -> Vec<Event> {
         self.log.lock().unwrap().clone()
     }
+
+    fn parked(&self) -> usize {
+        self.parked.lock().unwrap().len()
+    }
+
+    /// The device completes a marker: every parked retry is published.
+    fn complete(&self, world: &World) -> usize {
+        let frames: Vec<_> = self.parked.lock().unwrap().drain(..).collect();
+        let count = frames.len();
+        for (_, frame) in frames {
+            assert!(world.host.offer(frame).is_ok(), "the lake refused a retry");
+        }
+        count
+    }
 }
 
 impl Stages for Fake {
@@ -100,6 +137,7 @@ impl Stages for Fake {
     type Pass = ();
 
     fn head(&self, (): &(), (): &mut (), first: u32, count: u32) -> Result<Attempt<u64>, ForwardError> {
+        self.head_calls.fetch_add(1, Ordering::SeqCst);
         if self
             .busy_heads
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
@@ -118,13 +156,11 @@ impl Stages for Fake {
             if index == 1 {
                 self.sequence_one_ran.store(true, Ordering::SeqCst);
             } else if !self.sequence_one_ran.load(Ordering::SeqCst) {
-                if self.spins.fetch_add(1, Ordering::SeqCst) > 200_000 {
-                    return Err(ForwardError::Invalid(
-                        "sequence 1 never ran while sequence 0 waited for it".to_owned(),
-                    ));
-                }
                 return Ok(Attempt::Busy);
             }
+        }
+        if self.held == Some(index) && !self.gate.load(Ordering::SeqCst) {
+            return Ok(Attempt::Busy);
         }
         let mark = self.mark();
         self.record(Event::Sequence { index, after, mark });
@@ -151,16 +187,34 @@ impl Stages for Fake {
             count,
             waited,
             mark,
+            open: self.gate.load(Ordering::SeqCst),
         });
         Ok(Attempt::Ready(mark))
     }
 
-    fn fence(&self, (): &mut ()) -> Result<Attempt<u64>, ForwardError> {
+    fn fence(&self, (): &mut (), marks: &mut Vec<u64>) -> Result<Result<u64, LaneRef>, ForwardError> {
+        while (marks.len() as u32) < self.slots {
+            let lane = marks.len() as u32;
+            if lane == 1 && self.fence_busy.swap(false, Ordering::SeqCst) {
+                return Ok(Err(LaneRef::Slot(lane)));
+            }
+            self.record(Event::FenceMark { lane });
+            marks.push(self.mark());
+        }
         self.record(Event::Fence);
-        Ok(Attempt::Ready(self.mark()))
+        Ok(Ok(self.mark()))
+    }
+
+    fn retry(&self, lane: LaneRef, then: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+        self.parked.lock().unwrap().push((lane, then));
+        Ok(())
     }
 
     fn after(&self, mark: u64, then: Box<dyn Frame>) -> Result<(), ForwardError> {
+        if self.refuse_after {
+            drop(then);
+            return Err(ForwardError::Invalid("the completions refused".to_owned()));
+        }
         self.ended.send((mark, then));
         Ok(())
     }
@@ -173,7 +227,21 @@ impl Stages for Fake {
 type Outcome = Handoff<Result<(), ForwardError>>;
 
 fn pipeline(world: &World, fake: Fake, slots: u32) -> Scheduler<Fake> {
+    let fake = Fake { slots, ..fake };
     Scheduler::new(fake, Arc::clone(&world.host), (), (0..slots).collect())
+}
+
+/// Runs the device until the pass has ended: completes every parked retry as it appears and reaches the pass's end
+/// marker. Bounded by the hang deadline.
+fn settle(world: &World, scheduler: &Scheduler<Fake>, outcome: &Outcome) {
+    let begun = Instant::now();
+    while !outcome.is_set() {
+        assert!(begun.elapsed() < LONGEST, "the pass never ended");
+        scheduler.stages().complete(world);
+        if let Some((_, frame)) = scheduler.stages().ended.take() {
+            assert!(world.host.offer(frame).is_ok());
+        }
+    }
 }
 
 fn start(scheduler: &Scheduler<Fake>, sequences: u32, batch: u32) -> (Arc<Outcome>, Result<(), ForwardError>) {
@@ -249,6 +317,7 @@ fn batches_run_in_order_with_each_sequence_between_its_head_and_tail() {
             count: tail_count,
             ref waited,
             mark,
+            ..
         } = events[at]
         else {
             panic!("batch {first}: the tail follows its sequences, saw {:?}", events[at]);
@@ -320,19 +389,23 @@ fn the_sequences_of_a_batch_are_separate_frames() {
     let scheduler = pipeline(&world, fake, 2);
     let (outcome, started) = start(&scheduler, 2, 2);
     started.unwrap();
-    // A pass that ran its sequences one after another would fail here, on sequence 0 never seeing sequence 1.
-    let (_, frame) = scheduler
-        .stages()
-        .ended
-        .wait(LONGEST)
-        .expect("the pass never reached its end");
-    assert!(world.host.offer(frame).is_ok());
+    // A pass that ran its sequences one after another would never get past sequence 0, which answers Busy until
+    // sequence 1 has run.
+    settle(&world, &scheduler, &outcome);
     ended(&outcome).unwrap();
+    let events = scheduler.stages().events();
+    let at = |wanted: u32| {
+        events
+            .iter()
+            .position(|event| matches!(event, Event::Sequence { index, .. } if *index == wanted))
+            .expect("the sequence ran")
+    };
+    assert!(at(1) < at(0), "sequence 0 ran only after sequence 1: {events:?}");
     drop(world);
 }
 
 #[test]
-fn a_busy_lane_is_asked_again_and_nothing_is_lost() {
+fn a_busy_lane_is_asked_again_only_after_a_completion_and_nothing_is_lost() {
     let world = World::start();
     let fake = Fake {
         busy_heads: AtomicU32::new(3),
@@ -341,7 +414,25 @@ fn a_busy_lane_is_asked_again_and_nothing_is_lost() {
     let scheduler = pipeline(&world, fake, 1);
     let (outcome, started) = start(&scheduler, 2, 1);
     started.unwrap();
-    reach(&world, &scheduler);
+    let begun = Instant::now();
+    for completed in 0..3u32 {
+        while scheduler.stages().parked() == 0 {
+            assert!(
+                begun.elapsed() < LONGEST,
+                "a Busy head was not parked behind a completion (answers so far: {})",
+                scheduler.stages().head_calls.load(Ordering::SeqCst)
+            );
+        }
+        // The retry rests in the lane's completions: the head was asked once more only per completion.
+        assert_eq!(
+            scheduler.stages().head_calls.load(Ordering::SeqCst),
+            completed + 1,
+            "the head was asked again before a completion"
+        );
+        assert_eq!(scheduler.stages().parked.lock().unwrap()[0].0, LaneRef::Main);
+        assert_eq!(scheduler.stages().complete(&world), 1);
+    }
+    settle(&world, &scheduler, &outcome);
     ended(&outcome).unwrap();
     let heads = scheduler
         .stages()
@@ -350,6 +441,116 @@ fn a_busy_lane_is_asked_again_and_nothing_is_lost() {
         .filter(|event| matches!(event, Event::Head { .. }))
         .count();
     assert_eq!(heads, 2, "each batch's head is taken once after the lane's refusals");
+    drop(world);
+}
+
+/// A sequence held behind a gate holds the batch's tail: it runs after the gate opened, with every sequence's mark.
+#[test]
+fn the_tail_of_a_batch_waits_for_its_slowest_sequence() {
+    let world = World::start();
+    let fake = Fake {
+        held: Some(0),
+        ..Fake::default()
+    };
+    let scheduler = pipeline(&world, fake, 2);
+    let (outcome, started) = start(&scheduler, 2, 2);
+    started.unwrap();
+    let begun = Instant::now();
+    // Sequence 1 runs and arrives; sequence 0 answers Busy and rests behind its lane's completion.
+    loop {
+        let ran = scheduler
+            .stages()
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Sequence { index: 1, .. }));
+        if ran && scheduler.stages().parked() == 1 {
+            break;
+        }
+        assert!(
+            begun.elapsed() < LONGEST,
+            "sequence 1 never ran or sequence 0 never parked"
+        );
+    }
+    assert!(!outcome.is_set());
+    scheduler.stages().gate.store(true, Ordering::SeqCst);
+    settle(&world, &scheduler, &outcome);
+    ended(&outcome).expect("the batch ends once its held sequence ran");
+    let tails: Vec<_> = scheduler
+        .stages()
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Tail { open, waited, .. } => Some((open, waited.len())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tails,
+        vec![(true, 2)],
+        "the tail ran before the held sequence was released"
+    );
+    drop(world);
+}
+
+/// A failed pass whose fence answers Busy on a slot lane claims one mark on each lane, not one per attempt.
+#[test]
+fn a_fence_that_is_refused_keeps_the_marks_it_made() {
+    let world = World::start();
+    let fake = Fake {
+        failing: Some(1),
+        fence_busy: AtomicBool::new(true),
+        ..Fake::default()
+    };
+    let scheduler = pipeline(&world, fake, 2);
+    let (outcome, started) = start(&scheduler, 2, 2);
+    started.unwrap();
+    let begun = Instant::now();
+    while scheduler.stages().parked() == 0 {
+        assert!(begun.elapsed() < LONGEST, "the refused fence was not parked");
+    }
+    assert_eq!(scheduler.stages().parked.lock().unwrap()[0].0, LaneRef::Slot(1));
+    settle(&world, &scheduler, &outcome);
+    assert!(ended(&outcome).is_err());
+    let marks: Vec<u32> = scheduler
+        .stages()
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::FenceMark { lane } => Some(lane),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(marks, vec![0, 1], "one fence mark per lane");
+    drop(world);
+}
+
+/// The caller's buffers are not handed back while the device may still use them: a pass whose frames were dropped
+/// (the lake closed), and a failed pass that could not be fenced, tell the caller so.
+#[test]
+fn a_pass_that_cannot_be_fenced_says_the_device_may_still_use_the_buffers() {
+    let world = World::start();
+    let scheduler = pipeline(&world, Fake::default(), 2);
+    let (outcome, started) = start(&scheduler, 2, 2);
+    started.unwrap();
+    let (_, frame) = scheduler
+        .stages()
+        .ended
+        .wait(LONGEST)
+        .expect("the pass never reached its end");
+    drop(frame);
+    let error = ended(&outcome).expect_err("a pass that lost its end says so");
+    assert!(matches!(error, ForwardError::Unfenced(_)), "{error}");
+
+    let refusing = Fake {
+        failing: Some(0),
+        refuse_after: true,
+        ..Fake::default()
+    };
+    let scheduler = pipeline(&world, refusing, 2);
+    let (outcome, started) = start(&scheduler, 2, 2);
+    started.unwrap();
+    let error = ended(&outcome).expect_err("the failed pass");
+    assert!(matches!(error, ForwardError::Unfenced(_)), "{error}");
     drop(world);
 }
 

@@ -1,10 +1,12 @@
 //! A checkpoint directory that reads as a source checkpoint with some 1-D tensors replaced.
 //!
-//! Every file of the source is linked, the replacements (BF16) go into [`SHARD`], and the index's weight map sends the
-//! replaced names there. The readers that open the shards the index names ([`Safetensors`](super::safetensors))
-//! open them in name order and take a tensor from the last shard that holds it, so the replacements shadow the
-//! source's copies because `trained.safetensors` sorts after the usual `model-…` shards; the source's own copies are
-//! never read.
+//! Every file of the source is linked, the replacements (BF16) go into a new shard, and the index's weight map sends
+//! the replaced names there. The readers that open the shards the index names ([`Safetensors`](super::safetensors))
+//! open them in name order and take a tensor from the last shard that holds it, so the shard is named to sort after
+//! every shard the source's index names: [`SHARD`], or when the source has a shard that sorts at or after that (a
+//! name such as `weights-…`, or the shard of an earlier overlay), that last shard's name followed by `.` and
+//! [`SHARD`]. The replacements then shadow the source's copies whatever the source's shard names are, and an overlay
+//! of an overlay shadows the first one's.
 //!
 //! Nothing here blocks the caller: the index is read through `AsyncIo`, the links are made by a frame of the host lake,
 //! and the two files are written as [`write_file`] and [`SafetensorsWriter`] write them, whole or not at all. The shard
@@ -26,7 +28,7 @@ use super::writer::{SafetensorsWriter, bytes_source, write_file};
 use super::{CheckpointError, Done};
 use crate::step::{Kind, step};
 
-/// The file the replacements are written to.
+/// The file the replacements are written to, unless a shard of the source sorts at or after it.
 pub const SHARD: &str = "trained.safetensors";
 const INDEX: &str = "model.safetensors.index.json";
 const BUFFER_BYTES: usize = 1 << 20;
@@ -38,6 +40,8 @@ struct Overlaying {
     source: PathBuf,
     target: PathBuf,
     tensors: BTreeMap<String, Vec<f32>>,
+    /// The name of the shard of the replacements; known once the source's index was read.
+    shard: String,
     then: Done<()>,
 }
 
@@ -65,6 +69,7 @@ pub fn write(
         source: source.to_path_buf(),
         target: target.to_path_buf(),
         tensors,
+        shard: SHARD.to_owned(),
         then: Arc::clone(&then),
     };
     let cell = Handoff::new();
@@ -74,6 +79,7 @@ pub fn write(
         &source.join(INDEX),
         Arc::new(move |index| {
             let Some(overlaying) = cell.take() else { return };
+            let mut overlaying = overlaying;
             match index.and_then(|bytes| overlaying.reindexed(&bytes)) {
                 Ok(index) => overlaying.link(index),
                 Err(error) => (overlaying.then)(Err(error)),
@@ -83,14 +89,20 @@ pub fn write(
 }
 
 impl Overlaying {
-    /// The source's index with the replaced names sent to the shard.
-    fn reindexed(&self, bytes: &[u8]) -> Result<Vec<u8>, CheckpointError> {
+    /// The source's index with the replaced names sent to the shard, whose name is chosen to sort after the source's.
+    fn reindexed(&mut self, bytes: &[u8]) -> Result<Vec<u8>, CheckpointError> {
         let mut index: Value = serde_json::from_slice(bytes)
             .map_err(|error| CheckpointError::Format(format!("{INDEX} is not JSON: {error}")))?;
         let map = index
             .get_mut("weight_map")
             .and_then(Value::as_object_mut)
             .ok_or_else(|| CheckpointError::Format(format!("{INDEX} has no weight_map")))?;
+        let mut shard = SHARD.to_owned();
+        for source in map.values().filter_map(Value::as_str) {
+            if source >= shard.as_str() {
+                shard = format!("{source}.{SHARD}");
+            }
+        }
         for name in self.tensors.keys() {
             let Some(entry) = map.get_mut(name) else {
                 return Err(CheckpointError::Invalid(format!(
@@ -98,8 +110,9 @@ impl Overlaying {
                     self.source.display()
                 )));
             };
-            *entry = Value::String(SHARD.to_owned());
+            *entry = Value::String(shard.clone());
         }
+        self.shard = shard;
         serde_json::to_vec_pretty(&index).map_err(|error| CheckpointError::Format(format!("the index: {error}")))
     }
 
@@ -112,7 +125,7 @@ impl Overlaying {
         let held = Arc::clone(&cell);
         let frame = step(Kind::Durable, move || {
             let Some((overlaying, index)) = held.take() else { return };
-            match link_files(&overlaying.source, &overlaying.target) {
+            match link_files(&overlaying.source, &overlaying.target, &overlaying.shard) {
                 Ok(()) => overlaying.shard(index),
                 Err(error) => (overlaying.then)(Err(error)),
             }
@@ -130,10 +143,11 @@ impl Overlaying {
             host,
             target,
             tensors,
+            shard,
             then,
             ..
         } = self;
-        let mut writer = SafetensorsWriter::new(&target.join(SHARD));
+        let mut writer = SafetensorsWriter::new(&target.join(&shard));
         for (name, values) in &tensors {
             if let Err(error) = writer.add(name, "BF16", &[values.len() as u64], bf16_bytes(values)) {
                 return then(Err(error));
@@ -173,19 +187,19 @@ impl Overlaying {
     }
 }
 
-/// Links every file of `source` (but its index and the shard) into `target`, which is made if it is not there. A name
+/// Links every file of `source` (but its index and a file named `shard`) into `target`, which is made if it is not there. A name
 /// `target` already has is left alone.
 #[expect(
     clippy::disallowed_methods,
     reason = "no-wait, blocking directory calls with no AsyncIo form: run as a host lake frame"
 )]
-fn link_files(source: &Path, target: &Path) -> Result<(), CheckpointError> {
+fn link_files(source: &Path, target: &Path, shard: &str) -> Result<(), CheckpointError> {
     let context = |what: &str, path: &Path, error| CheckpointError::io(format!("{what} {}", path.display()), error);
     fs::create_dir_all(target).map_err(|error| context("creating", target, error))?;
     for entry in fs::read_dir(source).map_err(|error| context("listing", source, error))? {
         let entry = entry.map_err(|error| context("listing", source, error))?;
         let name = entry.file_name();
-        if name == INDEX || name == SHARD {
+        if name == INDEX || name == shard {
             continue;
         }
         let link = target.join(&name);

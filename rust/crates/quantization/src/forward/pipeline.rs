@@ -39,6 +39,13 @@ pub enum Attempt<T> {
     Busy,
 }
 
+/// A lane of a pass: the main lane, or the lane of one slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneRef {
+    Main,
+    Slot(u32),
+}
+
 /// What a pass ends with, called once from a frame of the lattice; it must not wait.
 pub type Done = Box<dyn FnOnce(Result<(), ForwardError>) + Send>;
 
@@ -83,8 +90,21 @@ pub trait Stages: Send + Sync + 'static {
         marks: &[Self::Mark],
     ) -> Result<Attempt<Option<Self::Mark>>, ForwardError>;
 
-    /// A mark after everything queued so far on the main lane and on every slot lane.
-    fn fence(&self, main: &mut Self::Main) -> Result<Attempt<Self::Mark>, ForwardError>;
+    /// A mark after everything queued so far on the main lane and on every slot lane. The marks of the slot lanes are
+    /// claimed in the slots' order and kept in `marks` as they are made, so a call that answers Busy is made again
+    /// with the marks it has, and claims no second mark on a lane. The main lane's mark comes after the last slot's:
+    /// with every slot's mark in `marks`, the call is the main lane's.
+    /// A lane that answers Busy is named in the `Err` of the answer.
+    fn fence(
+        &self,
+        main: &mut Self::Main,
+        marks: &mut Vec<Self::Mark>,
+    ) -> Result<Result<Self::Mark, LaneRef>, ForwardError>;
+
+    /// Runs `then` once `lane` has completed its oldest marker still in flight, which frees a place of its ring: the
+    /// retry of a call that answered Busy. With no marker in flight there is nothing to wait for and `then` comes
+    /// back, to be offered at once.
+    fn retry(&self, lane: LaneRef, then: Box<dyn Frame>) -> Result<(), Box<dyn Frame>>;
 
     /// Emits `then` once the lanes have reached `mark`.
     fn after(&self, mark: Self::Mark, then: Box<dyn Frame>) -> Result<(), ForwardError>;
@@ -255,7 +275,7 @@ impl Drop for Ending {
     fn drop(&mut self) {
         if let Some(done) = self.done.take() {
             let result = self.result.take().unwrap_or_else(|| {
-                Err(ForwardError::Invalid(
+                Err(ForwardError::Unfenced(
                     "the lake closed before the pass finished".to_owned(),
                 ))
             });
@@ -348,7 +368,7 @@ impl<S: Stages> Pass<S> {
             if pass.has_failed() {
                 return Box::new(move || {
                     pass.main.send(main);
-                    Self::end_failed(&pass);
+                    Self::end_failed_fresh(&pass);
                 });
             }
             let count = pass.count(first);
@@ -360,12 +380,12 @@ impl<S: Stages> Pass<S> {
                 Ok(Attempt::Busy) => Box::new(move || {
                     pass.main.send(main);
                     let frame = Self::start(&pass, first);
-                    Self::publish(&pass, frame, Self::end_failed);
+                    Self::again(&pass, LaneRef::Main, frame, Self::end_failed_fresh);
                 }),
                 Err(error) => Box::new(move || {
                     pass.fail(error);
                     pass.main.send(main);
-                    Self::end_failed(&pass);
+                    Self::end_failed_fresh(&pass);
                 }),
             }
         })
@@ -411,12 +431,10 @@ impl<S: Stages> Pass<S> {
                 }
                 Ok(Attempt::Busy) => Box::new(move || {
                     let frame = Self::sequence(&pass, &join, index);
-                    if pass.lake.offer(frame).is_err() {
-                        pass.fail(ForwardError::Invalid(
-                            "the lake is closed: a frame of the pass was refused".to_owned(),
-                        ));
-                        Self::arrive(&pass, &join);
-                    }
+                    let arriving = Arc::clone(&join);
+                    Self::again(&pass, LaneRef::Slot(index), frame, move |pass| {
+                        Self::arrive(pass, &arriving);
+                    });
                 }),
                 Err(error) => Box::new(move || {
                     pass.fail(error);
@@ -432,10 +450,10 @@ impl<S: Stages> Pass<S> {
             return;
         }
         if pass.has_failed() {
-            return Self::end_failed(pass);
+            return Self::end_failed_fresh(pass);
         }
         let frame = Self::finish(pass, join);
-        Self::publish(pass, frame, Self::end_failed);
+        Self::publish(pass, frame, Self::end_failed_fresh);
     }
 
     fn finish(pass: &Arc<Self>, join: &Arc<Join<S>>) -> Box<dyn Frame> {
@@ -452,7 +470,7 @@ impl<S: Stages> Pass<S> {
                 pass.fail(ForwardError::Invalid("a sequence ended without its mark".to_owned()));
                 return Box::new(move || {
                     pass.main.send(main);
-                    Self::end_failed(&pass);
+                    Self::end_failed_fresh(&pass);
                 });
             }
             match pass
@@ -463,25 +481,25 @@ impl<S: Stages> Pass<S> {
                     pass.main.send(main);
                     if !last {
                         let frame = Self::start(&pass, following);
-                        return Self::publish(&pass, frame, Self::end_failed);
+                        return Self::publish(&pass, frame, Self::end_failed_fresh);
                     }
                     match mark {
                         Some(mark) => Self::end_ok(&pass, mark),
                         None => {
                             pass.fail(ForwardError::Invalid("the last tail gave no mark".to_owned()));
-                            Self::end_failed(&pass);
+                            Self::end_failed_fresh(&pass);
                         }
                     }
                 }),
                 Ok(Attempt::Busy) => Box::new(move || {
                     pass.main.send(main);
                     let frame = Self::finish(&pass, &join);
-                    Self::publish(&pass, frame, Self::end_failed);
+                    Self::again(&pass, LaneRef::Main, frame, Self::end_failed_fresh);
                 }),
                 Err(error) => Box::new(move || {
                     pass.fail(error);
                     pass.main.send(main);
-                    Self::end_failed(&pass);
+                    Self::end_failed_fresh(&pass);
                 }),
             }
         })
@@ -493,45 +511,70 @@ impl<S: Stages> Pass<S> {
         if let Err(error) = pass.stages.after(mark, frame) {
             // The frame went with the refusal; the device may still be running the pass: fence, then end.
             pass.fail(error);
-            Self::end_failed(pass);
+            Self::end_failed_fresh(pass);
         }
     }
 
+    fn end_failed_fresh(pass: &Arc<Self>) {
+        Self::end_failed(pass, Vec::new());
+    }
+
     /// Ends a failed pass behind a fence over every lane it used: the error reaches the caller only once the device
-    /// no longer reads the caller's buffers.
-    fn end_failed(pass: &Arc<Self>) {
+    /// no longer reads the caller's buffers. `marks` are the slot lanes' fence marks made so far. Where no fence can
+    /// be made the pass ends unfenced, which its caller is told (the buffers are not theirs again).
+    fn end_failed(pass: &Arc<Self>, mut marks: Vec<S::Mark>) {
         let Some(mut main) = pass.main.take() else {
-            return Self::finalize(pass);
+            return Self::finalize(pass, false);
         };
-        let outcome = pass.stages.fence(&mut main);
+        let outcome = pass.stages.fence(&mut main, &mut marks);
         pass.main.send(main);
         match outcome {
-            Ok(Attempt::Ready(mark)) => {
+            Ok(Ok(mark)) => {
                 let frame = Self::last(pass);
                 if pass.stages.after(mark, frame).is_err() {
-                    Self::finalize(pass);
+                    Self::finalize(pass, false);
                 }
             }
-            Ok(Attempt::Busy) => {
+            Ok(Err(lane)) => {
                 let held = Arc::clone(pass);
-                let frame = pass.frame(move || Box::new(move || Self::end_failed(&held)));
-                if pass.lake.offer(frame).is_err() {
-                    Self::finalize(pass);
+                let frame = pass.frame(move || Box::new(move || Self::end_failed(&held, marks)));
+                match pass.stages.retry(lane, frame) {
+                    Ok(()) => {}
+                    Err(frame) => {
+                        if pass.lake.offer(frame).is_err() {
+                            Self::finalize(pass, false);
+                        }
+                    }
                 }
             }
-            Err(_) => Self::finalize(pass),
+            Err(_) => Self::finalize(pass, false),
+        }
+    }
+
+    /// Calls again what answered Busy on `lane`, behind the lane's oldest marker in flight: nothing is offered, and
+    /// no worker spins, until the lane has made room. A refusal by the lake ends the pass through `refused`.
+    fn again(pass: &Arc<Self>, lane: LaneRef, frame: Box<dyn Frame>, refused: impl FnOnce(&Arc<Self>)) {
+        if let Err(frame) = pass.stages.retry(lane, frame) {
+            Self::publish(pass, frame, refused);
         }
     }
 
     /// The frame that ends the pass, emitted when the device is through.
     fn last(pass: &Arc<Self>) -> Box<dyn Frame> {
         let held = Arc::clone(pass);
-        pass.frame(move || Box::new(move || Self::finalize(&held)))
+        pass.frame(move || Box::new(move || Self::finalize(&held, true)))
     }
 
-    /// Returns the lanes' state, releases the lake and tells the caller.
-    fn finalize(pass: &Arc<Self>) {
-        let result = if pass.has_failed() {
+    /// Returns the lanes' state, releases the lake and tells the caller. `fenced` is whether the device is through
+    /// with the pass: when it is not, the caller is told the buffers are still in use.
+    fn finalize(pass: &Arc<Self>, fenced: bool) {
+        let result = if !fenced {
+            let cause = pass.failure.take();
+            Err(ForwardError::Unfenced(cause.map_or_else(
+                || "the pass could not be fenced".to_owned(),
+                |cause| cause.to_string(),
+            )))
+        } else if pass.has_failed() {
             Err(pass
                 .failure
                 .take()

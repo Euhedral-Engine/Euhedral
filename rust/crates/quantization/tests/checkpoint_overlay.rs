@@ -21,6 +21,11 @@ use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 
 /// A source of one shard holding `a.weight` and `b.weight`, an index naming it, and a config file.
 fn source(directory: &Path) {
+    source_shard(directory, "model-00001.safetensors");
+}
+
+/// The same source with its shard named `shard`.
+fn source_shard(directory: &Path, shard_name: &str) {
     fs::create_dir_all(directory).unwrap();
     let shard = safetensors(&[
         Spec {
@@ -36,11 +41,9 @@ fn source(directory: &Path) {
             bytes: bf16(&[4.0, 5.0]),
         },
     ]);
-    write(&directory.join("model-00001.safetensors"), &shard);
-    write(
-        &directory.join("model.safetensors.index.json"),
-        br#"{"metadata":{},"weight_map":{"a.weight":"model-00001.safetensors","b.weight":"model-00001.safetensors"}}"#,
-    );
+    write(&directory.join(shard_name), &shard);
+    let index = format!(r#"{{"metadata":{{}},"weight_map":{{"a.weight":"{shard_name}","b.weight":"{shard_name}"}}}}"#);
+    write(&directory.join("model.safetensors.index.json"), index.as_bytes());
     write(&directory.join("config.json"), b"{}");
 }
 
@@ -127,5 +130,57 @@ fn a_name_the_source_does_not_have_is_refused_before_anything_is_written() {
     .unwrap_err();
     assert!(error.to_string().contains("nope.weight"), "{error}");
     assert!(!to.exists(), "nothing was written for a refused overlay");
+    world.finish();
+}
+
+/// The shadowing does not depend on the names of the source's shards: a source shard that sorts after
+/// `trained.safetensors` is still shadowed.
+#[test]
+fn a_replacement_wins_over_a_source_shard_that_sorts_after_the_default_name() {
+    let world = World::start();
+    let directory = tempfile::tempdir().unwrap();
+    let (from, to) = (directory.path().join("source"), directory.path().join("overlay"));
+    source_shard(&from, "weights-00001-of-00001.safetensors");
+    overlay_of(&world, &from, &to, &[("b.weight", &[-0.5, 6.5])]).unwrap();
+    assert_eq!(values(&world, &to, "b.weight"), [-0.5, 6.5]);
+    assert_eq!(values(&world, &to, "a.weight"), [1.0, 2.0, 3.0]);
+    world.finish();
+}
+
+/// An overlay of an overlay: the second round's tensors win over the first round's and over the base, and the first
+/// round's tensors it does not replace survive.
+#[test]
+fn an_overlay_of_an_overlay_keeps_the_first_rounds_replacements_and_replaces_them() {
+    let world = World::start();
+    let directory = tempfile::tempdir().unwrap();
+    let (base, first, second) = (
+        directory.path().join("base"),
+        directory.path().join("first"),
+        directory.path().join("second"),
+    );
+    source(&base);
+    overlay_of(
+        &world,
+        &base,
+        &first,
+        &[("a.weight", &[7.0, 8.0, 9.0]), ("b.weight", &[0.5, 1.5])],
+    )
+    .unwrap();
+    overlay_of(&world, &first, &second, &[("b.weight", &[-2.0, -3.0])]).unwrap();
+    assert_eq!(
+        values(&world, &second, "a.weight"),
+        [7.0, 8.0, 9.0],
+        "the first round's tensor survives"
+    );
+    assert_eq!(
+        values(&world, &second, "b.weight"),
+        [-2.0, -3.0],
+        "the second round's tensor wins"
+    );
+    assert_eq!(
+        values(&world, &first, "b.weight"),
+        [0.5, 1.5],
+        "the first overlay is untouched"
+    );
     world.finish();
 }

@@ -50,6 +50,10 @@ pub enum ForwardError {
     /// An argument or a model dimension the layer cannot run with.
     #[error("{0}")]
     Invalid(String),
+    /// A pass ended while the device may still be using the buffers it was given (the lake closed, or no fence
+    /// could be made): the caller must not free or reuse them, and leaks them.
+    #[error("the device may still use the pass's buffers: {0}")]
+    Unfenced(String),
 }
 
 /// The widths the layer's kernels work in, derived from the model's configuration.

@@ -19,7 +19,7 @@ use euhedral_inference_cuda::math::LaneHandles;
 use euhedral_inference_cuda::{CudaLibrary, DevicePtr};
 use euhedral_inference_engine::Handoff;
 
-use super::{Attempt, Done, Scheduler, Stages};
+use super::{Attempt, Done, LaneRef, Scheduler, Stages};
 use crate::forward::{ForwardError, ForwardKernels, LaneContext, LayerForward, LayerWeights, Observation, Slot};
 
 const BF16_BYTES: u64 = 2;
@@ -90,6 +90,8 @@ pub struct Job {
 #[derive(Debug)]
 pub struct MainLane {
     handles: LaneHandles,
+    /// How many of a fence's slot marks the main lane waits for already.
+    awaited: usize,
 }
 
 /// The device calls of a pass.
@@ -286,23 +288,58 @@ impl Stages for DeviceStages {
         })
     }
 
-    fn fence(&self, main: &mut MainLane) -> Result<Attempt<Marker>, ForwardError> {
-        let _ = main;
-        for lane in &self.slots {
-            let mark = match lane.mark() {
-                Ok(mark) => mark,
-                Err(GpuError::Busy) => return Ok(Attempt::Busy),
-                Err(error) => return Err(error.into()),
-            };
-            if let Err(error) = self.main.await_marker(mark) {
-                return control(error);
+    fn fence(&self, main: &mut MainLane, marks: &mut Vec<Marker>) -> Result<Result<Marker, LaneRef>, ForwardError> {
+        // The marks of the slot lanes: each claimed once, and waited for once, in the slots' order. A Busy answer
+        // leaves what was done in `marks` and `main.awaited`, and the call is made again.
+        while main.awaited < self.slots.len() {
+            let index = main.awaited;
+            if marks.len() == index {
+                match self.slots[index].mark() {
+                    Ok(mark) => marks.push(mark),
+                    Err(GpuError::Busy) => return Ok(Err(LaneRef::Slot(index as u32))),
+                    Err(error) => {
+                        main.awaited = 0;
+                        return Err(error.into());
+                    }
+                }
+            }
+            match self.main.await_marker(marks[index]) {
+                Ok(()) => main.awaited += 1,
+                Err(ControlError::Busy) => return Ok(Err(LaneRef::Main)),
+                Err(error) => {
+                    main.awaited = 0;
+                    return Err(ForwardError::Invalid(error.to_string()));
+                }
             }
         }
+        main.awaited = 0;
         match self.main.mark() {
-            Ok(mark) => Ok(Attempt::Ready(mark)),
-            Err(GpuError::Busy) => Ok(Attempt::Busy),
+            Ok(mark) => Ok(Ok(mark)),
+            Err(GpuError::Busy) => {
+                main.awaited = self.slots.len();
+                Ok(Err(LaneRef::Main))
+            }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn retry(&self, lane: LaneRef, then: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+        let queue = match lane {
+            LaneRef::Main => &self.main,
+            LaneRef::Slot(index) => match self.slots.get(index as usize) {
+                Some(queue) => queue,
+                None => return Err(then),
+            },
+        };
+        let oldest = DeviceQueue::completed(&**queue) + 1;
+        if oldest > DeviceQueue::issued(&**queue) {
+            return Err(then);
+        }
+        self.completions.after_marker(
+            Marker::new(DeviceQueue::id(&**queue), Lane::lane(&**queue), oldest),
+            then,
+        );
+        Ok(())
     }
 
     fn after(&self, mark: Marker, then: Box<dyn Frame>) -> Result<(), ForwardError> {
@@ -388,7 +425,7 @@ impl ForwardPipeline {
             completions,
         };
         Ok(ForwardPipeline {
-            scheduler: Scheduler::new(stages, lake, MainLane { handles }, states),
+            scheduler: Scheduler::new(stages, lake, MainLane { handles, awaited: 0 }, states),
             main,
         })
     }
@@ -406,6 +443,22 @@ impl ForwardPipeline {
             observer,
             write,
         } = request;
+        let (rows, bytes) = (
+            u64::from(batch) * u64::from(length),
+            self.scheduler.stages().sequence_bytes(length) * u64::from(sequences),
+        );
+        if rows > u64::from(self.scheduler.stages().forward.max_rows()) {
+            return Err(ForwardError::Invalid(format!(
+                "a batch of {rows} rows is past the {} the workspace holds",
+                self.scheduler.stages().forward.max_rows()
+            )));
+        }
+        if bytes > states.bytes as u64 {
+            return Err(ForwardError::Invalid(format!(
+                "the pass needs {bytes} host bytes of states, {} were given",
+                states.bytes
+            )));
+        }
         let hold = Handoff::empty();
         if let Some(observer) = observer {
             hold.send(observer);
@@ -424,10 +477,13 @@ impl ForwardPipeline {
     /// Frees the layer's workspace and the states in stream order on the main lane and closes its handles, once no
     /// pass is running (a pass is over when its `done` was called). Returns the marker after the frees; the lane has
     /// retired them when it is reached.
-    pub fn finish(self) -> Result<Marker, ForwardError> {
+    ///
+    /// While a pass is still running the pipeline comes back in the `Err`, to be finished once the pass has ended.
+    pub fn finish(self) -> Result<Marker, Box<NotFinished>> {
         let main = self.main;
-        let Ok((stages, lane, slots)) = self.scheduler.into_parts() else {
-            return Err(ForwardError::Invalid("a pass is still running".to_owned()));
+        let (stages, lane, slots) = match self.scheduler.into_parts() {
+            Ok(parts) => parts,
+            Err(scheduler) => return Err(Box::new(NotFinished::Running(ForwardPipeline { scheduler, main }))),
         };
         let DeviceStages {
             mut forward,
@@ -444,10 +500,19 @@ impl ForwardPipeline {
         let closed = lane.handles.close();
         let marker = match released {
             Ok((Ok(()), marker)) => marker,
-            Ok((Err(error), _)) => return Err(error),
-            Err(error) => return Err(error.into()),
+            Ok((Err(error), _)) => return Err(Box::new(NotFinished::Failed(error))),
+            Err(error) => return Err(Box::new(NotFinished::Failed(error.into()))),
         };
-        closed?;
+        closed.map_err(|error| Box::new(NotFinished::Failed(error.into())))?;
         Ok(marker)
     }
+}
+
+/// Why a pipeline did not finish.
+#[derive(Debug)]
+pub enum NotFinished {
+    /// A pass is still running: the pipeline, to be finished once the pass has ended.
+    Running(ForwardPipeline),
+    /// Freeing the workspace or closing the handles failed.
+    Failed(ForwardError),
 }
