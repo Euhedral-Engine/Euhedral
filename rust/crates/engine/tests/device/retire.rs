@@ -889,6 +889,8 @@ fn captured() -> Option<Captured> {
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_captured_quantum_killed_before_its_launch_retires() {
+    // A capture fails when another thread of the process allocates or synchronizes meanwhile: nothing else runs.
+    let _card = common::card();
     let Some(mut captured) = captured() else { return };
     let quantum = captured.quantum.take().unwrap();
     let started = captured
