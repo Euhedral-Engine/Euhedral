@@ -170,6 +170,11 @@ class FailFastTest(unittest.TestCase):
             has_pull_request = triggers is not None and re.search(r"^  pull_request:", triggers.group(1), flags=re.MULTILINE)
             self.assertEqual(bool(has_pull_request), path.name == "ci.yaml", path.name)
 
+    def test_the_workflow_may_cancel_its_own_run(self):
+        # Without `actions: write` the cancel call is refused (403) and a failed job stops nothing.
+        text = (ROOT / ".gitea/workflows/ci.yaml").read_text()
+        self.assertRegex(text, r"(?m)^permissions:\n(?:  .*\n)*  actions: write\n")
+
     def test_every_job_ends_by_cancelling_the_run_when_it_fails(self):
         jobs = jobs_of((ROOT / ".gitea/workflows/ci.yaml").read_text())
         reusable = [name for name, lines in jobs.items() if any(line.startswith("    uses: ") for line in lines)]

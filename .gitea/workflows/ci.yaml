@@ -194,8 +194,6 @@ jobs:
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
-      - name: Fail on purpose (throwaway)
-        run: exit 1
       - name: Install the Rust toolchain
         run: mise install rust >/dev/null
       - name: Install bindgen
