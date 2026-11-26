@@ -161,7 +161,7 @@ struct Rig {
     reader: DiskReader,
     port: Arc<FakePort>,
     window: Arc<DiskWindow>,
-    harness: StageHarness,
+    harness: Arc<StageHarness>,
     stage: Copy,
     failures: Arc<Mutex<Vec<String>>>,
 }
@@ -180,7 +180,7 @@ impl Rig {
             reader,
             port,
             window,
-            harness: StageHarness::new(lanes),
+            harness: Arc::new(StageHarness::new(lanes)),
             failures: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -460,7 +460,7 @@ fn a_quantum_abandoned_before_its_registration_reads_nothing() {
 }
 
 #[test]
-fn a_failed_read_fails_its_quantum_and_still_releases_the_gate() {
+fn a_failed_read_fails_its_quantum_and_the_gate_of_its_waiting_copy() {
     let rig = Rig::new(1);
     rig.enqueue(1, vec![use_of("weights", 0, 100, 0)]);
     assert!(!rig.claim(0, 1));
@@ -471,17 +471,75 @@ fn a_failed_read_fails_its_quantum_and_still_releases_the_gate() {
         failures[0].contains("weights") && failures[0].contains("no disk"),
         "{failures:?}"
     );
-    assert_eq!(rig.events(), [GateEvent::Released]);
+    assert!(matches!(
+        rig.events().as_slice(),
+        [GateEvent::Failed(StageError::Fatal(why))] if why.contains("no disk")
+    ));
 }
 
 #[test]
-fn a_short_read_is_a_failed_read() {
+fn a_short_read_is_a_failed_read_and_its_copy_is_failed_not_handed_the_slot() {
     let rig = Rig::new(1);
     rig.enqueue(1, vec![use_of("weights", 0, 100, 0)]);
     rig.port.finish_with(0, Ok(40));
     assert_eq!(lock(&rig.failures).len(), 1);
-    // The copy still gets the slot: its quantum cannot commit.
-    assert!(rig.claim(0, 1));
+    // No copy was waiting: the failure stays with the slot, and the copy that comes is failed with it.
+    assert!(!rig.claim(0, 1));
+    assert!(
+        matches!(rig.events().as_slice(), [GateEvent::Failed(StageError::Fatal(why))] if why.contains("40 of 100")),
+        "{:?}",
+        rig.events()
+    );
+}
+
+#[test]
+fn a_failed_slot_goes_back_once_the_failed_copy_frees_it() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    rig.enqueue(2, vec![use_of("b", 0, 100, 0)]);
+    rig.port.finish_with(0, Err(io::Error::other("no disk")));
+    assert!(!rig.claim(0, 1));
+    // The copy owns the slot until its quantum ends; the next quantum reads only after.
+    assert!(rig.port.pending().is_empty());
+    rig.reader.slot_freed(0, 1);
+    assert_eq!(rig.port.pending().len(), 1);
+}
+
+#[test]
+fn a_claim_between_the_owners_release_and_the_failure_is_never_ready() {
+    let rig = Rig::new(1);
+    let (reader, harness) = (rig.reader.clone(), Arc::clone(&rig.harness));
+    let seen: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    // The fail handle runs where a racing claim would: after the owner's claim is released, before the failure is told.
+    let fail: FailHandle = Arc::new(move |_why| {
+        let passed = harness.pass_gate(&Copy(reader.clone()), &(0, 1));
+        lock(&record).push(passed.open);
+    });
+    rig.reader
+        .enqueue(1, vec![use_of("weights", 0, 100, 0)], fail)
+        .expect("accepted");
+    rig.port.finish_with(0, Err(io::Error::other("no disk")));
+    assert_eq!(*lock(&seen), [false], "the copy of a failed read was handed the slot");
+    assert!(matches!(rig.events().as_slice(), [GateEvent::Failed(StageError::Fatal(_))]));
+}
+
+#[test]
+fn a_claim_the_owner_decides_later_on_a_failed_read_fails_its_gate() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("weights", 0, 100, 0)]);
+    rig.port.finish_with(0, Err(io::Error::other("no disk")));
+    // The claim finds the owner busy and leaves its gate to it.
+    {
+        let rig_ref = &rig;
+        rig.reader.mailbox.with(move |_| {
+            assert!(!rig_ref.claim(0, 1));
+        });
+    }
+    assert!(matches!(
+        rig.events().as_slice(),
+        [GateEvent::Failed(StageError::Fatal(why))] if why.contains("no disk")
+    ));
 }
 
 #[test]

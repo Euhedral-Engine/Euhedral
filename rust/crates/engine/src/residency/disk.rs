@@ -15,7 +15,7 @@
 //! once ([`Claimed::Ready`]) and takes no gate.
 //!
 //! **Slots.** Each slot is read one use at a time: its uses wait in a queue, in admission order and, within a quantum, in
-//! use order, which is the order the copies of that slot run. A slot is `Idle`, `Reading`, `Filled` (read, no copy
+//! use order, which is the order the copies of that slot run. A slot is `Idle`, `Reading`, `Filled` (read, or failed, no copy
 //! claimed it yet) or `Claimed` (its copy owns the bytes until [`DiskMessage::SlotFreed`] of the same ticket). A read is never started
 //! into a slot before the previous read of it has arrived, whoever it belonged to: the kernel may still be writing.
 //!
@@ -589,9 +589,11 @@ enum State {
         direct: bool,
         discard: bool,
     },
-    /// Read, and no copy has claimed it.
+    /// Read, and no copy has claimed it. `failure` is why the read failed: the claim of the copy fails with it, so no
+    /// copy is ever handed a slot whose bytes are wrong, however it races the quantum being told.
     Filled {
         ticket: u64,
+        failure: Option<String>,
     },
     /// The copy of `ticket` owns the bytes until it frees the slot.
     Claimed {
@@ -699,7 +701,7 @@ impl DiskOwner {
             slot.queue.iter().any(|pending| pending.ticket == ticket)
                 || slot.claims.iter().any(|(claimed, _)| *claimed == ticket)
                 || matches!(&slot.state, State::Reading { pending, .. } if pending.ticket == ticket)
-                || matches!(&slot.state, State::Filled { ticket: filled } if *filled == ticket)
+                || matches!(&slot.state, State::Filled { ticket: filled, .. } if *filled == ticket)
         });
         // A ticket the owner has never heard of is either to come (remembered) or over (nothing to do): tickets grow,
         // so one below every ticket posted that is not here is over. Remembering it too costs one entry, pruned by the
@@ -721,7 +723,7 @@ impl DiskOwner {
             slot.claims = kept;
             match &mut slot.state {
                 State::Reading { pending, discard, .. } if pending.ticket == ticket => *discard = true,
-                State::Filled { ticket: filled } if *filled == ticket => slot.state = State::Idle,
+                State::Filled { ticket: filled, .. } if *filled == ticket => slot.state = State::Idle,
                 _ => {}
             }
         }
@@ -806,21 +808,25 @@ impl DiskOwner {
             self.launch(slot, pending, false);
             return;
         }
-        if let Err(failed) = result {
+        let failure = result.err().map(|failed| {
             let why = format!("reading '{}' from the artifact failed: {failed}", pending.use_.name);
             log::error!("{why}");
-            self.told.push(Finished::Fail(Arc::clone(&pending.fail), why));
-        }
+            self.told.push(Finished::Fail(Arc::clone(&pending.fail), why.clone()));
+            why
+        });
         let state = &mut self.slots[slot];
         match state.claims.front() {
             Some((claimed, _)) if *claimed == ticket => {
                 state.state = State::Claimed { ticket };
                 if let Some((_, gate)) = state.claims.pop_front() {
-                    self.told.push(Finished::Release(gate));
+                    self.told.push(match failure {
+                        Some(why) => Finished::FailGate(gate, StageError::Fatal(why)),
+                        None => Finished::Release(gate),
+                    });
                 }
             }
             // No copy of this read has claimed it yet (a copy waiting is another quantum's, and ordered after).
-            _ => state.state = State::Filled { ticket },
+            _ => state.state = State::Filled { ticket, failure },
         }
     }
 
@@ -835,9 +841,13 @@ impl DiskOwner {
                 "a copy claimed an unknown window slot {slot}"
             )));
         };
-        if matches!(state.state, State::Filled { ticket: filled } if filled == ticket) {
+        if let State::Filled { ticket: filled, failure } = &mut state.state
+            && *filled == ticket
+        {
+            let failure = failure.take();
+            // The copy owns the slot either way: a failed one hands it back when its quantum ends.
             state.state = State::Claimed { ticket };
-            return Ok(true);
+            return failure.map_or(Ok(true), |why| Err(StageError::Fatal(why)));
         }
         let held = state.queue.iter().any(|pending| pending.ticket == ticket)
             || matches!(&state.state, State::Reading { pending, discard: false, .. } if pending.ticket == ticket);
