@@ -50,8 +50,10 @@ on:
     branches: [main, "rust/next*"]
   workflow_dispatch:
 
+# `actions: write` is for the cancel call of the fail-fast step, and nothing else.
 permissions:
   contents: read
+  actions: write
 
 # The event is part of the group, so a manual run on the integration branch never cancels the push run that
 # `rollover promote` requires for that commit. Each push to main has its own group (its sha), so no main run is
@@ -193,7 +195,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Fail on purpose (throwaway)
-        run: sleep 90 && exit 1
+        run: exit 1
       - name: Install the Rust toolchain
         run: mise install rust >/dev/null
       - name: Install bindgen

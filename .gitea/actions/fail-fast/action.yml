@@ -1,6 +1,6 @@
 # Cancels the run this job belongs to. The last step of every job of ci.yaml, with `if: failure()`: the first job that
 # fails stops the others at once, instead of every job running to its end. Cancelling is the Actions API call
-# `POST /actions/runs/{run}/cancel`, which the job's own token may make. It never turns a red run green: the run ends
+# `POST /actions/runs/{run}/cancel`, which the job's own token may make when the workflow grants it `actions: write`. It never turns a red run green: the run ends
 # cancelled, the job that failed stays failed in its log, and the aggregate checks (`device`, `gate-ok`) are cancelled with
 # it, so they never report success. A cancel that cannot be made is printed and does not hide the failure.
 name: fail-fast
@@ -21,6 +21,6 @@ runs:
         REPO: ${{ github.repository }}
         RUN_ID: ${{ github.run_id }}
       run: |
-        curl -sS --max-time 20 --retry 2 -o /dev/null -w 'cancel run %{http_code}\n' -X POST \
+        curl -fsS --max-time 20 --retry 2 -o /dev/null -w 'cancel run %{http_code}\n' -X POST \
           -H "Authorization: token $TOKEN" "$API/repos/$REPO/actions/runs/$RUN_ID/cancel" \
-          || echo "::warning::the run could not be cancelled"
+          || echo "::error::the run could not be cancelled (the token needs actions: write)"
