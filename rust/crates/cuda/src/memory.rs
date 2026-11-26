@@ -151,8 +151,10 @@ impl DeviceBuffer {
         self.generation
     }
 
-    /// Copies `host` into the buffer at `offset` and returns when the copy is done. Startup, shutdown and tests: it
-    /// blocks, and unless it runs inside a lane's lent stream (`LaneTable::submit_host`) it runs on the legacy stream, which does not order against lane work.
+    /// Copies `host` into the buffer at `offset` and returns once the bytes are on the card, so lane work submitted
+    /// afterwards reads them. For startup, shutdown and tests: it blocks, and it waits for all work on the device, not
+    /// only for this copy. A pageable-source copy on the legacy stream can return before its transfer finishes, and
+    /// lane streams do not order against that stream, so the call ends with a device synchronize.
     #[allow(
         clippy::disallowed_methods,
         reason = "no-wait, synchronous copy: documented as startup, shutdown and tests only"
@@ -167,11 +169,14 @@ impl DeviceBuffer {
                 host.len() as u64,
             )
         };
-        check("euhedral_cuda_copy_host_to_device", status)
+        check("euhedral_cuda_copy_host_to_device", status)?;
+        self.library.synchronize()
     }
 
-    /// Copies `host.len()` bytes from the buffer at `offset` and returns when the copy is done. See
-    /// [`DeviceBuffer::copy_from_host`].
+    /// Copies `host.len()` bytes from the buffer at `offset` and returns when the bytes are in `host`. A
+    /// device-to-host copy into pageable memory returns only after the transfer, so it needs no further wait. For
+    /// startup, shutdown and tests; unless it runs inside a lane's lent stream (`LaneTable::submit_host`) it runs on
+    /// the legacy stream, which does not order against lane work.
     #[allow(
         clippy::disallowed_methods,
         reason = "no-wait, synchronous copy: documented as startup, shutdown and tests only"
