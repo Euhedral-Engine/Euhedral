@@ -2,9 +2,9 @@
 
 use super::super::allocation::Allocation;
 use super::super::feasibility::Feasibility;
+use super::Search;
 use super::candidate::Candidate;
 use super::failure::SearchFailure;
-use super::Search;
 use crate::java_random::Random;
 
 /// Attempts at a random mix that fits before the search gives up on that draw.

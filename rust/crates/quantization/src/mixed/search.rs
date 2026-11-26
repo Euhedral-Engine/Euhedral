@@ -32,15 +32,16 @@ mod tests;
 
 use std::collections::HashSet;
 use std::fmt;
+use std::mem::take;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-pub use self::failure::SearchFailure;
-pub use self::ports::{Assembly, Fan, Inline, Ledger, Score, Scoring, World};
-pub use self::settings::Settings;
 use self::candidate::{Candidate, Prepared, front_of};
+pub use self::failure::SearchFailure;
 use self::output::render;
+pub use self::ports::{Assembly, Fan, Inline, Ledger, Score, Scoring, World};
+pub use self::settings::{MOST_BANDS, MOST_CANDIDATES, MOST_KNAPSACK_STEPS, MOST_MEMBERS, MOST_WEIGHTS, Settings};
 use super::cost_table::CostTable;
 use super::ensemble::Ensemble;
 use super::option::QuantOption;
@@ -85,7 +86,11 @@ impl<'a> Search<'a> {
     ) -> Result<Search<'a>, SearchFailure> {
         settings.validate()?;
         let known = priors.options();
-        let mut options: Vec<QuantOption> = options.iter().copied().filter(|option| known.contains(option)).collect();
+        let mut options: Vec<QuantOption> = options
+            .iter()
+            .copied()
+            .filter(|option| known.contains(option))
+            .collect();
         options.sort();
         options.dedup();
         if !options.contains(&sources.base()) {
@@ -121,7 +126,10 @@ impl<'a> Search<'a> {
             self.settings.context,
             self.space.objects().len()
         );
-        Sha256::digest(text.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
+        Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// Runs the search, resuming from the ledger if it holds one.
@@ -161,7 +169,13 @@ impl<'a> Search<'a> {
             }
             let round = progress.round;
             // Only what earlier rounds measured: a resumed round proposes what the unbroken one would have.
-            let data: Vec<Measured> = world.ledger.measured().iter().filter(|each| each.round < round).cloned().collect();
+            let data: Vec<Measured> = world
+                .ledger
+                .measured()
+                .iter()
+                .filter(|each| each.round < round)
+                .cloned()
+                .collect();
             if data.is_empty() {
                 return Err(SearchFailure::NothingMeasured);
             }
@@ -176,7 +190,9 @@ impl<'a> Search<'a> {
                 seed,
             )?;
             if chosen.is_empty() {
-                world.ledger.note(&format!("round {round}: no candidate that was not measured"));
+                world
+                    .ledger
+                    .note(&format!("round {round}: no candidate that was not measured"));
             }
             self.measure(&mut world, chosen, round)?;
             self.finish_round(&mut world, round, &proposals.ensemble, budget)?;
@@ -199,7 +215,9 @@ impl<'a> Search<'a> {
         let fits = world.feasibility.check(allocation)?.fits;
         let bytes = world.assembly.resident_bytes(allocation)?;
         let prefill = self.costs.prefill_micros_per_token(self.sources, allocation)?;
-        let decode = self.costs.verify_micros(self.sources, allocation, self.settings.verify_rows)?;
+        let decode = self
+            .costs
+            .verify_micros(self.sources, allocation, self.settings.verify_rows)?;
         Ok(Prepared {
             candidate,
             bytes,
@@ -211,11 +229,18 @@ impl<'a> Search<'a> {
 
     /// Scores the candidates of `batch` not measured yet, each recorded as soon as it is scored. One that does not fit
     /// the device is left out.
-    fn measure<F: Fan>(&self, world: &mut World<'_, F>, batch: Vec<Candidate>, round: u32) -> Result<(), SearchFailure> {
+    fn measure<F: Fan>(
+        &self,
+        world: &mut World<'_, F>,
+        batch: Vec<Candidate>,
+        round: u32,
+    ) -> Result<(), SearchFailure> {
         let mut listed = HashSet::new();
         let todo: Vec<Candidate> = batch
             .into_iter()
-            .filter(|candidate| !world.ledger.contains(&candidate.allocation) && listed.insert(candidate.allocation.clone()))
+            .filter(|candidate| {
+                !world.ledger.contains(&candidate.allocation) && listed.insert(candidate.allocation.clone())
+            })
             .collect();
         let total = todo.len();
         for (k, candidate) in todo.into_iter().enumerate() {
@@ -259,10 +284,13 @@ impl<'a> Search<'a> {
 
     /// Records the imported candidates: each one's measured KL, with size, costs and fit prepared for this search.
     fn import<F: Fan>(&self, world: &mut World<'_, F>) -> Result<(), SearchFailure> {
-        let imported = std::mem::take(&mut world.imported);
+        let imported = take(&mut world.imported);
         let mut ready = Vec::with_capacity(imported.len());
         for each in &imported {
-            let candidate = Candidate::given(self.space.normalize(&each.allocation)?, format!("import:{}", each.origin));
+            let candidate = Candidate::given(
+                self.space.normalize(&each.allocation)?,
+                format!("import:{}", each.origin),
+            );
             ready.push(self.prepare(world, candidate)?);
         }
         let mut fitting = 0;
@@ -283,7 +311,10 @@ impl<'a> Search<'a> {
                 fitting += 1;
             }
         }
-        world.ledger.note(&format!("imported {} measured candidates, {fitting} fit", imported.len()));
+        world.ledger.note(&format!(
+            "imported {} measured candidates, {fitting} fit",
+            imported.len()
+        ));
         Ok(())
     }
 
@@ -296,7 +327,13 @@ impl<'a> Search<'a> {
         proposer: &Ensemble,
         budget: i64,
     ) -> Result<(), SearchFailure> {
-        let mine: Vec<Measured> = world.ledger.measured().iter().filter(|each| each.round == round).cloned().collect();
+        let mine: Vec<Measured> = world
+            .ledger
+            .measured()
+            .iter()
+            .filter(|each| each.round == round)
+            .cloned()
+            .collect();
         let held_out = proposer.held_out_error(&mine)?;
         let before = world.ledger.progress();
         let mut progress = Progress {
@@ -335,6 +372,8 @@ impl<'a> Search<'a> {
 
 impl fmt::Debug for Search<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Search").field("settings", &self.settings).finish_non_exhaustive()
+        f.debug_struct("Search")
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
     }
 }

@@ -93,7 +93,11 @@ impl Feasibility for Cap {
     }
 
     fn check(&self, allocation: &Allocation) -> Result<Check, MixedError> {
-        let count = allocation.choices().values().filter(|option| **option == QuantOption::Nvfp4).count();
+        let count = allocation
+            .choices()
+            .values()
+            .filter(|option| **option == QuantOption::Nvfp4)
+            .count();
         Ok(Check {
             fits: count <= self.most_nvfp4,
             device_bytes: 1000 * i64::try_from(count).unwrap(),
@@ -250,7 +254,11 @@ fn a_resumed_search_scores_nothing_twice_and_reaches_the_front_of_an_unbroken_on
     scoring.allow = 7;
     let stopped = run(&search, &mut ledger, &mut scoring, 4, Vec::new());
     assert!(matches!(stopped, Err(SearchFailure::Scoring(_))));
-    assert_eq!(ledger.measured.len(), 7, "each scored candidate was recorded before the stop");
+    assert_eq!(
+        ledger.measured.len(),
+        7,
+        "each scored candidate was recorded before the stop"
+    );
     scoring.allow = usize::MAX;
     run(&search, &mut ledger, &mut scoring, 4, Vec::new()).unwrap();
 
@@ -270,10 +278,19 @@ fn an_infeasible_candidate_is_not_scored() {
     run(&search, &mut ledger, &mut scoring, 2, Vec::new()).unwrap();
     assert!(!scoring.scored.is_empty());
     for allocation in &scoring.scored {
-        assert!(Cap { most_nvfp4: 2 }.check(allocation).unwrap().fits, "scored {}", allocation.render());
+        assert!(
+            Cap { most_nvfp4: 2 }.check(allocation).unwrap().fits,
+            "scored {}",
+            allocation.render()
+        );
     }
     assert!(ledger.measured.iter().all(|each| each.fits));
-    assert!(ledger.notes.iter().any(|line| line.contains("does not fit the device, not scored")));
+    assert!(
+        ledger
+            .notes
+            .iter()
+            .any(|line| line.contains("does not fit the device, not scored"))
+    );
 }
 
 #[test]
@@ -344,7 +361,10 @@ fn imported_candidates_are_recorded_unscored_before_the_seeds() {
     let (mut ledger, mut scoring) = (Memory::default(), Fake::new());
     run(&search, &mut ledger, &mut scoring, 4, vec![imported]).unwrap();
     let first = &ledger.measured[0];
-    assert_eq!((first.kl, first.round, first.origin.as_str()), (0.123, 0, "import:elsewhere"));
+    assert_eq!(
+        (first.kl, first.round, first.origin.as_str()),
+        (0.123, 0, "import:elsewhere")
+    );
     assert!(first.fits, "fit is judged again for this search");
     assert!(!scoring.scored.contains(&first.allocation));
 }
@@ -357,10 +377,17 @@ fn the_front_is_written_with_every_allocation_it_names() {
     let outcome = run(&search, &mut ledger, &mut scoring, 4, Vec::new()).unwrap();
     assert!(ledger.files.contains_key("report.txt"));
     for (i, point) in outcome.front.iter().enumerate() {
-        assert_eq!(ledger.files[&format!("allocations/front-{i:02}.json")], point.allocation.render());
+        assert_eq!(
+            ledger.files[&format!("allocations/front-{i:02}.json")],
+            point.allocation.render()
+        );
     }
     assert_eq!(
-        ledger.files.keys().filter(|path| path.starts_with("allocations/")).count(),
+        ledger
+            .files
+            .keys()
+            .filter(|path| path.starts_with("allocations/"))
+            .count(),
         outcome.front.len()
     );
 }
@@ -369,7 +396,9 @@ fn the_front_is_written_with_every_allocation_it_names() {
 fn the_fingerprint_follows_the_identity_but_not_the_priors_or_the_batch() {
     let (sources, costs) = (TinySources::new(), costs());
     let search = |settings: Settings, priors: &Priors| {
-        Search::new(settings, &sources, &options(), priors, &costs).unwrap().fingerprint()
+        Search::new(settings, &sources, &options(), priors, &costs)
+            .unwrap()
+            .fingerprint()
     };
     let base = search(settings(), &priors(0.5));
     let mut batch = settings();
@@ -378,10 +407,18 @@ fn the_fingerprint_follows_the_identity_but_not_the_priors_or_the_batch() {
     assert_eq!(search(settings(), &priors(0.9)), base, "changed priors resume");
     let mut other = settings();
     other.identity = "another reference\ncosts".to_owned();
-    assert_ne!(search(other, &priors(0.5)), base, "a different reference is a different search");
+    assert_ne!(
+        search(other, &priors(0.5)),
+        base,
+        "a different reference is a different search"
+    );
     let mut other = settings();
     other.identity = "references\nother costs".to_owned();
-    assert_ne!(search(other, &priors(0.5)), base, "a different cost table is a different search");
+    assert_ne!(
+        search(other, &priors(0.5)),
+        base,
+        "a different cost table is a different search"
+    );
 }
 
 #[test]
@@ -390,7 +427,9 @@ fn settings_outside_their_limits_are_refused_with_the_value() {
     let refused = |change: fn(&mut Settings)| {
         let mut bad = settings();
         change(&mut bad);
-        Search::new(bad, &sources, &options(), &priors(0.5), &costs).unwrap_err().to_string()
+        Search::new(bad, &sources, &options(), &priors(0.5), &costs)
+            .unwrap_err()
+            .to_string()
     };
     assert!(refused(|s| s.batch = 0).contains("batch is 0"));
     assert!(refused(|s| s.explore = 1.5).contains("explore is 1.5"));

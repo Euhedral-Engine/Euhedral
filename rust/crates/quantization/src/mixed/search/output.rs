@@ -61,7 +61,8 @@ pub(super) fn render(
             point.origin
         );
     }
-    let text = to_string_pretty(&json!({ "front": points })).map_err(|error| SearchFailure::Output(error.to_string()))?;
+    let text =
+        to_string_pretty(&json!({ "front": points })).map_err(|error| SearchFailure::Output(error.to_string()))?;
     files.push(("front.json".to_owned(), format!("{text}\n")));
     files.push(("report.txt".to_owned(), report));
     Ok(files)

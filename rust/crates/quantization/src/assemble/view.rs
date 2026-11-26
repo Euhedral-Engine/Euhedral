@@ -4,12 +4,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use euhedral_inference_edrl::{ModelMetadata, TensorEntry, TokenizerSection};
+use euhedral_inference_edrl::{ModelMetadata, TensorEntry, TensorTable, TokenizerSection};
 use euhedral_io::OwnedFile;
 
 use super::AssembleError;
 use super::sources::{COMPANION_SUFFIXES, SourceSet};
-use crate::mixed::{Allocation, QuantOption};
+use crate::mixed::{Allocation, Composites, MixedError, QuantOption};
 
 /// One object of the assembled artifact: its descriptor in the source it is read from, and that source.
 #[derive(Debug, Clone)]
@@ -124,4 +124,19 @@ fn companion_of_replaced(name: &str, chosen: &BTreeMap<&str, QuantOption>, base:
             .and_then(|stem| chosen.get(stem))
             .is_some_and(|option| *option != base)
     })
+}
+
+/// The table of the artifact an allocation assembles, which the residency check plans.
+impl Composites for SourceSet {
+    fn table(&self, allocation: &Allocation) -> Result<TensorTable, MixedError> {
+        let assembled = view(self, allocation, None).map_err(|error| MixedError::Invalid(error.to_string()))?;
+        TensorTable::from_entries(assembled.pieces.into_iter().map(|piece| piece.entry).collect())
+            .map_err(|error| MixedError::Invalid(error.to_string()))
+    }
+}
+
+impl Composites for Arc<SourceSet> {
+    fn table(&self, allocation: &Allocation) -> Result<TensorTable, MixedError> {
+        self.as_ref().table(allocation)
+    }
 }

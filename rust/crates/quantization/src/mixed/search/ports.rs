@@ -27,7 +27,7 @@ impl Score {
             if chunk.is_empty() || !chunk.len().is_multiple_of(FIELDS) {
                 return None;
             }
-            let kl: Vec<f64> = chunk.chunks_exact(FIELDS).map(|row| row[2]).collect();
+            let kl: Vec<f64> = chunk.as_chunks::<FIELDS>().0.iter().map(|row| row[2]).collect();
             per_chunk.push(mean(&kl));
             all.extend(kl);
         }
@@ -105,6 +105,8 @@ pub struct World<'w, F: Fan> {
 
 impl<F: Fan> fmt::Debug for World<'_, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("World").field("imported", &self.imported.len()).finish_non_exhaustive()
+        f.debug_struct("World")
+            .field("imported", &self.imported.len())
+            .finish_non_exhaustive()
     }
 }

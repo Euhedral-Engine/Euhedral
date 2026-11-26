@@ -8,10 +8,10 @@ use super::super::ensemble::Ensemble;
 use super::super::error::MixedError;
 use super::super::feasibility::Feasibility;
 use super::super::search_state::Measured;
+use super::Search;
 use super::candidate::{Candidate, front_of};
 use super::proposing::Proposals;
 use super::seeding::below;
-use super::Search;
 use crate::java_random::Random;
 
 /// Neighbours tried by one move.
@@ -62,6 +62,10 @@ fn anchors(data: &[Measured]) -> Vec<Measured> {
 impl Search<'_> {
     /// The `need` candidates of round `round` from `proposals`, never one in `data`. Exploring picks are `share` of the
     /// batch, rounded half up.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one round's inputs, each used once; a record would only carry them"
+    )]
     pub(super) fn choose(
         &self,
         proposals: &Proposals,

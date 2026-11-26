@@ -13,10 +13,10 @@ use super::super::knapsack;
 use super::super::rco::{self, Objective as RcoObjective};
 use super::super::search_state::Measured;
 use super::super::space::Space;
+use super::Search;
 use super::candidate::Candidate;
 use super::failure::SearchFailure;
 use super::ports::Fan;
-use super::Search;
 
 /// Repairs of an assignment that does not fit, each with a smaller byte limit.
 const FIT_REPAIRS: usize = 12;
@@ -133,8 +133,21 @@ impl Cell {
         let minimum = self.space.minimum_bytes()?;
         let budget = minimum.saturating_add((self.fraction * (self.ceiling - minimum).max(0) as f64) as i64);
         let unit = (budget / i64::from(self.knapsack_steps)).max(1);
-        let objective = Objective::new(Arc::clone(&self.ensemble), Arc::clone(&self.space), self.lambda_prefill, self.lambda_decode);
-        let outcome = rco::run(&objective, self.space.bytes(), budget, unit, self.rco, self.seed, self.restart)?;
+        let objective = Objective::new(
+            Arc::clone(&self.ensemble),
+            Arc::clone(&self.space),
+            self.lambda_prefill,
+            self.lambda_decode,
+        );
+        let outcome = rco::run(
+            &objective,
+            self.space.bytes(),
+            budget,
+            unit,
+            self.rco,
+            self.seed,
+            self.restart,
+        )?;
         let mut choice = outcome.choice;
         let mut check = self.feasibility.check(&self.space.allocation(&choice))?;
         let log_p: Vec<Vec<f64>> = outcome
@@ -176,6 +189,9 @@ impl Cell {
     }
 }
 
+/// What one RCO cell finds: a candidate, or nothing feasible.
+type Found = Result<Option<Candidate>, MixedError>;
+
 impl Search<'_> {
     /// The sweep's lambda cells: every pair (prefill, decode) of the lambda list.
     pub(super) fn lambda_cells(&self) -> usize {
@@ -194,7 +210,8 @@ impl Search<'_> {
             .map(|fit| {
                 let (data, priors) = (Arc::clone(&data), Arc::clone(&self.priors));
                 let (ridge, bands) = (self.settings.ridge, self.settings.bands);
-                Box::new(move || fit.fit(&data, ridge, &priors, bands)) as Box<dyn FnOnce() -> Result<FidelityModel, MixedError> + Send>
+                Box::new(move || fit.fit(&data, ridge, &priors, bands))
+                    as Box<dyn FnOnce() -> Result<FidelityModel, MixedError> + Send>
             })
             .collect();
         let members = fan.map(tasks)?.into_iter().collect::<Result<Vec<_>, MixedError>>()?;
@@ -214,7 +231,7 @@ impl Search<'_> {
     ) -> Result<Proposals, SearchFailure> {
         let ensemble = Arc::new(self.fit(fan, Arc::new(data.to_vec()), seed, round)?);
         let (lambdas, fractions) = (&self.settings.lambdas, &self.settings.budget_fractions);
-        let mut tasks: Vec<Box<dyn FnOnce() -> Result<Option<Candidate>, MixedError> + Send>> = Vec::new();
+        let mut tasks: Vec<Box<dyn FnOnce() -> Found + Send>> = Vec::new();
         for lambda_index in 0..self.lambda_cells() {
             for (fraction_index, fraction) in fractions.iter().enumerate() {
                 for restart in 0..self.settings.rco.restarts {
@@ -243,10 +260,10 @@ impl Search<'_> {
         let mut seen: HashSet<Allocation> = HashSet::new();
         let mut candidates = Vec::new();
         for found in fan.map(tasks)? {
-            if let Some(candidate) = found? {
-                if seen.insert(candidate.allocation.clone()) {
-                    candidates.push(candidate);
-                }
+            if let Some(candidate) = found?
+                && seen.insert(candidate.allocation.clone())
+            {
+                candidates.push(candidate);
             }
         }
         Ok(Proposals { ensemble, candidates })

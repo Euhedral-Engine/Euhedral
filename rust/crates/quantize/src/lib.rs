@@ -1,10 +1,10 @@
 //! The command line of the quantization tools: `quantization COMMAND [FLAGS]`.
 //!
 //! This crate parses the command and its flags and starts the work; the work is in
-//! `euhedral-inference-quantization`. [`COMMANDS`] lists every command the tools have. A command whose work is not
-//! wired yet says so and exits with [`EXIT_NOT_AVAILABLE`]; three commands are not part of this tool at all
-//! ([`Availability::Dropped`]).
+//! `euhedral-inference-quantization`. [`COMMANDS`] lists every command the tools have. Three commands are not part of
+//! this tool at all ([`Availability::Dropped`]) and exit with [`EXIT_NOT_AVAILABLE`].
 
+mod allocate;
 mod assemble;
 mod calibrate;
 mod cost;
@@ -30,8 +30,6 @@ pub const EXIT_NOT_AVAILABLE: u8 = 3;
 pub enum Availability {
     /// The command runs.
     Wired,
-    /// The command is part of the tool and its work is not wired yet.
-    Pending,
     /// The command is not part of this tool: it was an experiment that was measured and not adopted.
     Dropped,
 }
@@ -99,8 +97,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "allocate",
-        availability: Availability::Pending,
-        usage: "--source OPTION=ARTIFACT... --base OPTION --costs COSTS.json --priors PRIORS.json --reference R.kld... --context N --state SEARCH.resume --out DIR",
+        availability: Availability::Wired,
+        usage: "--source OPTION=ARTIFACT... --base OPTION --costs COSTS.json --priors PRIORS.json --reference R.kld... --state SEARCH.resume --out DIR [--context N] [--seed-file FILE] [--import-state FILE] [--free-mib N] [--workers N] [--host-mib N] [--score-rows N] [--score-batch N] [--batch N] [--explore X] [--patience N] [--random N] [--bands N] [--verify-rows N] [--host-sinks N] [--members N] [--ridge X] [--lambdas A,B,...] [--budget-fractions A,B,...] [--rco-steps N] [--rco-lr X] [--rco-samples N] [--rco-restarts N] [--knapsack-steps N] [--max-rounds N] [--seed N] [--max-concurrent 1] [--config YAML] [--cuda-library FILE]",
     },
     Command {
         name: "reference",
@@ -152,6 +150,7 @@ pub fn run(args: &[String]) -> Outcome {
     };
     match command.availability {
         Availability::Wired => match command.name {
+            "allocate" => allocate::run(&args[1..]),
             "assemble" => assemble::run(&args[1..]),
             "calibrate" => calibrate::run(&args[1..]),
             "cost" => cost::run(&args[1..]),
@@ -165,10 +164,6 @@ pub fn run(args: &[String]) -> Outcome {
                 code: EXIT_NOT_AVAILABLE,
                 message: format!("the command '{name}' has no work behind it\n"),
             },
-        },
-        Availability::Pending => Outcome {
-            code: EXIT_NOT_AVAILABLE,
-            message: format!("the command '{name}' is not available in this build yet\n"),
         },
         Availability::Dropped => Outcome {
             code: EXIT_NOT_AVAILABLE,
@@ -203,19 +198,6 @@ mod tests {
         let unknown = run_words(&["frobnicate"]);
         assert_eq!(unknown.code, EXIT_USAGE);
         assert!(unknown.message.starts_with("unknown command 'frobnicate'"));
-    }
-
-    #[test]
-    fn a_pending_command_says_it_is_not_available() {
-        let Some(pending) = COMMANDS
-            .iter()
-            .find(|command| command.availability == Availability::Pending)
-        else {
-            return;
-        };
-        let outcome = run_words(&[pending.name, "--model", "x"]);
-        assert_eq!(outcome.code, EXIT_NOT_AVAILABLE);
-        assert!(outcome.message.contains("not available"));
     }
 
     #[test]

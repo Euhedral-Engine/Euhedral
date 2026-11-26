@@ -1,8 +1,8 @@
 //! The byte budget RCO may use, found on a nested family of allocations.
 
 use super::super::feasibility::Feasibility;
-use super::failure::SearchFailure;
 use super::Search;
+use super::failure::SearchFailure;
 
 impl Search<'_> {
     /// The choice that puts the first `dearest` objects on their dearest option and the rest on their cheapest.
