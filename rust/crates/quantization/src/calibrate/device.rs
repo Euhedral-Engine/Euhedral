@@ -60,10 +60,12 @@ use crate::resume::ResumeFile;
 use crate::step::{Kind, idle, step};
 
 mod heads;
+mod staging;
 mod trellis;
 
 use super::head_state::HeadState;
-use heads::{DeviceHeads, OUTPUT_HEAD};
+use heads::{Call, DeviceHeads, OUTPUT_HEAD, head_groups, read_tensors};
+use staging::HeadStaging;
 use trellis::{Opening, Trellis, TrellisDeviceHeads, round_layer};
 
 pub use trellis::TrellisRun;
@@ -189,6 +191,8 @@ struct Inner {
     completions: Arc<Completions>,
     pipeline: ForwardPipeline,
     staging: Arc<PinnedPool>,
+    /// The buffer the embedding read, the MTP block and the heads read their tensors into.
+    head_staging: HeadStaging<PinnedBuffer>,
     states: States,
     batch_states: DeviceBuffer,
     /// The main lane's second set of math handles: the pipeline holds the first.
@@ -324,6 +328,14 @@ impl Calibration {
                 .map_err(|error| CalibrateError::failed("the hidden states", error))?,
             bytes: states_bytes,
         };
+        let head_staging = HeadStaging::open(
+            &library,
+            &head_groups(
+                settings.trellis.is_some(),
+                |call| call.names(&objects),
+                |name| objects.store().tensor(name).ok().map(|tensor| tensor.bytes as usize),
+            ),
+        )?;
         let batch_states = DeviceBuffer::alloc(&library, batch * length * hidden * BF16_BYTES)
             .map_err(|error| CalibrateError::failed("the batch states", error))?;
 
@@ -440,6 +452,7 @@ impl Calibration {
             completions: Arc::clone(&completions),
             pipeline,
             staging,
+            head_staging,
             states,
             batch_states,
             handles: Handoff::empty(),
@@ -681,32 +694,28 @@ fn embed(inner: Arc<Inner>, then: Once<usize>) {
     if let Err(error) = checked {
         return end(&then, Err(error));
     }
-    // The staging pool's memory, which a drop returns to the pool: a plain pinned buffer is freed with a wait for the
-    // device, in the frame that ends the read.
-    let memory = match inner.staging.acquire(tensor.bytes as usize) {
-        Ok(memory) => memory,
-        Err(error) => return end(&then, Err(CalibrateError::failed("the embedding table", error))),
+    // The heads' own buffer, allocated at open: a pooled loan of this size would be rounded up to a power of two and
+    // allocated in this frame.
+    let names = match Call::Embedding.names(&inner.objects) {
+        Ok(names) => names,
+        Err(error) => return end(&then, Err(error)),
     };
-    let failed = Arc::clone(&then);
-    let started = store.read_tensor(
-        EMBEDDING,
-        memory,
-        Arc::new(move |read: Result<PooledPinned, CheckpointError>| {
-            let outcome = read
-                .map_err(|error| CalibrateError::failed("the embedding table", error))
-                .and_then(|memory| {
-                    // SAFETY: the table was read whole into the buffer, which nothing else touches.
-                    let table = unsafe { slice::from_raw_parts(memory.buffer().as_ptr(), tensor.bytes as usize) };
-                    // SAFETY: the states are the run's own and nothing touches them before the run starts.
-                    let states = unsafe { slice::from_raw_parts_mut(inner.states.pointer(), inner.states.bytes) };
-                    embedding::copy_rows(&inner.settings.tokens, table, inner.row_bytes(), states)
-                });
+    let reading = Arc::clone(&inner);
+    read_tensors(
+        &reading,
+        names,
+        Box::new(move |read| {
+            let outcome = read.and_then(|memory| {
+                let table = memory
+                    .bytes(0)
+                    .ok_or_else(|| CalibrateError::Failed("the embedding table was not read".to_owned()))?;
+                // SAFETY: the states are the run's own and nothing touches them before the run starts.
+                let states = unsafe { slice::from_raw_parts_mut(inner.states.pointer(), inner.states.bytes) };
+                embedding::copy_rows(&inner.settings.tokens, table, inner.row_bytes(), states)
+            });
             end(&then, outcome.map(|()| 0));
         }),
     );
-    if let Err(error) = started {
-        end(&failed, Err(CalibrateError::failed("the embedding table", error)));
-    }
 }
 
 // ---- checkpoint ----

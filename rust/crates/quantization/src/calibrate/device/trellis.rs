@@ -21,11 +21,12 @@ use euhedral_gpu::cuda::{CudaGpu, CudaModule};
 use euhedral_gpu::{Gpu, StreamOptions};
 use euhedral_graph::{Completions, Lake};
 use euhedral_inference_cuda::math::MathLibraries;
-use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool, PooledPinned};
+use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool};
 use euhedral_inference_engine::Handoff;
 use euhedral_io::AsyncIo;
 
-use super::heads::{Context, DeviceHeads, free, lane, on_main, read_tensors, upload_pinned};
+use super::heads::{Context, DeviceHeads, free, lane, on_main, read_tensors, upload_part};
+use super::staging::HeadMemory;
 use super::{BF16_BYTES, FP32_BYTES, Inner, Settings, lane_handles, write_pass};
 use crate::calibrate::CalibrateError;
 use crate::calibrate::allocation::Allocation;
@@ -838,6 +839,11 @@ fn listed_in_heads(then: Then<Vec<String>>) -> Then<Vec<String>> {
     Box::new(move |result| then(result.map(|files| files.iter().map(|file| in_heads(file)).collect())))
 }
 
+/// The tensors of the MTP block's eight linears, in the order they are rounded.
+pub(super) fn mtp_tensors() -> Vec<String> {
+    MTP_LINEARS.iter().map(|name| format!("{name}.weight")).collect()
+}
+
 impl Heads for TrellisDeviceHeads {
     fn observe(&self, then: Then<()>) {
         self.heads.observe(then);
@@ -846,10 +852,9 @@ impl Heads for TrellisDeviceHeads {
     /// Rounds the MTP block's eight linears without a Hessian, as Java does, and has the writer write them.
     fn mtp(&self, then: Then<Vec<String>>) {
         let inner = Arc::clone(&self.inner);
-        let names = MTP_LINEARS.iter().map(|name| format!("{name}.weight")).collect();
         read_tensors(
             &self.inner,
-            names,
+            mtp_tensors(),
             Box::new(move |read| match read {
                 Ok(memory) => upload_mtp(inner, memory, then),
                 Err(error) => then(Err(error)),
@@ -907,7 +912,7 @@ impl TrellisHeads for TrellisDeviceHeads {
 }
 
 /// The MTP weights, read into pinned memory, up on the main lane; then rounds them.
-fn upload_mtp(inner: Arc<Inner>, memory: Vec<PooledPinned>, then: Then<Vec<String>>) {
+fn upload_mtp(inner: Arc<Inner>, memory: HeadMemory, then: Then<Vec<String>>) {
     let working = Arc::clone(&inner);
     let next = Arc::clone(&inner);
     on_main(
@@ -916,10 +921,10 @@ fn upload_mtp(inner: Arc<Inner>, memory: Vec<PooledPinned>, then: Then<Vec<Strin
         memory,
         move |queue, handles, memory| {
             let mut context = lane(&working, queue, handles);
-            let mut uploaded = Vec::with_capacity(memory.len());
-            for weight in memory {
+            let mut uploaded = Vec::with_capacity(MTP_LINEARS.len());
+            for index in 0..MTP_LINEARS.len() {
                 // SAFETY: the memory is kept until the lane has retired the copies, and is left alone.
-                uploaded.push(unsafe { upload_pinned(&working, &mut context, weight) }?);
+                uploaded.push(unsafe { upload_part(&working, &mut context, memory, index) }?);
             }
             Ok(uploaded)
         },

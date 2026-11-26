@@ -29,8 +29,8 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from euhedral_artifacts import device  # noqa: E402
-from euhedral_artifacts.codes import (QuantState, export_key, export_state, finish_export, state_size,  # noqa: E402
-                                      write_state)
+from euhedral_artifacts.codes import (QuantState, checkpoint_export_key, export_state, finish_export,  # noqa: E402
+                                      state_size, write_state)
 from euhedral_artifacts.edrl import FORMAT_ORDINAL, LAYOUT_ORDINAL, align_up, read_table  # noqa: E402
 from euhedral_artifacts.importance import ImportanceMatrix  # noqa: E402
 from euhedral_artifacts.inventory import build_plans, draft_token_ids  # noqa: E402
@@ -134,8 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     importance = ImportanceMatrix(args.imatrix) if args.imatrix is not None else None
     pattern = re.compile(args.objects)
     # What names this export: an export into a directory of another key is refused.
-    key = export_key(args.model.resolve(), args.artifact.resolve(), args.quantization, args.compressed,
-                     args.imatrix.resolve() if args.imatrix is not None else None)
+    key = checkpoint_export_key(args.model, args.artifact, args.quantization, args.compressed, args.imatrix)
     if args.export is not None:
         args.export.mkdir(parents=True, exist_ok=True)
     formats = {ordinal: name for name, ordinal in FORMAT_ORDINAL.items()}

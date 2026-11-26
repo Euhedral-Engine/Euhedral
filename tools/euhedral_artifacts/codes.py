@@ -5,6 +5,7 @@ fake_quant.py exports these from trained modules."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 
@@ -151,9 +152,45 @@ def _plain(name) -> bool:
 
 def export_key(*parts) -> str:
     """The key of an export: what names the run whose objects it holds (the source model, the artifact, the recipe,
-    the importance matrix), joined as calibrate joins its key. The objects chosen are not part of it: passes over other
+    the importance matrix: the identity of the model and the digest of the matrix, not only their paths), joined as calibrate joins its key. The objects chosen are not part of it: passes over other
     objects of the same run add to one export."""
     return "|".join(str(part) for part in parts)
+
+
+def model_identity(directory: Path) -> str:
+    """A digest of what a checkpoint directory holds, for the export key: a checkpoint rebuilt at the same path is
+    another run. Every regular file counts by name; a `.json` file (config, index) by its bytes; any other file (the
+    shards) by its size alone, so a shard's contents are never read."""
+    digest = hashlib.sha256()
+    for path in sorted(directory.iterdir(), key=lambda entry: entry.name):
+        if not path.is_file():
+            continue
+        name = path.name.encode("utf-8")
+        digest.update(len(name).to_bytes(8, "little") + name)
+        if path.suffix == ".json":
+            content = path.read_bytes()
+            digest.update(b"b" + len(content).to_bytes(8, "little") + content)
+        else:
+            digest.update(b"s" + path.stat().st_size.to_bytes(8, "little"))
+    return digest.hexdigest()
+
+
+def file_digest(path: Path) -> str:
+    """A digest of a file's bytes, read in blocks: the importance matrix can be large."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def checkpoint_export_key(model: Path, artifact: Path, quantization: str, compressed: bool,
+                          imatrix: Path | None) -> str:
+    """The export key of a run over `model`, `artifact` and an optional importance matrix: the model's identity and
+    the matrix's digest are in it, so that a rewritten model or matrix at the same path is another run."""
+    return export_key(model.resolve(), model_identity(model), artifact.resolve(), quantization, compressed,
+                      imatrix.resolve() if imatrix is not None else None,
+                      file_digest(imatrix) if imatrix is not None else None)
 
 
 def _own_export(directory: Path, key: str, producer: str) -> dict:
