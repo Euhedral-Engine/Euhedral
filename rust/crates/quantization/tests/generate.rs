@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
@@ -264,6 +265,11 @@ struct Started {
 struct Fake {
     started: Mutex<Vec<Started>>,
     arrived: Condvar,
+    /// The call of `answer` that waits for the gate to open after it has taken its request: 0 for none.
+    hold: AtomicUsize,
+    calls: AtomicUsize,
+    gate: Mutex<bool>,
+    opened: Condvar,
     flying: AtomicUsize,
     most_flying: AtomicUsize,
 }
@@ -279,11 +285,25 @@ impl Answerer for Fake {
         self.most_flying.fetch_max(flying, Ordering::SeqCst);
         self.started.lock().unwrap().push(Started { request, sink, cancel });
         self.arrived.notify_all();
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.hold.load(Ordering::SeqCst) {
+            // The caller is the run's turn, which holds the run: what the others post waits until it goes on.
+            let mut open = self.gate.lock().unwrap();
+            while !*open {
+                let (guard, timeout) = self.opened.wait_timeout(open, Duration::from_secs(60)).unwrap();
+                assert!(!timeout.timed_out(), "the gate of the held start never opened");
+                open = guard;
+            }
+        }
         Ok(())
     }
 }
 
 impl Fake {
+    fn open_gate(&self) {
+        *self.gate.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
     /// The newest answer asked for, waiting until the run asks for one: a worker of the lattice may still be starting
     /// it when the test thread gets here.
     fn await_next(&self, what: &str) -> Started {
@@ -635,6 +655,7 @@ fn a_torn_last_index_line_is_cut_back_on_reopening_and_the_corpus_goes_on() {
     let sequences = four_sequences();
     let rig = rig();
     write_all(&rig, torn.path(), &sequences[..2]);
+    let whole = fs::read(torn.path().join("index.jsonl")).unwrap();
     // A stopped run cut its last index line short, after the rows it names were written.
     let mut index = OpenOptions::new()
         .append(true)
@@ -644,6 +665,8 @@ fn a_torn_last_index_line_is_cut_back_on_reopening_and_the_corpus_goes_on() {
     assert_eq!(corpus::entries(torn.path()).unwrap().len(), 2);
     let writer = open(&rig, torn.path(), WIDTH);
     assert_eq!(writer.ids().len(), 2);
+    // Opening alone cuts the fragment off.
+    assert_eq!(fs::read(torn.path().join("index.jsonl")).unwrap(), whole);
     let (_, result) = append(&rig, writer, &sequences[2]);
     result.unwrap();
     write_all(&rig, clean.path(), &sequences[..3]);
@@ -664,6 +687,8 @@ fn a_bad_line_before_the_last_is_a_corrupt_index_and_is_refused() {
     rig.shut();
 }
 
+/// The run's turn is held inside the engine's third start, so what the three answers post is all in the inbox when the
+/// next turn takes it in: two answers finished and queued for the writer, then a failure.
 #[test]
 fn answers_that_finished_before_a_failure_are_still_written() {
     let directory = tempfile::tempdir().unwrap();
@@ -674,14 +699,12 @@ fn answers_that_finished_before_a_failure_are_still_written() {
         .map(|(n, id)| prompt(id, n as u32))
         .collect();
     let fake = Arc::new(Fake::default());
+    fake.hold.store(3, Ordering::SeqCst);
     let writer = open(&rig, directory.path(), WIDTH);
-    let done = start(
-        &rig.host,
-        Arc::clone(&fake) as Arc<dyn Answerer>,
-        writer,
-        prompts.clone(),
-        options(3),
-    );
+    let starter = {
+        let (host, fake, prompts) = (Arc::clone(&rig.host), Arc::clone(&fake), prompts.clone());
+        thread::spawn(move || start(&host, fake as Arc<dyn Answerer>, writer, prompts, options(3)))
+    };
     let (first, second, third) = (
         fake.await_next("the first prompt"),
         fake.await_next("the second prompt"),
@@ -699,14 +722,18 @@ fn answers_that_finished_before_a_failure_are_still_written() {
         })
         .collect();
     finished.sort();
-    // The second answer ends while the first is being written, and the third fails.
     play(first, None);
     play(second, None);
     play(third, Some(FinishReason::ContextFull));
+    fake.open_gate();
+    let done = starter.join().expect("the start returned");
     let error = wait(&done).unwrap_err();
     assert!(matches!(error, GenerateError::Engine(_)), "{error}");
-    let entries = corpus::entries(directory.path()).unwrap();
-    let mut written: Vec<String> = entries.into_iter().map(|entry| entry.id).collect();
+    let mut written: Vec<String> = corpus::entries(directory.path())
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
     written.sort();
     assert_eq!(written, finished);
     rig.shut();
