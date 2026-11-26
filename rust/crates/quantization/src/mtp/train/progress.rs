@@ -308,7 +308,8 @@ impl Progress {
                 .and_then(|text| text.parse().ok())
                 .ok_or(StateError::Field(key))
         }
-        let (epoch, cursor, step): (u32, usize, u32) = (field(header, EPOCH)?, field(header, CURSOR)?, field(header, STEP)?);
+        let (epoch, cursor, step): (u32, usize, u32) =
+            (field(header, EPOCH)?, field(header, CURSOR)?, field(header, STEP)?);
         let (best, pending): (f64, u32) = (field(header, BEST)?, field(header, PENDING)?);
         if !best.is_finite() {
             return Err(StateError::Field(BEST));
@@ -382,7 +383,12 @@ impl Evaluation {
     /// Takes in a window of a sequence (`sampled` or greedy) whose drafts were checked against `checked` and drafted
     /// `predicted`, both depth-major `[depths][count]`.
     pub fn add(&mut self, sampled: bool, count: usize, checked: &[i32], predicted: &[i32]) {
-        let at = |k: usize, r: usize| (checked.get(k * count + r).copied(), predicted.get(k * count + r).copied());
+        let at = |k: usize, r: usize| {
+            (
+                checked.get(k * count + r).copied(),
+                predicted.get(k * count + r).copied(),
+            )
+        };
         for r in 0..count {
             let complete = (0..self.depths).all(|k| at(k, r).0.is_some_and(|row| row != NO_TARGET));
             if !complete {
@@ -413,7 +419,9 @@ impl Evaluation {
 
     /// The accepted drafts per lineage.
     pub fn mean(&self) -> f64 {
-        let sum: f64 = (0..=self.depths).map(|run| run as f64 * self.accepted[run] as f64).sum();
+        let sum: f64 = (0..=self.depths)
+            .map(|run| run as f64 * self.accepted[run] as f64)
+            .sum();
         sum / self.lineages.max(1) as f64
     }
 
@@ -488,11 +496,15 @@ mod tests {
         let mut progress = progress();
         let mut seen = Vec::new();
         for _ in 0..3 {
-            let Next::Sequence(sequence) = progress.next() else { panic!("the epoch ended early") };
+            let Next::Sequence(sequence) = progress.next() else {
+                panic!("the epoch ended early")
+            };
             seen.push(sequence);
         }
         assert_eq!(seen, shuffled(&[1, 2, 4], 0));
-        let Next::Sequence(first) = progress.next() else { panic!("the second epoch did not start") };
+        let Next::Sequence(first) = progress.next() else {
+            panic!("the second epoch did not start")
+        };
         assert_eq!((progress.epoch(), first), (1, shuffled(&[1, 2, 4], 1)[0]));
         progress.next();
         progress.next();
@@ -546,7 +558,14 @@ mod tests {
 
     #[test]
     fn no_evaluate_every_means_no_evaluation_between_updates() {
-        let mut progress = Progress::new(Settings { evaluate_every: 0, ..settings() }, vec![1], 5);
+        let mut progress = Progress::new(
+            Settings {
+                evaluate_every: 0,
+                ..settings()
+            },
+            vec![1],
+            5,
+        );
         let (checked, predicted) = window(&[5, 5, 5], &[5, 5, 5]);
         assert!(train(&mut progress, &checked, &predicted).is_some());
         assert!(!progress.take_evaluation_due());
@@ -554,7 +573,14 @@ mod tests {
 
     #[test]
     fn every_tenth_update_reports_the_mean_loss_and_top_1_of_the_labelled_drafts_and_starts_over() {
-        let mut progress = Progress::new(Settings { tokens: 1, ..settings() }, vec![1], 5);
+        let mut progress = Progress::new(
+            Settings {
+                tokens: 1,
+                ..settings()
+            },
+            vec![1],
+            5,
+        );
         // Ten windows: summed losses 1 and 2 over 20 and 30 labelled drafts; depth 1 is right for half of them. A draft without a target is not counted.
         let (checked, predicted) = window(&[5, 6, NO_TARGET], &[5, 0, 0]);
         let mut reports = Vec::new();
@@ -563,7 +589,10 @@ mod tests {
             reports.extend(progress.report(&update));
         }
         assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0], "step 10 (epoch 0, 0/1): d1 loss 0.500 top-1 0.500 d2 loss 0.667 top-1 1.000");
+        assert_eq!(
+            reports[0],
+            "step 10 (epoch 0, 0/1): d1 loss 0.500 top-1 0.500 d2 loss 0.667 top-1 1.000"
+        );
         let update = train(&mut progress, &checked, &predicted).unwrap();
         assert_eq!(progress.report(&update), None);
         assert_eq!(progress.tally.count[0], 2);
@@ -575,11 +604,21 @@ mod tests {
         let mut evaluation = Evaluation::new(2);
         evaluation.add(false, 1, &[5, 5], &[5, 5]);
         let initial = progress.evaluated(&evaluation, true, false);
-        assert_eq!((initial.mean, initial.improved, initial.save_state, initial.finished), (2.0, true, false, false));
-        assert!(initial.line.starts_with("before training: held-out accepted drafts 2.0000 per lineage (1 lineages)"));
+        assert_eq!(
+            (initial.mean, initial.improved, initial.save_state, initial.finished),
+            (2.0, true, false, false)
+        );
+        assert!(
+            initial
+                .line
+                .starts_with("before training: held-out accepted drafts 2.0000 per lineage (1 lineages)")
+        );
         let worse = Evaluation::new(2);
         let later = progress.evaluated(&worse, false, true);
-        assert_eq!((later.mean, later.improved, later.save_state, later.finished), (0.0, false, true, true));
+        assert_eq!(
+            (later.mean, later.improved, later.save_state, later.finished),
+            (0.0, false, true, true)
+        );
         assert_eq!(progress.best(), 2.0);
     }
 
@@ -587,7 +626,12 @@ mod tests {
     fn an_evaluation_counts_leading_accepted_drafts_of_lineages_whose_every_draft_has_a_target() {
         let mut evaluation = Evaluation::new(2);
         // Lineage 0: both accepted. 1: the first only. 2: a rejected token outside the head. 3: no target at depth 2.
-        evaluation.add(false, 4, &[5, 6, OUTSIDE_HEAD, 7, 5, 6, 6, NO_TARGET], &[5, 6, 5, 7, 5, 0, 6, 0]);
+        evaluation.add(
+            false,
+            4,
+            &[5, 6, OUTSIDE_HEAD, 7, 5, 6, 6, NO_TARGET],
+            &[5, 6, 5, 7, 5, 0, 6, 0],
+        );
         evaluation.add(true, 1, &[3, 3], &[3, 4]);
         assert_eq!(evaluation.lineages(), 4);
         assert_eq!(evaluation.mean(), (2.0 + 1.0 + 0.0 + 1.0) / 4.0);
@@ -616,18 +660,38 @@ mod tests {
         progress.step = 7;
         progress.best = 1.25;
         let resumed = Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &saved(&progress)).unwrap();
-        let Resume::Continue(mut resumed) = resumed else { panic!("not a state to continue") };
-        assert_eq!((resumed.epoch(), resumed.position(), resumed.step(), resumed.pending, resumed.best()), (1, (1, 3), 7, 2, 1.25));
+        let Resume::Continue(mut resumed) = resumed else {
+            panic!("not a state to continue")
+        };
+        assert_eq!(
+            (
+                resumed.epoch(),
+                resumed.position(),
+                resumed.step(),
+                resumed.pending,
+                resumed.best()
+            ),
+            (1, (1, 3), 7, 2, 1.25)
+        );
         assert_eq!(resumed.next(), progress.next());
     }
 
     #[test]
     fn a_state_of_another_run_or_of_an_unfinished_save_starts_fresh() {
         let header = saved(&progress());
-        assert!(matches!(Progress::resume(settings(), vec![1, 2, 4], 5, "run b", &header), Ok(Resume::Fresh)));
-        assert!(matches!(Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &Header::new()), Ok(Resume::Fresh)));
+        assert!(matches!(
+            Progress::resume(settings(), vec![1, 2, 4], 5, "run b", &header),
+            Ok(Resume::Fresh)
+        ));
+        assert!(matches!(
+            Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &Header::new()),
+            Ok(Resume::Fresh)
+        ));
         let writing = Progress::invalid_header(IDENTITY_TEXT);
-        assert!(matches!(Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &writing), Ok(Resume::Fresh)));
+        assert!(matches!(
+            Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &writing),
+            Ok(Resume::Fresh)
+        ));
     }
 
     #[test]
@@ -648,11 +712,17 @@ mod tests {
         ));
         let mut header = saved(&progress());
         header.set("epoch", "3");
-        assert!(matches!(Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header), Err(StateError::Past { .. })));
+        assert!(matches!(
+            Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header),
+            Err(StateError::Past { .. })
+        ));
         let mut header = saved(&progress());
         header.set("epoch", "2");
         header.set("cursor", "1");
-        assert!(matches!(Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header), Err(StateError::Past { .. })));
+        assert!(matches!(
+            Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header),
+            Err(StateError::Past { .. })
+        ));
         for key in ["epoch", "cursor", "step", "best", "pending"] {
             let mut header = saved(&progress());
             header.set(key, "x");
@@ -668,7 +738,10 @@ mod tests {
                 "{key}"
             );
             header.remove(key);
-            assert!(Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header).is_err(), "{key} missing");
+            assert!(
+                Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header).is_err(),
+                "{key} missing"
+            );
         }
     }
 

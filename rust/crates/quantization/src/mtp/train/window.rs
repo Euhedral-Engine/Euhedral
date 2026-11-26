@@ -56,12 +56,7 @@ pub struct Addresses {
 
 /// Plans `window` in `mode`: an unlabelled window runs depth 1 only (it writes the sequence's keys and values), a
 /// labelled one every depth and the head's losses, and a training one the backward passes and the head's gradient.
-pub fn plan(
-    drafter: &mut Drafter,
-    at: &Addresses,
-    window: &Window,
-    mode: Mode,
-) -> Result<Vec<Work>, RunError> {
+pub fn plan(drafter: &mut Drafter, at: &Addresses, window: &Window, mode: Mode) -> Result<Vec<Work>, RunError> {
     let (count, hidden) = (window.count, at.hidden);
     let span = Span {
         position: u64::from(window.a),

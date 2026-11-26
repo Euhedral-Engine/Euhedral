@@ -135,11 +135,7 @@ impl TrainLane {
             table,
             completions,
         } = resources;
-        let (rows_wide, hidden, depths) = (
-            rows as usize,
-            addresses.hidden as usize,
-            addresses.depths as usize,
-        );
+        let (rows_wide, hidden, depths) = (rows as usize, addresses.hidden as usize, addresses.depths as usize);
         let staging = Staging {
             inputs: pinned(library, rows_wide * hidden * 2 + 2 * 4 * rows_wide * depths)?,
             results: pinned(library, 4 * rows_wide * depths + 8 * depths)?,

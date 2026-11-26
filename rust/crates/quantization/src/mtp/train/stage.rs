@@ -98,7 +98,11 @@ mod tests {
     #[test]
     fn a_draft_reads_the_token_at_its_depth_and_targets_the_one_after() {
         let (tokens, labels, rows) = fixture();
-        let sequence = Sequence { tokens: &tokens, labels: &labels, prompt: 3 };
+        let sequence = Sequence {
+            tokens: &tokens,
+            labels: &labels,
+            prompt: 3,
+        };
         let staged = stage(&sequence, &window(0, 2), 2, &rows, false);
         // Depth 1 inputs are tokens 1 and 2, depth 2 inputs tokens 2 and 3.
         assert_eq!(staged.ids, [11, 12, 12, 13]);
@@ -111,7 +115,11 @@ mod tests {
     #[test]
     fn evaluation_checks_against_the_texts_own_tokens() {
         let (tokens, labels, rows) = fixture();
-        let sequence = Sequence { tokens: &tokens, labels: &labels, prompt: 3 };
+        let sequence = Sequence {
+            tokens: &tokens,
+            labels: &labels,
+            prompt: 3,
+        };
         let staged = stage(&sequence, &window(0, 2), 2, &rows, true);
         // What trains is unchanged; the token at position 3 is 13 (row 1), at position 4 is 14 (outside the head).
         assert_eq!(staged.labels, [-1, 4, 4, -1]);
@@ -121,7 +129,11 @@ mod tests {
     #[test]
     fn positions_past_the_sequence_read_token_zero_and_have_no_target() {
         let (tokens, labels, rows) = fixture();
-        let sequence = Sequence { tokens: &tokens, labels: &labels, prompt: 3 };
+        let sequence = Sequence {
+            tokens: &tokens,
+            labels: &labels,
+            prompt: 3,
+        };
         // The last window of 9 lineages: positions 8 only (a = 8, count 1), depths 3 reach 11, 12, 13.
         let staged = stage(&sequence, &window(8, 1), 3, &rows, false);
         assert_eq!(staged.ids, [19, 0, 0]);
@@ -132,10 +144,18 @@ mod tests {
     #[test]
     fn a_label_or_token_outside_the_table_is_outside_the_head() {
         let (tokens, labels, _) = fixture();
-        let sequence = Sequence { tokens: &tokens, labels: &labels, prompt: 0 };
+        let sequence = Sequence {
+            tokens: &tokens,
+            labels: &labels,
+            prompt: 0,
+        };
         let staged = stage(&sequence, &window(0, 1), 1, &[], false);
         assert_eq!((staged.labels, staged.checked), (vec![-1], vec![OUTSIDE_HEAD]));
-        let negative = Sequence { tokens: &tokens, labels: &[-5; 10], prompt: 0 };
+        let negative = Sequence {
+            tokens: &tokens,
+            labels: &[-5; 10],
+            prompt: 0,
+        };
         let rows = vec![0; 200];
         let staged = stage(&negative, &window(0, 1), 1, &rows, false);
         assert_eq!(staged.checked, [OUTSIDE_HEAD]);
@@ -144,9 +164,16 @@ mod tests {
     #[test]
     fn every_depth_has_every_lineage_in_depth_major_order() {
         let (tokens, labels, rows) = fixture();
-        let sequence = Sequence { tokens: &tokens, labels: &labels, prompt: 0 };
+        let sequence = Sequence {
+            tokens: &tokens,
+            labels: &labels,
+            prompt: 0,
+        };
         let staged = stage(&sequence, &window(1, 3), 4, &rows, false);
-        assert_eq!((staged.ids.len(), staged.labels.len(), staged.checked.len()), (12, 12, 12));
+        assert_eq!(
+            (staged.ids.len(), staged.labels.len(), staged.checked.len()),
+            (12, 12, 12)
+        );
         // Depth 2, lineage 1: position 2, input position 4.
         assert_eq!(staged.ids[3 + 1], 14);
     }

@@ -98,9 +98,16 @@ impl Settings {
             return Err(invalid("--epochs", self.epochs, "at least 1"));
         }
         if self.holdout < 1 {
-            return Err(invalid("--holdout", self.holdout, "at least 1: an evaluation needs held-out sequences"));
+            return Err(invalid(
+                "--holdout",
+                self.holdout,
+                "at least 1: an evaluation needs held-out sequences",
+            ));
         }
-        for (what, rate) in [("--projection-rate", self.projection_rate), ("--norm-rate", self.norm_rate)] {
+        for (what, rate) in [
+            ("--projection-rate", self.projection_rate),
+            ("--norm-rate", self.norm_rate),
+        ] {
             if !rate.is_finite() || rate <= 0.0 {
                 return Err(invalid(what, rate, "a positive number"));
             }
@@ -214,22 +221,41 @@ mod tests {
             Settings { tokens: 0, ..base },
             Settings { epochs: 0, ..base },
             Settings { holdout: 0, ..base },
-            Settings { projection_rate: 0.0, ..base },
-            Settings { projection_rate: f32::NAN, ..base },
-            Settings { norm_rate: -1.0, ..base },
-            Settings { norm_rate: f32::INFINITY, ..base },
+            Settings {
+                projection_rate: 0.0,
+                ..base
+            },
+            Settings {
+                projection_rate: f32::NAN,
+                ..base
+            },
+            Settings {
+                norm_rate: -1.0,
+                ..base
+            },
+            Settings {
+                norm_rate: f32::INFINITY,
+                ..base
+            },
         ];
         for settings in refused {
             assert!(settings.check().is_err(), "{settings:?} was accepted");
         }
-        for settings in [Settings { depths: 16, ..base }, Settings { keys: 16384, ..base }, Settings { warmup: 0, ..base }] {
+        for settings in [
+            Settings { depths: 16, ..base },
+            Settings { keys: 16384, ..base },
+            Settings { warmup: 0, ..base },
+        ] {
             assert_eq!(settings.check(), Ok(()), "{settings:?} was refused");
         }
     }
 
     #[test]
     fn holds_out_every_holdout_th_sequence_from_the_first() {
-        let settings = Settings { holdout: 3, ..Settings::default() };
+        let settings = Settings {
+            holdout: 3,
+            ..Settings::default()
+        };
         let held: Vec<usize> = (0..7).filter(|&s| settings.held_out(s)).collect();
         assert_eq!(held, [0, 3, 6]);
     }
@@ -289,7 +315,13 @@ mod tests {
 
     #[test]
     fn rates_warm_up_linearly_then_decay_to_a_tenth() {
-        let settings = Settings { warmup: 4, epochs: 1, projection_rate: 1e-3, norm_rate: 2e-3, ..Settings::default() };
+        let settings = Settings {
+            warmup: 4,
+            epochs: 1,
+            projection_rate: 1e-3,
+            norm_rate: 2e-3,
+            ..Settings::default()
+        };
         let at = |step| rates(&settings, step, 10);
         assert_eq!(at(2), (5e-4, 1e-3));
         assert_eq!(at(4), (1e-3, 2e-3));
@@ -303,7 +335,15 @@ mod tests {
 
     #[test]
     fn rates_without_warm_up_start_at_the_full_rate() {
-        let settings = Settings { warmup: 0, projection_rate: 1e-3, norm_rate: 1e-3, ..Settings::default() };
-        assert_eq!(rates(&settings, 1, 10).0, 1e-3 * (0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * 0.1).cos())) as f32);
+        let settings = Settings {
+            warmup: 0,
+            projection_rate: 1e-3,
+            norm_rate: 1e-3,
+            ..Settings::default()
+        };
+        assert_eq!(
+            rates(&settings, 1, 10).0,
+            1e-3 * (0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * 0.1).cos())) as f32
+        );
     }
 }
