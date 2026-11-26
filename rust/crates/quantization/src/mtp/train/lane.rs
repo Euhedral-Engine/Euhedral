@@ -1,8 +1,12 @@
 //! The training run's lane: one stream with the drafter, its kernels, the cuBLAS handles and the buffers of a window.
 //! A window, an update or a read of device memory is one chain of stages on the lane's stream (see
 //! [`chain`](crate::chain)); each takes the lane by value and gives it back in [`Finished`], so no two overlap and
-//! nothing waits on the device. The calls that do wait ([`run_blocking`](TrainLane::run_blocking),
-//! [`put`](TrainLane::put) and [`close`](TrainLane::close)) are for startup and shutdown, outside any frame.
+//! nothing waits on the device. A call that cannot run, because its job is wrong, ends the same way: the lane comes
+//! back in `done` with the error, so the caller closes it off the lattice workers whatever happened. The calls that do
+//! wait ([`run_blocking`](TrainLane::run_blocking), [`put`](TrainLane::put) and [`close`](Lane::close)) are for
+//! startup and shutdown, outside any frame.
+//!
+//! The run is written against the [`Lane`] trait, so that its frames are tested with a lane that has no device.
 
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
@@ -14,10 +18,11 @@ use euhedral_inference_cuda::math::LaneHandles;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, HostWeightsArena, PinnedBuffer};
 
 use super::error::RunError;
+use super::load::Keep;
 use super::progress::Update;
 use super::settings::Window;
 use super::window::{Addresses, Mode, plan};
-use crate::chain::{self, Next, Parts, Unsettled};
+use crate::chain::{self, Next, Parts, Scratch, Unsettled};
 use crate::mtp::{Drafter, DrafterKernels, Work};
 
 /// The bytes of device memory a read of the lane moves at a time.
@@ -39,6 +44,10 @@ pub struct Resources {
     /// The embedding table the addresses name.
     pub table: HostWeightsArena,
     pub completions: Arc<Completions>,
+    /// What the device needs to stay open until the lane is closed.
+    pub keep: Keep,
+    /// Fills the lane's pinned memory with this byte before use (see `Options::poison`).
+    pub poison: Option<u8>,
 }
 
 impl Debug for Resources {
@@ -69,6 +78,8 @@ struct LaneParts {
     staging: Staging,
     completions: Arc<Completions>,
     unsettled: Unsettled,
+    /// Dropped after everything else, by [`close`](Lane::close): the device outlives everything the lane holds.
+    keep: Keep,
 }
 
 impl Parts for LaneParts {
@@ -94,7 +105,38 @@ impl Debug for TrainLane {
 }
 
 /// What a call hands to its `done`: the lane, free again, and the result.
-pub type Finished<T> = chain::Finished<TrainLane, T, RunError>;
+pub type Finished<L, T> = chain::Finished<L, T, RunError>;
+
+/// What a call's `done` is: run once, with the lane back, in the frame that ends the call.
+pub type Done<L, T> = Box<dyn FnOnce(Finished<L, T>) + Send>;
+
+/// What the run needs of a lane. Each call takes the lane and gives it back to `done`, exactly once, whether the call
+/// ran, failed or was refused: the lane never gets lost on an error path.
+pub trait Lane: Sized + Send + 'static {
+    /// Runs `job`: uploads its inputs, plans and runs the window, and reads the argmaxes and losses back. Returns at
+    /// once; `done` runs in the frame that retires the work.
+    fn window(self, job: Job, done: Done<Self, Outcome>);
+
+    /// Applies one optimiser step of `update`'s rates: the drafter's parameters move, their gradients are zeroed and
+    /// their scales measured.
+    fn update(self, update: Update, done: Done<Self, ()>);
+
+    /// Reads `bytes` of device memory at `address`, at most [`CHUNK_BYTES`].
+    fn read(self, address: u64, bytes: usize, done: Done<Self, Vec<u8>>);
+
+    /// Ends the lane at shutdown: waits for the stream, which a frame never does, and frees what it holds. Whoever
+    /// made the lane calls it, outside any frame, once.
+    fn close(self) -> Result<(), RunError>;
+}
+
+/// Ends a call that cannot run: the lane comes back to `done` with `error`.
+fn refuse<L, T>(lane: L, error: RunError, done: Done<L, T>) {
+    done(chain::Finished {
+        lane,
+        scratch: Scratch::new(()),
+        result: Err(error),
+    });
+}
 
 /// One window to run: its rows and inputs, staged on the host.
 #[derive(Debug)]
@@ -117,11 +159,43 @@ pub struct Outcome {
     pub losses: Vec<f64>,
 }
 
-fn pinned(library: &Arc<CudaLibrary>, bytes: usize) -> Result<PinnedBuffer, RunError> {
+/// Pinned memory of `bytes`, which holds whatever the allocator left unless `poison` fills it.
+fn pinned(library: &Arc<CudaLibrary>, bytes: usize, poison: Option<u8>) -> Result<PinnedBuffer, RunError> {
     let mut buffer = PinnedBuffer::alloc(library, bytes.max(1))?;
-    // The allocator leaves it undefined, and a window shorter than the lane's rows uploads the tail too.
-    buffer.as_mut_slice().fill(0);
+    if let Some(byte) = poison {
+        buffer.as_mut_slice().fill(byte);
+    }
     Ok(buffer)
+}
+
+/// Why a window of `job` cannot run on a lane of `rows` rows, `hidden` wide and `depths` deep.
+fn check_window(job: &Job, rows: u32, hidden: u32, depths: u32) -> Result<(), RunError> {
+    let (count, depths) = (job.window.count as usize, depths as usize);
+    if job.window.count == 0 || job.window.count > rows {
+        return Err(RunError::Broken(format!(
+            "a window of {} rows on a lane of {rows}",
+            job.window.count
+        )));
+    }
+    let wanted = (count * hidden as usize * 2, depths * count, depths * count);
+    let got = (job.hidden.len(), job.ids.len(), job.labels.len());
+    if wanted != got {
+        return Err(RunError::Broken(format!(
+            "a window of {count} rows has {} hidden bytes, {} ids and {} labels, not {} bytes, {} and {}",
+            got.0, got.1, got.2, wanted.0, wanted.1, wanted.2
+        )));
+    }
+    Ok(())
+}
+
+/// Why a read of `bytes` cannot run.
+fn check_read(bytes: usize) -> Result<(), RunError> {
+    if bytes == 0 || bytes > CHUNK_BYTES {
+        return Err(RunError::Broken(format!(
+            "a read of {bytes} bytes, between 1 and {CHUNK_BYTES} fit"
+        )));
+    }
+    Ok(())
 }
 
 impl TrainLane {
@@ -137,12 +211,14 @@ impl TrainLane {
             buffers,
             table,
             completions,
+            keep,
+            poison,
         } = resources;
         let (rows_wide, hidden, depths) = (rows as usize, addresses.hidden as usize, addresses.depths as usize);
         let staging = Staging {
-            inputs: pinned(library, rows_wide * hidden * 2 + 2 * 4 * rows_wide * depths)?,
-            results: pinned(library, 4 * rows_wide * depths + 8 * depths)?,
-            chunk: pinned(library, CHUNK_BYTES)?,
+            inputs: pinned(library, rows_wide * hidden * 2 + 2 * 4 * rows_wide * depths, poison)?,
+            results: pinned(library, 4 * rows_wide * depths + 8 * depths, poison)?,
+            chunk: pinned(library, CHUNK_BYTES, poison)?,
         };
         Ok(TrainLane {
             stream,
@@ -158,6 +234,7 @@ impl TrainLane {
                 staging,
                 completions,
                 unsettled: Unsettled::default(),
+                keep,
             },
         })
     }
@@ -204,12 +281,13 @@ impl TrainLane {
             .ok_or_else(|| RunError::Broken(format!("{address:#x} is not in the drafter's arena")))?;
         Ok(arena.copy_from_host(offset, bytes)?)
     }
+}
 
-    /// Runs `job`: uploads its inputs, plans and runs the window, and reads the argmaxes and losses back. Returns at
-    /// once; `done` runs in the frame that retires the work.
-    pub fn window(self, job: Job, done: Box<dyn FnOnce(Finished<Outcome>) + Send>) -> Result<(), Box<Refused>> {
-        if let Err(error) = self.check(&job) {
-            return Err(Box::new(Refused { lane: self, error }));
+impl Lane for TrainLane {
+    fn window(self, job: Job, done: Done<Self, Outcome>) {
+        let at = &self.parts.addresses;
+        if let Err(error) = check_window(&job, self.parts.rows, at.hidden, at.depths) {
+            return refuse(self, error, done);
         }
         let TrainLane { stream, parts } = self;
         chain::start(
@@ -220,32 +298,9 @@ impl TrainLane {
             done,
             Box::new(move |stream, parts, ()| window_stage(stream, parts, &job)),
         );
-        Ok(())
     }
 
-    fn check(&self, job: &Job) -> Result<(), RunError> {
-        let at = &self.parts.addresses;
-        let (count, depths) = (job.window.count as usize, at.depths as usize);
-        if job.window.count == 0 || job.window.count > self.parts.rows {
-            return Err(RunError::Broken(format!(
-                "a window of {} rows on a lane of {}",
-                job.window.count, self.parts.rows
-            )));
-        }
-        let wanted = (count * at.hidden as usize * 2, depths * count, depths * count);
-        let got = (job.hidden.len(), job.ids.len(), job.labels.len());
-        if wanted != got {
-            return Err(RunError::Broken(format!(
-                "a window of {count} rows has {} hidden bytes, {} ids and {} labels, not {} bytes, {} and {}",
-                got.0, got.1, got.2, wanted.0, wanted.1, wanted.2
-            )));
-        }
-        Ok(())
-    }
-
-    /// Applies one optimiser step of `update`'s rates: the drafter's parameters move, their gradients are zeroed and
-    /// their scales measured.
-    pub fn update(self, update: Update, done: Box<dyn FnOnce(Finished<()>) + Send>) {
+    fn update(self, update: Update, done: Done<Self, ()>) {
         let TrainLane { stream, parts } = self;
         chain::start(
             stream,
@@ -268,18 +323,9 @@ impl TrainLane {
         );
     }
 
-    /// Reads `bytes` of device memory at `address`, at most [`CHUNK_BYTES`].
-    pub fn read(
-        self,
-        address: u64,
-        bytes: usize,
-        done: Box<dyn FnOnce(Finished<Vec<u8>>) + Send>,
-    ) -> Result<(), Box<Refused>> {
-        if bytes == 0 || bytes > CHUNK_BYTES {
-            return Err(Box::new(Refused {
-                lane: self,
-                error: RunError::Broken(format!("a read of {bytes} bytes, at most {CHUNK_BYTES} fit")),
-            }));
+    fn read(self, address: u64, bytes: usize, done: Done<Self, Vec<u8>>) {
+        if let Err(error) = check_read(bytes) {
+            return refuse(self, error, done);
         }
         let TrainLane { stream, parts } = self;
         chain::start(
@@ -307,23 +353,21 @@ impl TrainLane {
                 })))
             }),
         );
-        Ok(())
     }
 
-    /// Ends the lane at shutdown: waits for the stream, which a frame never does, and frees what it holds.
-    pub fn close(mut self) -> Result<(), RunError> {
-        self.parts.unsettled.settle(&mut self.stream, || {});
-        Stream::quiesce(&mut self.stream);
-        let LaneParts { handles, .. } = self.parts;
-        handles.close().map_err(RunError::from)
+    fn close(self) -> Result<(), RunError> {
+        let TrainLane { mut stream, mut parts } = self;
+        parts.unsettled.settle(&mut stream, || {});
+        Stream::quiesce(&mut stream);
+        // The handles close first; the rest of the parts, the buffers among them, are freed at the end of the block.
+        let (closed, keep) = {
+            let LaneParts { handles, keep, .. } = parts;
+            (handles.close().map_err(RunError::from), keep)
+        };
+        drop(stream);
+        drop(keep);
+        closed
     }
-}
-
-/// A call that did not start: the lane comes back untouched.
-#[derive(Debug)]
-pub struct Refused {
-    pub lane: TrainLane,
-    pub error: RunError,
 }
 
 /// The first stage of a window: stages the inputs, plans the window, enqueues it and the readbacks.
@@ -399,4 +443,92 @@ fn window_stage(
                 .collect(),
         }))
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "a test: a failed unwrap is the failure, and a sink the test thread reads after the call ran"
+    )]
+
+    use std::sync::Mutex;
+
+    use super::*;
+
+    const ROWS: u32 = 8;
+    const HIDDEN: u32 = 4;
+    const DEPTHS: u32 = 2;
+
+    fn job(count: u32) -> Job {
+        let (rows, depths) = (count as usize, DEPTHS as usize);
+        Job {
+            window: Window {
+                a: 0,
+                count,
+                first_key: 0,
+                labelled: true,
+            },
+            mode: Mode::Train,
+            hidden: vec![0; rows * HIDDEN as usize * 2],
+            ids: vec![0; depths * rows],
+            labels: vec![0; depths * rows],
+        }
+    }
+
+    fn check(job: &Job) -> Result<(), RunError> {
+        check_window(job, ROWS, HIDDEN, DEPTHS)
+    }
+
+    #[test]
+    fn a_window_of_one_to_the_lanes_rows_with_its_inputs_whole_runs() {
+        for count in [1, 5, ROWS] {
+            check(&job(count)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_window_of_no_rows_or_more_than_the_lane_has_is_refused() {
+        assert!(check(&job(0)).is_err());
+        assert!(check(&job(ROWS + 1)).is_err());
+    }
+
+    #[test]
+    fn a_window_whose_hidden_rows_ids_or_labels_are_the_wrong_length_is_refused() {
+        let mut short = job(3);
+        short.hidden.pop();
+        let mut few_ids = job(3);
+        few_ids.ids.pop();
+        let mut few_labels = job(3);
+        few_labels.labels.pop();
+        for refused in [short, few_ids, few_labels] {
+            assert!(matches!(check(&refused), Err(RunError::Broken(_))));
+        }
+    }
+
+    #[test]
+    fn a_read_of_one_byte_to_a_chunk_runs_and_anything_else_is_refused() {
+        check_read(1).unwrap();
+        check_read(CHUNK_BYTES).unwrap();
+        assert!(check_read(0).is_err());
+        assert!(check_read(CHUNK_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn a_refused_call_gives_the_lane_back_to_its_done_with_the_error() {
+        let seen = Arc::new(Mutex::new(None));
+        let held = Arc::clone(&seen);
+        refuse(
+            7u8,
+            RunError::Broken("no".to_owned()),
+            Box::new(move |finished: Finished<u8, ()>| {
+                *held.lock().unwrap() = Some((finished.lane, finished.result));
+            }),
+        );
+        let (lane, result) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(lane, 7);
+        assert!(matches!(result, Err(RunError::Broken(message)) if message == "no"));
+    }
 }

@@ -19,15 +19,17 @@ pub const OUTSIDE_HEAD: i32 = -2;
 /// How often a training report is made, in updates.
 const REPORT_EVERY: u32 = 10;
 
-/// The headers' keys.
-const IDENTITY: &str = "identity";
+/// The headers' keys. The identity has one key per part, so that a refusal can name which part differs.
+const CORPUS: &str = "identity.corpus";
+const MODEL: &str = "identity.model";
+const ARTIFACT: &str = "identity.artifact";
+const SETTINGS: &str = "identity.settings";
+const IDENTITY_KEYS: [&str; 4] = [CORPUS, MODEL, ARTIFACT, SETTINGS];
 const EPOCH: &str = "epoch";
 const CURSOR: &str = "cursor";
 const STEP: &str = "step";
 const BEST: &str = "best";
 const PENDING: &str = "pending";
-/// Present in the header of a state that is being rewritten: its sections are not whole.
-const WRITING: &str = "writing";
 /// The header key of the best parameters' accepted drafts.
 const ACCEPTED: &str = "accepted";
 
@@ -37,6 +39,15 @@ pub enum StateError {
     /// The state is the run's own but a field is missing or does not parse.
     #[error("the saved state has no valid {0}")]
     Field(&'static str),
+    /// The file is there but holds no run's header: it was cut short, or it is not a state.
+    #[error("the saved state has no header of a run: it is torn or not a state; --fresh starts over")]
+    Torn,
+    /// The state is another run's: the parts of the identity that differ are named.
+    #[error("the saved state is of another run: its {} differ; --fresh starts over", .differs.join(", "))]
+    Foreign { differs: Vec<&'static str> },
+    /// The best parameters of a run are there but its state is not.
+    #[error("best.bin is there but no saved state to continue from; --fresh starts over")]
+    Leftover,
     /// The state is further on than the run can be.
     #[error("the saved state is at epoch {epoch} cursor {cursor}, past the {epochs} epochs of {sequences} sequences")]
     Past {
@@ -45,6 +56,66 @@ pub enum StateError {
         epochs: u32,
         sequences: usize,
     },
+}
+
+/// What a run is: the content of its corpus, of the model's starting parameters and of the artifact, and the settings
+/// that shape its state. A saved state continues only a run of the same identity; where the files lie does not matter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    /// A digest of the corpus's content.
+    pub corpus: String,
+    /// A digest of the drafter's starting parameters.
+    pub model: String,
+    /// A digest of the artifact's draft head and embedding.
+    pub artifact: String,
+    settings: String,
+}
+
+impl Identity {
+    /// The identity of a run over `sequences` sequences of the corpus, with the digests of its inputs.
+    pub fn new(corpus: String, model: String, artifact: String, settings: &Settings, sequences: usize) -> Identity {
+        Identity {
+            corpus,
+            model,
+            artifact,
+            settings: format!(
+                "sequences={sequences} depths={} rows={} keys={} tokens={} epochs={} rates={}/{} warmup={} holdout={}",
+                settings.depths,
+                settings.rows,
+                settings.keys,
+                settings.tokens,
+                settings.epochs,
+                settings.projection_rate,
+                settings.norm_rate,
+                settings.warmup,
+                settings.holdout,
+            ),
+        }
+    }
+
+    fn parts(&self) -> [(&'static str, &str); 4] {
+        [
+            (CORPUS, &self.corpus),
+            (MODEL, &self.model),
+            (ARTIFACT, &self.artifact),
+            (SETTINGS, &self.settings),
+        ]
+    }
+
+    fn write(&self, header: &mut Header) {
+        for (key, value) in self.parts() {
+            header.set(key, value);
+        }
+    }
+
+    /// The names of the parts that `header` does not hold the same as this identity; none when it is this run's.
+    fn differing(&self, header: &Header) -> Vec<&'static str> {
+        self.parts()
+            .into_iter()
+            .filter(|(key, value)| header.get(key) != Some(*value))
+            .map(|(key, _)| key.strip_prefix("identity.").unwrap_or(key))
+            .collect()
+    }
 }
 
 /// What the run does next.
@@ -86,6 +157,15 @@ struct Tally {
     loss: [f64; DEPTH_SLOTS],
     correct: [u64; DEPTH_SLOTS],
     count: [u64; DEPTH_SLOTS],
+}
+
+/// The saved state's file as the start found it.
+#[derive(Clone, Copy, Debug)]
+pub enum Found<'a> {
+    /// There is no file.
+    Missing,
+    /// The file's header: empty when the file is shorter than a header.
+    Header(&'a Header),
 }
 
 /// How a run continues from a saved state.
@@ -263,9 +343,9 @@ impl Progress {
     }
 
     /// The header of the state: the identity of the run and where it is.
-    pub fn header(&self, identity: &str) -> Header {
+    pub fn header(&self, identity: &Identity) -> Header {
         let mut header = Header::new();
-        header.set(IDENTITY, identity);
+        identity.write(&mut header);
         header.set(EPOCH, self.epoch.to_string());
         header.set(CURSOR, self.cursor.to_string());
         header.set(STEP, self.step.to_string());
@@ -274,35 +354,43 @@ impl Progress {
         header
     }
 
-    /// The header of a state being rewritten: its sections are not whole until the header of [`header`](Self::header)
-    /// replaces it.
-    pub fn invalid_header(identity: &str) -> Header {
-        let mut header = Header::new();
-        header.set(IDENTITY, identity);
-        header.set(WRITING, "1");
-        header
-    }
-
     /// The header of the best parameters: the step they were found at and their accepted drafts per lineage.
-    pub fn best_header(&self, identity: &str) -> Header {
+    pub fn best_header(&self, identity: &Identity) -> Header {
         let mut header = Header::new();
-        header.set(IDENTITY, identity);
+        identity.write(&mut header);
         header.set(STEP, self.step.to_string());
         header.set(ACCEPTED, self.best.to_string());
         header
     }
 
-    /// What the saved state `header` means for a run of `settings` over `training`, whose identity is `identity`. A
-    /// state of another run, or one whose rewrite did not finish, is not used.
+    /// What the saved state `found` means for a run of `settings` over `training`, whose identity is `identity`.
+    ///
+    /// Nothing that a run has saved is ever started over by accident: a state of another run, a torn one, or best
+    /// parameters without a state refuse and say what differs. Only `fresh`, which the caller sets when the user asked
+    /// to start over, takes the checkpoint again.
     pub fn resume(
         settings: Settings,
         training: Vec<usize>,
         expected: u64,
-        identity: &str,
-        header: &Header,
+        identity: &Identity,
+        found: Found<'_>,
+        best_exists: bool,
+        fresh: bool,
     ) -> Result<Resume, StateError> {
-        if header.get(IDENTITY) != Some(identity) || header.get(WRITING).is_some() {
+        if fresh {
             return Ok(Resume::Fresh);
+        }
+        let header = match found {
+            Found::Missing if best_exists => return Err(StateError::Leftover),
+            Found::Missing => return Ok(Resume::Fresh),
+            Found::Header(header) => header,
+        };
+        let differs = identity.differing(header);
+        if differs.len() == IDENTITY_KEYS.len() {
+            return Err(StateError::Torn);
+        }
+        if !differs.is_empty() {
+            return Err(StateError::Foreign { differs });
         }
         fn field<T: FromStr>(header: &Header, key: &'static str) -> Result<T, StateError> {
             header
@@ -453,7 +541,14 @@ impl Evaluation {
 mod tests {
     use super::*;
 
-    const IDENTITY_TEXT: &str = "run a";
+    fn identity(corpus: &str) -> Identity {
+        Identity::new(corpus.to_owned(), "m".to_owned(), "a".to_owned(), &settings(), 3)
+    }
+
+    /// The decision for a state `found`, of the run `identity("a")`.
+    fn decide(found: Found<'_>, best_exists: bool, fresh: bool) -> Result<Resume, StateError> {
+        Progress::resume(settings(), vec![1, 2, 4], 5, &identity("a"), found, best_exists, fresh)
+    }
 
     fn settings() -> Settings {
         Settings {
@@ -649,7 +744,7 @@ mod tests {
     }
 
     fn saved(progress: &Progress) -> Header {
-        progress.header(IDENTITY_TEXT)
+        progress.header(&identity("a"))
     }
 
     #[test]
@@ -661,7 +756,7 @@ mod tests {
         progress.pending = 2;
         progress.step = 7;
         progress.best = 1.25;
-        let resumed = Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &saved(&progress)).unwrap();
+        let resumed = decide(Found::Header(&saved(&progress)), true, false).unwrap();
         let Resume::Continue(mut resumed) = resumed else {
             panic!("not a state to continue")
         };
@@ -679,28 +774,77 @@ mod tests {
     }
 
     #[test]
-    fn a_state_of_another_run_or_of_an_unfinished_save_starts_fresh() {
-        let header = saved(&progress());
-        assert!(matches!(
-            Progress::resume(settings(), vec![1, 2, 4], 5, "run b", &header),
-            Ok(Resume::Fresh)
-        ));
-        assert!(matches!(
-            Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &Header::new()),
-            Ok(Resume::Fresh)
-        ));
-        let writing = Progress::invalid_header(IDENTITY_TEXT);
-        assert!(matches!(
-            Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &writing),
-            Ok(Resume::Fresh)
-        ));
+    fn a_state_of_another_run_is_refused_naming_the_parts_that_differ() {
+        let other = Progress::new(settings(), vec![1, 2, 4], 5).header(&identity("b"));
+        assert_eq!(
+            decide(Found::Header(&other), true, false).err(),
+            Some(StateError::Foreign {
+                differs: vec!["corpus"]
+            })
+        );
+        let moved = Identity::new("a".to_owned(), "m2".to_owned(), "a".to_owned(), &settings(), 4);
+        let other = Progress::new(settings(), vec![1, 2, 4], 5).header(&moved);
+        assert_eq!(
+            decide(Found::Header(&other), true, false).err(),
+            Some(StateError::Foreign {
+                differs: vec!["model", "settings"]
+            })
+        );
+    }
+
+    #[test]
+    fn a_header_with_no_identity_is_a_torn_state_and_is_refused() {
+        assert_eq!(
+            decide(Found::Header(&Header::new()), true, false).err(),
+            Some(StateError::Torn)
+        );
+        assert_eq!(
+            decide(Found::Header(&Header::new()), false, false).err(),
+            Some(StateError::Torn)
+        );
+    }
+
+    #[test]
+    fn nothing_saved_starts_fresh_but_best_parameters_without_a_state_are_refused() {
+        assert!(matches!(decide(Found::Missing, false, false), Ok(Resume::Fresh)));
+        assert_eq!(decide(Found::Missing, true, false).err(), Some(StateError::Leftover));
+    }
+
+    #[test]
+    fn a_fresh_start_is_taken_over_whatever_is_saved_and_only_when_asked() {
+        let torn = Header::new();
+        let foreign = Progress::new(settings(), vec![1, 2, 4], 5).header(&identity("b"));
+        for found in [Found::Missing, Found::Header(&torn), Found::Header(&foreign)] {
+            assert!(matches!(decide(found, true, true), Ok(Resume::Fresh)));
+        }
+        assert!(decide(Found::Header(&foreign), true, false).is_err());
+    }
+
+    #[test]
+    fn the_identity_is_the_digests_and_settings_not_where_the_files_lie() {
+        let settings = settings();
+        let same = Identity::new("c".to_owned(), "m".to_owned(), "a".to_owned(), &settings, 3);
+        assert_eq!(
+            same,
+            Identity::new("c".to_owned(), "m".to_owned(), "a".to_owned(), &settings, 3)
+        );
+        let mut other = settings;
+        other.tokens += 1;
+        assert_ne!(
+            same,
+            Identity::new("c".to_owned(), "m".to_owned(), "a".to_owned(), &other, 3)
+        );
+        assert_ne!(
+            same,
+            Identity::new("c".to_owned(), "m".to_owned(), "a".to_owned(), &settings, 4)
+        );
     }
 
     #[test]
     fn a_state_of_a_finished_run_is_complete_and_trains_nothing() {
         let mut progress = progress();
         progress.epoch = 2;
-        let resumed = Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &saved(&progress)).unwrap();
+        let resumed = decide(Found::Header(&saved(&progress)), true, false).unwrap();
         assert!(matches!(resumed, Resume::Complete(ref done) if done.epoch() == 2));
     }
 
@@ -709,27 +853,27 @@ mod tests {
         let mut header = saved(&progress());
         header.set("cursor", "4");
         assert!(matches!(
-            Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header),
+            decide(Found::Header(&header), true, false),
             Err(StateError::Past { cursor: 4, .. })
         ));
         let mut header = saved(&progress());
         header.set("epoch", "3");
         assert!(matches!(
-            Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header),
+            decide(Found::Header(&header), true, false),
             Err(StateError::Past { .. })
         ));
         let mut header = saved(&progress());
         header.set("epoch", "2");
         header.set("cursor", "1");
         assert!(matches!(
-            Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header),
+            decide(Found::Header(&header), true, false),
             Err(StateError::Past { .. })
         ));
         for key in ["epoch", "cursor", "step", "best", "pending"] {
             let mut header = saved(&progress());
             header.set(key, "x");
             assert_eq!(
-                Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header).err(),
+                decide(Found::Header(&header), true, false).err(),
                 Some(StateError::Field(match key {
                     "epoch" => EPOCH,
                     "cursor" => CURSOR,
@@ -740,10 +884,7 @@ mod tests {
                 "{key}"
             );
             header.remove(key);
-            assert!(
-                Progress::resume(settings(), vec![1, 2, 4], 5, IDENTITY_TEXT, &header).is_err(),
-                "{key} missing"
-            );
+            assert!(decide(Found::Header(&header), true, false).is_err(), "{key} missing");
         }
     }
 
@@ -752,7 +893,7 @@ mod tests {
         let mut progress = progress();
         progress.step = 4;
         progress.best = 0.5;
-        let header = progress.best_header(IDENTITY_TEXT);
+        let header = progress.best_header(&identity("a"));
         assert_eq!((header.get("step"), header.get("accepted")), (Some("4"), Some("0.5")));
     }
 }

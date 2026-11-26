@@ -23,11 +23,12 @@ use std::time::{Duration, Instant};
 use euhedral_core::generics::LatticeSource;
 use euhedral_gpu::cuda::{CudaGpu, CudaModule, CudaStream};
 use euhedral_gpu::{Gpu, StreamOptions};
-use euhedral_graph::Completions;
+use euhedral_graph::{Completions, LanePool};
 use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, HostWeightsArena};
 use euhedral_inference_quantization::kernels::{Compiled, Module, ModuleOptions, Modules};
-use euhedral_inference_quantization::mtp::train::lane::{Finished, Job, Resources, TrainLane};
+use euhedral_inference_quantization::mtp::train::lane::{Finished, Job, Lane, Resources, TrainLane};
+use euhedral_inference_quantization::mtp::train::load::Keep;
 use euhedral_inference_quantization::mtp::train::progress::Update;
 use euhedral_inference_quantization::mtp::train::settings::Window;
 use euhedral_inference_quantization::mtp::train::window::{Addresses, Mode, plan};
@@ -40,6 +41,8 @@ const ROWS: u32 = 6;
 const DRAFT_ROWS: u32 = 16;
 const VOCABULARY: u32 = 12;
 const COUNT: u32 = 5;
+/// What unwritten device memory holds: a NaN in every float format.
+const POISON: u8 = 0xff;
 const WINDOW: Window = Window {
     a: 0,
     count: COUNT,
@@ -90,6 +93,8 @@ struct Model {
 }
 
 struct Rig {
+    gpu: Arc<CudaGpu>,
+    pool: Arc<LanePool>,
     library: Arc<CudaLibrary>,
     math: Arc<MathLibraries>,
     train: Arc<Compiled<CudaModule>>,
@@ -100,7 +105,9 @@ struct Rig {
 
 fn take(library: &Arc<CudaLibrary>, bytes: usize, contents: &[u8]) -> DeviceBuffer {
     let buffer = DeviceBuffer::alloc(library, bytes.max(1)).unwrap();
-    buffer.copy_from_host(0, &vec![0u8; bytes.max(1)]).unwrap();
+    // NaN in every float format, so that a read of what nothing wrote shows in the results. Only the drafter's
+    // gradients and moments start at zero, and `prepare` writes those.
+    buffer.copy_from_host(0, &vec![POISON; bytes.max(1)]).unwrap();
     if !contents.is_empty() {
         buffer.copy_from_host(0, contents).unwrap();
     }
@@ -201,6 +208,13 @@ impl Rig {
             buffers: owned,
             table,
             completions: Arc::clone(&self.completions),
+            keep: Keep::new(
+                Arc::clone(&self.gpu),
+                Arc::clone(&self.pool),
+                Arc::clone(&self.math),
+                Arc::clone(&self.library),
+            ),
+            poison: Some(POISON),
         };
         let mut lane = TrainLane::new(self.streams.remove(0), library, resources).unwrap();
         // The lane's own drafter has its parameters measured and its gradients zeroed; so has the planning copy.
@@ -216,8 +230,11 @@ impl Rig {
     }
 
     /// Runs `start` and pumps the lattice until its `done` has run.
-    fn wait<T: Send + 'static>(&self, start: impl FnOnce(Box<dyn FnOnce(Finished<T>) + Send>)) -> (TrainLane, T) {
-        let slot: Arc<Mutex<Option<Finished<T>>>> = Arc::new(Mutex::new(None));
+    fn wait<T: Send + 'static>(
+        &self,
+        start: impl FnOnce(Box<dyn FnOnce(Finished<TrainLane, T>) + Send>),
+    ) -> (TrainLane, T) {
+        let slot: Arc<Mutex<Option<Finished<TrainLane, T>>>> = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&slot);
         start(Box::new(move |finished| *sink.lock().unwrap() = Some(finished)));
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -246,8 +263,7 @@ impl Rig {
 
     fn read(&self, lane: TrainLane, address: u64, bytes: usize) -> (TrainLane, Vec<u8>) {
         self.wait(|done| {
-            lane.read(address, bytes, done)
-                .unwrap_or_else(|refused| panic!("the read was refused: {}", refused.error));
+            lane.read(address, bytes, done);
         })
     }
 }
@@ -308,6 +324,8 @@ fn a_window_and_a_step_through_the_lane_equal_the_same_work_run_directly() {
         .expect("two lanes open");
     let completions = Completions::new(&pool);
     let mut rig = Rig {
+        gpu,
+        pool,
         library,
         math,
         train,
@@ -320,10 +338,7 @@ fn a_window_and_a_step_through_the_lane_equal_the_same_work_run_directly() {
 
     // Through the lane: the window, then the optimiser step.
     let (lane, outcome) = rig.wait(|done| {
-        through
-            .lane
-            .window(job(), done)
-            .unwrap_or_else(|refused| panic!("the window was refused: {}", refused.error));
+        through.lane.window(job(), done);
     });
     let (lane, after_window) = snapshot(&rig, lane);
     let (lane, ()) = rig.wait(|done| lane.update(UPDATE, done));

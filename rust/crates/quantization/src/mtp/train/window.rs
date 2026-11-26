@@ -297,6 +297,43 @@ mod tests {
         assert_eq!(count(&single, "draft_cross_entropy"), 1);
     }
 
+    /// The labels, argmaxes and label log-probabilities of depth `d`'s chunk starting at row `first` lie
+    /// `4 * ((d - 1) * count + first)` bytes into their `[depths, count]` buffers, and its loss in the depth's own double.
+    #[test]
+    fn each_depths_head_chunk_reads_and_writes_its_own_rows_of_the_depth_major_buffers() {
+        let (depths, count_rows) = (3, HEAD_ROWS + 5);
+        let at = addresses(depths);
+        let mut drafter = drafter(depths);
+        let work = plan(&mut drafter, &at, &window(count_rows, true), Mode::Train).unwrap();
+        let seen: Vec<_> = work
+            .iter()
+            .filter_map(|piece| match piece {
+                Work::Steps(steps) => Some(steps),
+                _ => None,
+            })
+            .flatten()
+            .filter(|step| step.kernel() == "draft_cross_entropy")
+            .map(|step| {
+                let args = step.args();
+                let at = |index| args.read::<u64>(index).unwrap();
+                (at(2), at(4), at(5), at(6))
+            })
+            .collect();
+        let mut wanted = Vec::new();
+        for depth in 0..u64::from(depths) {
+            for first in [0, u64::from(HEAD_ROWS)] {
+                let label = 4 * (depth * u64::from(count_rows) + first);
+                wanted.push((
+                    at.labels + label,
+                    at.loss + 8 * depth,
+                    at.predicted + label,
+                    at.label_log_probabilities + label,
+                ));
+            }
+        }
+        assert_eq!(seen, wanted);
+    }
+
     #[test]
     fn a_window_the_drafter_cannot_hold_is_refused() {
         let mut drafter = drafter(1);

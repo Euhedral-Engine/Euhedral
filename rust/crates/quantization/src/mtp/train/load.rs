@@ -4,9 +4,11 @@
 //! This runs on the calling thread before any frame of the run: it waits for each read and each copy, which a frame
 //! never does. The run itself ([`run`](super::run)) is frames.
 
-use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::fmt::Debug;
 use std::fs;
-use std::path::{Path, absolute};
+use std::io::ErrorKind;
+use std::mem::take;
+use std::path::Path;
 use std::sync::Arc;
 
 use euhedral_core::generics::LatticeSource;
@@ -17,25 +19,27 @@ use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, HostWeightsArena};
 use euhedral_inference_engine::runtime::open_device;
 use euhedral_io::OwnedFile;
+use sha2::{Digest as _, Sha256};
 
 use super::data::{Data, Files};
 use super::error::RunError;
-use super::lane::{CHUNK_BYTES, Resources, TrainLane};
+use super::lane::{CHUNK_BYTES, Lane, Resources, TrainLane};
 use super::options::{Host, Log, Options};
-use super::progress::{Progress, Resume};
-use super::settings::{MAX_POSITIONS, Settings, expected_steps};
-use super::state::{File, pieces};
+use super::progress::{Found, Identity, Progress, Resume};
+use super::run::{Ready, Start};
+use super::settings::{HEAD_ROWS, MAX_POSITIONS, Settings, expected_steps};
+use super::state::{File, place};
 use super::wait::{call, done, then};
 use super::window::Addresses;
 use crate::assemble::ArtifactFile;
 use crate::checkpoint::io::{open_read, read_exact, read_file};
 use crate::checkpoint::objects::{Config as ModelConfig, Qwen38Objects};
 use crate::checkpoint::safetensors::Safetensors;
-use crate::corpus;
+use crate::corpus::{self, Entry};
 use crate::kernels::{Module, ModuleOptions, Modules};
 use crate::mtp::layout::{NORMS, PROJECTIONS};
 use crate::mtp::{Config, Drafter, DrafterKernels, Shape, Work, plan_nvfp4_decode_bf16};
-use crate::resume::ResumeFile;
+use crate::resume::{ResumeError, ResumeFile};
 
 /// The checkpoint tensors of the drafter's norms, in the order of [`NORMS`].
 const NORM_TENSORS: [&str; 7] = [
@@ -48,17 +52,6 @@ const NORM_TENSORS: [&str; 7] = [
     "mtp.norm.weight",
 ];
 
-/// How the run begins.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Start {
-    /// From the checkpoint: the held-out sequences are evaluated before any training.
-    Initial,
-    /// From a saved state, which already had that evaluation.
-    Continue,
-    /// The saved state is of a run that ended: there is nothing to do.
-    Complete,
-}
-
 /// What stays open for the lane.
 #[derive(Debug)]
 pub struct Keep {
@@ -68,25 +61,15 @@ pub struct Keep {
     _library: Arc<CudaLibrary>,
 }
 
-/// A run ready to go.
-pub struct Loaded {
-    pub lane: TrainLane,
-    pub data: Data,
-    /// The width of the hidden state.
-    pub width: u32,
-    pub hidden: Arc<OwnedFile>,
-    /// A token's row in the draft head, -1 for a token it does not hold.
-    pub row_of_token: Vec<i32>,
-    pub identity: String,
-    pub progress: Progress,
-    pub state: ResumeFile,
-    pub start: Start,
-    pub keep: Keep,
-}
-
-impl Debug for Loaded {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
-        formatter.debug_struct("Loaded").finish_non_exhaustive()
+impl Keep {
+    /// Keeps `gpu`, its lane pool, the math libraries and the engine library open for as long as it lives.
+    pub fn new(gpu: Arc<CudaGpu>, pool: Arc<LanePool>, math: Arc<MathLibraries>, library: Arc<CudaLibrary>) -> Keep {
+        Keep {
+            _gpu: gpu,
+            _pool: pool,
+            _math: math,
+            _library: library,
+        }
     }
 }
 
@@ -125,27 +108,44 @@ pub fn widen(bf16: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// What the run is: its corpus, model, artifact and the settings that shape its state. A saved state of another run is
-/// not resumed.
-pub fn identity(options: &Options, sequences: usize) -> Result<String, RunError> {
-    let display = |path: &Path| absolute(path).map(|path| path.display().to_string());
-    let settings = &options.settings;
-    Ok(format!(
-        "corpus={} sequences={sequences} model={} artifact={} depths={} rows={} keys={} tokens={} epochs={} rates={}/{} \
-         warmup={} holdout={}",
-        display(&options.corpus)?,
-        display(&options.model)?,
-        display(&options.artifact)?,
-        settings.depths,
-        settings.rows,
-        settings.keys,
-        settings.tokens,
-        settings.epochs,
-        settings.projection_rate,
-        settings.norm_rate,
-        settings.warmup,
-        settings.holdout,
-    ))
+/// A SHA-256 over parts, each prefixed with its length, so that where one part ends and the next begins matters.
+struct Digest(Sha256);
+
+impl Digest {
+    fn new() -> Digest {
+        Digest(Sha256::new())
+    }
+
+    fn part(&mut self, bytes: &[u8]) {
+        self.0.update((bytes.len() as u64).to_le_bytes());
+        self.0.update(bytes);
+    }
+
+    fn hex(self) -> String {
+        self.0.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+/// The digest of a corpus's content: its index, its tokens and labels, and the size of its hidden rows, which the base
+/// model computes from the tokens. Where the corpus lies is not in it.
+fn corpus_digest(entries: &[Entry], tokens: &[u8], labels: &[u8], hidden_bytes: u64) -> String {
+    let mut digest = Digest::new();
+    for entry in entries {
+        digest.part(entry.id.as_bytes());
+        for number in [
+            entry.token,
+            entry.row,
+            entry.length,
+            entry.prompt,
+            u64::from(entry.sampled),
+        ] {
+            digest.part(&number.to_le_bytes());
+        }
+    }
+    digest.part(tokens);
+    digest.part(labels);
+    digest.part(&hidden_bytes.to_le_bytes());
+    digest.hex()
 }
 
 /// Reads `len` bytes at `offset` of `file`.
@@ -164,25 +164,26 @@ fn read(host: &Host<'_>, file: &Arc<OwnedFile>, offset: u64, len: u64, context: 
     })
 }
 
-/// The corpus's files in memory, checked.
+/// The corpus's files in memory, checked, and the digest of its content.
 fn open_corpus(
     options: &Options,
     host: &Host<'_>,
     width: u32,
     vocabulary: u64,
-) -> Result<(Data, Arc<OwnedFile>), RunError> {
+) -> Result<(Data, Arc<OwnedFile>, String), RunError> {
     let mut entries = corpus::entries(&options.corpus)?;
     if options.settings.limit > 0 {
         entries.truncate(options.settings.limit);
     }
     let file = |name: &str| call(|reply| read_file(host.io, &options.corpus.join(name), done(&reply)));
-    let (tokens, labels) = (words(&file("tokens.bin")?), words(&file("labels.bin")?));
+    let (token_bytes, label_bytes) = (file("tokens.bin")?, file("labels.bin")?);
     let path = options.corpus.join("hidden.bin");
     #[allow(
         clippy::disallowed_methods,
         reason = "startup: the size of the corpus file, read before any frame runs"
     )]
-    let hidden_rows = fs::metadata(&path)?.len() / (2 * u64::from(width));
+    let hidden_bytes = fs::metadata(&path)?.len();
+    let hidden_rows = hidden_bytes / (2 * u64::from(width));
     let hidden = call(|reply| {
         open_read(
             host.io,
@@ -190,17 +191,18 @@ fn open_corpus(
             Box::new(move |opened| reply.send(opened.map(Arc::new).map_err(RunError::from))),
         )
     })?;
+    let digest = corpus_digest(&entries, &token_bytes, &label_bytes, hidden_bytes);
     let data = Data::new(
         Files {
             entries,
-            tokens,
-            labels,
+            tokens: words(&token_bytes),
+            labels: words(&label_bytes),
             hidden_rows,
             vocabulary,
         },
         &options.settings,
     )?;
-    Ok((data, hidden))
+    Ok((data, hidden, digest))
 }
 
 /// Everything the artifact gives the run.
@@ -210,38 +212,44 @@ struct Artifact {
     row_of_token: Vec<i32>,
     table: HostWeightsArena,
     scale_offset: u64,
+    /// The digest of the head's token ids, the head and the embedding.
+    digest: String,
 }
 
-/// Bytes zeroed per copy.
-const ZERO_CHUNK: usize = 8 << 20;
+/// Bytes filled per copy.
+const FILL_CHUNK: usize = 8 << 20;
 
-/// Clears a fresh device buffer: the allocator leaves it undefined, and the gradients and tallies accumulate into it.
-/// For startup: it waits.
+/// Fills a fresh device buffer with `byte`: the poison of a run that looks for a read of memory before its write. For
+/// startup: it waits.
 #[allow(
     clippy::disallowed_methods,
     reason = "startup: a synchronous copy before any frame runs on the lane"
 )]
-fn zero(buffer: &DeviceBuffer) -> Result<(), RunError> {
-    let zeros = vec![0u8; buffer.bytes().min(ZERO_CHUNK)];
+fn fill(buffer: &DeviceBuffer, byte: u8) -> Result<(), RunError> {
+    let filler = vec![byte; buffer.bytes().min(FILL_CHUNK)];
     let mut at = 0;
     while at < buffer.bytes() {
-        let end = (at + zeros.len()).min(buffer.bytes());
-        buffer.copy_from_host(at, &zeros[..end - at])?;
+        let end = (at + filler.len()).min(buffer.bytes());
+        buffer.copy_from_host(at, &filler[..end - at])?;
         at = end;
     }
     Ok(())
 }
 
-/// The device buffers a run owns and the addresses they give.
+/// The device buffers a run owns and the addresses they give. A buffer holds whatever the allocator left unless
+/// `poison` fills it: the kernels write what they read, and the poison is how a test finds one that does not.
 struct Buffers {
     library: Arc<CudaLibrary>,
     owned: Vec<DeviceBuffer>,
+    poison: Option<u8>,
 }
 
 impl Buffers {
     fn take(&mut self, bytes: u64) -> Result<u64, RunError> {
         let buffer = DeviceBuffer::alloc(&self.library, size(bytes.max(4), "a buffer")?)?;
-        zero(&buffer)?;
+        if let Some(byte) = self.poison {
+            fill(&buffer, byte)?;
+        }
         let address = buffer.addr();
         self.owned.push(buffer);
         Ok(address)
@@ -288,13 +296,8 @@ fn read_artifact(
         )));
     }
     let file = artifact.file();
-    let ids = words(&read(
-        host,
-        file,
-        ids.offset(),
-        ids.bytes(),
-        "the draft head's token ids",
-    )?);
+    let id_bytes = read(host, file, ids.offset(), ids.bytes(), "the draft head's token ids")?;
+    let ids = words(&id_bytes);
     let mut row_of_token = vec![-1i32; size(vocabulary, "the vocabulary")?];
     for (row, token) in ids.iter().enumerate() {
         let slot = usize::try_from(*token)
@@ -333,6 +336,10 @@ fn read_artifact(
         return Err(input("the token embedding is shorter than its layout needs".to_owned()));
     }
     let bytes = read(host, file, embedding.offset(), embedding.bytes(), "the token embedding")?;
+    let mut digest = Digest::new();
+    for part in [&id_bytes, &packed, &bytes] {
+        digest.part(part);
+    }
     let mut table = HostWeightsArena::alloc(library, bytes.len())?;
     table.as_mut_slice().copy_from_slice(&bytes);
     let head_address = 0;
@@ -350,6 +357,7 @@ fn read_artifact(
             row_of_token,
             table,
             scale_offset: table_scales,
+            digest: digest.hex(),
         },
     ))
 }
@@ -377,6 +385,9 @@ fn decode_head(
 ) -> Result<(), RunError> {
     let staging = DeviceBuffer::alloc(library, stored.packed.len())?;
     staging.copy_from_host(0, &stored.packed)?;
+    // The copy from pageable memory may return before the transfer lands, and the lane's stream does not wait for it:
+    // without this the decode kernel can read the staging buffer before its bytes are there.
+    library.synchronize()?;
     let base = staging.addr();
     let steps = plan_nvfp4_decode_bf16(
         base,
@@ -390,25 +401,39 @@ fn decode_head(
     lane.run_blocking(&[Work::Steps(steps)])
 }
 
-/// The parameters' values from the checkpoint, widened to FP32 and written to the lane.
-fn load_checkpoint(objects: &Qwen38Objects, lane: &TrainLane) -> Result<(), RunError> {
+/// The checkpoint's drafter tensors as BF16 bytes, by the name of the parameter each starts.
+fn read_checkpoint(objects: &Qwen38Objects) -> Result<Vec<(&'static str, Vec<u8>)>, RunError> {
     let store = objects.store();
+    let mut tensors = Vec::new();
+    for name in PROJECTIONS {
+        let source = objects.object(name)?;
+        tensors.push((name, call(|reply| objects.read_bytes(&source, done(&reply)))?));
+    }
+    for (name, tensor) in NORMS.into_iter().zip(NORM_TENSORS) {
+        let memory = vec![0u8; size(store.tensor(tensor)?.bytes, tensor)?];
+        tensors.push((name, call(|reply| store.read_tensor(tensor, memory, done(&reply)))?));
+    }
+    Ok(tensors)
+}
+
+/// The digest of the drafter's starting parameters.
+fn checkpoint_digest(tensors: &[(&'static str, Vec<u8>)]) -> String {
+    let mut digest = Digest::new();
+    for (name, bytes) in tensors {
+        digest.part(name.as_bytes());
+        digest.part(bytes);
+    }
+    digest.hex()
+}
+
+/// Writes the checkpoint's values, widened to FP32, to the lane's parameters.
+fn load_checkpoint(tensors: &[(&'static str, Vec<u8>)], lane: &TrainLane) -> Result<(), RunError> {
     for parameter in lane.drafter().parameters() {
         let count = parameter.count();
-        let bf16 = if let Some(at) = PROJECTIONS.iter().position(|name| *name == parameter.name) {
-            let source = objects.object(PROJECTIONS[at])?;
-            call(|reply| objects.read_bytes(&source, done(&reply)))?
-        } else if let Some(at) = NORMS.iter().position(|name| *name == parameter.name) {
-            let name = NORM_TENSORS[at];
-            let bytes = store.tensor(name)?.bytes;
-            let memory = vec![0u8; size(bytes, name)?];
-            call(|reply| store.read_tensor(name, memory, done(&reply)))?
-        } else {
-            return Err(RunError::Broken(format!(
-                "{} is not a parameter of the drafter",
-                parameter.name
-            )));
-        };
+        let (_, bf16) = tensors
+            .iter()
+            .find(|(name, _)| *name == parameter.name)
+            .ok_or_else(|| RunError::Broken(format!("{} is not a parameter of the drafter", parameter.name)))?;
         if bf16.len() as u64 != 2 * count {
             return Err(input(format!(
                 "{} holds {} bytes in the checkpoint, the drafter needs {}",
@@ -417,27 +442,17 @@ fn load_checkpoint(objects: &Qwen38Objects, lane: &TrainLane) -> Result<(), RunE
                 2 * count
             )));
         }
-        lane.put(parameter.values, &widen(&bf16))?;
+        lane.put(parameter.values, &widen(bf16))?;
     }
     Ok(())
 }
 
 /// Writes the saved state's pieces to the lane.
-fn restore(host: &Host<'_>, lane: &TrainLane, state: &ResumeFile) -> Result<(), RunError> {
-    let parameters = lane.drafter().parameters().to_vec();
-    let counts: Vec<u64> = parameters.iter().map(|parameter| parameter.count()).collect();
-    for piece in pieces(File::State, &counts, CHUNK_BYTES) {
-        let bytes = call(|reply| state.read(piece.offset, piece.bytes, then(&reply)))?;
-        let parameter = &parameters[piece.parameter];
-        let base = match piece.part {
-            super::state::Part::Values => parameter.values,
-            super::state::Part::First => parameter.first,
-            super::state::Part::Second => parameter.second,
-            super::state::Part::Gradient => parameter.gradient,
-        };
-        lane.put(base + piece.inside, &bytes)?;
+fn restore(lane: &TrainLane, state: &ResumeFile) -> Result<(), RunError> {
+    for placed in place(lane.drafter().parameters(), File::State, CHUNK_BYTES) {
+        let bytes = call(|reply| state.read(placed.piece.offset, placed.piece.bytes, then(&reply)))?;
+        lane.put(placed.address, &bytes)?;
     }
-    let _ = host;
     Ok(())
 }
 
@@ -460,25 +475,114 @@ fn config_of(settings: &Settings, objects: &ModelConfig) -> Result<Config, RunEr
     })
 }
 
+/// Opens the saved state to read it; none when there is no file.
+fn open_state(host: &Host<'_>, path: &Path) -> Result<Option<ResumeFile>, RunError> {
+    match call(|reply| ResumeFile::open_read_only(host.io, host.lake, path, then(&reply))) {
+        Ok(file) => Ok(Some(file)),
+        Err(RunError::Resume(ResumeError::Io(error))) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// What the start brings the lane from, and where from.
+struct Source<'a> {
+    library: &'a Arc<CudaLibrary>,
+    stored: &'a ArtifactBytes,
+    draft_rows: u32,
+    head: u64,
+    checkpoint: &'a [(&'static str, Vec<u8>)],
+    state: Option<&'a ResumeFile>,
+}
+
+/// Brings the lane to where `resume` says the run starts: the head decoded, the parameters from the checkpoint or from
+/// the saved state, the scales measured. `fresh` is the progress of a run from the checkpoint.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "startup: the device is waited for before any frame runs on the lane"
+)]
+fn bring_up(
+    lane: &mut TrainLane,
+    resume: Resume,
+    fresh: Progress,
+    from: &Source<'_>,
+) -> Result<(Progress, Start), RunError> {
+    decode_head(lane, from.library, from.stored, from.draft_rows, from.head)?;
+    match resume {
+        Resume::Fresh => {
+            load_checkpoint(from.checkpoint, lane)?;
+            from.library.synchronize()?;
+            lane.prepare(true)?;
+            Ok((fresh, Start::Initial))
+        }
+        Resume::Continue(progress) => {
+            let state = from
+                .state
+                .ok_or_else(|| RunError::Broken("a state to continue from is not open".to_owned()))?;
+            // The drafter refuses steps until its zeroing was planned; the saved state then overwrites what it zeroed.
+            lane.prepare(true)?;
+            restore(lane, state)?;
+            from.library.synchronize()?;
+            lane.prepare(false)?;
+            Ok((progress, Start::Continue))
+        }
+        Resume::Complete(progress) => Ok((progress, Start::Complete)),
+    }
+}
+
 /// Opens everything the run needs and brings it to where it starts.
 #[allow(
     clippy::disallowed_methods,
     reason = "startup: the calling thread is the binary's own, it waits for each read and copy before any frame runs"
 )]
-pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Loaded, RunError> {
+pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Ready<TrainLane>, RunError> {
     let settings = options.settings;
     settings.check()?;
-    fs::create_dir_all(&options.out)?;
+    // The libraries first: a wrong path is refused before the corpus and the artifact are read.
+    let library = CudaLibrary::load(&options.library)?;
+    let math = MathLibraries::load(&options.math)?;
     let store = Arc::new(call(|reply| Safetensors::open(host.io, &options.model, done(&reply)))?);
     let objects = call(|reply| Qwen38Objects::open(Arc::clone(&store), &options.model, done(&reply)))?;
     let config = config_of(&settings, &objects.config)?;
     config.validate()?;
     let (width, vocabulary) = (config.shape.hidden, objects.config.vocabulary);
 
-    let library = CudaLibrary::load(&options.library)?;
-    let (data, hidden) = open_corpus(options, host, width, vocabulary)?;
-    let identity = identity(options, data.entries().len())?;
+    let (data, hidden, corpus) = open_corpus(options, host, width, vocabulary)?;
     let (stored, mut artifact) = read_artifact(options, host, &library, width, vocabulary)?;
+    let checkpoint = read_checkpoint(&objects)?;
+    let artifact_digest = take(&mut artifact.digest);
+    let identity = Identity::new(
+        corpus,
+        checkpoint_digest(&checkpoint),
+        artifact_digest,
+        &settings,
+        data.entries().len(),
+    );
+    let expected = expected_steps(data.lengths(), settings.tokens);
+
+    // What was saved decides the start before the device is opened: a refusal costs nothing.
+    fs::create_dir_all(&options.out)?;
+    let (state_path, best_path) = (options.out.join("resume.bin"), options.out.join("best.bin"));
+    if options.fresh {
+        // A state of the run being replaced must not outlive the first best parameters of the new one.
+        match fs::remove_file(&state_path) {
+            Err(error) if error.kind() != ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+    }
+    let state = open_state(host, &state_path)?;
+    let saved = match &state {
+        Some(file) => Some(call(|reply| file.header(then(&reply)))?),
+        None => None,
+    };
+    let resume = Progress::resume(
+        settings,
+        data.training().to_vec(),
+        expected,
+        &identity,
+        saved.as_ref().map_or(Found::Missing, Found::Header),
+        best_path.try_exists()?,
+        options.fresh,
+    )?;
 
     let gpu = open_device(&library).map_err(|error| RunError::Input(error.to_string()))?;
     let mut modules = Modules::<CudaModule>::open(
@@ -493,7 +597,6 @@ pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Loaded, Run
         .ok_or_else(|| RunError::Broken("the device opened no lane".to_owned()))?;
     let completions = Completions::new(&pool);
     (host.attach)(Arc::clone(&completions) as Arc<dyn LatticeSource>).map_err(RunError::Input)?;
-    let math = MathLibraries::load(&options.math)?;
     let handles = math.lane_handles().map_err(|failed| {
         if let Some(leftover) = failed.leftover {
             let _ = leftover.close();
@@ -501,17 +604,23 @@ pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Loaded, Run
         RunError::from(failed.error)
     })?;
 
+    // The start writes every parameter value and every scale; only the gradients and the Adam moments rely on the
+    // zero that `Drafter::initialise` writes (a gradient adds into its array, a moment starts empty). Everything else is
+    // as the allocator left it, or poison when asked for.
     let arena = DeviceBuffer::alloc(&library, size(Drafter::arena_bytes(&config)?, "the drafter's arena")?)?;
-    zero(&arena)?;
+    if let Some(byte) = options.poison {
+        fill(&arena, byte)?;
+    }
     let drafter = Drafter::new(&config, arena.addr())?;
     let mut buffers = Buffers {
         library: Arc::clone(&library),
         owned: Vec::new(),
+        poison: options.poison,
     };
     let (rows, depths) = (u64::from(settings.rows), u64::from(settings.depths));
     let wide = u64::from(width);
     artifact.head = buffers.take(2 * u64::from(artifact.draft_rows) * wide)?;
-    let head_rows = u64::from(super::settings::HEAD_ROWS);
+    let head_rows = u64::from(HEAD_ROWS);
     let draft_rows = u64::from(artifact.draft_rows);
     let hidden_bf16 = buffers.take(2 * rows * wide)?;
     let hidden_input = buffers.take(4 * rows * wide)?;
@@ -551,31 +660,31 @@ pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Loaded, Run
         buffers: buffers.owned,
         table: artifact.table,
         completions,
+        keep: Keep::new(gpu, pool, math, Arc::clone(&library)),
+        poison: options.poison,
     };
     let mut lane = TrainLane::new(stream, &library, resources)?;
-    decode_head(&mut lane, &library, &stored, artifact.draft_rows, head)?;
-
-    let expected = expected_steps(data.lengths(), settings.tokens);
-    let state = call(|reply| ResumeFile::open(host.io, host.lake, &options.out.join("resume.bin"), then(&reply)))?;
-    let saved = call(|reply| state.header(then(&reply)))?;
-    let resume = Progress::resume(settings, data.training().to_vec(), expected, &identity, &saved)?;
-    let (progress, start) = match resume {
-        Resume::Fresh => {
-            load_checkpoint(&objects, &lane)?;
-            lane.prepare(true)?;
-            (
-                Progress::new(settings, data.training().to_vec(), expected),
-                Start::Initial,
-            )
+    // The fills above are copies from pageable memory, which may still be under way: the lane's stream does not wait.
+    let source = Source {
+        library: &library,
+        stored: &stored,
+        draft_rows: artifact.draft_rows,
+        head,
+        checkpoint: &checkpoint,
+        state: state.as_ref(),
+    };
+    let fresh = Progress::new(settings, data.training().to_vec(), expected);
+    let begun = library
+        .synchronize()
+        .map_err(RunError::from)
+        .and_then(|()| bring_up(&mut lane, resume, fresh, &source));
+    let (progress, start) = match begun {
+        Ok(begun) => begun,
+        Err(error) => {
+            // Close the lane here, on the calling thread: its buffers are device memory.
+            let _ = lane.close();
+            return Err(error);
         }
-        Resume::Continue(progress) => {
-            // The drafter refuses steps until its zeroing was planned; the saved state then overwrites what it zeroed.
-            lane.prepare(true)?;
-            restore(host, &lane, &state)?;
-            lane.prepare(false)?;
-            (progress, Start::Continue)
-        }
-        Resume::Complete(progress) => (progress, Start::Complete),
     };
     log(&format!(
         "{} training and {} held-out sequences, {} draft-head rows{}",
@@ -588,7 +697,12 @@ pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Loaded, Run
                 format!(", resumed at epoch {} step {}", progress.epoch(), progress.step()),
         }
     ));
-    Ok(Loaded {
+    let parameters = lane.drafter().parameters();
+    let (state_pieces, best_pieces) = (
+        place(parameters, File::State, CHUNK_BYTES),
+        place(parameters, File::Best, CHUNK_BYTES),
+    );
+    Ok(Ready {
         lane,
         data,
         width,
@@ -596,14 +710,9 @@ pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Loaded, Run
         row_of_token: artifact.row_of_token,
         identity,
         progress,
-        state,
         start,
-        keep: Keep {
-            _gpu: gpu,
-            _pool: pool,
-            _math: math,
-            _library: library,
-        },
+        state_pieces,
+        best_pieces,
     })
 }
 
@@ -623,6 +732,68 @@ mod tests {
             .collect();
         assert_eq!(floats, [1.0, -2.5, 0.0]);
         assert!(widen(&[0x80]).is_empty());
+    }
+
+    fn entry(id: &str, token: u64) -> Entry {
+        Entry {
+            id: id.to_owned(),
+            token,
+            row: 0,
+            length: 5,
+            prompt: 2,
+            sampled: false,
+        }
+    }
+
+    #[test]
+    fn a_digest_tells_where_one_part_ends_and_the_next_begins() {
+        let of = |parts: &[&[u8]]| {
+            let mut digest = Digest::new();
+            parts.iter().for_each(|part| digest.part(part));
+            digest.hex()
+        };
+        assert_eq!(of(&[b"ab", b"c"]), of(&[b"ab", b"c"]));
+        assert_ne!(of(&[b"ab", b"c"]), of(&[b"a", b"bc"]));
+        assert_eq!(of(&[]).len(), 64);
+    }
+
+    #[test]
+    fn a_corpus_digest_changes_with_any_of_its_content_and_with_nothing_else() {
+        let entries = [entry("a", 0), entry("b", 5)];
+        let base = corpus_digest(&entries, &[1, 0, 0, 0], &[2, 0, 0, 0], 80);
+        assert_eq!(base, corpus_digest(&entries, &[1, 0, 0, 0], &[2, 0, 0, 0], 80));
+        let mut moved = entries.clone();
+        moved[1].token = 6;
+        let mut renamed = entries.clone();
+        renamed[0].id = "c".to_owned();
+        let mut sampled = entries.clone();
+        sampled[0].sampled = true;
+        for (name, other) in [
+            (
+                "an entry's start",
+                corpus_digest(&moved, &[1, 0, 0, 0], &[2, 0, 0, 0], 80),
+            ),
+            (
+                "an entry's id",
+                corpus_digest(&renamed, &[1, 0, 0, 0], &[2, 0, 0, 0], 80),
+            ),
+            (
+                "an entry's sampling",
+                corpus_digest(&sampled, &[1, 0, 0, 0], &[2, 0, 0, 0], 80),
+            ),
+            ("a token", corpus_digest(&entries, &[3, 0, 0, 0], &[2, 0, 0, 0], 80)),
+            ("a label", corpus_digest(&entries, &[1, 0, 0, 0], &[3, 0, 0, 0], 80)),
+            (
+                "the hidden rows",
+                corpus_digest(&entries, &[1, 0, 0, 0], &[2, 0, 0, 0], 96),
+            ),
+            (
+                "an entry fewer",
+                corpus_digest(&entries[..1], &[1, 0, 0, 0], &[2, 0, 0, 0], 80),
+            ),
+        ] {
+            assert_ne!(base, other, "{name}");
+        }
     }
 
     #[test]

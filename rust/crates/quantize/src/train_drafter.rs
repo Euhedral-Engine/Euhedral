@@ -17,7 +17,7 @@ use crate::{EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, Outcome};
 /// What the command line accepts, for the message that refuses another option.
 const OPTIONS: &str = "--corpus, --model, --artifact, --out, --cuda-libraries, --depths, --rows, --keys, --tokens, \
 --epochs, --projection-rate, --norm-rate, --warmup, --holdout, --evaluate-every, --limit, --stop-after-saves, \
---library";
+--library, --fresh, --poison-memory, --fail-in-save";
 
 /// The flags of the command.
 #[derive(Debug, PartialEq)]
@@ -30,16 +30,43 @@ struct Flags {
     library: Option<PathBuf>,
     settings: Training,
     stop_after_saves: u32,
+    fresh: bool,
+    poison: Option<u8>,
+    fail_in_save: u32,
 }
+
+/// What `--poison-memory` fills unwritten memory with: a NaN in every float format.
+const POISON: u8 = 0xff;
 
 fn flags(args: &[String]) -> Result<Flags, String> {
     let (mut corpus, mut model, mut artifact, mut out, mut math, mut library) = (None, None, None, None, None, None);
     let (mut settings, mut stop_after_saves) = (Training::default(), 0);
+    let (mut fresh, mut poison, mut fail_in_save) = (false, None, 0);
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
+        // The flags that take no value.
+        match arg.as_str() {
+            "--fresh" => {
+                fresh = true;
+                continue;
+            }
+            "--poison-memory" => {
+                poison = Some(POISON);
+                continue;
+            }
+            _ => {}
+        }
         let value = rest.next().ok_or_else(|| format!("{arg} needs a value"))?;
-        let whole = || value.parse::<u32>().map_err(|_| format!("{arg} needs a whole number"));
-        let real = || value.parse::<f32>().map_err(|_| format!("{arg} needs a number"));
+        let whole = || {
+            value
+                .parse::<u32>()
+                .map_err(|_| format!("{arg} needs a whole number, not {value:?}"))
+        };
+        let real = || {
+            value
+                .parse::<f32>()
+                .map_err(|_| format!("{arg} needs a number, not {value:?}"))
+        };
         match arg.as_str() {
             "--corpus" => corpus = Some(PathBuf::from(value)),
             "--model" => model = Some(PathBuf::from(value)),
@@ -55,10 +82,19 @@ fn flags(args: &[String]) -> Result<Flags, String> {
             "--projection-rate" => settings.projection_rate = real()?,
             "--norm-rate" => settings.norm_rate = real()?,
             "--warmup" => settings.warmup = whole()?,
-            "--holdout" => settings.holdout = value.parse().map_err(|_| format!("{arg} needs a whole number"))?,
+            "--holdout" => {
+                settings.holdout = value
+                    .parse()
+                    .map_err(|_| format!("{arg} needs a whole number, not {value:?}"))?;
+            }
             "--evaluate-every" => settings.evaluate_every = whole()?,
-            "--limit" => settings.limit = value.parse().map_err(|_| format!("{arg} needs a whole number"))?,
+            "--limit" => {
+                settings.limit = value
+                    .parse()
+                    .map_err(|_| format!("{arg} needs a whole number, not {value:?}"))?;
+            }
             "--stop-after-saves" => stop_after_saves = whole()?,
+            "--fail-in-save" => fail_in_save = whole()?,
             other => {
                 return Err(format!(
                     "unknown train-drafter option {other}; the options are {OPTIONS}"
@@ -80,6 +116,9 @@ fn flags(args: &[String]) -> Result<Flags, String> {
         library,
         settings,
         stop_after_saves,
+        fresh,
+        poison,
+        fail_in_save,
     })
 }
 
@@ -141,6 +180,9 @@ pub fn run(args: &[String]) -> Outcome {
         library,
         math: flags.math,
         stop_after_saves: flags.stop_after_saves,
+        fresh: flags.fresh,
+        poison: flags.poison,
+        fail_in_save: flags.fail_in_save,
     };
     let attach = |source| rig.attach(source);
     let host = Host {
@@ -286,13 +328,33 @@ mod tests {
                 .contains("unknown train-drafter option --bogus")
         );
         assert!(flags(&with(&["--depths"])).unwrap_err().contains("needs a value"));
-        assert!(flags(&with(&["--depths", "x"])).unwrap_err().contains("whole number"));
+        assert!(
+            flags(&with(&["--depths", "x"]))
+                .unwrap_err()
+                .contains("whole number, not \"x\"")
+        );
         assert!(flags(&with(&["--depths", "-1"])).unwrap_err().contains("whole number"));
         assert!(
             flags(&with(&["--norm-rate", "fast"]))
                 .unwrap_err()
-                .contains("needs a number")
+                .contains("needs a number, not \"fast\"")
         );
+        assert!(
+            flags(&with(&["--limit", "many"]))
+                .unwrap_err()
+                .contains("whole number, not \"many\"")
+        );
+    }
+
+    #[test]
+    fn the_flags_that_take_no_value_set_only_their_own_switch() {
+        let parsed = flags(&with(&["--fresh", "--poison-memory", "--fail-in-save", "2"])).unwrap();
+        assert!(parsed.fresh);
+        assert_eq!(parsed.poison, Some(0xff));
+        assert_eq!(parsed.fail_in_save, 2);
+        assert_eq!(parsed.settings, Training::default());
+        let plain = flags(&with(&[])).unwrap();
+        assert!((plain.fresh, plain.poison, plain.fail_in_save) == (false, None, 0));
     }
 
     #[test]

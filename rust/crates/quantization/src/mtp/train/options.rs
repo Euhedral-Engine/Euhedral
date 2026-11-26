@@ -28,6 +28,14 @@ pub struct Options {
     pub math: PathBuf,
     /// Ends the run after this many state saves, leaving the state to resume from; 0 never stops early.
     pub stop_after_saves: u32,
+    /// Starts from the checkpoint even when `out` holds a saved state or best parameters, which the new run replaces.
+    pub fresh: bool,
+    /// Fills device and pinned memory that nothing has written with this byte, `0xff` being a NaN in every float
+    /// format: a read of memory before its write shows up in the results. Gradients and moments start at zero anyway.
+    pub poison: Option<u8>,
+    /// Fails the state save of this number (from 1) after half of its pieces are written, to prove that a save which
+    /// does not finish leaves the saved state whole; 0 never fails.
+    pub fail_in_save: u32,
 }
 
 /// The runtime a run goes on: the asynchronous I/O, the host lake and the way to have the lattice take the lane's

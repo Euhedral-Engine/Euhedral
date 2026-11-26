@@ -5,6 +5,7 @@
 //! order Java's state has), then every parameter's gradient, which Java does not save: a state taken between two
 //! updates has gradients that the next update needs. The best file holds the values only.
 
+use crate::mtp::Parameter;
 use crate::resume::HEADER;
 
 /// One of the four arrays a parameter has on the device.
@@ -69,8 +70,41 @@ pub fn pieces(file: File, counts: &[u64], chunk: usize) -> Vec<Piece> {
     out
 }
 
+/// A piece of a file with the device address of the bytes it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub piece: Piece,
+    pub address: u64,
+}
+
+/// Where the device keeps the bytes of `piece`.
+pub fn address(parameters: &[Parameter], piece: &Piece) -> u64 {
+    let parameter = &parameters[piece.parameter];
+    let base = match piece.part {
+        Part::Values => parameter.values,
+        Part::First => parameter.first,
+        Part::Second => parameter.second,
+        Part::Gradient => parameter.gradient,
+    };
+    base + piece.inside
+}
+
+/// The pieces of `file` for `parameters`, none larger than `chunk` bytes, with their device addresses.
+pub fn place(parameters: &[Parameter], file: File, chunk: usize) -> Vec<Placed> {
+    let counts: Vec<u64> = parameters.iter().map(Parameter::count).collect();
+    pieces(file, &counts, chunk)
+        .into_iter()
+        .map(|piece| Placed {
+            piece,
+            address: address(parameters, &piece),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
+
     use super::*;
 
     #[test]
@@ -123,5 +157,38 @@ mod tests {
     fn no_parameters_have_no_pieces() {
         assert!(pieces(File::State, &[], 8).is_empty());
         assert!(pieces(File::Best, &[0], 8).is_empty());
+    }
+
+    fn parameter(rows: u32, columns: u32, base: u64) -> Parameter {
+        Parameter {
+            name: "test",
+            rows,
+            columns,
+            values: base,
+            gradient: base + 0x1000,
+            first: base + 0x2000,
+            second: base + 0x3000,
+            maximum: None,
+        }
+    }
+
+    #[test]
+    fn a_piece_is_read_from_its_arrays_address_plus_how_far_into_the_array_it_starts() {
+        let parameters = [parameter(1, 7, 0x10_0000), parameter(2, 2, 0x20_0000)];
+        let placed = place(&parameters, File::State, 8);
+        let seen: Vec<_> = placed
+            .iter()
+            .map(|placed| (placed.piece.parameter, placed.piece.part, placed.address))
+            .collect();
+        assert_eq!(seen[0], (0, Part::Values, 0x10_0000));
+        assert_eq!(seen[1], (0, Part::Values, 0x10_0008));
+        assert_eq!(seen[3], (0, Part::Values, 0x10_0018));
+        let first_moment = placed
+            .iter()
+            .find(|p| p.piece.part == Part::First && p.piece.parameter == 1);
+        assert_eq!(first_moment.map(|p| p.address), Some(0x20_2000));
+        let last = placed.last().unwrap();
+        assert_eq!((last.piece.parameter, last.piece.part), (1, Part::Gradient));
+        assert_eq!(last.address, 0x20_1008);
     }
 }
