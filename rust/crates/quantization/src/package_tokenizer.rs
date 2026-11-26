@@ -8,6 +8,18 @@
 //! The run is a chain of `AsyncIo` operations and host-lake frames: each completion starts the next step, and the
 //! final result goes to the callback. The section's body is written, made durable, and only then the footer, so an
 //! interrupted run leaves no section, and running it again repairs the artifact.
+//!
+//! How a run ends, and what it never does while it ends:
+//! - A call that is refused at once returns `Err` and never calls `done`: an I/O engine that is complete, a lake that
+//!   will not admit the run or take its first frame.
+//! - A step that `AsyncIo` refuses once the run is going ends the run with the refusal (the I/O error), through the
+//!   run's own failure path, once. That path runs on a worker, so it may remove the temporary output.
+//! - A step that the I/O engine or the host lake accepted and later discards unrun (it is closing) drops the run.
+//!   RustEE may discard a frame from the tail of a pull, where a worker must not push, so dropping the run offers
+//!   nothing: not the removal of the temporary output either. `done` is called once with [`PackageError::Lost`], and
+//!   with [`PackageError::PartLeft`] when a temporary output was begun, which says the file was left, or
+//!   [`PackageError::Cut`] when an artifact written in place had been cut back.
+//! - A step that the host lake refuses once the run is going (a removal, a cut, a flush) drops the run the same way.
 
 use std::fs::File;
 use std::io;
@@ -15,8 +27,10 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use euhedral_core::generics::LatticeSource;
 use euhedral_graph::{Lake, UnitGuard};
 use euhedral_inference_edrl::{FOOTER_BYTES, HEADER_BYTES, Header, TensorTable};
+use euhedral_inference_engine::Handoff;
 use euhedral_io::{AsyncIo, Create, IoBuf, OpenSpec, RawFile};
 
 use crate::durable::{self, SharedFile};
@@ -100,7 +114,8 @@ pub fn content_end(header: &Header, table: &[u8], file_len: u64) -> Result<u64, 
         .fold(header.data_offset(), u64::max))
 }
 
-/// Starts packaging. The result goes to `done` on a worker; an `Err` here means nothing started.
+/// Starts packaging. The result goes to `done` on a worker; an `Err` here means nothing started, and `done` is never
+/// called.
 ///
 /// `io` does the reads and writes; `host` runs the checks (loading the tokenizer is CPU work) and the few file
 /// operations `AsyncIo` lacks.
@@ -127,6 +142,12 @@ pub fn package_tokenizer(
             ),
         });
     }
+    if io.is_complete() {
+        return Err(PackageError::Io {
+            what: "cannot start",
+            source: io::Error::other("the I/O engine is closed"),
+        });
+    }
     let unit = host.admit().map_err(|error| PackageError::Lake(error.to_string()))?;
     let job = Job {
         io,
@@ -140,7 +161,24 @@ pub fn package_tokenizer(
         },
         _unit: unit,
     };
-    on_host(&host, move || job.read_checkpoint());
+    // The frame is the job's only holder once it is accepted. A lake that refuses it drops the frame, so the job waits
+    // in a cell: it comes back, spent, and the call returns `Err` without calling `done`.
+    let parked = Handoff::new();
+    parked.send(job);
+    let taken = Arc::clone(&parked);
+    let run = step(Kind::Resolve, move || {
+        if let Some(job) = taken.take() {
+            job.read_checkpoint();
+        }
+    });
+    if host.offer(run).is_err() {
+        if let Some(mut job) = parked.take() {
+            job.end.abandon();
+        }
+        return Err(PackageError::Lake(
+            "the host lake refused the run's first step".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -150,6 +188,11 @@ struct Completion {
 }
 
 impl Completion {
+    /// Spends the callback without calling it: the call that returns `Err` started nothing.
+    fn disarm(mut self) {
+        self.done.take();
+    }
+
     fn finish(mut self, result: Result<Packaged, PackageError>) {
         if let Some(done) = self.done.take() {
             done(result);
@@ -174,10 +217,12 @@ struct Job {
     _unit: UnitGuard,
 }
 
-/// How a run ends. It owns the callback and, once there is one, the temporary output, so that the callback is called
-/// only after the output is removed: a run that is dropped while an output is armed (a refused step, a lake that
-/// closed) removes the file and then reports itself lost, so no run leaves a `.part` behind and a caller that starts
-/// again never has its new `.part` deleted by the old run.
+/// How a run ends. It owns the callback and, once there is one, the temporary output, so that a failure calls the
+/// callback only after the output is removed ([`RunEnd::remove_then_fail`]), and a caller that starts again never has
+/// its new `.part` deleted by the old run.
+///
+/// A run that is dropped without ending (a step the I/O engine or the lake accepted and discarded unrun) does not
+/// remove the output: the discard may be inside a pull, where nothing may be offered. It says what was left.
 struct RunEnd {
     host: Arc<Lake>,
     part: Option<PathBuf>,
@@ -195,6 +240,14 @@ impl RunEnd {
         self.part = None;
     }
 
+    /// Spends the run without reporting: the call that returns `Err` started nothing.
+    fn abandon(&mut self) {
+        self.part = None;
+        if let Some(completion) = self.completion.take() {
+            completion.disarm();
+        }
+    }
+
     /// Reports the end of the run; the output, if armed, was moved into place or is not this run's to remove.
     fn finish(&mut self, result: Result<Packaged, PackageError>) {
         self.part = None;
@@ -203,8 +256,8 @@ impl RunEnd {
         }
     }
 
-    /// Removes the armed output, then reports `error`. A removal the lake refuses drops the frame and, with it,
-    /// the continuation, which reports all the same.
+    /// Removes the armed output, then reports `error`. A removal the lake refuses, or accepts and discards, drops
+    /// [`Failing`], which reports all the same.
     fn remove_then_fail(&mut self, error: PackageError) {
         let part = self.part.take();
         let Some(completion) = self.completion.take() else {
@@ -237,8 +290,21 @@ impl RunEnd {
 }
 
 impl Drop for RunEnd {
+    // This runs inside the discard of a frame or of an I/O continuation: it reports and offers nothing.
     fn drop(&mut self) {
-        self.remove_then_fail(PackageError::Lost);
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        let error = match self.part.take() {
+            Some(part) => PackageError::PartLeft {
+                part,
+                removal: io::Error::other("the run was closed before the file could be removed"),
+                cause: Box::new(PackageError::Lost),
+            },
+            None if self.cut => PackageError::Cut(Box::new(PackageError::Lost)),
+            None => PackageError::Lost,
+        };
+        completion.finish(Err(error));
     }
 }
 
@@ -287,12 +353,31 @@ struct Checkpoint {
     generation_config: Vec<u8>,
 }
 
-/// Runs `work` as a frame of `host`; a lake that refuses it drops `work`, which the run reports as lost.
+/// Runs `work` as a frame of `host`; a lake that refuses it drops `work`, which the run reports as lost (no output
+/// is begun where this is used, so nothing is left).
 fn on_host(host: &Arc<Lake>, work: impl FnOnce() + Send + 'static) {
     drop(host.offer(step(Kind::Resolve, work)));
 }
 
 type Then<T> = Box<dyn FnOnce(io::Result<T>) + Send>;
+
+/// Starts an I/O step that owns `held`. `start` gets the cell the step takes `held` from. A submission that `AsyncIo`
+/// refuses dropped the step, so `held` is given back to `refused` with the error, on this thread, which is not a
+/// discard: it may fail the run through its own path. A step dropped after it was accepted drops the last holder of the
+/// cell and, with it, `held`.
+fn submit<H: Send + 'static>(
+    held: H,
+    refused: impl FnOnce(H, io::Error),
+    start: impl FnOnce(Arc<Handoff<H>>) -> io::Result<()>,
+) {
+    let cell = Handoff::new();
+    cell.send(held);
+    if let Err(error) = start(Arc::clone(&cell))
+        && let Some(held) = cell.take()
+    {
+        refused(held, error);
+    }
+}
 
 #[cfg(unix)]
 fn raw_file(file: &File) -> RawFile {
@@ -308,16 +393,24 @@ fn raw_file(file: &File) -> RawFile {
     file.as_raw_handle()
 }
 
-/// Opens `path`; a submission the I/O refuses drops `then`, which the run reports as lost.
+/// Opens `path`; a submission the I/O refuses calls `then` with the error.
 fn open(io: &AsyncIo, path: &Path, spec: OpenSpec, then: Then<SharedFile>) {
-    drop(io.open_path(
-        path,
-        spec,
-        Box::new(move |result| {
-            then(result.map(durable::share));
-            idle()
-        }),
-    ));
+    submit(
+        then,
+        |then, error| then(Err(error)),
+        |parked| {
+            io.open_path(
+                path,
+                spec,
+                Box::new(move |result| {
+                    if let Some(then) = parked.take() {
+                        then(result.map(durable::share));
+                    }
+                    idle()
+                }),
+            )
+        },
+    );
 }
 
 /// Reads exactly `len` bytes at `offset` into the end of `got`.
@@ -329,29 +422,38 @@ fn read_exact(io: &Arc<AsyncIo>, file: SharedFile, offset: u64, len: usize, mut 
     let want = len - got.len();
     let at = offset + got.len() as u64;
     let next = (Arc::clone(io), Arc::clone(&file));
-    drop(io.read(
-        raw_file(&file),
-        at,
-        IoBuf {
-            bytes: vec![0; want],
-            filled: 0,
+    submit(
+        then,
+        |then, error| then(Err(error)),
+        |parked| {
+            io.read(
+                raw_file(&file),
+                at,
+                IoBuf {
+                    bytes: vec![0; want],
+                    filled: 0,
+                },
+                Box::new(move |done| {
+                    let Some(then) = parked.take() else {
+                        return idle();
+                    };
+                    match done.result {
+                        Ok(0) => then(Err(io::ErrorKind::UnexpectedEof.into())),
+                        Ok(moved) if got.is_empty() && moved == want => {
+                            // The first read filled the request: the buffer is the result, no copy.
+                            then(Ok(done.buf.bytes));
+                        }
+                        Ok(moved) => {
+                            got.extend_from_slice(&done.buf.bytes[..moved]);
+                            read_exact(&next.0, next.1, offset, len, got, then);
+                        }
+                        Err(error) => then(Err(error)),
+                    }
+                    idle()
+                }),
+            )
         },
-        Box::new(move |done| {
-            match done.result {
-                Ok(0) => then(Err(io::ErrorKind::UnexpectedEof.into())),
-                Ok(moved) if got.is_empty() && moved == want => {
-                    // The first read filled the request: the buffer is the result, no copy.
-                    then(Ok(done.buf.bytes));
-                }
-                Ok(moved) => {
-                    got.extend_from_slice(&done.buf.bytes[..moved]);
-                    read_exact(&next.0, next.1, offset, len, got, then);
-                }
-                Err(error) => then(Err(error)),
-            }
-            idle()
-        }),
-    ));
+    );
 }
 
 /// Writes all of `bytes` at `offset`.
@@ -361,25 +463,34 @@ fn write_all(io: &Arc<AsyncIo>, file: SharedFile, offset: u64, bytes: Vec<u8>, t
         return;
     }
     let next = (Arc::clone(io), Arc::clone(&file));
-    drop(io.write(
-        raw_file(&file),
-        offset,
-        IoBuf {
-            filled: bytes.len(),
-            bytes,
+    submit(
+        then,
+        |then, error| then(Err(error)),
+        |parked| {
+            io.write(
+                raw_file(&file),
+                offset,
+                IoBuf {
+                    filled: bytes.len(),
+                    bytes,
+                },
+                Box::new(move |mut done| {
+                    let Some(then) = parked.take() else {
+                        return idle();
+                    };
+                    match done.result {
+                        Ok(0) => then(Err(io::ErrorKind::WriteZero.into())),
+                        Ok(moved) => {
+                            let rest = done.buf.bytes.split_off(moved);
+                            write_all(&next.0, next.1, offset + moved as u64, rest, then);
+                        }
+                        Err(error) => then(Err(error)),
+                    }
+                    idle()
+                }),
+            )
         },
-        Box::new(move |mut done| {
-            match done.result {
-                Ok(0) => then(Err(io::ErrorKind::WriteZero.into())),
-                Ok(moved) => {
-                    let rest = done.buf.bytes.split_off(moved);
-                    write_all(&next.0, next.1, offset + moved as u64, rest, then);
-                }
-                Err(error) => then(Err(error)),
-            }
-            idle()
-        }),
-    ));
+    );
 }
 
 /// The whole file at `path`.
@@ -394,16 +505,27 @@ fn read_all(io: &Arc<AsyncIo>, path: &Path, then: Then<Vec<u8>>) {
             Ok(file) => {
                 let reader = Arc::clone(&again);
                 let held = Arc::clone(&file);
-                drop(again.file_len(
-                    raw_file(&file),
-                    Box::new(move |length| {
-                        match length.and_then(|length| usize::try_from(length).map_err(io::Error::other)) {
-                            Ok(length) => read_exact(&reader, held, 0, length, Vec::with_capacity(length), then),
-                            Err(error) => then(Err(error)),
-                        }
-                        idle()
-                    }),
-                ));
+                submit(
+                    then,
+                    |then, error| then(Err(error)),
+                    |parked| {
+                        again.file_len(
+                            raw_file(&file),
+                            Box::new(move |length| {
+                                let Some(then) = parked.take() else {
+                                    return idle();
+                                };
+                                match length.and_then(|length| usize::try_from(length).map_err(io::Error::other)) {
+                                    Ok(length) => {
+                                        read_exact(&reader, held, 0, length, Vec::with_capacity(length), then);
+                                    }
+                                    Err(error) => then(Err(error)),
+                                }
+                                idle()
+                            }),
+                        )
+                    },
+                );
             }
         }),
     );
@@ -526,39 +648,49 @@ impl Job {
     fn read_header(self, file: SharedFile, section: Vec<u8>) {
         let io = Arc::clone(&self.io);
         let held = Arc::clone(&file);
-        drop(io.file_len(
-            raw_file(&file),
-            Box::new(move |length| {
-                match length {
-                    Err(error) => self.fail(PackageError::Io {
-                        what: "cannot read the artifact's size",
-                        source: error,
+        let size_failure = |error| PackageError::Io {
+            what: "cannot read the artifact's size",
+            source: error,
+        };
+        submit(
+            self,
+            |job, error| job.fail(size_failure(error)),
+            |parked| {
+                io.file_len(
+                    raw_file(&file),
+                    Box::new(move |length| {
+                        let Some(job) = parked.take() else {
+                            return idle();
+                        };
+                        match length {
+                            Err(error) => job.fail(size_failure(error)),
+                            Ok(length) if length < HEADER_BYTES as u64 => {
+                                job.fail(PackageError::Format("artifact is truncated before the header"));
+                            }
+                            Ok(length) => {
+                                let io = Arc::clone(&job.io);
+                                let held_again = Arc::clone(&held);
+                                read_exact(
+                                    &io,
+                                    held,
+                                    0,
+                                    HEADER_BYTES,
+                                    Vec::new(),
+                                    Box::new(move |header| match header {
+                                        Err(error) => job.fail(PackageError::Io {
+                                            what: "cannot read the artifact's header",
+                                            source: error,
+                                        }),
+                                        Ok(header) => job.read_table(held_again, header, length, section),
+                                    }),
+                                );
+                            }
+                        }
+                        idle()
                     }),
-                    Ok(length) if length < HEADER_BYTES as u64 => {
-                        self.fail(PackageError::Format("artifact is truncated before the header"))
-                    }
-                    Ok(length) => {
-                        let io = Arc::clone(&self.io);
-                        let held_again = Arc::clone(&held);
-                        read_exact(
-                            &io,
-                            held,
-                            0,
-                            HEADER_BYTES,
-                            Vec::new(),
-                            Box::new(move |header| match header {
-                                Err(error) => self.fail(PackageError::Io {
-                                    what: "cannot read the artifact's header",
-                                    source: error,
-                                }),
-                                Ok(header) => self.read_table(held_again, header, length, section),
-                            }),
-                        );
-                    }
-                }
-                idle()
-            }),
-        ));
+                )
+            },
+        );
     }
 
     fn read_table(self, file: SharedFile, header_bytes: Vec<u8>, file_len: u64, section: Vec<u8>) {
@@ -836,31 +968,38 @@ impl Job {
                     part: part.clone(),
                     out: out.clone(),
                 };
-                drop(io.rename(
-                    &part,
-                    &out,
-                    Box::new(move |renamed| {
-                        match renamed {
-                            Ok(()) => {
-                                let mut job = self;
-                                job.end.disarm();
-                                job.end.finish(Ok(Packaged {
-                                    target,
-                                    content_bytes,
-                                    section_bytes,
-                                }));
-                            }
-                            Err(error) => self.fail_written(
-                                &cleanup,
-                                PackageError::Io {
-                                    what: "cannot move the output into place",
-                                    source: error,
-                                },
-                            ),
-                        }
-                        idle()
-                    }),
-                ));
+                let move_failure = |error| PackageError::Io {
+                    what: "cannot move the output into place",
+                    source: error,
+                };
+                let refused_cleanup = cleanup.clone();
+                submit(
+                    self,
+                    |job, error| job.fail_written(&refused_cleanup, move_failure(error)),
+                    |parked| {
+                        io.rename(
+                            &part,
+                            &out,
+                            Box::new(move |renamed| {
+                                let Some(mut job) = parked.take() else {
+                                    return idle();
+                                };
+                                match renamed {
+                                    Ok(()) => {
+                                        job.end.disarm();
+                                        job.end.finish(Ok(Packaged {
+                                            target,
+                                            content_bytes,
+                                            section_bytes,
+                                        }));
+                                    }
+                                    Err(error) => job.fail_written(&cleanup, move_failure(error)),
+                                }
+                                idle()
+                            }),
+                        )
+                    },
+                );
             }
         }
     }
@@ -922,6 +1061,7 @@ fn part_path(out: &Path) -> PathBuf {
 mod tests {
     use std::fs;
     use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -931,9 +1071,10 @@ mod tests {
 
     use super::*;
 
-    /// A run that is dropped with its temporary output armed removes the file first and only then reports itself lost.
+    // Mutant caught: a run dropped inside a discard that offers the removal of its output to the lake (a push where a
+    // worker must not push), or that calls `done` more than once or without saying the file was left.
     #[test]
-    fn a_dropped_run_removes_its_output_and_then_reports_lost() {
+    fn a_dropped_run_offers_no_removal_and_says_its_output_was_left() {
         let lattice =
             ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
         let host = Lake::new(
@@ -947,28 +1088,116 @@ mod tests {
         fs::write(&part, b"partial").unwrap();
 
         let (sender, receiver) = mpsc::channel();
-        let seen = part.clone();
         let mut end = RunEnd {
             host: Arc::clone(&host),
             part: None,
             cut: false,
             completion: Some(Completion {
-                done: Some(Box::new(move |result| {
-                    sender.send((result, seen.exists())).unwrap();
-                })),
+                done: Some(Box::new(move |result| sender.send(result).unwrap())),
             }),
         };
         end.arm(part.clone());
         drop(end);
 
-        let (result, existed_when_told) = receiver.recv_timeout(Duration::from_secs(30)).expect("the run reports");
-        assert!(matches!(result, Err(PackageError::Lost)), "{result:?}");
+        // `done` was called inside the drop: the answer is already there, and nothing was offered to the lake that
+        // could still remove the file.
+        let result = receiver.try_recv().expect("the drop reports at once");
         assert!(
-            !existed_when_told,
-            "the output is gone before the caller hears of the end"
+            matches!(&result, Err(PackageError::PartLeft { part: left, cause, .. })
+                if *left == part && matches!(**cause, PackageError::Lost)),
+            "{result:?}"
         );
+        assert!(receiver.try_recv().is_err(), "the run reports once");
         host.complete_gracefully();
         lattice.close();
+        assert!(part.exists(), "the drop removed the output");
+    }
+
+    /// A job holding the armed `.part` file `part`, and the channel its `done` reports into.
+    fn armed_job(
+        host: &Arc<Lake>,
+        io: Arc<AsyncIo>,
+        part: &Path,
+    ) -> (Job, mpsc::Receiver<Result<Packaged, PackageError>>) {
+        let (sender, receiver) = mpsc::channel();
+        let mut end = RunEnd {
+            host: Arc::clone(host),
+            part: None,
+            cut: false,
+            completion: Some(Completion {
+                done: Some(Box::new(move |result| sender.send(result).unwrap())),
+            }),
+        };
+        end.arm(part.to_owned());
+        let job = Job {
+            io,
+            host: Arc::clone(host),
+            request: PackageRequest::in_place(PathBuf::from("artifact"), PathBuf::from("checkpoint")),
+            end,
+            _unit: host.admit().unwrap(),
+        };
+        (job, receiver)
+    }
+
+    // Mutant caught: a host frame or an accepted I/O step that is discarded unrun and offers the removal of the output
+    // (a push inside the discard), or that ends the run twice or not at all.
+    #[test]
+    fn a_host_frame_or_an_io_step_discarded_unrun_ends_the_run_once_and_offers_nothing() {
+        let lattice =
+            ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
+        let host = Lake::new(
+            Arc::clone(&lattice),
+            NonZeroUsize::new(2).unwrap(),
+            Duration::from_secs(1),
+        );
+        let io = AsyncIo::open().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let part = directory.path().join("out.edrl.part");
+        fs::write(&part, b"partial").unwrap();
+
+        let (job, receiver) = armed_job(&host, Arc::clone(&io), &part);
+        drop(step(Kind::Resolve, move || job.read_checkpoint()));
+        let (job, other) = armed_job(&host, Arc::clone(&io), &part);
+        submit(
+            job,
+            |_, _| panic!("an accepted step is not refused"),
+            |parked| {
+                drop(parked);
+                Ok(())
+            },
+        );
+
+        for reports in [receiver, other] {
+            let result = reports.try_recv().expect("the discard reports at once");
+            assert!(matches!(&result, Err(PackageError::PartLeft { .. })), "{result:?}");
+            assert!(reports.try_recv().is_err(), "the run reports once");
+        }
+        host.complete_gracefully();
+        io.complete();
+        lattice.close();
+        assert!(part.exists(), "a discard removed the output");
+    }
+
+    // Mutant caught: a refused step that drops its continuation (the step is never told, and reports `Lost`) instead
+    // of calling it with the refusal; a step that is refused and also called a second time.
+    #[test]
+    fn a_step_the_io_refuses_calls_its_continuation_once_with_the_error() {
+        let io = AsyncIo::open().unwrap();
+        io.complete();
+        let file = Arc::new(File::open(env!("CARGO_MANIFEST_DIR").to_owned() + "/Cargo.toml").unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        fn counted<T: 'static>(calls: &Arc<AtomicUsize>) -> Then<T> {
+            let calls = Arc::clone(calls);
+            Box::new(move |result| {
+                assert!(result.is_err(), "a refused step has an error");
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+        open(&io, Path::new("absent"), OpenSpec::default(), counted(&calls));
+        read_exact(&io, Arc::clone(&file), 0, 4, Vec::new(), counted(&calls));
+        write_all(&io, Arc::clone(&file), 0, vec![1], counted(&calls));
+        read_all(&io, Path::new("absent"), counted(&calls));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     /// A run dropped after the artifact was cut says the artifact has no section, not just that it was lost.

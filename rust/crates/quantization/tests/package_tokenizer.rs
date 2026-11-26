@@ -21,15 +21,16 @@ use std::num::NonZeroUsize;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
 use euhedral_graph::Lake;
 use euhedral_inference_edrl::tiny::TinyArtifact;
 use euhedral_inference_edrl::{FOOTER_BYTES, TokenizerFooter, TokenizerSection};
-use euhedral_inference_engine::lattice_config;
+use euhedral_inference_engine::{Handoff, lattice_config};
 use euhedral_inference_quantization::package_error::PackageError;
 use euhedral_inference_quantization::package_tokenizer::{PackageRequest, Packaged, package_tokenizer};
 use euhedral_inference_quantization::tokenizer_files::TokenizerFiles;
@@ -495,4 +496,123 @@ fn a_checkpoint_directory_gives_the_tokenizer_a_package_would_carry() {
     fs::remove_file(directory.path().join("generation_config.json")).unwrap();
     let error = read_checkpoint_tokenizer(directory.path()).err().unwrap();
     assert!(error.to_string().contains("generation_config.json"), "{error}");
+}
+
+// Mutant caught: a call that is refused at once and still reports through `done` (and returns `Ok`).
+#[test]
+fn a_call_on_an_io_that_is_complete_returns_err_and_never_calls_done() {
+    let run = Run::start();
+    let fixture = Fixture::new(&Checkpoint::standard());
+    run.io.complete();
+    let (sender, receiver) = mpsc::channel::<()>();
+    let refused = package_tokenizer(
+        Arc::clone(&run.io),
+        Arc::clone(&run.host),
+        fixture.to_output(),
+        Box::new(move |_| sender.send(()).unwrap()),
+    );
+    assert!(refused.is_err());
+    // The callback is gone with the call: a callback that was kept would hold the sender, and the channel would not
+    // be disconnected.
+    assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+    assert!(!fixture.path("out.edrl.part").exists());
+}
+
+/// A lattice and a host lake, and for each run an `AsyncIo` that the test drives by hand: it reaps, and so decides
+/// where the run is when the I/O closes.
+struct Stepped {
+    lattice: Arc<ControlPlaneLattice>,
+    host: Arc<Lake>,
+}
+
+impl Stepped {
+    fn start() -> Stepped {
+        let settings = Settings::with_model(ModelSettings::default());
+        let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+        let host = Lake::new(
+            Arc::clone(&lattice),
+            NonZeroUsize::new(2).unwrap(),
+            Duration::from_secs(1),
+        );
+        Stepped { lattice, host }
+    }
+
+    /// Starts `request` and closes the I/O as soon as `after` operations have ended, so that the run's next
+    /// submission is refused. A run is sequential, but how far it gets within one reap is not fixed: the sweep over
+    /// `after` makes the refusal land at every kind of step, not at one fixed step.
+    fn closed_after(&self, after: usize, request: PackageRequest) -> Result<Packaged, PackageError> {
+        let io = AsyncIo::open().expect("the asynchronous I/O opens");
+        let ended: Arc<Handoff<Result<Packaged, PackageError>>> = Handoff::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (sink, counted) = (Arc::clone(&ended), Arc::clone(&calls));
+        package_tokenizer(
+            Arc::clone(&io),
+            Arc::clone(&self.host),
+            request,
+            Box::new(move |result| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                sink.send(result);
+            }),
+        )
+        .unwrap();
+        let mut reaped = 0;
+        let begun = Instant::now();
+        let result = loop {
+            if let Some(result) = ended.take() {
+                break result;
+            }
+            assert!(
+                begun.elapsed() < Duration::from_secs(30),
+                "the run never ended after the I/O closed behind operation {after}"
+            );
+            reaped += io.reap();
+            let mut frames = Vec::new();
+            io.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+            drop(frames);
+            if reaped >= after {
+                io.complete();
+            }
+        };
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "operation {after} refused: the run ends once"
+        );
+        io.complete();
+        result
+    }
+
+    fn finish(self) {
+        self.host.complete_gracefully();
+        self.lattice.close();
+    }
+}
+
+// Mutant caught: a refused operation that drops the run (the caller hears `Lost`, not the refusal), a run that ends
+// twice, and a refusal that leaves the temporary output behind.
+#[test]
+fn an_operation_the_io_refuses_ends_the_run_once_with_the_refusal_and_leaves_no_output() {
+    // The four checkpoint files take 12 operations, so a close behind any of the first 12 refuses a later one.
+    let stepped = Stepped::start();
+    for after in 0..30 {
+        let fixture = Fixture::new(&Checkpoint::standard());
+        let result = stepped.closed_after(after, fixture.to_output());
+        match &result {
+            Err(PackageError::Io { .. }) => {}
+            Ok(_) if after >= 12 => {}
+            other => panic!("the I/O closed behind operation {after}: {other:?}"),
+        }
+        if result.is_err() {
+            assert!(
+                !fixture.path("out.edrl.part").exists(),
+                "operation {after}: the output is left"
+            );
+            assert!(
+                !fixture.path("out.edrl").exists(),
+                "operation {after}: a failed run has an output"
+            );
+        }
+        assert_eq!(fs::read(fixture.artifact()).unwrap(), fixture.content);
+    }
+    stepped.finish();
 }
