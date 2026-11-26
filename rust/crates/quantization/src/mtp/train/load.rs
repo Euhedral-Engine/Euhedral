@@ -25,7 +25,7 @@ use super::data::{Data, Files};
 use super::error::RunError;
 use super::lane::{CHUNK_BYTES, Lane, PackedHead, Resources, TrainLane};
 use super::options::{Host, Log, Options};
-use super::progress::{Found, Identity, Progress, Resume};
+use super::progress::{Best, Found, Identity, Progress, Resume};
 use super::run::{Ready, Start};
 use super::settings::{HEAD_ROWS, MAX_POSITIONS, Settings, expected_steps};
 use super::state::{File, place};
@@ -39,7 +39,7 @@ use crate::corpus::{self, Entry};
 use crate::kernels::{Module, ModuleOptions, Modules};
 use crate::mtp::layout::{NORMS, PROJECTIONS};
 use crate::mtp::{Config, Drafter, DrafterKernels, Shape};
-use crate::resume::{ResumeError, ResumeFile};
+use crate::resume::{Header, ResumeError, ResumeFile};
 
 /// The checkpoint tensors of the drafter's norms, in the order of [`NORMS`].
 const NORM_TENSORS: [&str; 7] = [
@@ -451,6 +451,12 @@ fn open_state(host: &Host<'_>, path: &Path) -> Result<Option<ResumeFile>, RunErr
     }
 }
 
+/// The header of the best parameters, or nothing when there is no such file or it holds no readable header.
+fn read_best(host: &Host<'_>, path: &Path) -> Option<Header> {
+    let file = open_state(host, path).ok()??;
+    call(|reply| file.header(then(&reply))).ok()
+}
+
 /// What the start brings the lane from, and where from.
 struct Source<'a> {
     library: &'a Arc<CudaLibrary>,
@@ -540,13 +546,25 @@ pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Ready<Train
         Some(file) => Some(call(|reply| file.header(then(&reply)))?),
         None => None,
     };
+    // Only read when there is a state to compare it with; one that cannot be read is not used, as before.
+    let best_exists = best_path.try_exists()?;
+    let best_header = if best_exists && state.is_some() {
+        read_best(host, &best_path)
+    } else {
+        None
+    };
+    let best = match (best_exists, &best_header) {
+        (false, _) => Best::Missing,
+        (true, None) => Best::Unread,
+        (true, Some(header)) => Best::Header(header),
+    };
     let resume = Progress::resume(
         settings,
         data.training().to_vec(),
         expected,
         &identity,
         saved.as_ref().map_or(Found::Missing, Found::Header),
-        best_path.try_exists()?,
+        best,
         options.fresh,
     )?;
 
