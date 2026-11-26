@@ -38,7 +38,6 @@ use euhedral_inference_settings::SamplingSettings;
 
 use super::{GenerateError, Prompt, answers_greedily, seed};
 use crate::corpus::{Sequence, Writer};
-use crate::step::{Kind, step};
 
 /// Slots in a chunk of the run's inbox.
 const INBOX_CHUNK: usize = 64;
@@ -372,7 +371,7 @@ impl State {
 
     /// Starts the append of the oldest finished answer, if the writer is free.
     fn write_next(&mut self, this: &Arc<Generation>) {
-        if self.writing || self.failure.is_some() {
+        if self.writing {
             return;
         }
         let Some(writer) = self.writer.take() else {
@@ -384,17 +383,11 @@ impl State {
         };
         let answer = sequence.tokens.len() - sequence.prompt;
         let next = Arc::clone(this);
-        let frame = step(Kind::Corpus, move || {
-            let mut writer = writer;
-            let result = writer.append(&sequence);
-            next.post(Record::Written { writer, result, answer });
-        });
-        if this.host.offer(frame).is_err() {
-            return self.fail(GenerateError::Corpus(
-                "the host lake would not take the write".to_owned(),
-            ));
-        }
         self.writing = true;
+        writer.append(
+            sequence,
+            Box::new(move |writer, result| next.post(Record::Written { writer, result, answer })),
+        );
     }
 
     /// Starts prompts while a lane is free.
@@ -431,13 +424,16 @@ impl State {
         }
     }
 
-    /// The first failure ends what is to come: answers in flight are cancelled, queued ones dropped.
+    /// The first failure ends what is to come: answers in flight are cancelled and prompts not started dropped. The
+    /// answers that finished are still written, unless the corpus is what failed.
     fn fail(&mut self, error: GenerateError) {
+        if matches!(error, GenerateError::Corpus(_)) {
+            self.ready.clear();
+        }
         if self.failure.is_none() {
             self.failure = Some(error);
         }
         self.prompts.clear();
-        self.ready.clear();
         for lane in self.lanes.iter().flatten() {
             lane.cancel.cancel();
         }

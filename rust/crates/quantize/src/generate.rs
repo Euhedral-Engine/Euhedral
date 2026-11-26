@@ -250,30 +250,32 @@ pub fn run(args: &[String]) -> Outcome {
     };
     let (hidden, vocabulary) = (runtime.config().hidden_size, runtime.config().vocab_size);
     let result = match u32::try_from(flags.max_tokens) {
-        Ok(max_tokens) => match Writer::open(&flags.out, hidden) {
-            Ok(writer) => {
-                let answers: Arc<dyn Answerer> = Arc::clone(&runtime) as Arc<dyn Answerer>;
-                let ended = start(
-                    runtime.host(),
-                    answers,
-                    writer,
-                    prompts,
-                    Options {
-                        max_tokens,
-                        greedy_fraction: flags.greedy_fraction,
-                        batch: flags.batch,
-                        sampling: settings.sampling,
-                        stops,
-                        vocabulary,
-                    },
-                );
-                ended
-                    .wait(LONGEST_RUN)
-                    .map_err(|_| "the run did not finish in time".to_owned())
-                    .and_then(|ended| ended.map_err(|error| error.to_string()))
+        Ok(max_tokens) => {
+            match Writer::open(&flags.out, hidden, Arc::clone(runtime.io()), Arc::clone(runtime.host())) {
+                Ok(writer) => {
+                    let answers: Arc<dyn Answerer> = Arc::clone(&runtime) as Arc<dyn Answerer>;
+                    let ended = start(
+                        runtime.host(),
+                        answers,
+                        writer,
+                        prompts,
+                        Options {
+                            max_tokens,
+                            greedy_fraction: flags.greedy_fraction,
+                            batch: flags.batch,
+                            sampling: settings.sampling,
+                            stops,
+                            vocabulary,
+                        },
+                    );
+                    ended
+                        .wait(LONGEST_RUN)
+                        .map_err(|_| "the run did not finish in time".to_owned())
+                        .and_then(|ended| ended.map_err(|error| error.to_string()))
+                }
+                Err(error) => Err(format!("{}: {error}", flags.out.display())),
             }
-            Err(error) => Err(format!("{}: {error}", flags.out.display())),
-        },
+        }
         Err(_) => Err("--max-tokens does not fit".to_owned()),
     };
     let shutdown = owner

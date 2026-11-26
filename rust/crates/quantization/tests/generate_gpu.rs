@@ -120,7 +120,13 @@ fn the_greedy_answer_is_the_artifacts_own_decode_and_every_row_has_the_models_hi
     assert!(!own.is_empty());
 
     let directory = tempfile::tempdir().unwrap();
-    let writer = Writer::open(directory.path(), width).unwrap();
+    let writer = Writer::open(
+        directory.path(),
+        width,
+        Arc::clone(runtime.io()),
+        Arc::clone(runtime.host()),
+    )
+    .unwrap();
     let ended = start(
         runtime.host(),
         Arc::clone(&runtime) as Arc<dyn Answerer>,

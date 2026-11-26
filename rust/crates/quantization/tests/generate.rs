@@ -16,7 +16,7 @@
 )]
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
@@ -25,7 +25,9 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::generics::LatticeSource;
 use euhedral_graph::Lake;
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::generation::{
     CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, HiddenSink, Speculation,
 };
@@ -34,6 +36,7 @@ use euhedral_inference_quantization::corpus::{self, Entry, Sequence, Writer};
 use euhedral_inference_quantization::generate::run::{Answerer, Options, start};
 use euhedral_inference_quantization::generate::{GenerateError, Prompt, Summary, answers_greedily, seed};
 use euhedral_inference_settings::{ModelSettings, SamplingSettings, Settings};
+use euhedral_io::AsyncIo;
 
 const WIDTH: usize = 2;
 
@@ -78,11 +81,29 @@ fn four_sequences() -> Vec<Sequence> {
     ]
 }
 
-fn write_all(directory: &Path, sequences: &[Sequence]) {
-    let mut writer = Writer::open(directory, WIDTH).unwrap();
+/// Appends `sequence` and waits for it to be durable; the writer comes back with the outcome.
+fn append(rig: &Rig, writer: Writer, sequence: &Sequence) -> (Writer, io::Result<()>) {
+    let _unit = rig.host.admit().expect("the host lake admits");
+    let done = Handoff::new();
+    let sent = Arc::clone(&done);
+    writer.append(
+        sequence.clone(),
+        Box::new(move |writer, result| sent.send((writer, result))),
+    );
+    done.wait(Duration::from_secs(60)).expect("the append never ended")
+}
+
+fn write_all(rig: &Rig, directory: &Path, sequences: &[Sequence]) {
+    let mut writer = Writer::open(directory, WIDTH, Arc::clone(&rig.io), Arc::clone(&rig.host)).unwrap();
     for sequence in sequences {
-        writer.append(sequence).unwrap();
+        let (back, result) = append(rig, writer, sequence);
+        result.unwrap();
+        writer = back;
     }
+}
+
+fn open(rig: &Rig, directory: &Path, width: usize) -> Writer {
+    Writer::open(directory, width, Arc::clone(&rig.io), Arc::clone(&rig.host)).unwrap()
 }
 
 fn files(directory: &Path) -> Vec<Vec<u8>> {
@@ -96,7 +117,9 @@ fn files(directory: &Path) -> Vec<Vec<u8>> {
 fn a_corpus_is_four_files_in_the_format_the_java_tools_read() {
     let directory = tempfile::tempdir().unwrap();
     let sequences = four_sequences();
-    write_all(directory.path(), &sequences);
+    let rig = rig();
+    write_all(&rig, directory.path(), &sequences);
+    rig.shut();
     let [tokens, labels, hidden_bytes, index] = files(directory.path()).try_into().unwrap();
     let all = |pick: fn(&Sequence) -> &[u32]| sequences.iter().flat_map(pick).copied().collect::<Vec<u32>>();
     assert_eq!(tokens, le(&all(|sequence| &sequence.tokens)));
@@ -118,7 +141,9 @@ fn a_corpus_is_four_files_in_the_format_the_java_tools_read() {
 fn the_index_reads_back_as_written() {
     let directory = tempfile::tempdir().unwrap();
     assert!(corpus::entries(directory.path()).unwrap().is_empty());
-    write_all(directory.path(), &four_sequences());
+    let rig = rig();
+    write_all(&rig, directory.path(), &four_sequences());
+    rig.shut();
     let entries = corpus::entries(directory.path()).unwrap();
     let expected = [
         ("a\"b\\c", 0, 0, 5, 3, true),
@@ -142,17 +167,19 @@ fn reopening_cuts_a_torn_tail_back_to_the_index_and_carries_on_as_if_it_never_ha
     let torn = tempfile::tempdir().unwrap();
     let clean = tempfile::tempdir().unwrap();
     let sequences = four_sequences();
-    write_all(torn.path(), &sequences[..3]);
+    let rig = rig();
+    write_all(&rig, torn.path(), &sequences[..3]);
     // A stopped run left rows past the last index line.
     for name in ["tokens.bin", "labels.bin", "hidden.bin"] {
         let mut file = OpenOptions::new().append(true).open(torn.path().join(name)).unwrap();
         file.write_all(&[0xEE; 37]).unwrap();
     }
-    let mut writer = Writer::open(torn.path(), WIDTH).unwrap();
+    let writer = open(&rig, torn.path(), WIDTH);
     assert_eq!(writer.ids().len(), 3);
     assert!(writer.ids().contains("capped") && !writer.ids().contains("tab\there"));
-    writer.append(&sequences[3]).unwrap();
-    write_all(clean.path(), &sequences);
+    append(&rig, writer, &sequences[3]).1.unwrap();
+    write_all(&rig, clean.path(), &sequences);
+    rig.shut();
     assert_eq!(files(torn.path()), files(clean.path()));
 }
 
@@ -160,7 +187,8 @@ fn reopening_cuts_a_torn_tail_back_to_the_index_and_carries_on_as_if_it_never_ha
 fn reopening_a_corpus_without_labels_makes_its_labels_its_tokens() {
     let directory = tempfile::tempdir().unwrap();
     let sequences = [sequence("x", 3, &[4, 5], false, 1), sequence("y", 2, &[6, 7], false, 2)];
-    write_all(directory.path(), &sequences);
+    let rig = rig();
+    write_all(&rig, directory.path(), &sequences);
     let labels = directory.path().join("labels.bin");
     // Only the first sequence's labels survive.
     fs::OpenOptions::new()
@@ -169,7 +197,8 @@ fn reopening_a_corpus_without_labels_makes_its_labels_its_tokens() {
         .unwrap()
         .set_len(4 * 5)
         .unwrap();
-    drop(Writer::open(directory.path(), WIDTH).unwrap());
+    drop(open(&rig, directory.path(), WIDTH));
+    rig.shut();
     assert_eq!(
         fs::read(labels).unwrap(),
         fs::read(directory.path().join("tokens.bin")).unwrap()
@@ -179,23 +208,28 @@ fn reopening_a_corpus_without_labels_makes_its_labels_its_tokens() {
 #[test]
 fn opening_for_the_ids_alone_leaves_the_hidden_rows_as_they_are() {
     let directory = tempfile::tempdir().unwrap();
-    write_all(directory.path(), &four_sequences()[..2]);
+    let rig = rig();
+    write_all(&rig, directory.path(), &four_sequences()[..2]);
     let before = files(directory.path());
-    let writer = Writer::open(directory.path(), 0).unwrap();
+    let writer = open(&rig, directory.path(), 0);
     assert_eq!(writer.ids().len(), 2);
+    rig.shut();
     assert_eq!(files(directory.path()), before);
 }
 
 #[test]
 fn a_sequence_whose_hidden_is_not_a_row_for_each_run_token_is_refused_and_writes_nothing() {
     let directory = tempfile::tempdir().unwrap();
-    let mut writer = Writer::open(directory.path(), WIDTH).unwrap();
+    let rig = rig();
+    let writer = open(&rig, directory.path(), WIDTH);
     let mut short = sequence("short", 3, &[4], false, 1);
     short.hidden.pop();
     let mut labels = sequence("labels", 3, &[4], false, 1);
     labels.labels.pop();
-    assert!(writer.append(&short).is_err());
-    assert!(writer.append(&labels).is_err());
+    let (writer, result) = append(&rig, writer, &short);
+    assert!(result.is_err());
+    assert!(append(&rig, writer, &labels).1.is_err());
+    rig.shut();
     assert!(files(directory.path()).iter().all(Vec::is_empty));
 }
 
@@ -275,15 +309,33 @@ impl Fake {
     }
 }
 
-fn rig() -> (Arc<ControlPlaneLattice>, Arc<Lake>) {
+struct Rig {
+    lattice: Arc<ControlPlaneLattice>,
+    host: Arc<Lake>,
+    io: Arc<AsyncIo>,
+}
+
+impl Rig {
+    fn shut(self) {
+        self.host.complete_gracefully();
+        self.io.complete();
+        self.lattice.close();
+    }
+}
+
+fn rig() -> Rig {
     let settings = Settings::with_model(ModelSettings::default());
     let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
+    let io = AsyncIo::open().expect("the asynchronous I/O opens");
+    lattice
+        .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
+        .expect("the lattice takes the I/O");
     let host = Lake::new(
         Arc::clone(&lattice),
         NonZeroUsize::new(2).unwrap(),
         Duration::from_secs(1),
     );
-    (lattice, host)
+    Rig { lattice, host, io }
 }
 
 fn options(batch: usize) -> Options {
@@ -401,7 +453,8 @@ fn wait<T>(done: &euhedral_inference_engine::Handoff<T>) -> T {
 #[test]
 fn every_answer_reaches_the_corpus_whole_whatever_order_the_answers_end_in() {
     let directory = tempfile::tempdir().unwrap();
-    let (lattice, host) = rig();
+    let rig = rig();
+    let host = &rig.host;
     // p0 and p1 are answered greedily, the rest sampled.
     let prompts: Vec<Prompt> = ["p0", "a", "p10", "p1", "p11"]
         .iter()
@@ -409,9 +462,9 @@ fn every_answer_reaches_the_corpus_whole_whatever_order_the_answers_end_in() {
         .map(|(number, id)| prompt(id, number as u32))
         .collect();
     let fake = Arc::new(Fake::default());
-    let writer = Writer::open(directory.path(), WIDTH).unwrap();
+    let writer = open(&rig, directory.path(), WIDTH);
     let done = start(
-        &host,
+        host,
         Arc::clone(&fake) as Arc<dyn Answerer>,
         writer,
         prompts.clone(),
@@ -472,23 +525,23 @@ fn every_answer_reaches_the_corpus_whole_whatever_order_the_answers_end_in() {
             prompt.id
         );
     }
-    host.complete_gracefully();
-    lattice.close();
+    rig.shut();
 }
 
 #[test]
 fn a_failed_answer_cancels_the_others_and_ends_the_run_with_its_reason_and_nothing_of_it_written() {
     let directory = tempfile::tempdir().unwrap();
-    let (lattice, host) = rig();
+    let rig = rig();
+    let host = &rig.host;
     let prompts: Vec<Prompt> = ["p0", "a", "p10"]
         .iter()
         .enumerate()
         .map(|(n, id)| prompt(id, n as u32))
         .collect();
     let fake = Arc::new(Fake::default());
-    let writer = Writer::open(directory.path(), WIDTH).unwrap();
+    let writer = open(&rig, directory.path(), WIDTH);
     let done = start(
-        &host,
+        host,
         Arc::clone(&fake) as Arc<dyn Answerer>,
         writer,
         prompts,
@@ -509,18 +562,18 @@ fn a_failed_answer_cancels_the_others_and_ends_the_run_with_its_reason_and_nothi
     );
     assert!(corpus::entries(directory.path()).unwrap().is_empty());
     assert!(fake.take().is_none());
-    host.complete_gracefully();
-    lattice.close();
+    rig.shut();
 }
 
 #[test]
 fn rows_that_do_not_follow_on_end_the_run_as_inconsistent() {
     let directory = tempfile::tempdir().unwrap();
-    let (lattice, host) = rig();
+    let rig = rig();
+    let host = &rig.host;
     let fake = Arc::new(Fake::default());
-    let writer = Writer::open(directory.path(), WIDTH).unwrap();
+    let writer = open(&rig, directory.path(), WIDTH);
     let done = start(
-        &host,
+        host,
         Arc::clone(&fake) as Arc<dyn Answerer>,
         writer,
         vec![prompt("p0", 0)],
@@ -538,18 +591,123 @@ fn rows_that_do_not_follow_on_end_the_run_as_inconsistent() {
     });
     let error = wait(&done).unwrap_err();
     assert!(matches!(error, GenerateError::Inconsistent(_)), "{error}");
-    host.complete_gracefully();
-    lattice.close();
+    rig.shut();
 }
 
 #[test]
 fn a_run_with_no_prompts_ends_at_once_having_written_nothing() {
     let directory = tempfile::tempdir().unwrap();
-    let (lattice, host) = rig();
+    let rig = rig();
+    let host = &rig.host;
     let fake = Arc::new(Fake::default());
-    let writer = Writer::open(directory.path(), WIDTH).unwrap();
-    let done = start(&host, fake as Arc<dyn Answerer>, writer, Vec::new(), options(4));
+    let writer = open(&rig, directory.path(), WIDTH);
+    let done = start(host, fake as Arc<dyn Answerer>, writer, Vec::new(), options(4));
     assert_eq!(wait(&done).unwrap(), Summary::default());
-    host.complete_gracefully();
-    lattice.close();
+    rig.shut();
+}
+
+/// A tool reaches the template as the prompts file writes it: a bare function, keys in the record's order, extra
+/// keys and a description that is not text, printed as Python's `json.dumps` prints them, as Java prints its tool map.
+#[test]
+fn a_tool_is_printed_into_the_prompt_as_written() {
+    use euhedral_inference_api_protocol::template::{TemplateOptions, render_tool_objects};
+    use euhedral_inference_quantization::generate::prompt::parse;
+
+    let line = r#"{"id":"t","messages":[{"role":"user","content":"hi"}],"tools":[{"parameters":{"b":1,"a":[1,2]},"name":"f","description":7,"extra":null},{"type":"function","function":{"name":"g"}}]}"#;
+    let (id, messages, tools) = parse(line).unwrap();
+    assert_eq!(id, "t");
+    let text = render_tool_objects(&messages, &tools, &TemplateOptions::default()).unwrap();
+    let block = concat!(
+        "<tools>\n",
+        r#"{"parameters": {"b": 1, "a": [1, 2]}, "name": "f", "description": 7, "extra": null}"#,
+        "\n",
+        r#"{"type": "function", "function": {"name": "g"}}"#,
+        "\n</tools>",
+    );
+    assert!(text.contains(block), "{text}");
+    assert!(parse(r#"{"id":"t","tools":["f"]}"#).is_err());
+}
+
+#[test]
+fn a_torn_last_index_line_is_cut_back_on_reopening_and_the_corpus_goes_on() {
+    let torn = tempfile::tempdir().unwrap();
+    let clean = tempfile::tempdir().unwrap();
+    let sequences = four_sequences();
+    let rig = rig();
+    write_all(&rig, torn.path(), &sequences[..2]);
+    // A stopped run cut its last index line short, after the rows it names were written.
+    let mut index = OpenOptions::new()
+        .append(true)
+        .open(torn.path().join("index.jsonl"))
+        .unwrap();
+    index.write_all(br#"{"id":"half","token":9,"ro"#).unwrap();
+    assert_eq!(corpus::entries(torn.path()).unwrap().len(), 2);
+    let writer = open(&rig, torn.path(), WIDTH);
+    assert_eq!(writer.ids().len(), 2);
+    let (_, result) = append(&rig, writer, &sequences[2]);
+    result.unwrap();
+    write_all(&rig, clean.path(), &sequences[..3]);
+    rig.shut();
+    assert_eq!(files(torn.path()), files(clean.path()));
+}
+
+#[test]
+fn a_bad_line_before_the_last_is_a_corrupt_index_and_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let rig = rig();
+    write_all(&rig, directory.path(), &four_sequences()[..2]);
+    let path = directory.path().join("index.jsonl");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, format!("not a record\n{text}")).unwrap();
+    assert!(corpus::entries(directory.path()).is_err());
+    assert!(Writer::open(directory.path(), WIDTH, Arc::clone(&rig.io), Arc::clone(&rig.host)).is_err());
+    rig.shut();
+}
+
+#[test]
+fn answers_that_finished_before_a_failure_are_still_written() {
+    let directory = tempfile::tempdir().unwrap();
+    let rig = rig();
+    let prompts: Vec<Prompt> = ["p0", "p1", "p10"]
+        .iter()
+        .enumerate()
+        .map(|(n, id)| prompt(id, n as u32))
+        .collect();
+    let fake = Arc::new(Fake::default());
+    let writer = open(&rig, directory.path(), WIDTH);
+    let done = start(
+        &rig.host,
+        Arc::clone(&fake) as Arc<dyn Answerer>,
+        writer,
+        prompts.clone(),
+        options(3),
+    );
+    let (first, second, third) = (
+        fake.await_next("the first prompt"),
+        fake.await_next("the second prompt"),
+        fake.await_next("the third prompt"),
+    );
+    let mut finished: Vec<String> = [&first, &second]
+        .iter()
+        .map(|started| {
+            prompts
+                .iter()
+                .find(|prompt| prompt.tokens == started.request.prompt)
+                .unwrap()
+                .id
+                .clone()
+        })
+        .collect();
+    finished.sort();
+    // The second answer ends while the first is being written, and the third fails.
+    play(first, None);
+    play(second, None);
+    play(third, Some(FinishReason::ContextFull));
+    let error = wait(&done).unwrap_err();
+    assert!(matches!(error, GenerateError::Engine(_)), "{error}");
+    let entries = corpus::entries(directory.path()).unwrap();
+    let mut written: Vec<String> = entries.into_iter().map(|entry| entry.id).collect();
+    written.sort();
+    assert_eq!(written, finished);
+    rig.shut();
 }

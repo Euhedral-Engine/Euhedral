@@ -216,7 +216,17 @@ impl Error for TemplateError {}
 
 /// Renders the conversation followed by the assistant generation prompt.
 pub fn render(conversation: &TemplateInput, options: &TemplateOptions) -> Result<String, TemplateError> {
-    let messages = &conversation.messages;
+    let tools: Vec<JsonValue> = conversation.tools.iter().map(ToolDefinition::to_json).collect();
+    render_tool_objects(&conversation.messages, &tools, options)
+}
+
+/// As [`render`], with each tool given as the JSON object the template serializes, in the object's own key order and
+/// whatever its shape: how a prompt file's tools reach the template as they are written.
+pub fn render_tool_objects(
+    messages: &[Message],
+    tools: &[JsonValue],
+    options: &TemplateOptions,
+) -> Result<String, TemplateError> {
     let Some(first) = messages.first() else {
         return Err(TemplateError::NoMessages);
     };
@@ -228,7 +238,7 @@ pub fn render(conversation: &TemplateInput, options: &TemplateOptions) -> Result
     } else {
         ""
     };
-    if !conversation.tools.is_empty() {
+    if !tools.is_empty() {
         prompt.push_str(IM_START);
         prompt.push_str("system\n");
         if !instructions.is_empty() {
@@ -236,9 +246,9 @@ pub fn render(conversation: &TemplateInput, options: &TemplateOptions) -> Result
             prompt.push_str("\n\n");
         }
         prompt.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
-        for tool in &conversation.tools {
+        for tool in tools {
             prompt.push('\n');
-            prompt.push_str(&escape_control_tokens(&tool.to_json().to_python_json()));
+            prompt.push_str(&escape_control_tokens(&tool.to_python_json()));
         }
         prompt.push_str("\n</tools>");
         prompt.push_str(TOOL_INSTRUCTIONS);

@@ -3,13 +3,11 @@
 //!
 //! A message's `content` is text (absent: empty), its role one of `system`, `user`, `assistant` and `tool` in any
 //! case. An assistant message's `tool_calls` are OpenAI's: `function.name` and `function.arguments`, a JSON object
-//! or its text. A tool is `{"type": "function", "function": {name, description, parameters}}` or the function object
-//! alone. The `id` is a string or an integer.
+//! or its text. A tool is any JSON object; the template prints it as written, keys in the order of the record. The `id` is a string or an integer.
 
-use euhedral_inference_api_protocol::ToolDefinition;
 use euhedral_inference_api_protocol::json::JsonValue;
 use euhedral_inference_api_protocol::template::{
-    AssistantMessage, ContentPart, Message, TemplateInput, TemplateOptions, ToolCall, render,
+    AssistantMessage, ContentPart, Message, TemplateOptions, ToolCall, render_tool_objects,
 };
 use euhedral_inference_tokenizer::Tokenizer;
 
@@ -23,8 +21,9 @@ pub fn read(text: &str, source: &str, tokenizer: &Tokenizer) -> Result<Vec<Promp
             continue;
         }
         let at = |why: String| format!("{source} line {}: {why}", index + 1);
-        let (id, input) = parse(line).map_err(at)?;
-        let rendered = render(&input, &TemplateOptions::default()).map_err(|error| at(error.to_string()))?;
+        let (id, messages, tools) = parse(line).map_err(at)?;
+        let rendered = render_tool_objects(&messages, &tools, &TemplateOptions::default())
+            .map_err(|error| at(error.to_string()))?;
         let tokens = tokenizer
             .encode(&rendered)
             .map_err(|error| at(format!("prompt {id}: {error}")))?;
@@ -33,26 +32,26 @@ pub fn read(text: &str, source: &str, tokenizer: &Tokenizer) -> Result<Vec<Promp
     Ok(prompts)
 }
 
-/// One record: its id and what the template renders.
-pub fn parse(line: &str) -> Result<(String, TemplateInput), String> {
+/// One record: its id, its messages and its tools, each tool as the record writes it.
+pub fn parse(line: &str) -> Result<(String, Vec<Message>, Vec<JsonValue>), String> {
     let record = JsonValue::parse(line).ok_or("not a JSON document")?;
     let id = match record.get("id") {
         Some(JsonValue::String(id)) if !id.is_empty() => id.clone(),
         Some(JsonValue::Integer(number)) => number.as_str().to_owned(),
         _ => return Err("the record needs an id, a string or an integer".to_owned()),
     };
-    let mut input = TemplateInput::default();
+    let mut messages = Vec::new();
     for message in items(record.get("messages")) {
-        input
-            .messages
-            .push(message_of(message).map_err(|why| format!("prompt {id}: {why}"))?);
+        messages.push(message_of(message).map_err(|why| format!("prompt {id}: {why}"))?);
     }
+    let mut tools = Vec::new();
     for tool in items(record.get("tools")) {
-        input
-            .tools
-            .push(tool_of(tool).map_err(|why| format!("prompt {id}: {why}"))?);
+        if !matches!(tool, JsonValue::Object(_)) {
+            return Err(format!("prompt {id}: a tool is not a JSON object"));
+        }
+        tools.push(tool.clone());
     }
-    Ok((id, input))
+    Ok((id, messages, tools))
 }
 
 /// The elements of an array, none for anything else.
@@ -108,20 +107,4 @@ fn call_of(call: &JsonValue) -> Result<ToolCall, String> {
         JsonValue::Object(arguments) => Ok(ToolCall { name, arguments }),
         _ => Err(format!("the arguments of the call to {name} are not an object")),
     }
-}
-
-fn tool_of(tool: &JsonValue) -> Result<ToolDefinition, String> {
-    let function = tool.get("function").unwrap_or(tool);
-    let name = text_of(function.get("name"));
-    if name.is_empty() {
-        return Err("a tool has no name".to_owned());
-    }
-    Ok(ToolDefinition {
-        name,
-        description: match function.get("description") {
-            Some(JsonValue::String(text)) => Some(text.clone()),
-            _ => None,
-        },
-        parameters: function.get("parameters").cloned(),
-    })
 }
