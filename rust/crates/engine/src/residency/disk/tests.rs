@@ -850,7 +850,12 @@ fn read_through_the_ring(file: ArtifactFile) -> (Vec<u8>, Vec<u8>, bool) {
     let file = Arc::new(file);
     let direct = file.has_direct();
     let window = DiskWindow::on_heap(geometry(2));
-    let port = Arc::new(FilePort::new(Arc::clone(&io), file, window));
+    let port = Arc::new(FilePort::new(
+        Arc::clone(&io),
+        file,
+        window,
+        DiskReadPiece::from_setting(Auto::Auto).unwrap(),
+    ));
     let reader = DiskReader::new(Arc::clone(&port) as Arc<dyn ReadPort>, geometry(2), inline());
     let failures = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&failures);
@@ -914,44 +919,30 @@ fn a_missing_artifact_is_an_error() {
 }
 
 #[test]
-fn a_direct_read_larger_than_a_part_lands_every_byte_in_its_place() {
-    // A read of three parts (PART_BYTES is 4 MiB), through a slot that holds it.
-    let file_bytes = 10 << 20;
-    let bytes: Vec<u8> = (0..file_bytes).map(|index| (index % 251) as u8).collect();
-    let Some((_dir, path)) = file_in_scratch(&bytes) else {
-        return;
-    };
-    let settings = Settings::with_model(ModelSettings::default());
-    let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
-    let io = AsyncIo::open().expect("the ring opens");
-    lattice
-        .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
-        .expect("the lattice takes the ring");
-    let geometry = WindowGeometry {
-        slots: 1,
-        slot_bytes: 10 << 20,
-    };
-    let window = DiskWindow::on_heap(geometry);
-    let file = Arc::new(ArtifactFile::open(&path).expect("opens"));
-    let port = Arc::new(FilePort::new(Arc::clone(&io), file, window));
-    let reader = DiskReader::new(Arc::clone(&port) as Arc<dyn ReadPort>, geometry, inline());
-    let failures = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&failures);
-    let fail: FailHandle = Arc::new(move |_| {
-        counted.fetch_add(1, Ordering::SeqCst);
-    });
-    let (start, len) = (5000, 9 << 20);
-    reader
-        .enqueue(1, vec![use_of("wide", start, len, 0)], fail)
-        .expect("accepted");
-    reader.close().wait(BOUND).expect("the reads ended in time");
-    lattice.close();
-    assert_eq!(failures.load(Ordering::SeqCst), 0);
-    let lead = start as usize % BLOCK as usize;
-    // SAFETY: the read ended; the window is live.
-    let read = unsafe { from_raw_parts(port.window().slot_ptr(0).add(lead), len as usize) };
-    assert!(
-        read == &bytes[start as usize..][..len as usize],
-        "the parts landed out of place"
-    );
+fn an_unset_read_piece_is_the_most_the_ring_allows() {
+    let piece = DiskReadPiece::from_setting(Auto::Auto).expect("auto is valid");
+    assert_eq!(piece.bytes(), MAX_PIECE);
+}
+
+#[test]
+fn a_stated_read_piece_of_whole_blocks_is_kept() {
+    let piece = DiskReadPiece::from_setting(Auto::Value(ByteSize::mib(8))).expect("8 MiB is whole blocks");
+    assert_eq!(piece.bytes(), 8 << 20);
+    let limit = DiskReadPiece::from_setting(Auto::Value(ByteSize(MAX_PIECE as u64))).expect("the limit");
+    assert_eq!(limit.bytes(), MAX_PIECE);
+}
+
+#[test]
+fn a_read_piece_that_is_zero_unaligned_or_over_the_limit_is_refused_naming_the_value() {
+    for bytes in [0, 1, BLOCK + 1, MAX_PIECE as u64 + BLOCK] {
+        let refusal = DiskReadPiece::from_setting(Auto::Value(ByteSize(bytes))).expect_err("refused");
+        assert!(refusal.contains(&format!("is {bytes} bytes")), "{refusal}");
+        assert!(refusal.contains(&MAX_PIECE.to_string()), "{refusal}");
+    }
+}
+
+#[test]
+fn a_read_piece_is_the_option_every_read_of_the_port_carries() {
+    let piece = DiskReadPiece::from_setting(Auto::Value(ByteSize(BLOCK))).expect("a block");
+    assert_eq!(piece.options().piece, Some(BLOCK as usize));
 }

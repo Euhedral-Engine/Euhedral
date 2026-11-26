@@ -29,6 +29,7 @@ use crate::model::{
     trellis_logical, validate_inventory,
 };
 use crate::residency::accounting::{Consumer, ConsumerBytes, plan_items};
+use crate::residency::disk::DiskReadPiece;
 use crate::residency::footprint::{self, PAGE_TOKENS};
 use crate::residency::offload::{self, Offload, OffloadInputs, Reach};
 use crate::residency::scratch::{
@@ -599,6 +600,7 @@ pub fn plan_closest(
              ({staging_slots}): the window is read one staging ring ahead, whole rings at a time"
         )));
     }
+    DiskReadPiece::from_setting(settings.memory.disk_read_piece).map_err(PlanError::Setting)?;
     let head_rows = sequences.saturating_mul((1 + draft_depth as u64).max(forced_rows as u64));
     let (layout, spills, offload, reach) = match decide(budgets, whole, split) {
         Ok((layout, spills)) => (layout, spills, Offload::default(), None),

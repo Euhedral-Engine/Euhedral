@@ -46,7 +46,7 @@ use crate::model::{
 };
 use crate::residency::accounting::{Consumer, PlanReservation};
 use crate::residency::budget::{self, HostBudget};
-use crate::residency::disk::{ArtifactFile, DiskReader, DiskWindow, FilePort};
+use crate::residency::disk::{ArtifactFile, DiskReadPiece, DiskReader, DiskWindow, FilePort};
 use crate::residency::footprint;
 use crate::residency::loader::{self, LoadOutcome, Ring};
 use crate::residency::offload::{self, Offload, WindowGeometry};
@@ -928,7 +928,8 @@ fn disk_tier(
         .map_err(|error| EngineError::Runtime(format!("the disk window: {error}")))?;
     let file =
         ArtifactFile::open(path).map_err(|error| EngineError::io(format!("opening {}", path.display()), error))?;
-    let port = FilePort::new(Arc::clone(&core.io), Arc::new(file), window);
+    let piece = DiskReadPiece::from_setting(core.settings.memory.disk_read_piece).map_err(EngineError::Runtime)?;
+    let port = FilePort::new(Arc::clone(&core.io), Arc::new(file), window, piece);
     let reader = DiskReader::new(Arc::new(port), geometry, Generation::spawner(core));
     core.teardown.hold_disk(reader.clone());
     let tier = DiskTier::new(reader, buffer, geometry, Arc::clone(core.completions()));
