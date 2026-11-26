@@ -358,7 +358,12 @@ pub fn plan_nvfp4_decode_bf16(
         .arg(k_pad)
         .arg(k_signed)
         .device(out);
-    Ok(vec![step("nvfp4_decode_bf16", elementwise("count", total)?, THREADS, args)?])
+    Ok(vec![step(
+        "nvfp4_decode_bf16",
+        elementwise("count", total)?,
+        THREADS,
+        args,
+    )?])
 }
 
 /// BF16 `out` (round to nearest even) of `count` floats at `x`.
@@ -366,7 +371,12 @@ pub fn plan_float_to_bf16(x: u64, count: u64, out: u64) -> Result<Vec<Step>, Tra
     let (x, out) = (address("x", x)?, address("out", out)?);
     let signed = count64("count", count)?;
     let args = Args::new().device(x).arg(signed).device(out);
-    Ok(vec![step("float_to_bf16", elementwise("count", count)?, THREADS, args)?])
+    Ok(vec![step(
+        "float_to_bf16",
+        elementwise("count", count)?,
+        THREADS,
+        args,
+    )?])
 }
 
 /// FP32 `out` `[rows, width]` of the embedding rows `ids` `[rows]` of a Q3G64 table whose FP16 scales start `scale_offset`
@@ -389,5 +399,10 @@ pub fn plan_q3_embedding_rows(
         .arg(width_signed)
         .arg(scale_offset)
         .device(out);
-    Ok(vec![step("q3_embedding_rows", elementwise("count", total)?, THREADS, args)?])
+    Ok(vec![step(
+        "q3_embedding_rows",
+        elementwise("count", total)?,
+        THREADS,
+        args,
+    )?])
 }

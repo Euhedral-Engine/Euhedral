@@ -35,6 +35,14 @@ impl Rig {
         Ok(Rig { lattice, io, host })
     }
 
+    /// Has the lattice take frames from one more source, such as a device lane's completions.
+    pub fn attach(&self, source: Arc<dyn LatticeSource>) -> Result<(), String> {
+        self.lattice
+            .add_upstream(source)
+            .map(drop)
+            .map_err(|error| format!("{error:?}"))
+    }
+
     /// Stops the runtime once its work has ended.
     pub fn stop(self) {
         self.host.complete_gracefully();

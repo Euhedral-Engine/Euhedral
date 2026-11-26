@@ -11,6 +11,7 @@ mod package;
 mod reference;
 mod rig;
 mod score;
+mod train_drafter;
 
 /// The process exit code of a run that finished.
 pub const EXIT_OK: u8 = 0;
@@ -60,8 +61,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "train-drafter",
-        availability: Availability::Pending,
-        usage: "--corpus CORPUS_DIR --model CHECKPOINT --artifact ARTIFACT --out DIR",
+        availability: Availability::Wired,
+        usage: "--corpus CORPUS_DIR --model CHECKPOINT --artifact ARTIFACT --out DIR --cuda-libraries DIR [--depths N] [--rows N] [--keys N] [--tokens N] [--epochs N] [--projection-rate R] [--norm-rate R] [--warmup N] [--holdout N] [--evaluate-every N] [--limit N] [--stop-after-saves N] [--library FILE]",
     },
     Command {
         name: "export-drafter",
@@ -153,6 +154,7 @@ pub fn run(args: &[String]) -> Outcome {
             "package-tokenizer" => package::run(&args[1..]),
             "reference" => reference::run(&args[1..]),
             "score" => score::run(&args[1..]),
+            "train-drafter" => train_drafter::run(&args[1..]),
             _ => Outcome {
                 code: EXIT_NOT_AVAILABLE,
                 message: format!("the command '{name}' has no work behind it\n"),
