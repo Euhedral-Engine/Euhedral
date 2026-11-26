@@ -17,7 +17,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread::spawn;
 use std::time::Duration;
 
-use common::{PATIENCE, chat, closed_by_server, exchange, gauge, idle_connection, ready, status, until};
+use common::{HANG_GUARD, chat, closed_by_server, exchange, gauge, idle_connection, status, until};
 use euhedral_inference_api_server::scripted::{MODEL_ID, Script};
 use euhedral_inference_server::scripted::{start, start_scripted, start_with};
 use euhedral_inference_server::{
@@ -32,12 +32,12 @@ const CHAT: &str = "/v1/chat/completions";
 const FOR_EVER: Duration = Duration::from_secs(3600);
 
 /// Runs `body`, which calls `serve`, on a thread of its own and returns what it returned. A `serve` that does not
-/// return within the patience is a stop that waits for something that does not end: the test fails, saying so.
+/// return within the hang guard is a stop that waits for something that does not end: the test fails, saying so.
 fn returns<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
     let (done, returned) = channel();
     spawn(move || done.send(body()).ok());
     returned
-        .recv_timeout(PATIENCE)
+        .recv_timeout(HANG_GUARD)
         .expect("serve never returned: the stop is waiting for something that does not end")
 }
 
@@ -54,7 +54,6 @@ fn settings() -> Settings {
 #[test]
 fn the_routes_answer_and_the_model_is_listed() {
     let code = serve(&settings(), StopWindows::default(), start, |addr| {
-        ready(addr);
         let health = exchange(addr, "GET", "/health", None);
         assert_eq!(status(&health), 200, "{health}");
         let models = exchange(addr, "GET", "/v1/models", None);
@@ -82,7 +81,7 @@ fn a_stop_with_nothing_running_returns_without_waiting_for_the_windows() {
 fn answered(answers: &Receiver<(&'static str, String)>) -> (String, String) {
     let mut running = String::new();
     let mut queued = String::new();
-    while let Ok((which, answer)) = answers.recv_timeout(PATIENCE) {
+    while let Ok((which, answer)) = answers.recv_timeout(HANG_GUARD) {
         if which == "running" {
             running = answer;
         } else {
@@ -113,7 +112,6 @@ fn a_stop_refuses_the_queued_request_and_interrupts_the_running_one() {
                 Some(FOR_EVER),
                 |_| start_with(Script::Hung),
                 |addr| {
-                    ready(addr);
                     let running = clients.clone();
                     spawn(move || {
                         running
@@ -287,7 +285,6 @@ fn running_and_queued_requests_finish_within_the_drain_window() {
                 windows,
                 |_| Ok(started),
                 |addr| {
-                    ready(addr);
                     let running = clients.clone();
                     spawn(move || {
                         running

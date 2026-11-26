@@ -11,7 +11,7 @@ mod common;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use common::{Fixture, PATIENCE, Raw};
+use common::{Fixture, HANG_GUARD, Raw};
 use euhedral_inference_api_server::answer::{owner_fault_is_held, release_owner_fault};
 use euhedral_inference_api_server::scripted::{LaunchFault, MODEL_ID, Script};
 use euhedral_inference_api_server::{Counts, Generation, Limits};
@@ -154,7 +154,7 @@ fn call(name: &str, parameters: &[(&str, &str)]) -> String {
 }
 
 fn settle(fx: &Fixture) {
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while fx.server.admission().counts() != Counts::default() {
         assert!(Instant::now() < end, "slots held: {:?}", fx.server.admission().counts());
         sleep(Duration::from_millis(5));
@@ -162,7 +162,7 @@ fn settle(fx: &Fixture) {
 }
 
 fn until(what: &str, check: impl Fn() -> bool) {
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while !check() {
         assert!(Instant::now() < end, "never: {what}");
         sleep(Duration::from_millis(5));
@@ -1075,10 +1075,10 @@ fn disconnect_while_generating_cancels() {
     fx.finish();
 }
 
-/// Feeds a hung generation 64 KiB pieces until `stop` holds, within the patience of a test.
+/// Feeds a hung generation 64 KiB pieces until `stop` holds, within the hang guard.
 fn feed(fx: &Fixture, stop: impl Fn() -> bool) {
     let piece = "a".repeat(64 << 10);
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while !stop() {
         assert!(
             Instant::now() < end,
@@ -1128,7 +1128,7 @@ fn a_reader_too_slow_for_the_held_bound_ends_the_request() {
     assert!(fx.backend.generations()[0].finish_held_ok(1, true));
     // The stream is cut: whatever the client reads, it never gets the closing chunk.
     let mut seen = String::new();
-    let end = Instant::now() + PATIENCE;
+    let end = Instant::now() + HANG_GUARD;
     while Instant::now() < end {
         match raw.read_for(Duration::from_millis(200)) {
             Some(more) => seen.push_str(&more),

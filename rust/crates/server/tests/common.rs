@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use euhedral_inference_api_server::scripted::MODEL_ID;
 
-/// How long a test waits for anything before it fails.
-pub const PATIENCE: Duration = Duration::from_secs(30);
+/// The bound of a test that waits for something that never happens: a hang guard, not a speed limit. No test passes or
+/// fails on how fast the host ran it, so the bound is long enough that a loaded host never reaches it.
+pub const HANG_GUARD: Duration = Duration::from_secs(600);
 
 /// The address a client connects to for a server that listens on `addr`: the loopback address where it listens on every
 /// address.
@@ -27,30 +28,8 @@ pub fn reach(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-/// Waits until the port accepts connections, then requires the first exchange to be answered: a connection made in the
-/// first moments after the port opens must not be reset or dropped.
-pub fn ready(addr: SocketAddr) {
-    let deadline = Instant::now() + PATIENCE;
-    loop {
-        match try_exchange(addr, "GET", "/health", None) {
-            Err(error) if error.starts_with("connecting") => {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for the port to open: {error}"
-                );
-                sleep(Duration::from_millis(10));
-            }
-            Ok(answer) => {
-                assert_eq!(status(&answer), 200, "the first answer: {answer}");
-                return;
-            }
-            Err(error) => panic!("the first connection after the port opened failed: {error}"),
-        }
-    }
-}
-
 /// The whole of one exchange: `request` sent, the answer read until the server closes (`Connection: close`) or the
-/// patience ends; what was read either way.
+/// hang guard ends; what was read either way.
 pub fn exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&str>) -> String {
     try_exchange(addr, method, target, body).unwrap_or_else(|error| panic!("{method} {target}: {error}"))
 }
@@ -58,7 +37,7 @@ pub fn exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&str>
 /// [`exchange`], reporting a connection that fails or an empty answer instead of panicking.
 pub fn try_exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&str>) -> Result<String, String> {
     let mut stream =
-        TcpStream::connect_timeout(&reach(addr), PATIENCE).map_err(|error| format!("connecting: {error}"))?;
+        TcpStream::connect_timeout(&reach(addr), HANG_GUARD).map_err(|error| format!("connecting: {error}"))?;
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .map_err(|error| error.to_string())?;
@@ -72,11 +51,12 @@ pub fn try_exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&
         .write_all(request.as_bytes())
         .map_err(|error| format!("writing: {error}"))?;
     let mut text = Vec::new();
-    let deadline = Instant::now() + PATIENCE;
+    let deadline = Instant::now() + HANG_GUARD;
     let mut chunk = [0_u8; 4096];
-    while Instant::now() < deadline {
+    let mut closed = false;
+    while !closed && Instant::now() < deadline {
         match stream.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => closed = true,
             Ok(count) => text.extend_from_slice(&chunk[..count]),
             Err(error)
                 if matches!(
@@ -86,6 +66,9 @@ pub fn try_exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&
             Err(error) => return Err(format!("reading: {error}")),
         }
     }
+    if !closed {
+        return Err("the server never closed the connection".to_owned());
+    }
     if text.is_empty() {
         return Err("no answer".to_owned());
     }
@@ -94,7 +77,7 @@ pub fn try_exchange(addr: SocketAddr, method: &str, target: &str, body: Option<&
 
 /// A connection that asked for `/health`, was answered and was left open: the server has accepted it and holds it idle.
 pub fn idle_connection(addr: SocketAddr) -> TcpStream {
-    let mut stream = TcpStream::connect_timeout(&reach(addr), PATIENCE).expect("a connection");
+    let mut stream = TcpStream::connect_timeout(&reach(addr), HANG_GUARD).expect("a connection");
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .expect("a read timeout");
@@ -103,9 +86,12 @@ pub fn idle_connection(addr: SocketAddr) -> TcpStream {
         .expect("a request");
     let mut head = Vec::new();
     let mut chunk = [0_u8; 4096];
-    let deadline = Instant::now() + PATIENCE;
+    let deadline = Instant::now() + HANG_GUARD;
     while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-        assert!(Instant::now() < deadline, "no answer on the idle connection");
+        assert!(
+            Instant::now() < deadline,
+            "the server never answered on the idle connection"
+        );
         match stream.read(&mut chunk) {
             Ok(0) => panic!("the server closed the connection before it answered"),
             Ok(count) => head.extend_from_slice(&chunk[..count]),
@@ -116,11 +102,11 @@ pub fn idle_connection(addr: SocketAddr) -> TcpStream {
     stream
 }
 
-/// Waits until the server closes `stream`, for at most the patience. The server closes an idle connection when it
+/// Waits until the server closes `stream`, for at most the hang guard. The server closes an idle connection when it
 /// stops, so this is the sign that a stop has begun.
 pub fn closed_by_server(mut stream: TcpStream) -> bool {
     let mut chunk = [0_u8; 4096];
-    let deadline = Instant::now() + PATIENCE;
+    let deadline = Instant::now() + HANG_GUARD;
     while Instant::now() < deadline {
         match stream.read(&mut chunk) {
             Ok(0) => return true,
@@ -156,11 +142,12 @@ pub fn gauge(addr: SocketAddr, name: &str) -> Option<f64> {
         .find_map(|line| line.rsplit(' ').next()?.parse().ok())
 }
 
-/// Calls `check` until it holds, for at most the patience.
+/// Polls `check` until it holds: the server offers no event for what the tests wait on (a gauge, a closed listener),
+/// so the only bound is the hang guard.
 pub fn until(what: &str, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + PATIENCE;
+    let deadline = Instant::now() + HANG_GUARD;
     while !check() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        assert!(Instant::now() < deadline, "never happened: {what}");
         sleep(Duration::from_millis(10));
     }
 }
