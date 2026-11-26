@@ -19,6 +19,9 @@ use super::driver::Then;
 pub const MANIFEST_FILE: &str = "calibration.json";
 /// The resume file's name in the output directory.
 pub const RESUME_FILE: &str = "hidden.bin";
+/// The directory of the output that holds the heads' state files in a trellis run, as Java's: the one directory a
+/// listed name may be in.
+pub const HEADS_DIRECTORY: &str = "heads";
 /// The suffix of a file being written, before it is renamed over its name.
 const TEMPORARY_SUFFIX: &str = ".tmp";
 /// The most names a refusal lists.
@@ -97,7 +100,7 @@ impl Manifest {
     pub fn parse(bytes: &[u8]) -> Result<Manifest, CalibrateError> {
         let manifest: Manifest =
             serde_json::from_slice(bytes).map_err(|error| CalibrateError::failed("the manifest", error))?;
-        if let Some(name) = manifest.files.iter().find(|name| !plain(name)) {
+        if let Some(name) = manifest.files.iter().find(|name| !listable(name)) {
             return Err(CalibrateError::Invalid(format!(
                 "the manifest lists {name:?}, which is not a file name of the directory"
             )));
@@ -119,6 +122,20 @@ pub fn plain(name: &str) -> bool {
         && name != MANIFEST_FILE
         && matches!(components.next(), Some(Component::Normal(_)))
         && components.next().is_none()
+}
+
+/// Whether `name` may be listed: a [`plain`] name, or a plain name inside [`HEADS_DIRECTORY`] (`heads/<name>`, with the
+/// slash on every platform). Nothing deeper and nothing outside the directory is ever read or removed.
+pub fn listable(name: &str) -> bool {
+    match name.strip_prefix(HEADS_DIRECTORY).and_then(|rest| rest.strip_prefix('/')) {
+        Some(inside) => plain(inside),
+        None => plain(name),
+    }
+}
+
+/// The name of `file` in [`HEADS_DIRECTORY`], as the manifest lists it.
+pub fn in_heads(file: &str) -> String {
+    format!("{HEADS_DIRECTORY}/{file}")
 }
 
 /// Names a run's key by its parts: the parts of `old` and `new` (joined with `|`) that differ, by the names of the
@@ -152,6 +169,8 @@ pub struct Prepared {
     resumed: bool,
     /// The files the manifest `--fresh` replaces listed, which `apply` removes.
     clear: Vec<PathBuf>,
+    /// Directories of the output (names inside it) that `apply` makes.
+    create: Vec<String>,
 }
 
 impl Prepared {
@@ -166,6 +185,12 @@ impl Prepared {
         self.resumed && self.manifest.is_complete()
     }
 
+    /// Has `apply` make the directory `name`, a plain name inside the output, too.
+    pub fn creating(mut self, name: &str) -> Prepared {
+        self.create.push(name.to_owned());
+        self
+    }
+
     /// Makes the directory the run's: removes the files of the manifest `--fresh` replaces and writes the manifest of
     /// a run that has written nothing (to a temporary file, renamed over the name). A resumed directory is left as it
     /// is. Call it only once the run has opened everything it needs.
@@ -178,6 +203,10 @@ impl Prepared {
     pub fn apply(self) -> Result<Manifest, CalibrateError> {
         let named = |path: &Path, error| CalibrateError::failed(&path.display().to_string(), error);
         fs::create_dir_all(&self.out).map_err(|error| named(&self.out, error))?;
+        for name in &self.create {
+            let path = self.out.join(name);
+            fs::create_dir_all(&path).map_err(|error| named(&path, error))?;
+        }
         for path in &self.clear {
             match fs::remove_file(path) {
                 Err(error) if error.kind() != ErrorKind::NotFound => return Err(named(path, error)),
@@ -248,6 +277,7 @@ pub fn inspect(
         manifest,
         resumed,
         clear,
+        create: Vec::new(),
     };
     let entries: Vec<String> = match fs::read_dir(out) {
         Ok(entries) => entries

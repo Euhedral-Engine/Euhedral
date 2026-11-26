@@ -22,6 +22,7 @@
 //!
 //! The rounding arm is the GPTQ one. A format whose rounding differs (trellis) plugs in at [`Stages::layer`].
 
+pub mod allocation;
 pub mod device;
 pub mod draft_ids;
 pub mod driver;
