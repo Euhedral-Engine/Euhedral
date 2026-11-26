@@ -1,5 +1,7 @@
 name: probe
-on: workflow_dispatch
+on:
+  pull_request:
+    paths: [".gitea/workflows/probe.yaml"]
 permissions:
   contents: read
   actions: write
