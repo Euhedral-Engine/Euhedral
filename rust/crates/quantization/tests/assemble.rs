@@ -183,6 +183,30 @@ fn the_view_takes_chosen_objects_from_their_source_and_drops_the_replaced_compan
 }
 
 #[test]
+fn a_view_taking_everything_from_one_source_holds_that_sources_objects_in_its_order() {
+    let fixture = Fixture::new();
+    let artifacts = fixture.two();
+    let sources = fixture.open(&artifacts).unwrap();
+    let every: Vec<(&str, QuantOption)> = PROJECTIONS.iter().map(|name| (*name, BASE)).collect();
+    let pure = view(&sources, &allocation(&every), None).unwrap();
+    let base = fixture.table(&artifacts[&BASE]);
+    let held: Vec<(&str, u64, u64)> = pure
+        .pieces
+        .iter()
+        .map(|piece| (piece.entry.name(), piece.entry.offset(), piece.entry.bytes()))
+        .collect();
+    let source: Vec<(&str, u64, u64)> = base
+        .table()
+        .entries()
+        .iter()
+        .map(|entry| (entry.name(), entry.offset(), entry.bytes()))
+        .collect();
+    assert_eq!(held, source);
+    assert!(pure.pieces.iter().all(|piece| piece.option == BASE));
+    fixture.world.finish();
+}
+
+#[test]
 fn an_object_chosen_from_a_source_brings_its_companions() {
     let fixture = Fixture::new();
     let artifacts = BTreeMap::from([

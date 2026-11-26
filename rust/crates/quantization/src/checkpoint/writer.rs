@@ -3,6 +3,13 @@
 //! padded with spaces to a multiple of 8 bytes) needs every tensor's size, so the data is pulled from each tensor's
 //! source in chunks only when the file is written; a tensor never has to be resident whole. The file is written as
 //! `<name>.part` and renamed once complete, so an interrupted run never leaves a truncated file under the final name.
+//!
+//! The continuation of a write ends the write exactly once. A call that returns `Err` started nothing and never calls
+//! it. Otherwise each step hands the chain, with the continuation, to the next step through a take-once cell, and every
+//! failure ends the chain with its own error. A step that the I/O engine or the host lake accepted and later discards
+//! unrun (they are closing) drops the chain with it: the drop ends the call with [`CheckpointError::LakeClosed`], so a
+//! caller that waits for the continuation is never left waiting. The `.part` file may be left then, as when the host
+//! lake closes mid-write.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -16,7 +23,7 @@ use euhedral_graph::{Lake, UnitGuard};
 use euhedral_inference_engine::Handoff;
 use euhedral_io::{AsyncIo, Create, IoBuf, IoDone, OpenSpec, OwnedFile};
 
-use super::io::{Next, file_length, open_read, raw_file, read_exact, submit_error};
+use super::io::{Closing, Next, file_length, open_read, raw_file, read_exact, submit_error};
 use super::{CheckpointError, Done};
 use crate::durable;
 use crate::step::{Kind, idle, step};
@@ -198,6 +205,7 @@ impl SafetensorsWriter {
         then: Done<()>,
     ) -> Result<(), CheckpointError> {
         let unit = host.admit().map_err(|_| CheckpointError::LakeClosed)?;
+        let then = Closing::new(then);
         let mut part: OsString = self.file.clone().into_os_string();
         part.push(".part");
         let part = PathBuf::from(part);
@@ -225,17 +233,31 @@ impl SafetensorsWriter {
             then,
         };
         let context = part.display().to_string();
+        let cell = Handoff::new();
+        cell.send(writing);
+        let waiting = Arc::clone(&cell);
         io.open_path(
             &part,
             spec,
             Box::new(move |opened| {
-                step(Kind::Resolve, move || match opened {
-                    Ok(file) => writing.begin(file, head),
-                    Err(error) => writing.end(Err(CheckpointError::io(format!("cannot create {context}"), error))),
+                step(Kind::Resolve, move || {
+                    let Some(writing) = waiting.take() else {
+                        return;
+                    };
+                    match opened {
+                        Ok(file) => writing.begin(file, head),
+                        Err(error) => writing.end(Err(CheckpointError::io(format!("cannot create {context}"), error))),
+                    }
                 })
             }),
         )
-        .map_err(|error| submit_error(&name, error))
+        .map_err(|error| {
+            // Nothing started: the refusal is the caller's, and the continuation is not called.
+            if let Some(writing) = cell.take() {
+                writing.then.release();
+            }
+            submit_error(&name, error)
+        })
     }
 
     fn file_name(&self) -> String {
@@ -280,7 +302,7 @@ struct Writing {
     /// Where the next write goes in the file.
     offset: u64,
     buffer: Vec<u8>,
-    then: Done<()>,
+    then: Closing<()>,
 }
 
 /// An open `.part` file and the chain's state.
@@ -304,7 +326,7 @@ impl Writing {
     /// Hands the result over and lets the lake go.
     fn end(self, result: Result<(), CheckpointError>) {
         let Writing { then, unit, .. } = self;
-        then(result);
+        then.end(result);
         drop(unit);
     }
 
@@ -313,27 +335,59 @@ impl Writing {
         let Writing {
             host, unit, part, then, ..
         } = self;
-        let pending = Handoff::new();
-        pending.send(error);
-        let (reported, held) = (Arc::clone(&pending), Arc::clone(&then));
-        let removed = durable::remove(
+        let Some(then) = then.release() else {
+            return;
+        };
+        if matches!(error, CheckpointError::LakeClosed) {
+            // A closing lake or engine may be discarding this chain from the tail of a pull, where nothing may be
+            // offered: the removal is not offered, and the file is said to be left.
+            drop(unit);
+            then(Err(CheckpointError::io(
+                "the write was cut short and the .part file was left",
+                IoError::other(error.to_string()),
+            )));
+            return;
+        }
+        let removal = Removal {
+            error: Some(error),
+            then,
+        };
+        // A refused or discarded removal drops its closure, and the guard in it ends the call: the lake is closed and
+        // nothing can remove the file.
+        let _ = durable::remove(
             &host,
             &part,
-            Box::new(move |removal| {
-                if let Some(error) = reported.take() {
-                    held(Err(match removal {
-                        Ok(()) => error,
-                        Err(source) => CheckpointError::io(format!("{error}; the .part file was not removed"), source),
-                    }));
-                }
+            Box::new(move |removed| {
+                removal.end(removed);
                 step(Kind::Release, move || drop(unit))
             }),
         );
-        if removed.is_err()
-            && let Some(error) = pending.take()
-        {
-            // The lake is closed: the continuation was dropped with the refusal, and nothing can remove the file.
-            then(Err(CheckpointError::io(
+    }
+}
+
+/// A failed write waiting for its `.part` file to be removed. Dropped before the removal ran, it ends the write with
+/// the failure and says that the file was left.
+struct Removal {
+    error: Option<CheckpointError>,
+    then: Done<()>,
+}
+
+impl Removal {
+    /// Ends the write with its failure, and what the removal added to it.
+    fn end(mut self, removed: Result<(), IoError>) {
+        if let Some(error) = self.error.take() {
+            (self.then)(Err(match removed {
+                Ok(()) => error,
+                Err(source) => CheckpointError::io(format!("{error}; the .part file was not removed"), source),
+            }));
+        }
+    }
+}
+
+impl Drop for Removal {
+    fn drop(&mut self) {
+        if let Some(error) = self.error.take() {
+            (self.then)(Err(CheckpointError::io(
                 format!("{error}; the .part file was not removed"),
                 IoError::other("the host lake is closed"),
             )));
@@ -427,6 +481,10 @@ impl Step {
                         "the source of {name} gave {} bytes for a chunk of {n}",
                         bytes.len()
                     )));
+                }
+                Err(CheckpointError::LakeClosed) => {
+                    drop(file);
+                    writing.fail(CheckpointError::LakeClosed);
                 }
                 Err(error) => {
                     drop(file);
@@ -580,7 +638,7 @@ fn write_target(
 }
 
 /// Copies `from` to `to` the way [`write_file`] writes a file, a buffer at a time, so a file of any size can be
-/// copied. `Err` started nothing.
+/// copied. `Err` started nothing; every started copy ends its call once, as for [`SafetensorsWriter::finish`].
 pub(crate) fn copy_file(
     from: &Path,
     to: &Path,
@@ -596,35 +654,36 @@ pub(crate) fn copy_file(
         from.display().to_string(),
     );
     let handed = Handoff::new();
-    handed.send(then);
+    handed.send(Closing::new(then));
     let waiting = Arc::clone(&handed);
     let opened = open_read(
         io,
         from,
-        Box::new(move |opened| {
-            let Some(then) = waiting.take() else { return };
+        Next::new(move |opened| {
+            let Some(closing) = waiting.take() else { return };
             let file = match opened {
                 Ok(file) => Arc::new(file),
-                Err(error) => return then(Err(error)),
+                Err(error) => return closing.end(Err(error)),
             };
             let sizing = Arc::clone(&file);
             let cell = Handoff::new();
-            cell.send((then, io_next.clone()));
+            cell.send((closing, io_next.clone()));
             let ready = Arc::clone(&cell);
             let sized = file_length(
                 &io_next,
                 sizing,
                 label.clone(),
-                Box::new(move |length| {
-                    let Some((then, io)) = ready.take() else { return };
+                Next::new(move |length| {
+                    let Some((closing, io)) = ready.take() else { return };
                     let size = match length {
                         Ok(size) => size,
-                        Err(error) => return then(Err(error)),
+                        Err(error) => return closing.end(Err(error)),
                     };
+                    let Some(then) = closing.release() else { return };
                     let reader = Arc::clone(&io);
                     let context = label.clone();
                     let source: Source = Arc::new(move |offset, chunk, done| {
-                        let next: Next<Vec<u8>> = Box::new(move |bytes| done(bytes));
+                        let next = Next::<Vec<u8>>::new(move |bytes| done(bytes));
                         read_exact(&reader, Arc::clone(&file), offset, chunk.len(), context.clone(), next)
                     });
                     let report = Arc::clone(&then);
@@ -639,16 +698,77 @@ pub(crate) fn copy_file(
                 }),
             );
             if let Err(error) = sized
-                && let Some((then, _)) = cell.take()
+                && let Some((closing, _)) = cell.take()
             {
-                then(Err(error));
+                closing.end(Err(error));
             }
         }),
     );
     if let Err(error) = opened {
         // Nothing started: the continuation was dropped with the refusal.
-        drop(handed.take());
+        if let Some(closing) = handed.take() {
+            drop(closing.release());
+        }
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    /// A continuation that counts its calls and keeps what it was last told.
+    fn recording() -> (Arc<AtomicU64>, Arc<Handoff<String>>, Done<()>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let told = Handoff::new();
+        let (counted, sink) = (Arc::clone(&calls), Arc::clone(&told));
+        let then: Done<()> = Arc::new(move |result| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            sink.send(result.map_or_else(|error| error.to_string(), |()| "ok".to_owned()));
+        });
+        (calls, told, then)
+    }
+
+    // Mutant caught: a guard that drops the continuation with it, or says something when the write ended itself.
+    #[test]
+    fn a_chain_dropped_unended_ends_the_call_and_one_that_ended_says_nothing() {
+        let (calls, told, then) = recording();
+        drop(Closing::new(then));
+        assert_eq!(told.take(), Some(CheckpointError::LakeClosed.to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (calls, told, then) = recording();
+        Closing::new(Arc::clone(&then)).end(Ok(()));
+        drop(Closing::new(then).release());
+        assert_eq!(told.take(), Some("ok".to_owned()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Mutant caught: a removal that is discarded unrun and drops the failure with it (the caller waits for ever), or
+    // that reports twice.
+    #[test]
+    fn a_removal_dropped_unrun_reports_the_failure_and_the_file_left() {
+        let (calls, told, then) = recording();
+        drop(Removal {
+            error: Some(CheckpointError::Invalid("boom".to_owned())),
+            then,
+        });
+        assert_eq!(
+            told.take().as_deref(),
+            Some("boom; the .part file was not removed: the host lake is closed")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (calls, told, then) = recording();
+        Removal {
+            error: Some(CheckpointError::Invalid("boom".to_owned())),
+            then,
+        }
+        .end(Ok(()));
+        assert_eq!(told.take().as_deref(), Some("boom"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

@@ -41,7 +41,7 @@ impl ArtifactFile {
         open_read(
             &io,
             &path,
-            Box::new(move |opened| match opened {
+            Next::new(move |opened| match opened {
                 Err(error) => done(Err(error.into())),
                 Ok(file) => {
                     let opening = Opening {
@@ -123,7 +123,7 @@ impl Opening {
         let file = Arc::clone(&self.file);
         let io = Arc::clone(&self.io);
         let context = self.path.display().to_string();
-        let next: Next<u64> = Box::new(move |length| match length {
+        let next = Next::<u64>::new(move |length| match length {
             Err(error) => self.fail(error.into()),
             Ok(length) => self.with_length(length),
         });
@@ -288,7 +288,7 @@ impl Opening {
         let io = Arc::clone(&self.io);
         let file = Arc::clone(&self.file);
         let context = format!("{what} of {}", self.path.display());
-        let next: Next<Vec<u8>> = Box::new(move |bytes| match bytes {
+        let next = Next::<Vec<u8>>::new(move |bytes| match bytes {
             Err(error) => self.fail(error.into()),
             Ok(bytes) => then(self, bytes),
         });

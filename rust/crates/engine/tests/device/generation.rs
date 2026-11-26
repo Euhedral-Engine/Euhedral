@@ -1310,25 +1310,202 @@ fn concurrent_sequences_match_alone() {
     }
 }
 
+/// The bytes of the host arena a disk-tier test leaves in the artifact file: about 0.6 GiB.
+const ON_DISK: u64 = 600 << 20;
+
+/// The settings that leave about [`ON_DISK`] bytes in the artifact file, and the device limit they were made with.
+fn disk_settings(machine: &Machine, sequences: u32) -> (Settings, u64) {
+    let mut engine = settings(&machine.artifact, 4096);
+    engine.batching.max_sequences = sequences;
+    let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
+    common::limit_gpu(&mut engine, limit);
+    let host = common::limit_to_disk(&machine.library, &engine, limit, ON_DISK);
+    common::limit_host_weights(&mut engine, host);
+    (engine, limit)
+}
+
+/// The prompt and the tokens a resident engine selects after it: what a run with weights in the file must also give.
+fn resident_reference(machine: &Machine) -> Greedy {
+    let (_card, runtime) = shared_engine(machine);
+    greedy_reference(machine, &runtime)
+}
+
+/// The logits rows of 64 teacher-forced steps with part of the weights read from the artifact file through the window
+/// are those of the resident engine, byte for byte: what is read from disk is what the host would have held.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn disk_backed_weights_compute_what_host_backed_ones_do() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let forced = &reference.generated[..64];
+    let resident = {
+        let (_card, runtime) = shared_engine(&machine);
+        forced_rows(&runtime, &reference.prompt, forced)
+    };
+    let (engine, limit) = disk_settings(&machine, 1);
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    if !common::read_through_the_window(&runtime, limit) {
+        return;
+    }
+    let from_disk = forced_rows(&runtime, &reference.prompt, forced);
+    assert_eq!(from_disk.len(), resident.len());
+    for (step, (disk, host)) in from_disk.iter().zip(&resident).enumerate() {
+        assert!(
+            disk == host,
+            "step {step}: the logits read through the window differ from the resident ones"
+        );
+    }
+}
+
+/// The engine closes with a request admitted and its reads in flight: the shutdown ends within its bound, frees nothing
+/// under a read and leaves no handle to the runtime.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn closing_with_reads_in_flight_frees_after_them_only() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let (engine, limit) = disk_settings(&machine, 1);
+    let _card = common::card();
+    let (closer, runtime) = common::start_engine(&engine, &machine.library);
+    if !common::read_through_the_window(&runtime, limit) {
+        closer.shutdown(runtime).unwrap();
+        return;
+    }
+    let done = submit(
+        &runtime,
+        &reference.prompt,
+        512,
+        &[],
+        Speculation::Off,
+        SamplingConfig::greedy(0),
+        None,
+    )
+    .expect("the request is admitted");
+    closer
+        .shutdown_within(runtime, Duration::from_secs(120))
+        .expect("the engine closes within its bound");
+    drop(done);
+}
+
+/// Two loads in a row, each generating the tokens of the reference and each closing with no memory left claimed: the
+/// window and the reader of one load are gone before the next begins (the second start's allocation and the leak check
+/// of the shutdown fail otherwise).
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn every_load_generates_within_its_bound() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let (engine, limit) = disk_settings(&machine, 1);
+    let _card = common::card();
+    for cycle in 0..2 {
+        let (closer, runtime) = common::start_engine(&engine, &machine.library);
+        if !common::read_through_the_window(&runtime, limit) {
+            closer.shutdown(runtime).unwrap();
+            return;
+        }
+        let recording = generate(&runtime, &reference.prompt, 128, &[]);
+        assert_eq!(recording.outcome.reason, FinishReason::Length, "cycle {cycle}");
+        assert_eq!(recording.tokens, reference.generated, "cycle {cycle}");
+        closer
+            .shutdown_within(runtime, Duration::from_secs(120))
+            .unwrap_or_else(|error| panic!("cycle {cycle}: the engine closes clean within its bound: {error}"));
+    }
+}
+
+/// A request cancelled while the reader has reads for its quanta ends, and the next request on the same engine
+/// generates the reference tokens: the cancelled quanta gave their slots back. A slot never given back hangs the
+/// next request, which the bounded waits report.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn cancel_during_a_disk_read_ends_cleanly() {
+    let Some(machine) = machine() else { return };
+    let reference = resident_reference(&machine);
+    let (engine, limit) = disk_settings(&machine, 1);
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    if !common::read_through_the_window(&runtime, limit) {
+        return;
+    }
+    for after in [1, 5] {
+        let cancelled = submit(
+            &runtime,
+            &reference.prompt,
+            512,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            Some(after),
+        )
+        .expect("the request is admitted")
+        .wait(Duration::from_secs(5 * 60))
+        .expect("the cancelled request never reported: a read or a held slot of a cancelled quantum was never freed");
+        assert_eq!(
+            cancelled.outcome.reason,
+            FinishReason::Cancelled,
+            "after {after} tokens"
+        );
+        assert!(cancelled.tokens.len() < 512);
+        let again = submit(
+            &runtime,
+            &reference.prompt,
+            128,
+            &[],
+            Speculation::Off,
+            SamplingConfig::greedy(0),
+            None,
+        )
+        .expect("the next request is admitted")
+        .wait(Duration::from_secs(5 * 60))
+        .expect("the next request never reported: the cancelled one left a slot held");
+        assert_eq!(again.tokens, reference.generated, "after a cancel at {after} tokens");
+    }
+}
+
 /// Two sequences with their draft layer on, projections staged through the one ring: each request's tokens are what
 /// they are alone. The waits are bounded.
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn concurrent_sequences_match_alone_when_staged() {
     let Some(machine) = machine() else { return };
+    concurrent_through(&machine, 2, false);
+}
+
+/// Sequences started together on the disk tier, with their draft layer on, each request's tokens are what they are
+/// alone: the reads of the quanta of several sequences are registered in the order the quanta start, and one slot of
+/// the window is never the copy of two quanta at once.
+#[test]
+#[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
+fn sessions_started_together_on_the_disk_tier_match_running_alone() {
+    let Some(machine) = machine() else { return };
+    for count in [2, 4] {
+        concurrent_through(&machine, count, true);
+    }
+}
+
+/// `count` sequences generate alone and then together (the draft layer on when the artifact has one) under a forced
+/// plan: staged through the ring, or, with `disk`, with part of the weights left in the artifact file.
+fn concurrent_through(machine: &Machine, count: usize, disk: bool) {
     let tokenizer = tokenizer(&machine.artifact);
     let prompts: Vec<Vec<u32>> = CONCURRENT_PROMPTS
         .iter()
-        .take(2)
+        .take(count)
         .map(|text| tokenizer.encode_with_model_special_tokens(text).unwrap())
         .collect();
     let mut engine = settings(&machine.artifact, 2048);
-    engine.batching.max_sequences = 2;
+    engine.batching.max_sequences = count as u32;
     let limit = common::limit_to_stage(&machine.library, &engine, STAGED_SHORT);
     common::limit_gpu(&mut engine, limit);
+    if disk {
+        let host = common::limit_to_disk(&machine.library, &engine, limit, ON_DISK);
+        common::limit_host_weights(&mut engine, host);
+    }
     let (_card, runtime) = common::engine(&engine, &machine.library);
-    assert_eq!(runtime.sequences(), 2, "the engine holds two sequences");
-    if !common::staged_through_a_ring(&runtime, limit) {
+    assert_eq!(runtime.sequences(), count, "the engine holds {count} sequences");
+    let forced = if disk {
+        common::read_through_the_window(&runtime, limit)
+    } else {
+        common::staged_through_a_ring(&runtime, limit)
+    };
+    if !forced {
         return;
     }
     let wait = Duration::from_secs(10 * 60);
@@ -1533,4 +1710,115 @@ fn multi_row_teacher_forcing_matches_the_one_row_path_alone_and_batched() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn eight_forced_rows_sized_by_the_setting_equal_the_one_row_path_alone_and_batched() {
     forced_rows_equal_the_one_row_path(8, |depth| (1 + depth).max(8));
+}
+
+/// The hidden rows and the logits rows of a forced run that takes the hidden state.
+type HiddenDelivery = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// A forced run whose sink takes the hidden state: the hidden row and the logits row of every step.
+struct HiddenRows {
+    hidden: Vec<Vec<u8>>,
+    rows: Vec<Vec<u8>>,
+    done: Option<Arc<Handoff<HiddenDelivery>>>,
+}
+
+impl LogitsSink for HiddenRows {
+    fn wants_hidden(&self) -> bool {
+        true
+    }
+
+    fn hidden(&mut self, step: usize, hidden: &[u8]) {
+        assert_eq!(
+            step,
+            self.hidden.len(),
+            "the hidden rows arrive in order, before their logits row"
+        );
+        self.hidden.push(hidden.to_vec());
+    }
+
+    fn row(&mut self, step: usize, _forced: u32, logits: &[u8]) {
+        assert_eq!(step, self.rows.len(), "the rows arrive in order");
+        assert_eq!(
+            self.hidden.len(),
+            step + 1,
+            "the hidden row came just before its logits row"
+        );
+        self.rows.push(logits.to_vec());
+    }
+
+    fn finished(&mut self, _outcome: GenerationOutcome) {
+        let done = self.done.take().expect("a run finishes once");
+        done.send((mem::take(&mut self.hidden), mem::take(&mut self.rows)));
+    }
+}
+
+/// The hidden rows and logits rows of a forced one-row run that takes the hidden state.
+fn forced_hidden(runtime: &EngineRuntime, prefix: &[u32], forced: &[u32]) -> Arc<Handoff<HiddenDelivery>> {
+    let done = Handoff::new();
+    runtime
+        .teacher_forced_rows(
+            prefix.to_vec(),
+            forced.to_vec(),
+            1,
+            Box::new(HiddenRows {
+                hidden: Vec::new(),
+                rows: Vec::new(),
+                done: Some(Arc::clone(&done)),
+            }),
+        )
+        .expect("the run is admitted");
+    done
+}
+
+/// A forced step's hidden row and logits row are the same when the run is alone and when another request shares the
+/// engine, and its logits rows are those of a run that does not take the hidden state: the quantum copies both rows
+/// before the workspace goes to the next sequence.
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn forced_hidden_rows_are_the_same_alone_and_beside_another_request() {
+    let Some(machine) = machine() else { return };
+    let mut engine = settings(&machine.artifact, 4096);
+    engine.batching.max_sequences = 2;
+    let (_card, runtime) = common::engine(&engine, &machine.library);
+    let tokenizer = tokenizer(&machine.artifact);
+    let document =
+        fs::read_to_string(repository_root().join("rust/resources/bench/chat-corpus-v1-document.md")).unwrap();
+    let document = tokenizer.encode(&document).unwrap();
+    let (prefix, steps) = (96, 24);
+    let first = &document[..prefix];
+    let forced = &document[prefix..prefix + steps];
+
+    let (alone_hidden, alone_rows) = forced_hidden(&runtime, first, forced).wait(WAIT).unwrap();
+    assert_eq!(alone_hidden.len(), steps);
+    assert!(
+        alone_hidden.windows(2).all(|pair| pair[0] != pair[1]),
+        "each step has its own hidden row"
+    );
+    let (plain, _) = run_forced(&runtime, first, forced, 1).unwrap().wait(WAIT).unwrap();
+    assert!(
+        alone_rows == plain,
+        "the logits rows differ when the hidden state is taken"
+    );
+
+    let other = &document[prefix + steps..prefix + steps + prefix];
+    let greedy = submit(
+        &runtime,
+        other,
+        48,
+        &[],
+        Speculation::Off,
+        SamplingConfig::greedy(0),
+        None,
+    )
+    .unwrap();
+    let (beside_hidden, beside_rows) = forced_hidden(&runtime, first, forced).wait(WAIT).unwrap();
+    greedy.wait(WAIT).unwrap();
+    assert!(
+        beside_hidden == alone_hidden,
+        "the hidden rows differ beside another request"
+    );
+    assert!(
+        beside_rows == alone_rows,
+        "the logits rows differ beside another request"
+    );
 }

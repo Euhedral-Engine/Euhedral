@@ -25,11 +25,11 @@ local_path_override(
 # own. The Windows leg of CI runs on GitHub and cannot reach the registry, so the root takes the same source from the
 # commit (a root-only override: a module that takes this one ignores it). The crate_universe below still resolves
 # the RustEE crates of Cargo.lock, but nothing refers to them: the targets use @euhedral_rustee.
-bazel_dep(name = "euhedral_rustee", version = "0.0.0-20261125020612+2d11a4aff406")
+bazel_dep(name = "euhedral_rustee", version = "0.0.0-20261126223154+c10b3c34ba5c")
 git_override(
     module_name = "euhedral_rustee",
     remote = "https://github.com/Euhedral-Engine/RustEE.git",
-    commit = "2d11a4aff406d7aa326f735b97da888d35f29d5f",
+    commit = "c10b3c34ba5c5cd7f7f070111d83071a61a29f75",
 )
 
 bazel_dep(name = "platforms", version = "1.1.0")

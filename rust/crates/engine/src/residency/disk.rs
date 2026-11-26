@@ -15,7 +15,7 @@
 //! once ([`Claimed::Ready`]) and takes no gate.
 //!
 //! **Slots.** Each slot is read one use at a time: its uses wait in a queue, in admission order and, within a quantum, in
-//! use order, which is the order the copies of that slot run. A slot is `Idle`, `Reading`, `Filled` (read, no copy
+//! use order, which is the order the copies of that slot run. A slot is `Idle`, `Reading`, `Filled` (read, or failed, no copy
 //! claimed it yet) or `Claimed` (its copy owns the bytes until [`DiskMessage::SlotFreed`] of the same ticket). A read is never started
 //! into a slot before the previous read of it has arrived, whoever it belonged to: the kernel may still be writing.
 //!
@@ -49,12 +49,13 @@ use std::path::Path;
 #[cfg(test)]
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Single};
 use euhedral_graph::{Gate, StageError};
 use euhedral_inference_cuda::{PinnedBuffer, PinnedRange};
-use euhedral_io::{AsyncIo, IoDoneOwned, IoMemory, OwnedFile};
+use euhedral_inference_settings::{Auto, ByteSize};
+use euhedral_io::{AsyncIo, IoDoneOwned, IoMemory, MAX_PIECE, OwnedFile, ReadOptions};
 
 use crate::frames::{Kind, step};
 use crate::generation::{Address, Mailbox, Spawn, Turn};
@@ -455,11 +456,51 @@ pub struct FilePort {
     io: Arc<AsyncIo>,
     file: Arc<ArtifactFile>,
     window: DiskWindow,
+    /// The options of every read: the ring is the core's, shared, so the piece is set per read and not on the ring.
+    options: ReadOptions,
+}
+
+/// The most bytes one piece of a read of the artifact moves (`memory.disk-read-piece`): from one block to what the ring
+/// allows, a whole number of blocks, so that a direct read's every piece is aligned. A value of this type is valid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskReadPiece(usize);
+
+impl DiskReadPiece {
+    /// The piece the setting `asked` names; `auto` is the most the ring allows, which reads each slot whole.
+    /// Refuses a size that is not a whole number of blocks, or above the ring's limit, naming the value and the limit.
+    pub fn from_setting(asked: Auto<ByteSize>) -> Result<DiskReadPiece, String> {
+        let Some(asked) = asked.into_value() else {
+            return Ok(DiskReadPiece(MAX_PIECE));
+        };
+        let bytes = asked.bytes();
+        let block = HOST_ALIGNMENT;
+        if bytes == 0 || bytes > MAX_PIECE as u64 || !bytes.is_multiple_of(block) {
+            return Err(format!(
+                "memory.disk-read-piece is {bytes} bytes: it must be a multiple of {block} bytes, from {block} to {MAX_PIECE}"
+            ));
+        }
+        Ok(DiskReadPiece(bytes as usize))
+    }
+
+    /// The bytes of one piece.
+    pub fn bytes(self) -> usize {
+        self.0
+    }
+
+    /// The options of a read in pieces of this size.
+    fn options(self) -> ReadOptions {
+        ReadOptions::with_piece(self.0)
+    }
 }
 
 impl FilePort {
-    pub fn new(io: Arc<AsyncIo>, file: Arc<ArtifactFile>, window: DiskWindow) -> FilePort {
-        FilePort { io, file, window }
+    pub fn new(io: Arc<AsyncIo>, file: Arc<ArtifactFile>, window: DiskWindow, piece: DiskReadPiece) -> FilePort {
+        FilePort {
+            io,
+            file,
+            window,
+            options: piece.options(),
+        }
     }
 
     /// The window, for the copies that read from it.
@@ -488,7 +529,8 @@ impl ReadPort for FilePort {
                 done(result);
             })
         });
-        self.io.read_into(raw_file(handle), spec.offset, memory, then)
+        self.io
+            .read_into_with(raw_file(handle), spec.offset, memory, self.options, then)
     }
 
     fn has_direct(&self) -> bool {
@@ -519,6 +561,11 @@ pub enum DiskMessage {
     },
     /// The quantum ended before its device work consumed all its uses.
     Abandon { ticket: u64 },
+    /// `ticket` ends when `kill` is set: a later [`DiskMessage::Killed`] of the same flag abandons it. Forgotten once
+    /// nothing else holds the flag.
+    Watch { ticket: u64, kill: Arc<AtomicBool> },
+    /// `kill` was set: the tickets watching it are abandoned.
+    Killed { kill: Arc<AtomicBool> },
     /// A read of `slot` ended.
     Arrived {
         slot: usize,
@@ -536,6 +583,8 @@ impl fmt::Debug for DiskMessage {
         match self {
             DiskMessage::Enqueue { ticket, uses, .. } => write!(formatter, "Enqueue({ticket}, {} uses)", uses.len()),
             DiskMessage::Abandon { ticket } => write!(formatter, "Abandon({ticket})"),
+            DiskMessage::Watch { ticket, .. } => write!(formatter, "Watch({ticket})"),
+            DiskMessage::Killed { .. } => write!(formatter, "Killed"),
             DiskMessage::Arrived { slot, ticket, .. } => write!(formatter, "Arrived({slot}, {ticket})"),
             DiskMessage::SlotFreed { slot, ticket } => write!(formatter, "SlotFreed({slot}, {ticket})"),
             DiskMessage::Close { .. } => write!(formatter, "Close"),
@@ -582,9 +631,11 @@ enum State {
         direct: bool,
         discard: bool,
     },
-    /// Read, and no copy has claimed it.
+    /// Read, and no copy has claimed it. `failure` is why the read failed: the claim of the copy fails with it, so no
+    /// copy is ever handed a slot whose bytes are wrong, however it races the quantum being told.
     Filled {
         ticket: u64,
+        failure: Option<String>,
     },
     /// The copy of `ticket` owns the bytes until it frees the slot.
     Claimed {
@@ -615,6 +666,8 @@ pub(crate) struct DiskOwner {
     closed: bool,
     closed_signals: Vec<Arc<Handoff<()>>>,
     told: Vec<Finished>,
+    /// The tickets that end when their kill flag is set.
+    watching: Vec<(u64, Arc<AtomicBool>)>,
 }
 
 fn abandoned_error() -> StageError {
@@ -634,6 +687,24 @@ impl DiskOwner {
         match message {
             DiskMessage::Enqueue { ticket, uses, fail } => self.enqueue(ticket, uses, fail),
             DiskMessage::Abandon { ticket } => self.abandon(ticket),
+            DiskMessage::Watch { ticket, kill } => {
+                // A flag nothing else holds can no longer be set.
+                self.watching.retain(|(_, flag)| Arc::strong_count(flag) > 1);
+                if kill.load(Ordering::Acquire) {
+                    self.abandon(ticket);
+                } else {
+                    self.watching.push((ticket, kill));
+                }
+            }
+            DiskMessage::Killed { kill } => {
+                let (killed, kept): (Vec<_>, Vec<_>) = mem::take(&mut self.watching)
+                    .into_iter()
+                    .partition(|(_, flag)| Arc::ptr_eq(flag, &kill));
+                self.watching = kept;
+                for (ticket, _) in killed {
+                    self.abandon(ticket);
+                }
+            }
             DiskMessage::Arrived { slot, ticket, result } => self.arrive(slot, ticket, result),
             DiskMessage::SlotFreed { slot, ticket } => {
                 if let Some(state) = self.slots.get_mut(slot).map(|slot| &mut slot.state)
@@ -672,7 +743,7 @@ impl DiskOwner {
             slot.queue.iter().any(|pending| pending.ticket == ticket)
                 || slot.claims.iter().any(|(claimed, _)| *claimed == ticket)
                 || matches!(&slot.state, State::Reading { pending, .. } if pending.ticket == ticket)
-                || matches!(&slot.state, State::Filled { ticket: filled } if *filled == ticket)
+                || matches!(&slot.state, State::Filled { ticket: filled, .. } if *filled == ticket)
         });
         // A ticket the owner has never heard of is either to come (remembered) or over (nothing to do): tickets grow,
         // so one below every ticket posted that is not here is over. Remembering it too costs one entry, pruned by the
@@ -694,7 +765,7 @@ impl DiskOwner {
             slot.claims = kept;
             match &mut slot.state {
                 State::Reading { pending, discard, .. } if pending.ticket == ticket => *discard = true,
-                State::Filled { ticket: filled } if *filled == ticket => slot.state = State::Idle,
+                State::Filled { ticket: filled, .. } if *filled == ticket => slot.state = State::Idle,
                 _ => {}
             }
         }
@@ -779,21 +850,25 @@ impl DiskOwner {
             self.launch(slot, pending, false);
             return;
         }
-        if let Err(failed) = result {
+        let failure = result.err().map(|failed| {
             let why = format!("reading '{}' from the artifact failed: {failed}", pending.use_.name);
             log::error!("{why}");
-            self.told.push(Finished::Fail(Arc::clone(&pending.fail), why));
-        }
+            self.told.push(Finished::Fail(Arc::clone(&pending.fail), why.clone()));
+            why
+        });
         let state = &mut self.slots[slot];
         match state.claims.front() {
             Some((claimed, _)) if *claimed == ticket => {
                 state.state = State::Claimed { ticket };
                 if let Some((_, gate)) = state.claims.pop_front() {
-                    self.told.push(Finished::Release(gate));
+                    self.told.push(match failure {
+                        Some(why) => Finished::FailGate(gate, StageError::Fatal(why)),
+                        None => Finished::Release(gate),
+                    });
                 }
             }
             // No copy of this read has claimed it yet (a copy waiting is another quantum's, and ordered after).
-            _ => state.state = State::Filled { ticket },
+            _ => state.state = State::Filled { ticket, failure },
         }
     }
 
@@ -808,9 +883,16 @@ impl DiskOwner {
                 "a copy claimed an unknown window slot {slot}"
             )));
         };
-        if matches!(state.state, State::Filled { ticket: filled } if filled == ticket) {
+        if let State::Filled {
+            ticket: filled,
+            failure,
+        } = &mut state.state
+            && *filled == ticket
+        {
+            let failure = failure.take();
+            // The copy owns the slot either way: a failed one hands it back when its quantum ends.
             state.state = State::Claimed { ticket };
-            return Ok(true);
+            return failure.map_or(Ok(true), |why| Err(StageError::Fatal(why)));
         }
         let held = state.queue.iter().any(|pending| pending.ticket == ticket)
             || matches!(&state.state, State::Reading { pending, discard: false, .. } if pending.ticket == ticket);
@@ -978,6 +1060,7 @@ impl DiskReader {
             closed: false,
             closed_signals: Vec::new(),
             told: Vec::new(),
+            watching: Vec::new(),
         };
         let mailbox = Arc::new(Mailbox::new(owner, producer, spawn));
         address.set(&mailbox);
@@ -1019,6 +1102,18 @@ impl DiskReader {
     /// `ticket` stopped before its device work consumed all its uses. At any time, before or after its uses were posted.
     pub fn abandon(&self, ticket: u64) {
         self.mailbox.post(DiskMessage::Abandon { ticket });
+    }
+
+    /// `ticket` ends when `kill` is set (see [`DiskReader::killed`]). Posted with its uses, so a flag set before the
+    /// quantum started abandons it at once.
+    pub fn watch(&self, ticket: u64, kill: Arc<AtomicBool>) {
+        self.mailbox.post(DiskMessage::Watch { ticket, kill });
+    }
+
+    /// `kill` was set: every ticket watching it is abandoned, so a copy waiting for a read of its own gives its gate up
+    /// and its quantum can end. Called by whoever sets the flag, after setting it.
+    pub fn killed(&self, kill: &Arc<AtomicBool>) {
+        self.mailbox.post(DiskMessage::Killed { kill: Arc::clone(kill) });
     }
 
     /// The copy of `ticket` that consumed `slot` ended (its marker completed): the slot may be read into again. A free

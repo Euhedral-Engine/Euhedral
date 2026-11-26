@@ -118,12 +118,9 @@ impl Rig {
         buffer
     }
 
-    /// Replaces the start of `buffer` with `bytes`, and returns once the bytes are on the device. The host copy runs on
-    /// the legacy stream and may return before its transfer has finished, and that stream does not order against the
-    /// lane: without the wait, lane work queued next can read the old bytes.
+    /// Replaces the start of `buffer` with `bytes`; the bytes are on the device when it returns.
     pub fn overwrite(&self, buffer: &DeviceBuffer, bytes: &[u8]) {
         buffer.copy_from_host(0, bytes).expect("upload");
-        self.library.synchronize().expect("the transfer finishes");
     }
 
     pub fn download(&self, buffer: &DeviceBuffer, bytes: usize) -> Vec<u8> {

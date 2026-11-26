@@ -20,6 +20,7 @@ use super::buffers::Access;
 use super::views::Variant;
 use crate::formats::{LinearFormat, TokenEmbedding};
 use crate::model::{LayerIndex, LayerKind, ModelConfig, MtpRole, NormKind, Role, WeightRef, Weights};
+use crate::residency::disk::DiskUse;
 use crate::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
 use crate::stages::elementwise::{ResidualAdd, Swiglu};
 use crate::stages::embed::Embed;
@@ -28,7 +29,7 @@ use crate::stages::linear::{Linear, LinearRows};
 use crate::stages::mtp::MtpStem;
 use crate::stages::norm::{NormRows, ResidualRmsNorm, RmsNormUnitOffset};
 use crate::stages::sampling::{Argmax, CopyRows, SelectedRows, SelectedToken};
-use crate::stages::transfer::WeightTransfer;
+use crate::stages::transfer::{DiskTier, DiskTransfer, WeightTransfer};
 use crate::stages::{Launch, Quantum, StageLaunch};
 use crate::workspace::BufferSlot::{
     self, AttentionContext, AttentionQkNormalized, FfnDelta, FinalHiddenState, FinalNormalized, GateUp, GdnAlpha,
@@ -251,6 +252,15 @@ pub(crate) enum Make {
         slot: usize,
         destination: DevicePtr,
     },
+    /// The copy of the weight a disk read left in `use_`'s window slot into the staging slot `slot`, at
+    /// `destination`; the `use_index`th disk use of the view.
+    DiskTransfer {
+        tier: Arc<DiskTier>,
+        use_: DiskUse,
+        use_index: usize,
+        slot: usize,
+        destination: DevicePtr,
+    },
 }
 
 impl Make {
@@ -275,7 +285,7 @@ impl Make {
             Make::CopyRows => StageKind::CopyRows,
             Make::SelectedToken => StageKind::SelectedToken,
             Make::Staged { inner, .. } => inner.kind(),
-            Make::Transfer { .. } => StageKind::WeightTransfer,
+            Make::Transfer { .. } | Make::DiskTransfer { .. } => StageKind::WeightTransfer,
         }
     }
 
@@ -303,7 +313,8 @@ impl Make {
             | Make::Argmax { .. }
             | Make::CopyRows
             | Make::SelectedToken
-            | Make::Transfer { .. } => Vec::new(),
+            | Make::Transfer { .. }
+            | Make::DiskTransfer { .. } => Vec::new(),
         }
     }
 
@@ -337,7 +348,7 @@ impl Make {
             Make::Swiglu => (vec![GateUp], vec![SwigluSlot]),
             Make::MtpStem { .. } => (vec![HiddenState], vec![MtpNormed, MtpPacked]),
             Make::Argmax { .. } => (vec![Logits], vec![]),
-            Make::CopyRows => (vec![Logits], vec![]),
+            Make::CopyRows => (vec![Logits, FinalHiddenState], vec![]),
             Make::SelectedToken => (vec![], vec![]),
             Make::Staged { slot, inner } => {
                 return Access {
@@ -345,7 +356,7 @@ impl Make {
                     ..inner.access()
                 };
             }
-            Make::Transfer { slot, .. } => {
+            Make::Transfer { slot, .. } | Make::DiskTransfer { slot, .. } => {
                 return Access {
                     slot_write: Some(*slot),
                     ..Access::default()
@@ -487,10 +498,25 @@ impl Make {
                 } else {
                     SelectedRows::Last
                 };
-                entry(self.kind(), CopyRows::new(Logits, rows))
+                entry(self.kind(), CopyRows::new(Logits, FinalHiddenState, rows))
             }
             Make::SelectedToken => entry(self.kind(), SelectedToken),
             Make::Staged { inner, .. } => inner.stage(variant, formats)?,
+            Make::DiskTransfer {
+                tier,
+                use_,
+                use_index,
+                destination,
+                ..
+            } => {
+                let stage = Arc::new(DiskTransfer::new(Arc::clone(&tier), &use_, use_index, destination));
+                Entry {
+                    kind: self.kind(),
+                    stage: Arc::clone(&stage) as Arc<dyn Stage<Quantum>>,
+                    launch: stage as Arc<dyn StageLaunch>,
+                    own_stage: true,
+                }
+            }
             Make::Transfer {
                 name,
                 source,
@@ -512,6 +538,8 @@ pub struct Entry {
     pub kind: StageKind,
     pub stage: Arc<dyn Stage<Quantum>>,
     pub launch: Arc<dyn StageLaunch>,
+    /// Whether `stage` does more than run the launch (a stage with a gate of its own), so the plan keeps it.
+    pub own_stage: bool,
 }
 
 impl fmt::Debug for Entry {
@@ -532,6 +560,7 @@ where
         kind,
         stage: Arc::clone(&stage) as Arc<dyn Stage<Quantum>>,
         launch: stage as Arc<dyn StageLaunch>,
+        own_stage: false,
     }
 }
 

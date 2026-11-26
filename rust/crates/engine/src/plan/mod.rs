@@ -26,7 +26,9 @@ use thiserror::Error;
 use crate::model::Speculation;
 use crate::model::{LayerIndex, LayerKind, ModelConfig, Residence, Role, WeightRef};
 use crate::quantum::home::lane_for;
+use crate::residency::disk::DiskUse;
 use crate::residency::planner::ResidencyPlan;
+use crate::stages::transfer::DiskTier;
 use crate::stages::{Chain, Placed, Quantum};
 use buffers::Access;
 pub use builder::{Entry, Formats, StageKind, WeightLookup};
@@ -67,8 +69,12 @@ pub enum PlanBuildError {
     WeightTooLarge { name: String, bytes: u64, slot_bytes: u64 },
     #[error("{name} is held in host memory but no stage of the plan can read it from a staging slot")]
     NotStageable { name: String },
-    #[error("{name} is held on disk, which no plan stages yet")]
-    OnDisk { name: String },
+    #[error("{name} is held on disk and the plan was given no disk window")]
+    NoDiskWindow { name: String },
+    #[error("the disk window has {window} slots, which is not a whole multiple of the {staging} staging slots")]
+    WindowSlots { window: usize, staging: usize },
+    #[error("{name} is read through {bytes} bytes of the disk window and a window slot holds {slot_bytes}")]
+    ReadTooLarge { name: String, bytes: u64, slot_bytes: u64 },
     #[error("the plan stages weights and was given no transfer lane")]
     NoTransferLane,
     #[error(transparent)]
@@ -108,6 +114,8 @@ struct VariantPlan {
     slot_readers: Vec<Option<StageId>>,
     /// For each staging slot that is read, its first transfer's unit.
     first_transfers: Vec<(usize, StageId)>,
+    /// The disk reads of the view, in the order its copies consume them.
+    disk_uses: Arc<[DiskUse]>,
 }
 
 /// The stages of a view that are not transfers, and the edges between them.
@@ -123,6 +131,8 @@ pub struct Plan {
     variants: Vec<Option<VariantPlan>>,
     lanes: usize,
     draft_depth: usize,
+    /// The disk tier the plan's views read through, when any of them reads a weight from disk.
+    disk: Option<Arc<DiskTier>>,
 }
 
 impl fmt::Debug for Plan {
@@ -151,6 +161,22 @@ impl Plan {
         staging: Option<&StagingRing>,
         transfer_lane: Option<LaneId>,
     ) -> Result<Plan, PlanBuildError> {
+        Self::build_tiered(config, weights, residency, formats, staging, transfer_lane, None)
+    }
+
+    /// [`Plan::build`] over weights that may also be on disk: with a `disk` tier, a weight whose [`Residence`] is disk is
+    /// read through the tier's window into a slot of the ring, and a transfer of its own copies it from there. The use
+    /// `u` of a ring slot `s` reads the window slot `s + slots * (k mod (window / slots))`, `k` counting the disk uses
+    /// of `s` before it in the view, so the read of the next use of a slot runs while the copy of the last one does.
+    pub fn build_tiered<W: WeightLookup + ?Sized>(
+        config: &Arc<ModelConfig>,
+        weights: &W,
+        residency: &ResidencyPlan,
+        formats: &Formats,
+        staging: Option<&StagingRing>,
+        transfer_lane: Option<LaneId>,
+        disk: Option<&Arc<DiskTier>>,
+    ) -> Result<Plan, PlanBuildError> {
         if config.layer_kinds.len() != config.num_hidden_layers {
             return Err(PlanBuildError::Geometry(format!(
                 "{} layer kinds for {} layers",
@@ -167,7 +193,7 @@ impl Plan {
             return Err(PlanBuildError::NoStagingRing { name });
         }
         if let Some(ring) = staging
-            && let Some(staged) = staging::staged(&base, weights.host_arena().as_ref(), ring)?
+            && let Some(staged) = staging::staged(&base, weights.host_arena().as_ref(), ring, disk)?
         {
             if transfer_lane.is_none() {
                 return Err(PlanBuildError::NoTransferLane);
@@ -209,11 +235,13 @@ impl Plan {
         for plan in variants.iter_mut().flatten() {
             plan.place()?;
         }
+        let variants_read_disk = variants.iter().flatten().any(|plan| !plan.disk_uses.is_empty());
         Ok(Plan {
             config: Arc::clone(config),
             variants,
             lanes,
             draft_depth: if drafts { residency.draft_depth } else { 0 },
+            disk: disk.filter(|_| variants_read_disk).cloned(),
         })
     }
 
@@ -443,6 +471,17 @@ impl Plan {
             .map_or(&[], |plan| plan.first_transfers.as_slice())
     }
 
+    /// The disk reads of `view`, in the order its copies consume them: what a quantum of the view registers with the
+    /// disk reader as it starts. Empty for a view that reads nothing from disk.
+    pub fn disk_uses(&self, view: View) -> &[DiskUse] {
+        self.variant(view.variant()).map_or(&[], |plan| &plan.disk_uses)
+    }
+
+    /// The disk tier the plan's views read through; `None` when none of them reads from disk.
+    pub fn disk_tier(&self) -> Option<&Arc<DiskTier>> {
+        self.disk.as_ref()
+    }
+
     /// The rows a verification covers at most: one more than the drafts, as a view captured into graphs.
     pub fn verified_rows(&self) -> usize {
         1 + self.draft_depth
@@ -479,6 +518,13 @@ impl VariantPlan {
         let transfers: Vec<bool> = nodes
             .iter()
             .map(|node| node.make.kind() == StageKind::WeightTransfer)
+            .collect();
+        let disk_uses: Arc<[DiskUse]> = nodes
+            .iter()
+            .filter_map(|node| match &node.make {
+                Make::DiskTransfer { use_, .. } => Some(use_.clone()),
+                _ => None,
+            })
             .collect();
         // Lanes and width come from the stages that are not transfers, ordered as they are with none: a transfer
         // runs on its own lane and must not change where the rest run.
@@ -529,6 +575,7 @@ impl VariantPlan {
             compute,
             slot_readers: Vec::new(),
             first_transfers: Vec::new(),
+            disk_uses,
         })
     }
 
@@ -537,7 +584,7 @@ impl VariantPlan {
         let count = self.entries.len();
         let compute_edges = self.compute.as_ref().map_or(&self.edges, |compute| &compute.edges);
         let path = placement::path_predecessors(compute_edges);
-        for entry in &mut self.entries {
+        for entry in self.entries.iter_mut().filter(|entry| !entry.own_stage) {
             entry.stage = Arc::new(Placed::new(Arc::clone(&entry.launch)));
         }
         // Each chain of lane continuations has one lane offset, fixed here, so the one lane a stage is allowed is the
@@ -581,6 +628,12 @@ impl VariantPlan {
             ends[node] = true;
         }
         self.units = placement::fused_units(&self.edges, &lane_keys, &ends);
+        debug_assert!(
+            self.units
+                .iter()
+                .all(|unit| unit.len() == 1 || unit.iter().all(|&node| !self.entries[node].own_stage)),
+            "a stage with a gate of its own runs alone in its unit"
+        );
         let mut unit_of = vec![0usize; count];
         for (unit, nodes) in self.units.iter().enumerate() {
             for &node in nodes {
@@ -636,7 +689,9 @@ impl VariantPlan {
                 Make::Staged { slot, .. } => {
                     readers[*slot] = Some(unit(index));
                 }
-                Make::Transfer { slot, .. } if !first.iter().any(|(seen, _)| seen == slot) => {
+                Make::Transfer { slot, .. } | Make::DiskTransfer { slot, .. }
+                    if !first.iter().any(|(seen, _)| seen == slot) =>
+                {
                     first.push((*slot, unit(index)));
                 }
                 _ => {}

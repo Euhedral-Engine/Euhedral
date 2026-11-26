@@ -313,6 +313,14 @@ fn disk_window_slots_parse_and_refuse_zero() {
 }
 
 #[test]
+fn disk_read_piece_parses_and_refuses_zero() {
+    assert_eq!(load(MODEL).unwrap().memory.disk_read_piece, Auto::Auto);
+    let stated = load(&format!("{MODEL}memory:\n  disk-read-piece: 8MiB\n")).unwrap();
+    assert_eq!(stated.memory.disk_read_piece, Auto::Value(ByteSize::mib(8)));
+    assert!(problems(&format!("{MODEL}memory:\n  disk-read-piece: 0\n"))[0].contains("memory.disk-read-piece"));
+}
+
+#[test]
 fn the_dispatch_kernel_settings_default_to_auto_and_parse() {
     use euhedral_inference_settings::{Auto, FusedVerifyFrom};
     let defaults = load(MODEL).unwrap().kernels;

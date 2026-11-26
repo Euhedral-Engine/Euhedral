@@ -41,8 +41,13 @@ window, first token found to last token found: `decodeSampledTokens / (timeToLas
 engine's own `decodeTokensPerSecond` is not used. There is no end-to-end column: Java's end-to-end includes a commit-only
 quantum that the Rust engine does not run.
 
+Every fork must yield at least one measured pair: a fork with none is reported as "no pair was compared" and is not a pass.
+Each library path a configuration names (`cudaLibrary`) must exist before any arm runs; a relative path is read from the
+repository root, where the arms run.
+
 Exit code: 0 when every row of both arms succeeded and every comparison is identical, 1 when a row failed or something
-differs or is missing, 2 when an arm could not run or the arguments are wrong.
+differs or is missing (including a fork with no measured pair), 2 when an arm could not run, a library is missing or the
+arguments are wrong.
 """
 from __future__ import annotations
 
@@ -65,6 +70,7 @@ ARMS = ("java", "rust")
 
 JAVA_START_SCRIPT = REPO / "benchmark" / "build" / "install" / "euhedral-inference-benchmark" / "bin" / "euhedral-inference-benchmark"
 DEFAULT_KV_DEVICE_MINIMUM_TOKENS = 65536
+LIBRARY_KEYS = ("cudaLibrary",)  # the library paths a benchmark configuration names
 
 
 def derived_config(path: Path, arm: str, output: Path, speculation: str) -> dict:
@@ -125,6 +131,13 @@ def scoped(command: list[str], launcher: str, memory_max: str, timeout: str, est
         launcher, "--system", "--mem", memory_max,
         "--est", str(est_seconds), "--who", who, "--", "timeout", timeout, *command,
     ]
+
+
+def missing_libraries(config: Path) -> list[str]:
+    """The library paths the configuration names that are not files."""
+    values = json.loads(config.read_text())
+    named = [values[key] for key in LIBRARY_KEYS if key in values]
+    return [value for value in named if not (REPO / value).is_file()]
 
 
 def memory_bytes(text: str) -> int:
@@ -233,12 +246,14 @@ def report(out_dir: Path, forks: int, failed_arms: set[tuple[str, int]]) -> int:
     )
     counts: dict[str, dict[str, int]] = {"prompt": {}, "output": {}, "drafts": {}}
     pairs = 0
+    pairs_per_fork = {fork: 0 for fork in range(1, forks + 1)}
     for fork in range(1, forks + 1):
         by_key = {arm: {(r["scenario"]["name"], r["iteration"]): r for r in rows[arm][fork]} for arm in ARMS}
         for key in sorted(set(by_key["java"]) | set(by_key["rust"])):
             java, rust = by_key["java"].get(key), by_key["rust"].get(key)
             prompt, output, drafts, verdict = compare(java, rust)
             pairs += 1
+            pairs_per_fork[fork] += 1
             for name, value in (("prompt", prompt), ("output", output), ("drafts", drafts)):
                 counts[name][value] = counts[name].get(value, 0) + 1
             statuses = "/".join((r["status"] if r else "absent") for r in (java, rust))
@@ -253,6 +268,12 @@ def report(out_dir: Path, forks: int, failed_arms: set[tuple[str, int]]) -> int:
         f"{pairs} pairs; prompts {counts['prompt']}; outputs {counts['output']} ('no output' is not an output pass); "
         f"drafts {counts['drafts']}"
     )
+    if pairs == 0:
+        lines.append("no pair was compared: nothing was checked, so the run is not a pass")
+    for fork, measured in pairs_per_fork.items():
+        if measured == 0:
+            lines.append(f"fork {fork}: no pair was compared; the fork is not a pass")
+            worst = 1
 
     lines.append("")
     lines.append("absolute figures over the successful measured rows; decode tok/s is first token to last token for both")
@@ -320,6 +341,10 @@ def main() -> int:
     if not args.dry_run and shutil.which(args.launcher) is None:
         parser.error(f"the system launcher {args.launcher!r} is not found: give its path with --launcher")
 
+    for arm, config in (("java", args.java_config), ("rust", args.rust_config)):
+        for library in missing_libraries(config):
+            print(f"{arm} configuration {config} names a library that does not exist: {library}", file=sys.stderr)
+            return 2
     out_dir = (args.out_dir or REPO / "benchmark-results" / time.strftime("rust-gate-%Y%m%dT%H%M%S")).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.dry_run:

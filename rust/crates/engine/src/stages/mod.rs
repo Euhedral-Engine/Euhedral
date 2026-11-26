@@ -791,6 +791,9 @@ pub struct Quantum {
     /// Set by the executor when the quantum runs as one body of the graph cache: its key, what its run holds, and how
     /// it ran.
     pub(crate) capture: Option<Capture>,
+    /// What the quantum owes the disk reader, set by the executor as the quantum starts when its view reads weights
+    /// from disk.
+    pub(crate) disk: Option<Arc<transfer::DiskLedger>>,
 }
 
 /// The next quantum's id.
@@ -878,6 +881,7 @@ impl Quantum {
             uploaded: false,
             prepared: None,
             capture: None,
+            disk: None,
         })
     }
 
@@ -964,6 +968,7 @@ impl Quantum {
             uploaded: false,
             prepared: None,
             capture: None,
+            disk: None,
         })
     }
 

@@ -12,6 +12,7 @@
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -98,6 +99,63 @@ pub fn drive<T: Send + 'static>(
             frame.do_finally();
         }
     }
+}
+
+/// Starts the call `start` on an `AsyncIo` driven by hand, once for each of its steps, and in each run drops that
+/// step's frame unrun, as an engine that is closing does. Every run must end its call exactly once, with
+/// `CheckpointError::LakeClosed`; the first run that drops nothing (the call has fewer steps) must end once with
+/// success. Returns the number of steps the call has.
+pub fn every_step_dropped_unrun<T: Send + 'static>(
+    start: impl Fn(&Arc<AsyncIo>, Done<T>) -> Result<(), CheckpointError>,
+) -> usize {
+    let closed = CheckpointError::LakeClosed.to_string();
+    for dropped in 0.. {
+        let io = AsyncIo::open().unwrap();
+        let ended: Arc<Handoff<Result<(), String>>> = Handoff::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (sink, counted) = (Arc::clone(&ended), Arc::clone(&calls));
+        let done: Done<T> = Arc::new(move |result| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            sink.send(result.map(|_| ()).map_err(|error| error.to_string()));
+        });
+        start(&io, done).unwrap();
+        let begun = Instant::now();
+        let mut seen = 0;
+        let result = loop {
+            if let Some(result) = ended.take() {
+                break result;
+            }
+            assert!(
+                begun.elapsed() < LONGEST,
+                "the call never ended after step {dropped} was dropped unrun"
+            );
+            io.reap();
+            let mut frames = Vec::new();
+            io.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+            for mut frame in frames {
+                seen += 1;
+                if seen - 1 == dropped {
+                    drop(frame);
+                    continue;
+                }
+                let _ = frame.execute();
+                frame.do_finally();
+            }
+        };
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "step {dropped} dropped unrun: the call ends once"
+        );
+        if seen <= dropped {
+            assert_eq!(result, Ok(()), "a call with {seen} steps ends with its result");
+            io.complete();
+            return dropped;
+        }
+        assert_eq!(result, Err(closed.clone()), "step {dropped} dropped unrun");
+        io.complete();
+    }
+    unreachable!("the loop ends when a call has fewer steps than the one dropped")
 }
 
 /// A lattice that drives an `AsyncIo`, and a lake on it: what the calls that run durability steps need.

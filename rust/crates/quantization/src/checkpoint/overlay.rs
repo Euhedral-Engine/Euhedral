@@ -23,7 +23,7 @@ use euhedral_inference_engine::Handoff;
 use euhedral_io::AsyncIo;
 use serde_json::Value;
 
-use super::io::read_file;
+use super::io::{Closing, read_file};
 use super::writer::{SafetensorsWriter, bytes_source, write_file};
 use super::{CheckpointError, Done};
 use crate::step::{Kind, step};
@@ -42,7 +42,7 @@ struct Overlaying {
     tensors: BTreeMap<String, Vec<f32>>,
     /// The name of the shard of the replacements; known once the source's index was read.
     shard: String,
-    then: Done<()>,
+    then: Closing<()>,
 }
 
 /// Makes `target` read as `source` with `tensors` (name to values, stored as BF16) replacing the source's tensors of
@@ -70,10 +70,11 @@ pub fn write(
         target: target.to_path_buf(),
         tensors,
         shard: SHARD.to_owned(),
-        then: Arc::clone(&then),
+        then: Closing::new(then),
     };
     let cell = Handoff::new();
     cell.send(overlaying);
+    let held = Arc::clone(&cell);
     read_file(
         io,
         &source.join(INDEX),
@@ -82,10 +83,16 @@ pub fn write(
             let mut overlaying = overlaying;
             match index.and_then(|bytes| overlaying.reindexed(&bytes)) {
                 Ok(index) => overlaying.link(index),
-                Err(error) => (overlaying.then)(Err(error)),
+                Err(error) => overlaying.then.end(Err(error)),
             }
         }),
     )
+    .inspect_err(|_| {
+        // Nothing started: the refusal is the caller's, and the continuation is not called.
+        if let Some(overlaying) = held.take() {
+            drop(overlaying.then.release());
+        }
+    })
 }
 
 impl Overlaying {
@@ -118,7 +125,6 @@ impl Overlaying {
 
     /// Links the source's files into the target, on the host lake, then writes the shard.
     fn link(self, index: Vec<u8>) {
-        let then = Arc::clone(&self.then);
         let host = Arc::clone(&self.host);
         let cell = Handoff::new();
         cell.send((self, index));
@@ -127,12 +133,14 @@ impl Overlaying {
             let Some((overlaying, index)) = held.take() else { return };
             match link_files(&overlaying.source, &overlaying.target, &overlaying.shard) {
                 Ok(()) => overlaying.shard(index),
-                Err(error) => (overlaying.then)(Err(error)),
+                Err(error) => overlaying.then.end(Err(error)),
             }
         });
-        if host.offer(frame).is_err() {
-            drop(cell.take());
-            then(Err(CheckpointError::LakeClosed));
+        // A frame that is accepted and later discarded unrun drops the overlay with it, and the drop ends the call.
+        if host.offer(frame).is_err()
+            && let Some((overlaying, _)) = cell.take()
+        {
+            overlaying.then.end(Err(CheckpointError::LakeClosed));
         }
     }
 
@@ -147,6 +155,7 @@ impl Overlaying {
             then,
             ..
         } = self;
+        let Some(then) = then.release() else { return };
         let mut writer = SafetensorsWriter::new(&target.join(&shard));
         for (name, values) in &tensors {
             if let Err(error) = writer.add(name, "BF16", &[values.len() as u64], bf16_bytes(values)) {

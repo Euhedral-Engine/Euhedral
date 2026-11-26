@@ -52,10 +52,12 @@ pub use input_record::{
 
 use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
 use crate::prefix::{Copier, CopyJob};
+use crate::residency::disk::DiskUse;
 use crate::stages::DraftSeed;
 use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};
 use crate::stages::sampling::SelectedRows;
+use crate::stages::transfer::{DiskLedger, DiskTier};
 use crate::stages::{LaneTable, QuantumError, QuantumKind, StageLaunch, fatal};
 use crate::state::SequenceId;
 use crate::workspace::BufferSlot;
@@ -383,6 +385,118 @@ fn keyed_host_pages(source: Option<KvSource>, base: u64, mtp: u64) -> [u64; 2] {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "the fake port's reads are shared between the test and the closures the reader is given"
+)]
+mod disk_reads_tests {
+    use std::io;
+    use std::sync::Mutex;
+
+    use euhedral_graph::Completions;
+
+    use super::*;
+    use crate::residency::disk::{DiskReader, ReadDone, ReadPort, ReadSpec};
+    use crate::residency::offload::WindowGeometry;
+
+    /// A port that records the offsets of the reads started and ends them when told.
+    #[derive(Default)]
+    struct Started(Mutex<Vec<u64>>, Mutex<Vec<ReadDone>>);
+
+    impl Started {
+        fn end_oldest(&self, bytes: usize) {
+            let done = self.1.lock().unwrap().remove(0);
+            done(Ok(bytes));
+        }
+    }
+
+    impl ReadPort for Arc<Started> {
+        fn start(&self, spec: ReadSpec, done: ReadDone) -> io::Result<()> {
+            self.0.lock().unwrap().push(spec.offset);
+            self.1.lock().unwrap().push(done);
+            Ok(())
+        }
+        fn has_direct(&self) -> bool {
+            false
+        }
+        fn file_len(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    fn tier() -> (Arc<DiskTier>, Arc<Started>) {
+        let geometry = WindowGeometry {
+            slots: 1,
+            slot_bytes: 4096,
+        };
+        let port = Arc::new(Started::default());
+        let reader = DiskReader::new(
+            Arc::new(Arc::clone(&port)),
+            geometry,
+            Box::new(|work| {
+                work();
+                true
+            }),
+        );
+        (DiskTier::detached(reader, geometry, Completions::without_lanes()), port)
+    }
+
+    fn use_at(file_offset: u64) -> DiskUse {
+        DiskUse {
+            name: format!("w@{file_offset}"),
+            file_offset,
+            bytes: 100,
+            slot: 0,
+        }
+    }
+
+    fn kill() -> Arc<AtomicBool> {
+        Arc::default()
+    }
+
+    #[test]
+    fn a_view_with_no_disk_use_or_a_plan_with_no_tier_registers_nothing() {
+        let (tier, port) = tier();
+        assert!(register_reads(Some(&tier), &[], &kill()).unwrap().is_none());
+        assert!(register_reads(None, &[use_at(0x1000)], &kill()).unwrap().is_none());
+        assert!(port.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn quanta_register_their_reads_in_the_order_they_start() {
+        let (tier, port) = tier();
+        let first = register_reads(Some(&tier), &[use_at(0x1000)], &kill())
+            .unwrap()
+            .unwrap();
+        let second = register_reads(Some(&tier), &[use_at(0x2000)], &kill())
+            .unwrap()
+            .unwrap();
+        assert_eq!((first.1.ticket(), second.1.ticket()), (0, 1));
+        assert_eq!(*port.0.lock().unwrap(), [0x1000], "the second waits for the slot");
+    }
+
+    #[test]
+    fn a_quantum_refused_after_its_reads_registered_ends_them_and_one_started_keeps_them() {
+        let (tier, port) = tier();
+        let refused = register_reads(Some(&tier), &[use_at(0x1000)], &kill()).unwrap();
+        let waiting = register_reads(Some(&tier), &[use_at(0x2000)], &kill()).unwrap();
+        let started: Result<(), StartError> = Ok(());
+        end_reads_if_refused(&waiting, &started);
+        end_reads_if_refused(&None, &Err::<(), _>(StartError::Closed));
+        port.end_oldest(100);
+        assert_eq!(
+            *port.0.lock().unwrap(),
+            [0x1000],
+            "the first quantum's bytes still wait for its copy"
+        );
+        // Refused, the first quantum reads no more: its slot is free again once its read has ended.
+        let failed: Result<(), StartError> = Err(StartError::Prepare("no record".to_string()));
+        end_reads_if_refused(&refused, &failed);
+        assert_eq!(*port.0.lock().unwrap(), [0x1000, 0x2000]);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -691,6 +805,34 @@ pub enum StartError {
     Prepare(String),
     #[error("the sequence stopped offering the step before it started")]
     Withdrawn,
+    #[error("the quantum's disk reads were refused: {0}")]
+    Disk(String),
+}
+
+/// The tier a quantum's reads were registered with, and the ledger of what they owe it.
+type Registered = (Arc<DiskTier>, Arc<DiskLedger>);
+
+/// The reads of a quantum's disk uses, registered with `tier` (the one place quanta start, so the reader's tickets follow
+/// the order they start in): `None` when no view of the plan reads from disk or this view has no disk use.
+fn register_reads(
+    tier: Option<&Arc<DiskTier>>,
+    uses: &[DiskUse],
+    kill: &Arc<AtomicBool>,
+) -> Result<Option<Registered>, StartError> {
+    let Some(tier) = tier.filter(|_| !uses.is_empty()) else {
+        return Ok(None);
+    };
+    let ledger = tier
+        .register(uses, kill)
+        .map_err(|error| StartError::Disk(error.to_string()))?;
+    Ok(Some((Arc::clone(tier), ledger)))
+}
+
+/// A quantum that registered reads and is then refused never runs a stage, so nothing else ends its reads: they end here.
+fn end_reads_if_refused<T>(reads: &Option<Registered>, outcome: &Result<T, StartError>) {
+    if let (Some((tier, ledger)), Err(_)) = (reads, outcome) {
+        ledger.end(tier.reader());
+    }
 }
 
 /// What uploads a quantum's input record when the executor starts it: the owner's lane, and the pinned pool the record is
@@ -923,6 +1065,14 @@ impl Executor {
         }
     }
 
+    /// `kill` was set: the quanta it stops read nothing more from disk, so a copy that waits for a read of its own gives
+    /// its gate up and its quantum can end. Called by whoever sets the flag, after setting it.
+    pub(crate) fn killed(&self, kill: &Arc<AtomicBool>) {
+        if let Some(tier) = self.plan.disk_tier() {
+            tier.killed(kill);
+        }
+    }
+
     /// One monotonic reading, in nanoseconds, taken as a quantum starts.
     fn clock(&self) -> u64 {
         u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -982,9 +1132,16 @@ impl Executor {
         let variant = view.variant();
         let home = home::home_of(quantum.id(), self.clock(), self.stage_lanes);
         let eager = self.eager[variant.index()].get(home).ok_or(StartError::NoView(view))?;
+        // The reads of a view with disk uses are registered here, in the one place quanta start, so the reader's queues
+        // and tickets follow the order the quanta start in (a staged view is never captured, so none of this is
+        // skipped for a quantum that runs as one body).
+        let ledger = register_reads(self.plan.disk_tier(), self.plan.disk_uses(view), &kill)?;
         // Nothing after this can refuse the quantum: the upload is queued last, and a quantum dropped after it would free
         // the pinned record under the copy.
-        self.prepare(&mut quantum)?;
+        let prepared = self.prepare(&mut quantum);
+        end_reads_if_refused(&ledger, &prepared);
+        prepared?;
+        quantum.disk = ledger.map(|(_, ledger)| ledger);
         let serial = quantum.id();
         let stages = self.plan.unit_stages(view).map_or(0, <[_]>::len);
         let keyed = self
