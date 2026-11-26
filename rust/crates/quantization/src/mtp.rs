@@ -14,13 +14,17 @@
 //!   backward of a depth and the optimiser step. Nothing here touches a device: each call plans [`Work`] that the
 //!   caller enqueues in order on one lane, and the arena belongs to the caller, who allocates [`Drafter::arena_bytes`]
 //!   and gives its address.
+//! - [`export`]: the artifact whose MTP layer is a trained drafter's, and [`nvfp4`], the rounding it writes the
+//!   projections with.
 //! - [`DrafterKernels`]: the resolved kernels of the training and drafter modules, and the enqueue of [`Work`].
 //! - the planners of the drafter module's kernels (`plan_*`), like those of [`training`](crate::training).
 
 mod drafter;
+pub mod export;
 mod head;
 mod kernels;
 mod layout;
+pub mod nvfp4;
 mod plan;
 pub mod train;
 
