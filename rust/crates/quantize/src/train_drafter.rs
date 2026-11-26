@@ -90,6 +90,10 @@ fn default_library() -> Option<PathBuf> {
 }
 
 /// The line of the log: the seconds since the run began, then the message.
+#[allow(
+    clippy::print_stderr,
+    reason = "a binary's progress log, as the Java command prints it"
+)]
 fn logger() -> Log {
     let started = Instant::now();
     Arc::new(move |line| eprintln!("[{:7.0} s] {line}", started.elapsed().as_secs_f64()))
@@ -169,6 +173,8 @@ fn start(settings: &Settings) -> Result<Rig, String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
+
     use super::*;
 
     fn words(words: &[&str]) -> Vec<String> {
@@ -193,7 +199,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
     fn the_defaults_are_javas() {
         let parsed = flags(&with(&[])).unwrap();
         assert_eq!(parsed.settings, Training::default());
@@ -212,7 +217,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
     fn every_value_flag_sets_its_own_setting() {
         let parsed = flags(&with(&[
             "--depths",

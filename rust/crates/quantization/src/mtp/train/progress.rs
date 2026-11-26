@@ -3,6 +3,8 @@
 //! here touches a device or a file: the run's frames feed it what the device returned and do what it decides.
 
 use std::fmt::Write;
+use std::mem::take;
+use std::str::FromStr;
 
 use thiserror::Error;
 
@@ -152,7 +154,7 @@ impl Progress {
 
     /// What follows: the next sequence of the epoch, the first of the next one (reshuffled), or, once the last epoch
     /// ends, the final evaluation.
-    pub fn next(&mut self) -> Next {
+    pub fn advance(&mut self) -> Next {
         if self.cursor >= self.order.len() {
             self.epoch += 1;
             self.cursor = 0;
@@ -236,7 +238,7 @@ impl Progress {
 
     /// Whether a sequence has just ended with an evaluation due; the due flag is cleared.
     pub fn take_evaluation_due(&mut self) -> bool {
-        std::mem::take(&mut self.evaluation_due)
+        take(&mut self.evaluation_due)
     }
 
     /// Takes in a finished evaluation. `initial` is the one before training, `last` the one after the final epoch.
@@ -302,7 +304,7 @@ impl Progress {
         if header.get(IDENTITY) != Some(identity) || header.get(WRITING).is_some() {
             return Ok(Resume::Fresh);
         }
-        fn field<T: std::str::FromStr>(header: &Header, key: &'static str) -> Result<T, StateError> {
+        fn field<T: FromStr>(header: &Header, key: &'static str) -> Result<T, StateError> {
             header
                 .get(key)
                 .and_then(|text| text.parse().ok())
@@ -496,19 +498,19 @@ mod tests {
         let mut progress = progress();
         let mut seen = Vec::new();
         for _ in 0..3 {
-            let Next::Sequence(sequence) = progress.next() else {
+            let Next::Sequence(sequence) = progress.advance() else {
                 panic!("the epoch ended early")
             };
             seen.push(sequence);
         }
         assert_eq!(seen, shuffled(&[1, 2, 4], 0));
-        let Next::Sequence(first) = progress.next() else {
+        let Next::Sequence(first) = progress.advance() else {
             panic!("the second epoch did not start")
         };
         assert_eq!((progress.epoch(), first), (1, shuffled(&[1, 2, 4], 1)[0]));
-        progress.next();
-        progress.next();
-        assert_eq!(progress.next(), Next::Final);
+        progress.advance();
+        progress.advance();
+        assert_eq!(progress.advance(), Next::Final);
         assert_eq!(progress.epoch(), 2);
     }
 
@@ -654,7 +656,7 @@ mod tests {
     fn a_state_resumes_where_it_was_with_the_waiting_lineages_and_the_order_of_its_epoch() {
         let mut progress = progress();
         for _ in 0..4 {
-            progress.next();
+            progress.advance();
         }
         progress.pending = 2;
         progress.step = 7;
@@ -673,7 +675,7 @@ mod tests {
             ),
             (1, (1, 3), 7, 2, 1.25)
         );
-        assert_eq!(resumed.next(), progress.next());
+        assert_eq!(resumed.advance(), progress.advance());
     }
 
     #[test]

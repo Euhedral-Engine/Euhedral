@@ -1,6 +1,8 @@
 //! What a run is asked for, and the host arithmetic that follows from it: the windows of a sequence, the shuffle of
 //! an epoch and the learning-rate schedule. Nothing here touches a device or a file.
 
+use std::f64::consts::PI;
+
 use thiserror::Error;
 
 use crate::java_random::Random;
@@ -183,7 +185,7 @@ pub fn rates(settings: &Settings, step: u32, expected: u64) -> (f32, f32) {
         f64::from(step) / f64::from(settings.warmup)
     } else {
         let progress = (f64::from(step - settings.warmup) / total).min(1.0);
-        RATE_FLOOR + (1.0 - RATE_FLOOR) * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+        RATE_FLOOR + (1.0 - RATE_FLOOR) * 0.5 * (1.0 + (PI * progress).cos())
     };
     (
         (f64::from(settings.projection_rate) * scale) as f32,
@@ -193,6 +195,8 @@ pub fn rates(settings: &Settings, step: u32, expected: u64) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
+    use std::iter::empty;
+
     use super::*;
 
     fn small(rows: u32, keys: u32, depths: u32) -> Settings {
@@ -310,7 +314,7 @@ mod tests {
         assert_eq!(expected_steps([(10, 4), (20, 4)].into_iter(), 8), 2);
         // A sequence that is all prompt counts none.
         assert_eq!(expected_steps([(4, 4), (0, 0)].into_iter(), 8), 1);
-        assert_eq!(expected_steps(std::iter::empty(), 8), 1);
+        assert_eq!(expected_steps(empty(), 8), 1);
     }
 
     #[test]
@@ -343,7 +347,7 @@ mod tests {
         };
         assert_eq!(
             rates(&settings, 1, 10).0,
-            1e-3 * (0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * 0.1).cos())) as f32
+            1e-3 * (0.1 + 0.9 * 0.5 * (1.0 + (PI * 0.1).cos())) as f32
         );
     }
 }

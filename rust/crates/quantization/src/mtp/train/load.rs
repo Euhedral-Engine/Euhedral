@@ -4,8 +4,9 @@
 //! This runs on the calling thread before any frame of the run: it waits for each read and each copy, which a frame
 //! never does. The run itself ([`run`](super::run)) is frames.
 
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, absolute};
 use std::sync::Arc;
 
 use euhedral_core::generics::LatticeSource;
@@ -83,8 +84,8 @@ pub struct Loaded {
     pub keep: Keep,
 }
 
-impl std::fmt::Debug for Loaded {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Loaded {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter.debug_struct("Loaded").finish_non_exhaustive()
     }
 }
@@ -127,14 +128,14 @@ pub fn widen(bf16: &[u8]) -> Vec<u8> {
 /// What the run is: its corpus, model, artifact and the settings that shape its state. A saved state of another run is
 /// not resumed.
 pub fn identity(options: &Options, sequences: usize) -> Result<String, RunError> {
-    let absolute = |path: &Path| std::path::absolute(path).map(|path| path.display().to_string());
+    let display = |path: &Path| absolute(path).map(|path| path.display().to_string());
     let settings = &options.settings;
     Ok(format!(
         "corpus={} sequences={sequences} model={} artifact={} depths={} rows={} keys={} tokens={} epochs={} rates={}/{} \
          warmup={} holdout={}",
-        absolute(&options.corpus)?,
-        absolute(&options.model)?,
-        absolute(&options.artifact)?,
+        display(&options.corpus)?,
+        display(&options.model)?,
+        display(&options.artifact)?,
         settings.depths,
         settings.rows,
         settings.keys,
@@ -177,6 +178,10 @@ fn open_corpus(
     let file = |name: &str| call(|reply| read_file(host.io, &options.corpus.join(name), done(&reply)));
     let (tokens, labels) = (words(&file("tokens.bin")?), words(&file("labels.bin")?));
     let path = options.corpus.join("hidden.bin");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "startup: the size of the corpus file, read before any frame runs"
+    )]
     let hidden_rows = fs::metadata(&path)?.len() / (2 * u64::from(width));
     let hidden = call(|reply| {
         open_read(
@@ -207,6 +212,26 @@ struct Artifact {
     scale_offset: u64,
 }
 
+/// Bytes zeroed per copy.
+const ZERO_CHUNK: usize = 8 << 20;
+
+/// Clears a fresh device buffer: the allocator leaves it undefined, and the gradients and tallies accumulate into it.
+/// For startup: it waits.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "startup: a synchronous copy before any frame runs on the lane"
+)]
+fn zero(buffer: &DeviceBuffer) -> Result<(), RunError> {
+    let zeros = vec![0u8; buffer.bytes().min(ZERO_CHUNK)];
+    let mut at = 0;
+    while at < buffer.bytes() {
+        let end = (at + zeros.len()).min(buffer.bytes());
+        buffer.copy_from_host(at, &zeros[..end - at])?;
+        at = end;
+    }
+    Ok(())
+}
+
 /// The device buffers a run owns and the addresses they give.
 struct Buffers {
     library: Arc<CudaLibrary>,
@@ -216,6 +241,7 @@ struct Buffers {
 impl Buffers {
     fn take(&mut self, bytes: u64) -> Result<u64, RunError> {
         let buffer = DeviceBuffer::alloc(&self.library, size(bytes.max(4), "a buffer")?)?;
+        zero(&buffer)?;
         let address = buffer.addr();
         self.owned.push(buffer);
         Ok(address)
@@ -476,6 +502,7 @@ pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Loaded, Run
     })?;
 
     let arena = DeviceBuffer::alloc(&library, size(Drafter::arena_bytes(&config)?, "the drafter's arena")?)?;
+    zero(&arena)?;
     let drafter = Drafter::new(&config, arena.addr())?;
     let mut buffers = Buffers {
         library: Arc::clone(&library),
@@ -542,6 +569,8 @@ pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Loaded, Run
             )
         }
         Resume::Continue(progress) => {
+            // The drafter refuses steps until its zeroing was planned; the saved state then overwrites what it zeroed.
+            lane.prepare(true)?;
             restore(host, &lane, &state)?;
             lane.prepare(false)?;
             (progress, Start::Continue)

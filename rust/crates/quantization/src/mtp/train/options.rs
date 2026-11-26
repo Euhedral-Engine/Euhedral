@@ -1,5 +1,6 @@
 //! What a run is asked to do and what it runs on.
 
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -40,8 +41,8 @@ pub struct Host<'a> {
 /// Where the run's lines go.
 pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
 
-impl std::fmt::Debug for Host<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Host<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter.debug_struct("Host").finish_non_exhaustive()
     }
 }

@@ -9,6 +9,7 @@ use thiserror::Error;
 use super::progress::StateError;
 use super::settings::SettingsError;
 use crate::assemble::AssembleError;
+use crate::chain::ChainError;
 use crate::checkpoint::CheckpointError;
 use crate::kernels::ModuleError;
 use crate::mtp::DrafterError;
@@ -48,7 +49,7 @@ pub enum RunError {
     Broken(String),
 }
 
-impl crate::chain::ChainError for RunError {
+impl ChainError for RunError {
     fn broken(message: &str) -> Self {
         RunError::Broken(message.to_owned())
     }

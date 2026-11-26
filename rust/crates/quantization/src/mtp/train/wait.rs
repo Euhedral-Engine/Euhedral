@@ -105,3 +105,50 @@ where
     start(reply).map_err(Into::into)?;
     wait.block()
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
+
+    use super::*;
+
+    #[test]
+    fn the_first_answer_counts() {
+        let (wait, reply) = pair();
+        reply.send(Ok(1));
+        reply.send(Ok(2));
+        reply.send(Err(RunError::Broken("late".to_owned())));
+        assert_eq!(wait.block().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_reply_dropped_unanswered_answers_that_it_ended() {
+        let (wait, reply) = pair::<u32>();
+        drop(reply);
+        let error = wait.block().unwrap_err();
+        assert!(matches!(error, RunError::Broken(message) if message.contains("without answering")));
+    }
+
+    #[test]
+    fn an_answer_survives_the_drop_of_its_reply() {
+        let (wait, reply) = pair();
+        reply.send(Ok(7));
+        drop(reply);
+        assert_eq!(wait.block().unwrap(), 7);
+    }
+
+    #[test]
+    fn a_call_that_cannot_start_returns_its_own_error() {
+        let result = call::<u32, RunError>(|_| Err(RunError::Broken("no start".to_owned())));
+        assert!(matches!(result, Err(RunError::Broken(message)) if message == "no start"));
+    }
+
+    #[test]
+    fn a_call_returns_what_its_continuation_answers() {
+        let result = call::<u32, RunError>(|reply| {
+            reply.send(Ok(5));
+            Ok(())
+        });
+        assert_eq!(result.unwrap(), 5);
+    }
+}

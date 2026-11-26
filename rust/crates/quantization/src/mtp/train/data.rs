@@ -225,8 +225,8 @@ mod tests {
     fn a_sequence_gives_its_own_tokens_and_choices() {
         let data = Data::new(files(3), &settings(2)).unwrap();
         let second = data.sequence(1).unwrap();
-        assert_eq!(second.tokens, [5 % 7, 6 % 7, 0, 1, 2]);
-        assert_eq!(second.labels, [6 % 7, 0, 1, 2, 3]);
+        assert_eq!(second.tokens, [5, 6, 0, 1, 2]);
+        assert_eq!(second.labels, [6, 0, 1, 2, 3]);
         assert_eq!(second.prompt, 2);
         assert!(data.sequence(3).is_err());
     }

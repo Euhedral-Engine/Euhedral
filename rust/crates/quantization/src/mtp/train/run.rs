@@ -8,6 +8,8 @@
 //! `stop_after_saves`.
 
 use std::collections::VecDeque;
+use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::mem::replace;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,8 +41,8 @@ pub struct Ended {
     pub outcome: Result<Summary, RunError>,
 }
 
-impl std::fmt::Debug for Ended {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Ended {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter
             .debug_struct("Ended")
             .field("outcome", &self.outcome)
@@ -250,7 +252,7 @@ fn started(reply: &Arc<Reply<Ended>>, result: Result<(), ResumeError>) {
 /// The next sequence to train on, or the end of the epochs.
 fn train(mut run: Step, lane: TrainLane) {
     run.phase = Phase::Training;
-    match run.progress.next() {
+    match run.progress.advance() {
         Next::Sequence(index) => begin(run, lane, index),
         Next::Final => {
             let held_out = run.data.held_out().iter().copied().collect();
@@ -400,7 +402,7 @@ fn next_held_out(mut run: Step, lane: TrainLane) {
 
 /// The evaluation is complete: log it, save the best parameters if they improved, save the state, and go on.
 fn verdict(mut run: Step, lane: TrainLane) {
-    let Phase::Evaluating(evaluating) = std::mem::replace(&mut run.phase, Phase::Training) else {
+    let Phase::Evaluating(evaluating) = replace(&mut run.phase, Phase::Training) else {
         return fail(
             run,
             lane,

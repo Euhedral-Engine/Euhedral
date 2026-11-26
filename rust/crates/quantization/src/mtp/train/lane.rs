@@ -18,7 +18,7 @@ use super::progress::Update;
 use super::settings::Window;
 use super::window::{Addresses, Mode, plan};
 use crate::chain::{self, Next, Parts, Unsettled};
-use crate::mtp::{Drafter, DrafterKernels};
+use crate::mtp::{Drafter, DrafterKernels, Work};
 
 /// The bytes of device memory a read of the lane moves at a time.
 pub const CHUNK_BYTES: usize = 32 << 20;
@@ -118,7 +118,10 @@ pub struct Outcome {
 }
 
 fn pinned(library: &Arc<CudaLibrary>, bytes: usize) -> Result<PinnedBuffer, RunError> {
-    Ok(PinnedBuffer::alloc(library, bytes.max(1))?)
+    let mut buffer = PinnedBuffer::alloc(library, bytes.max(1))?;
+    // The allocator leaves it undefined, and a window shorter than the lane's rows uploads the tail too.
+    buffer.as_mut_slice().fill(0);
+    Ok(buffer)
 }
 
 impl TrainLane {
@@ -165,7 +168,7 @@ impl TrainLane {
     }
 
     /// Runs `work` and waits for it. For startup: a frame never waits.
-    pub fn run_blocking(&mut self, work: &[crate::mtp::Work]) -> Result<(), RunError> {
+    pub fn run_blocking(&mut self, work: &[Work]) -> Result<(), RunError> {
         let parts = &mut self.parts;
         chain::submit(&mut self.stream, |queue| {
             // SAFETY: the work names buffers the lane owns and keeps until it is closed, and the lane's own handles;
