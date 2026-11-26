@@ -287,6 +287,19 @@ jobs:
           mise exec -- cargo test --profile device --workspace --exclude euhedral-inference-quantization \
             --exclude euhedral-inference-cuda --exclude euhedral-inference-engine -- --ignored --nocapture \
             2>&1 | tee -a "$RUNNER_TEMP/device.log"
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Device tests, memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
       # One test binary holds one engine at a time and reuses it for the tests with the same settings; the log counts the
       # model loads ("ENGINE LOAD n").
       - name: Device tests, engine
