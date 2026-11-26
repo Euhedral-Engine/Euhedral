@@ -14,6 +14,8 @@ pub(crate) enum Kind {
     Release = 2,
     /// The continuation of a finished call, offered to the host lake.
     Resolve = 3,
+    /// The append of one answered sequence to the corpus, run on the host lake.
+    Corpus = 4,
 }
 
 struct Step {

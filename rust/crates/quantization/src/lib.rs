@@ -14,6 +14,8 @@
 //!   each quantized linear's input.
 //! - [`memory`]: stream-ordered device buffers, pooled pinned staging and the claims that account for them, which
 //!   the GPTQ rounding and the trellis quantizer share.
+//! - [`corpus`] and [`generate`]: the MTP drafter's training corpus (its four files and their writer) and the run that
+//!   answers chat prompts with the artifact and appends each answer, with the hidden of every row it ran, to it.
 //! - [`kld`]: the reference logits file the scorer and the reference writer share, opened and read through `AsyncIo`.
 //! - [`rows`]: the work on the logits rows of one teacher-forced run, as frames of the `host` lake.
 //! - [`score`]: a candidate artifact scored against a reference: its logits reduced on the device to a KL divergence and a
@@ -34,9 +36,11 @@
 pub mod assemble;
 mod chain;
 pub mod checkpoint;
+pub mod corpus;
 pub mod durable;
 pub mod exl3;
 pub mod forward;
+pub mod generate;
 pub mod gptq;
 pub mod java_random;
 pub mod kernels;

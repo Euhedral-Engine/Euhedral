@@ -6,6 +6,7 @@
 //! ([`Availability::Dropped`]).
 
 mod assemble;
+mod generate;
 mod package;
 mod reference;
 mod rig;
@@ -54,8 +55,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "generate",
-        availability: Availability::Pending,
-        usage: "--artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)...",
+        availability: Availability::Wired,
+        usage: "--artifact ARTIFACT --tokenizer CHECKPOINT --out CORPUS_DIR (--prompts PROMPTS.jsonl)... [--max-tokens N] [--batch N] [--greedy-fraction F] [--limit N] [--host-mib N] [--workers N] [--config YAML] [--cuda-library FILE]",
     },
     Command {
         name: "train-drafter",
@@ -148,6 +149,7 @@ pub fn run(args: &[String]) -> Outcome {
     match command.availability {
         Availability::Wired => match command.name {
             "assemble" => assemble::run(&args[1..]),
+            "generate" => generate::run(&args[1..]),
             "package-tokenizer" => package::run(&args[1..]),
             "reference" => reference::run(&args[1..]),
             "score" => score::run(&args[1..]),
