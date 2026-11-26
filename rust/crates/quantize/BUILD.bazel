@@ -105,6 +105,62 @@ rust_test(
 )
 
 rust_test(
+    name = "assemble_test",
+    compile_data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ) + [
+        "//rust/crates/api-protocol:tests/data/qwen-chat-template.jinja",
+    ],
+    crate_name = "assemble",
+    crate_root = "tests/assemble.rs",
+    data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ) + [
+        ":quantization",
+    ],
+    deps = [
+        ":euhedral_inference_quantize",
+        "//rust/crates/edrl:euhedral_inference_edrl",
+        "//rust/crates/engine:euhedral_inference_engine",
+        "//rust/crates/quantization:euhedral_inference_quantization",
+        "//rust/crates/settings:euhedral_inference_settings",
+        "@euhedral_crates//:serde_json",
+        "@euhedral_crates//:tempfile",
+        "@euhedral_rustee//euhedral-core:euhedral_core_cuda_testing",
+        "@euhedral_rustee//euhedral-graph:euhedral_graph_cuda_testing",
+        "@euhedral_rustee//euhedral-io:euhedral_io_cuda_testing",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_BIN_EXE_quantization": "$(rootpath :quantization)",
+        "CARGO_MANIFEST_DIR": "rust/crates/quantize",
+        "CARGO_TARGET_TMPDIR": "unused-under-bazel",
+    },
+    srcs = glob(
+        [
+            "tests/assemble.rs",
+            "tests/*/**/*.rs",
+        ],
+        allow_empty = True,
+    ),
+    version = "0.1.0",
+)
+
+rust_test(
     name = "package_tokenizer_test",
     compile_data = glob(
         [

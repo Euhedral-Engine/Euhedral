@@ -5,8 +5,11 @@
 //! wired yet says so and exits with [`EXIT_NOT_AVAILABLE`]; three commands are not part of this tool at all
 //! ([`Availability::Dropped`]).
 
+mod assemble;
 mod package;
 mod reference;
+mod rig;
+mod score;
 
 /// The process exit code of a run that finished.
 pub const EXIT_OK: u8 = 0;
@@ -46,8 +49,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "score",
-        availability: Availability::Pending,
-        usage: "--artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)...",
+        availability: Availability::Wired,
+        usage: "--artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--values DIR] [--rows N] [--batch N] [--config YAML] [--cuda-library FILE]",
     },
     Command {
         name: "generate",
@@ -81,8 +84,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "assemble",
-        availability: Availability::Pending,
-        usage: "--allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT",
+        availability: Availability::Wired,
+        usage: "--allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT [--draft-depth N] [--copy-buffer-mib N] [--config YAML]",
     },
     Command {
         name: "cost",
@@ -144,8 +147,10 @@ pub fn run(args: &[String]) -> Outcome {
     };
     match command.availability {
         Availability::Wired => match command.name {
+            "assemble" => assemble::run(&args[1..]),
             "package-tokenizer" => package::run(&args[1..]),
             "reference" => reference::run(&args[1..]),
+            "score" => score::run(&args[1..]),
             _ => Outcome {
                 code: EXIT_NOT_AVAILABLE,
                 message: format!("the command '{name}' has no work behind it\n"),

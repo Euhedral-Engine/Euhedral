@@ -16,6 +16,8 @@
 //!   the GPTQ rounding and the trellis quantizer share.
 //! - [`kld`]: the reference logits file the scorer and the reference writer share, opened and read through `AsyncIo`.
 //! - [`rows`]: the work on the logits rows of one teacher-forced run, as frames of the `host` lake.
+//! - [`score`]: a candidate artifact scored against a reference: its logits reduced on the device to a KL divergence and a
+//!   negative log likelihood per position, and the summary of them.
 //! - [`mixed`]: the mixed allocation search's data: options, allocations, priors, the cost table, the knapsack, the
 //!   Pareto front and the residency check.
 //! - [`assemble`]: the source artifacts of a mixed artifact, opened and checked, and the artifact an allocation makes of
@@ -26,6 +28,8 @@
 //! - [`resume`]: the file a long run overwrites in place and resumes from, and [`durable`], the durability barrier,
 //!   truncation and removal it is built on.
 //! - [`package_tokenizer`]: gives an artifact a checkpoint's tokenizer, in place or as a copy.
+//! - [`weight_cache`]: the weights several engines on one machine share (loaded once, freed with the last engine that
+//!   uses them) and whether the next engine fits beside those running.
 
 pub mod assemble;
 mod chain;
@@ -47,7 +51,9 @@ pub mod recipe;
 pub mod reference;
 pub mod resume;
 pub mod rows;
+pub mod score;
 pub mod step;
 pub mod tokenizer_files;
 pub mod training;
 pub mod trellis;
+pub mod weight_cache;
