@@ -150,6 +150,39 @@ impl Rig {
         result
     }
 
+    /// The idle lane, for a call that runs it outside the rig.
+    pub fn take_lane(&mut self) -> GptqLane {
+        self.lane.take().expect("the lane is idle")
+    }
+
+    /// Gives back a lane taken with [`take_lane`](Self::take_lane), once its work has ended.
+    pub fn restore_lane(&mut self, mut lane: GptqLane) {
+        lane.reclaim().expect("the buffers are freed in stream order");
+        self.lane = Some(lane);
+    }
+
+    /// Delivers the lane's retirements until `done` holds (a minute at most).
+    pub fn pump_until(&self, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !done() {
+            self.completions.reap();
+            self.completions.pull(
+                &mut |mut frame| {
+                    frame.execute().unwrap();
+                    frame.do_finally();
+                },
+                &mut |_| false,
+                u64::MAX,
+            );
+            assert!(Instant::now() < deadline, "the rounding did not end in a minute");
+        }
+    }
+
+    /// The rig's planner and its owner, for a call that makes its own claims.
+    pub fn planner(&self) -> (Arc<Planner>, OwnerId) {
+        (Arc::clone(&self.planner), self.owner)
+    }
+
     /// Claims of exactly `bytes` from the rig's planner.
     pub fn claims(&self, bytes: StepBytes) -> Claims {
         let take = |location, bytes| {

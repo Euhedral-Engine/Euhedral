@@ -200,6 +200,16 @@ fn read_tokens(path: &Path, limit: usize) -> Result<(Vec<i32>, usize), String> {
     Ok((tokens, length))
 }
 
+/// The layers a run rounds, as Java's `--layers`: a count, which a count at or above the model's layers makes a run
+/// of the whole model.
+pub(crate) fn plan_for(requested: usize, model_layers: usize) -> Plan {
+    Plan::new(requested.min(model_layers))
+}
+
+/// Said after a run of the whole model: the heads and the MTP block are not rounded by this build.
+const HEADS_NOT_ROUNDED: &str = "calibrate: the layers are rounded; this build does not round the output head, the \
+draft head or the MTP block, so the output is not complete\n";
+
 /// Runs `calibrate` with the flags in `args`.
 #[allow(
     clippy::disallowed_methods,
@@ -241,9 +251,13 @@ pub fn run(args: &[String]) -> Outcome {
     let result = calibrated(&rig, &flags, &library, tokens, length);
     rig.stop();
     match result {
-        Ok(()) => Outcome {
+        Ok(whole) => Outcome {
             code: EXIT_OK,
-            message: String::new(),
+            message: if whole {
+                HEADS_NOT_ROUNDED.to_owned()
+            } else {
+                String::new()
+            },
         },
         Err(message) => failed(message),
     }
@@ -253,7 +267,7 @@ pub fn run(args: &[String]) -> Outcome {
     clippy::disallowed_methods,
     reason = "a binary: its main thread opens the checkpoint and waits for the one completion of the run"
 )]
-fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length: usize) -> Result<(), String> {
+fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length: usize) -> Result<bool, String> {
     let (sender, receiver) = mpsc::channel();
     let sent = sender.clone();
     Safetensors::open(
@@ -286,13 +300,6 @@ fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length
             .map_err(|error| error.to_string())?,
     );
     let model_layers = objects.config.layers;
-    if flags.layers >= model_layers {
-        return Err(format!(
-            "this build rounds the layers only, not the output head, the draft head or the MTP block: --layers must be \
-             below the model's {model_layers}, not {}",
-            flags.layers
-        ));
-    }
     let recipe = Recipe::new(flags.quantization, flags.compressed, flags.output_head.as_deref())
         .map_err(|error| error.to_string())?;
     let search = Nvfp4Search::new(flags.nvfp4_above, flags.nvfp4_scale_max).map_err(|error| error.to_string())?;
@@ -327,8 +334,8 @@ fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length
     for source in completions {
         rig.attach(source)?;
     }
-    let mut plan = Plan::new(model_layers);
-    plan.stop_after = flags.layers;
+    let plan = plan_for(flags.layers, model_layers);
+    let whole = flags.layers >= model_layers;
     let (sender, receiver) = mpsc::channel();
     drive(
         Arc::new(calibration),
@@ -340,7 +347,8 @@ fn calibrated(rig: &Rig, flags: &Flags, library: &Path, tokens: Vec<i32>, length
     receiver
         .recv()
         .map_err(|_| "the run ended without a result".to_owned())?
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(whole)
 }
 
 #[cfg(test)]
@@ -397,6 +405,14 @@ mod tests {
         assert_eq!((flags.layers, flags.batch, flags.sequences), (2, 4, 16));
         assert!(flags.act_order && flags.compressed);
         assert_eq!(flags.damp, 0.05);
+    }
+
+    #[test]
+    fn the_default_layers_run_the_whole_64_layer_model_and_a_count_below_it_a_part() {
+        let default = flags(&with(&[])).unwrap();
+        assert_eq!(plan_for(default.layers, 64), Plan::new(64));
+        assert_eq!(plan_for(10, 64).layers, 10);
+        assert_eq!(plan_for(64, 40).layers, 40);
     }
 
     #[test]
