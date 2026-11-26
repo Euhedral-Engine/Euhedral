@@ -372,9 +372,12 @@ impl Launch for DiskTransfer {
     }
 }
 
-impl Stage<Quantum> for DiskTransfer {
-    fn pass_gate(&self, quantum: &Quantum, gate: GateRef<'_>) -> bool {
-        let Some(ledger) = quantum.disk.as_ref() else {
+impl DiskTransfer {
+    /// The copy's claim on its window slot: `true` when the bytes are in and the stage may be published; otherwise the
+    /// gate is the reader's (released when they arrive, failed when they never will) or already failed. A quantum with
+    /// no ledger had no reads registered: its gate fails.
+    fn claim(&self, ledger: Option<&DiskLedger>, gate: GateRef<'_>) -> bool {
+        let Some(ledger) = ledger else {
             gate.hold().fail(fatal(format!(
                 "{} was started with no disk reads registered",
                 self.name
@@ -388,21 +391,43 @@ impl Stage<Quantum> for DiskTransfer {
         }
     }
 
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let ledger = quantum
-            .disk
-            .as_ref()
+    /// The ledger the copy may run under: refused when none was registered, or when a read of the quantum failed, as
+    /// the copy would move bytes that are not the weights.
+    fn admit<'a>(&self, ledger: Option<&'a Arc<DiskLedger>>) -> Result<&'a Arc<DiskLedger>, StageError> {
+        let ledger = ledger
             .ok_or_else(|| fatal(format!("{} was started with no disk reads registered", self.name)))?;
-        // A read that failed told the quantum before it released the copy: the copy of stale bytes does not run.
         if let Some(why) = ledger.failure() {
             return Err(fatal(why));
         }
-        let submitted = run_stage(self, quantum, cx)?;
+        Ok(ledger)
+    }
+
+    /// The quantum's stages ended: what it never copied is not read, and the slots it holds go back.
+    fn ended(&self, ledger: Option<&DiskLedger>) {
+        if let Some(ledger) = ledger {
+            ledger.end(&self.tier.reader);
+        }
+    }
+
+    /// The copy was queued, ending at `marker` (`None`: it ended already): its window slot goes back when it has.
+    fn queued(&self, ledger: &Arc<DiskLedger>, marker: Option<Marker>) {
         ledger.submitted(self.use_index);
-        match submitted.marker {
+        match marker {
             Some(marker) => self.tier.free_after(marker, self.window_slot, ledger, self.use_index),
             None => ledger.freed(self.use_index, &self.tier.reader),
         }
+    }
+}
+
+impl Stage<Quantum> for DiskTransfer {
+    fn pass_gate(&self, quantum: &Quantum, gate: GateRef<'_>) -> bool {
+        self.claim(quantum.disk.as_deref(), gate)
+    }
+
+    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        let ledger = self.admit(quantum.disk.as_ref())?;
+        let submitted = run_stage(self, quantum, cx)?;
+        self.queued(ledger, submitted.marker);
         Ok(submitted)
     }
 
@@ -410,9 +435,7 @@ impl Stage<Quantum> for DiskTransfer {
         quantum
             .unmarked
             .await_on(home, |lane| quantum.lanes.get(lane).map(|queue| queue.id()));
-        if let Some(ledger) = quantum.disk.as_ref() {
-            ledger.end(&self.tier.reader);
-        }
+        self.ended(quantum.disk.as_deref());
     }
 }
 
@@ -424,6 +447,8 @@ impl Stage<Quantum> for DiskTransfer {
 mod tests {
     use std::io;
     use std::sync::Mutex;
+
+    use euhedral_graph::testing::{FakeDevice, GateEvent, StageHarness};
 
     use super::*;
     use crate::residency::disk::{ReadDone, ReadPort, ReadSpec};
@@ -554,5 +579,194 @@ mod tests {
                 "the second quantum's read waits for the slot"
             );
         }
+    }
+
+    /// A port whose reads end when the test says.
+    #[derive(Default)]
+    struct Reads {
+        pending: Mutex<Vec<(usize, ReadDone)>>,
+        started: Mutex<usize>,
+    }
+
+    impl ReadPort for Arc<Reads> {
+        fn start(&self, spec: ReadSpec, done: ReadDone) -> io::Result<()> {
+            *self.started.lock().unwrap() += 1;
+            self.pending.lock().unwrap().push((spec.slot, done));
+            Ok(())
+        }
+        fn has_direct(&self) -> bool {
+            false
+        }
+        fn file_len(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    impl Reads {
+        fn started(&self) -> usize {
+            *self.started.lock().unwrap()
+        }
+
+        /// Ends the oldest read of `slot` as moving `moved` bytes, or failing.
+        fn end(&self, slot: usize, result: io::Result<usize>) {
+            let done = {
+                let mut pending = self.pending.lock().unwrap();
+                let index = pending.iter().position(|(held, _)| *held == slot).expect("a read of the slot");
+                pending.remove(index).1
+            };
+            done(result);
+        }
+    }
+
+    /// A tier over `slots` window slots, a quantum's copy of its first use, and the harness that takes its gates.
+    struct Copying {
+        reads: Arc<Reads>,
+        tier: Arc<DiskTier>,
+        harness: StageHarness,
+        kill: Arc<AtomicBool>,
+    }
+
+    /// The copy as a stage of the harness, over the ledger a quantum would carry.
+    struct Probe<'a> {
+        copy: &'a DiskTransfer,
+        ledger: Option<&'a Arc<DiskLedger>>,
+    }
+
+    impl Stage<()> for Probe<'_> {
+        fn run(&self, _: &(), _: &StageCx<'_>) -> Result<Submitted, StageError> {
+            Ok(Submitted::done())
+        }
+
+        fn pass_gate(&self, _: &(), gate: GateRef<'_>) -> bool {
+            self.copy.claim(self.ledger.map(|ledger| &**ledger), gate)
+        }
+    }
+
+    impl Copying {
+        fn new() -> Copying {
+            let geometry = WindowGeometry {
+                slots: 1,
+                slot_bytes: 4096,
+            };
+            let reads = Arc::new(Reads::default());
+            let reader = DiskReader::new(
+                Arc::new(Arc::clone(&reads)),
+                geometry,
+                Box::new(|work| {
+                    work();
+                    true
+                }),
+            );
+            let (lanes, _) = FakeDevice::pool(&["lane"]);
+            Copying {
+                reads,
+                tier: DiskTier::detached(reader, geometry, Completions::without_lanes()),
+                harness: StageHarness::new(lanes),
+                kill: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn register(&self) -> Arc<DiskLedger> {
+            self.tier.register(&[use_at(0, 0)], &self.kill).unwrap()
+        }
+
+        fn copy(&self) -> DiskTransfer {
+            DiskTransfer::new(Arc::clone(&self.tier), &use_at(0, 0), 0, DevicePtr::NULL)
+        }
+
+        /// The claim of the copy: `true` when its stage may be published at once.
+        fn claim(&self, copy: &DiskTransfer, ledger: Option<&Arc<DiskLedger>>) -> bool {
+            let passed = self.harness.pass_gate(&Probe { copy, ledger }, &());
+            assert!(!(passed.open && passed.held), "a claim that opens takes no gate");
+            passed.open
+        }
+    }
+
+    #[test]
+    fn a_copy_is_published_when_its_bytes_are_in_and_waits_for_them_otherwise() {
+        let rig = Copying::new();
+        let (ledger, copy) = (rig.register(), rig.copy());
+        assert!(!rig.claim(&copy, Some(&ledger)), "the read is still out");
+        assert!(rig.harness.gate_events().is_empty());
+        rig.reads.end(0, Ok(100));
+        assert_eq!(rig.harness.gate_events(), [GateEvent::Released]);
+        // A second quantum's read arrives before its copy asks: the claim is ready at once.
+        rig.tier.reader().slot_freed(0, ledger.ticket());
+        let next = rig.register();
+        rig.reads.end(0, Ok(100));
+        assert!(rig.claim(&copy, Some(&next)));
+    }
+
+    #[test]
+    fn a_copy_of_a_quantum_with_no_registered_reads_is_failed_at_its_gate_and_refused_at_its_run() {
+        let rig = Copying::new();
+        let copy = rig.copy();
+        assert!(!rig.claim(&copy, None));
+        assert!(matches!(
+            rig.harness.gate_events().as_slice(),
+            [GateEvent::Failed(StageError::Fatal(why))] if why.contains("no disk reads")
+        ));
+        assert!(matches!(copy.admit(None), Err(StageError::Fatal(why)) if why.contains("no disk reads")));
+    }
+
+    #[test]
+    fn a_copy_of_a_failed_read_is_failed_at_its_gate_whether_it_waited_or_came_late() {
+        for waited in [true, false] {
+            let rig = Copying::new();
+            let (ledger, copy) = (rig.register(), rig.copy());
+            if waited {
+                assert!(!rig.claim(&copy, Some(&ledger)));
+            }
+            rig.reads.end(0, Err(io::Error::other("no disk")));
+            if !waited {
+                assert!(!rig.claim(&copy, Some(&ledger)), "a failed read is never ready");
+            }
+            assert!(
+                matches!(
+                    rig.harness.gate_events().as_slice(),
+                    [GateEvent::Failed(StageError::Fatal(why))] if why.contains("no disk")
+                ),
+                "waited: {waited}: {:?}",
+                rig.harness.gate_events()
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_does_not_run_once_a_read_of_its_quantum_failed() {
+        let rig = Copying::new();
+        let (ledger, copy) = (rig.register(), rig.copy());
+        assert!(copy.admit(Some(&ledger)).is_ok());
+        ledger.fail("the artifact ended".to_string());
+        assert!(matches!(copy.admit(Some(&ledger)), Err(StageError::Fatal(why)) if why == "the artifact ended"));
+    }
+
+    #[test]
+    fn a_queued_copy_that_ended_hands_its_window_slot_to_the_next_read() {
+        let rig = Copying::new();
+        let (first, copy) = (rig.register(), rig.copy());
+        let _second = rig.register();
+        rig.reads.end(0, Ok(100));
+        assert_eq!(rig.reads.started(), 1, "the slot is the first copy's until it ends");
+        assert!(rig.claim(&copy, Some(&first)));
+        copy.queued(&first, None);
+        assert_eq!(rig.reads.started(), 2);
+    }
+
+    #[test]
+    fn the_end_of_a_quantum_fails_the_copy_that_waits_and_frees_the_slot_for_the_next() {
+        let rig = Copying::new();
+        let (first, copy) = (rig.register(), rig.copy());
+        let _second = rig.register();
+        assert!(!rig.claim(&copy, Some(&first)));
+        copy.ended(Some(&first));
+        assert!(matches!(
+            rig.harness.gate_events().as_slice(),
+            [GateEvent::Failed(StageError::Fatal(_))]
+        ));
+        // The read in flight is discarded when it arrives, and the next quantum's read follows it.
+        rig.reads.end(0, Ok(100));
+        assert_eq!(rig.reads.started(), 2);
+        copy.ended(None);
     }
 }
