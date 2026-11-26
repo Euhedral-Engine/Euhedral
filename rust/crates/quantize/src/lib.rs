@@ -7,6 +7,7 @@
 
 mod package;
 mod reference;
+mod score;
 
 /// The process exit code of a run that finished.
 pub const EXIT_OK: u8 = 0;
@@ -46,8 +47,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "score",
-        availability: Availability::Pending,
-        usage: "--artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)...",
+        availability: Availability::Wired,
+        usage: "--artifact ARTIFACT --results RESULTS.txt (--reference REFERENCE.kld --name NAME)... [--values DIR] [--rows N] [--batch N] [--config YAML] [--cuda-library FILE]",
     },
     Command {
         name: "generate",
@@ -146,6 +147,7 @@ pub fn run(args: &[String]) -> Outcome {
         Availability::Wired => match command.name {
             "package-tokenizer" => package::run(&args[1..]),
             "reference" => reference::run(&args[1..]),
+            "score" => score::run(&args[1..]),
             _ => Outcome {
                 code: EXIT_NOT_AVAILABLE,
                 message: format!("the command '{name}' has no work behind it\n"),
