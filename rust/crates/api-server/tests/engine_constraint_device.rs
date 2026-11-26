@@ -1,6 +1,6 @@
 //! Constrained requests on the device, end to end: the engine starts through the backend's start function, the server
 //! runs on its lattice on a loopback port, and a client asks for a JSON answer by schema and for a reasoning budget.
-//! The tests are `#[ignore]`d and run locally, one at a time, through the system arbiter (the engine loads the 12 GB
+//! The tests are `#[ignore]`d and run locally, through the system arbiter, one engine at a time (the engine loads the 12 GB
 //! artifact):
 //! `system-run --gpu shared:14 --mem 24G --est 600 --who <name> -- <test binary> --ignored --test-threads=1 <test>`.
 //!
@@ -17,8 +17,8 @@ mod common;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use common::{CREATED, Raw, text};
@@ -43,6 +43,9 @@ fn machine() -> Option<(PathBuf, PathBuf)> {
     Some((artifact, library))
 }
 
+/// The card, held by one test at a time: every engine of the model fills it, so two never exist side by side.
+static CARD: Mutex<()> = Mutex::new(());
+
 /// The engine, a server on its lattice and a client for it.
 struct Served {
     host: EngineHost,
@@ -50,11 +53,14 @@ struct Served {
     io: Arc<AsyncIo>,
     sink: Arc<QueueIngestSink>,
     addr: SocketAddr,
+    /// Released last, after the engine is gone, also when the test panics.
+    _card: MutexGuard<'static, ()>,
 }
 
 impl Served {
     fn start() -> Option<Served> {
         let (artifact, library) = machine()?;
+        let card = CARD.lock().unwrap_or_else(PoisonError::into_inner);
         let mut settings = Settings::with_model(ModelSettings {
             artifact,
             name: "qwen".to_owned(),
@@ -82,6 +88,7 @@ impl Served {
             io,
             sink,
             addr,
+            _card: card,
         })
     }
 

@@ -8,12 +8,11 @@
 # On an integration branch the jobs run whenever anything since main touched their paths, so a later push that touches none
 # of them cannot hide a failed earlier one. A push to a rust/next* branch that is not vars.INTEGRATION_BRANCH fails at once.
 #
-# Job labels are the runner's (arbiter-docker for the cheap job, arbiter-docker-unconfined for the two heavy ones, which need
-# seccomp off, arbiter-gpu for the device job, which gets the card). No docker job sets timeout-minutes: the arbiter's hold limit (ARBITER_EST + 60 s from the grant) is its limit.
+# Job labels are the runner's (arbiter-docker for the cheap job, arbiter-docker-unconfined for the heavy ones, which need
+# seccomp off, arbiter-gpu for the device test jobs, which get the card; the device build runs unconfined without it). No docker job sets timeout-minutes: the arbiter's hold limit (ARBITER_EST + 60 s from the grant) is its limit.
 # No job asks for more than --mem 32G, and none uses a cpu form (scripts/lint-workflows.py checks both).
 #
-# The artifact action's major version (v4 here) is not yet proven against Gitea's artifact store, and the action needs Node
-# in the image.
+# The artifact actions (v4) work against Gitea's artifact store and need Node in the image.
 name: ci
 
 on:
@@ -211,21 +210,26 @@ jobs:
           eval "$(mise env -s bash)"
           cargo test --workspace
 
-  # The ignored device tests of the workspace, on the card. Every location comes from the Actions variables below; the job
-  # writes none. EUHEDRAL_NVRTC_DIR (the directory holding libnvrtc) is required. The optional ones are passed to the tests
-  # only when set, and a test whose data is missing prints a skip line and passes (the last step lists them):
+  # The ignored device tests of the workspace, on the card, in groups that each ask the arbiter for what their own tests need.
+  # `device-build` builds the native library and the test binaries once, without the card, and uploads them as one artifact.
+  # Each `device-*` job downloads it and runs one group of `scripts/ci-device.py`, with no build: a failing group is red
+  # when it ends and the others still run. The binaries carry the paths of the build, so the build and the test jobs run
+  # in the same workspace path (the script refuses otherwise). `device` is the one check to require: it fails unless every
+  # group passed, a skipped group included. Every location comes from the Actions variables below; the jobs write none.
+  # EUHEDRAL_NVRTC_DIR (the directory holding libnvrtc) is required. The optional ones are passed to the tests only when set,
+  # and a test whose data is missing prints a skip line and passes (each group lists them at its end):
   #   EUHEDRAL_TEST_QWEN_RCO_ARTIFACT              the model artifact
   #   EUHEDRAL_TEST_RUST_GOLDENS                   the goldens directory
   #   EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES    the directory with the CUDA math libraries
-  device:
-    name: device
+  # The card holds one engine of the model at a time per process; the arbiter runs groups side by side when their asks fit.
+  device-build:
+    name: device-build
     needs: changes
     if: needs.changes.outputs.native == 'true'
-    runs-on: arbiter-gpu
+    runs-on: arbiter-docker-unconfined
     env:
-      # A full engine run peaks at 22.1 GB on the card (one engine at a time) and reached 24 GB of host memory.
-      ARBITER_ARGS: "--gpu shared:22.5 --mem 32G"
-      ARBITER_EST: "1500"
+      ARBITER_ARGS: "--mem 16G"
+      ARBITER_EST: "900"
       APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/native/.zig-global-cache
@@ -239,56 +243,53 @@ jobs:
         run: mise install >/dev/null
       - name: Build the native library
         run: mise exec -- gradle -q nativeBuildLinuxX64
-      - name: Set the test environment
-        env:
-          NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
-          QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
-          RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
-          MATH_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
-        run: |
-          set -euo pipefail
-          if [ -z "$NVRTC_DIR" ]; then
-            echo "::error::the Actions variable EUHEDRAL_NVRTC_DIR is not set"
-            exit 1
-          fi
-          library="$GITHUB_WORKSPACE/build/native/linux-x64/lib/libeuhedral_cuda.so"
-          test -f "$library"
-          {
-            echo "EUHEDRAL_TEST_CUDA_LIBRARY=$library"
-            echo "EUHEDRAL_NVRTC=$NVRTC_DIR/libnvrtc.so.13"
-            echo "LD_LIBRARY_PATH=$NVRTC_DIR"
-            if [ -n "$QWEN_RCO_ARTIFACT" ]; then echo "EUHEDRAL_TEST_QWEN_RCO_ARTIFACT=$QWEN_RCO_ARTIFACT"; fi
-            if [ -n "$RUST_GOLDENS" ]; then echo "EUHEDRAL_TEST_RUST_GOLDENS=$RUST_GOLDENS"; fi
-            if [ -n "$MATH_LIBRARIES" ]; then echo "EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES=$MATH_LIBRARIES"; fi
-          } >> "$GITHUB_ENV"
       # The device profile is the release profile with debug assertions and overflow checks on: the tests run at the speed
-      # of the product and still trip on what the debug build would. One build serves the three groups below.
+      # of the product and still trip on what the debug build would. The quantization crate's other device tests fail,
+      # not skip, without their settings: only its kernel tests are built for the groups.
       - name: Build the device tests
         working-directory: rust
         run: |
           set -euo pipefail
-          mise exec -- cargo test --profile device --workspace --exclude euhedral-inference-quantization --no-run
-          mise exec -- cargo test --profile device -p euhedral-inference-quantization --test kernels_gpu --no-run
-      # The groups stop at the first failure: no step runs on after a test failed. A test without a model artifact skips
-      # with a line starting "skipped:". The quantization crate's other device tests fail, not skip, without their
-      # settings: only its kernel tests run.
-      - name: Device tests, kernels
-        working-directory: rust
+          mise exec -- cargo test --profile device --workspace --exclude euhedral-inference-quantization --no-run \
+            --message-format=json > "$RUNNER_TEMP/build-workspace.json"
+          mise exec -- cargo test --profile device -p euhedral-inference-quantization --test kernels_gpu --no-run \
+            --message-format=json > "$RUNNER_TEMP/build-quantization.json"
+      - name: Pack the test binaries
         run: |
           set -euo pipefail
-          {
-            mise exec -- cargo test --profile device -p euhedral-inference-cuda -- --ignored --nocapture
-            mise exec -- cargo test --profile device -p euhedral-inference-quantization --test kernels_gpu -- --ignored --nocapture
-          } 2>&1 | tee "$RUNNER_TEMP/device.log"
-      - name: Device tests, servers and benchmarks
-        working-directory: rust
-        run: |
-          set -euo pipefail
-          mise exec -- cargo test --profile device --workspace --exclude euhedral-inference-quantization \
-            --exclude euhedral-inference-cuda --exclude euhedral-inference-engine -- --ignored --nocapture \
-            2>&1 | tee -a "$RUNNER_TEMP/device.log"
+          # The native library finds the CUDA runtime, the grammar library and the kernel sources beside it: the whole
+          # native directory goes along.
+          test -f build/native/linux-x64/lib/libeuhedral_cuda.so
+          mkdir -p "$RUNNER_TEMP/device-tests"
+          python3 scripts/ci-device.py pack "$RUNNER_TEMP/build-workspace.json" "$RUNNER_TEMP/build-quantization.json" \
+            --native build/native/linux-x64 --out "$RUNNER_TEMP/device-tests/device-tests.tar"
+      - name: Upload the device tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests/*
+          if-no-files-found: error
+          retention-days: 2
+
+  # The CUDA crate kernels and the quantization kernels.
+  device-kernels:
+    name: device-kernels
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # Measured: 0.5 GB on the card, 0.5 GB of host memory, 114 s.
+      ARBITER_ARGS: "--gpu shared:1.5 --mem 2G"
+      ARBITER_EST: "240"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
       # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
-      - name: Device tests, memory limits
+      - name: Memory limits
         run: |
           grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
           group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
@@ -300,17 +301,221 @@ jobs:
             grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
             group="${group%/*}"
           done
-      # One test binary holds one engine at a time and reuses it for the tests with the same settings; the log counts the
-      # model loads ("ENGINE LOAD n").
-      - name: Device tests, engine
-        working-directory: rust
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, kernels
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
         run: |
           set -euo pipefail
-          mise exec -- cargo test --profile device -p euhedral-inference-engine -- --ignored --nocapture \
-            2>&1 | tee -a "$RUNNER_TEMP/device.log"
+          python3 scripts/ci-device.py run kernels --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
       - name: Skipped tests
         if: always()
         run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+
+  # The server, API server, benchmark and tokenizer tests: each starts its own engine.
+  device-servers:
+    name: device-servers
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # Measured: 12.7 GB on the card (one engine at a time), 5.4 GB of host memory, 74 s.
+      ARBITER_ARGS: "--gpu shared:13.5 --mem 8G"
+      ARBITER_EST: "240"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, servers and benchmarks
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-device.py run servers --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Skipped tests
+        if: always()
+        run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+
+  # The engine binary, the tests that run on a reduced model: no engine of the model.
+  device-engine-rig:
+    name: device-engine-rig
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # Measured: 5.4 GB on the card (a reduced model), 12.2 GB of host memory, 140 s.
+      ARBITER_ARGS: "--gpu shared:6 --mem 14G"
+      ARBITER_EST: "300"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, engine, reduced model
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-device.py run engine-rig --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Skipped tests
+        if: always()
+        run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+
+  # The engine binary, the modules whose engines have a short context.
+  device-engine-small:
+    name: device-engine-small
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # Measured: 13.1 GB on the card (a 512 and an 8192 token engine), 2.6 GB of host memory, 57 to 141 s.
+      ARBITER_ARGS: "--gpu shared:14 --mem 6G"
+      ARBITER_EST: "300"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, engine, short context
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-device.py run engine-small --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Skipped tests
+        if: always()
+        run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+
+  # The engine binary, the modules that start the 4096-token engine and the loader.
+  device-engine-big:
+    name: device-engine-big
+    needs: [changes, device-build]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: arbiter-gpu
+    env:
+      # Measured: 22.1 GB on the card, 23.4 GB of host memory, 53 model loads, 582 s.
+      ARBITER_ARGS: "--gpu shared:22.5 --mem 28G"
+      ARBITER_EST: "700"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the device tests
+        uses: actions/download-artifact@v4
+        with:
+          name: device-tests
+          path: ${{ runner.temp }}/device-tests
+      # What an engine start reads to size its host budget: the memory limits of this job's cgroup and its parents.
+      - name: Memory limits
+        run: |
+          grep -E "^(MemTotal|MemAvailable)" /proc/meminfo || true
+          group="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "${#group}" -ge 14 ]; do
+            echo "== $group"
+            for file in memory.max memory.current; do
+              echo "$file: $(cat "$group/$file" 2>&1)"
+            done
+            grep -E "^(anon|file|active_file|inactive_file|file_dirty|file_writeback|shmem) " "$group/memory.stat" 2>&1 || true
+            group="${group%/*}"
+          done
+      # Stops at the first failing binary. A test without a model artifact skips with a line starting "skipped:".
+      - name: Device tests, engine, long context
+        env:
+          EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+          EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
+          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
+          EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-device.py run engine-big --archive "$RUNNER_TEMP/device-tests/device-tests.tar" 2>&1 | tee "$RUNNER_TEMP/device.log"
+      - name: Skipped tests
+        if: always()
+        run: grep -h "skipped:" "$RUNNER_TEMP/device.log" | sort | uniq -c || true
+
+  # The one check to require: the groups above all passed. A group that did not run (an earlier job failed, or it was
+  # cancelled) is a failure here, not a pass; only a run that touched no native path skips everything.
+  device:
+    name: device
+    needs: [changes, device-build, device-kernels, device-servers, device-engine-rig, device-engine-small, device-engine-big]
+    if: always()
+    runs-on: arbiter-docker
+    steps:
+      - name: Every device group passed
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        env:
+          PATH: /usr/bin:/bin
+          CHANGES: ${{ needs.changes.result }}
+          NATIVE: ${{ needs.changes.outputs.native }}
+          RESULTS: >-
+            ${{ needs.device-build.result }} ${{ needs.device-kernels.result }} ${{ needs.device-servers.result }}
+            ${{ needs.device-engine-rig.result }} ${{ needs.device-engine-small.result }} ${{ needs.device-engine-big.result }}
+        run: |
+          test "$CHANGES" = success
+          if test "$NATIVE" != true; then
+            exit 0
+          fi
+          for result in $RESULTS; do
+            test "$result" = success || { echo "::error::a device job ended $result"; exit 1; }
+          done
 
   native-package:
     name: native-package
