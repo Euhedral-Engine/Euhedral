@@ -28,6 +28,8 @@
 //! - [`resume`]: the file a long run overwrites in place and resumes from, and [`durable`], the durability barrier,
 //!   truncation and removal it is built on.
 //! - [`package_tokenizer`]: gives an artifact a checkpoint's tokenizer, in place or as a copy.
+//! - [`weight_cache`]: the weights several engines on one machine share (loaded once, freed with the last engine that
+//!   uses them) and whether the next engine fits beside those running.
 
 pub mod assemble;
 mod chain;
@@ -54,3 +56,4 @@ pub mod step;
 pub mod tokenizer_files;
 pub mod training;
 pub mod trellis;
+pub mod weight_cache;
