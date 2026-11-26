@@ -1,8 +1,8 @@
 # Cancels the run this job belongs to. The last step of every job of ci.yaml, with `if: failure()`: the first job that
 # fails stops the others at once, instead of every job running to its end. Cancelling is the Actions API call
-# `POST /actions/runs/{run}/cancel`, which the job's own token may make when the workflow grants it `actions: write`. It never turns a red run green: the run ends
-# cancelled, the job that failed stays failed in its log, and the aggregate checks (`device`, `gate-ok`) are cancelled with
-# it, so they never report success. A cancel that cannot be made is printed and does not hide the failure.
+# `POST /actions/runs/{run}/cancel`, which the job's own token may make when the workflow grants it `actions: write`.
+# It never turns a red run green: the run ends cancelled, every check of it reports failure, and the aggregate checks
+# (`device`, `gate-ok`) fail because a job they need did not succeed. A cancel that cannot be made is printed as an error.
 name: fail-fast
 description: Cancel the current run after a failed job.
 inputs:
