@@ -109,11 +109,17 @@ pub struct World {
 
 impl World {
     pub fn start() -> World {
+        World::with_sinks(2)
+    }
+
+    /// A world whose lake has `sinks` ingest sinks: with one, the frames offered to it are taken in the order they
+    /// were offered.
+    pub fn with_sinks(sinks: usize) -> World {
         let settings = Settings::with_model(ModelSettings::default());
         let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
         let io = AsyncIo::open().unwrap();
         lattice.add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>).unwrap();
-        let host = Lake::new(Arc::clone(&lattice), NonZeroUsize::new(2).unwrap(), LONGEST);
+        let host = Lake::new(Arc::clone(&lattice), NonZeroUsize::new(sinks).unwrap(), LONGEST);
         World { lattice, io, host }
     }
 

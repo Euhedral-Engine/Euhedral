@@ -312,7 +312,7 @@ fn the_fused_mtp_object_is_two_projections_one_after_the_other() {
     let config = &model.objects.config;
     let rows = 8u32;
     let hidden = rig.upload(&model.input[..rows as usize * config.hidden as usize * 2]);
-    let (mut forward, weights) = rig.run(|context| {
+    let (forward, weights) = rig.run(|context| {
         let forward = LayerForward::new(context.ops(), &library, &pool, config, rows)?;
         // SAFETY: `layer` outlives the call, and `rig.run` waits for the lane to retire the copies.
         let weights = unsafe { LayerWeights::upload(context.ops(), &layer, UPLOAD_CHUNK) }?;
