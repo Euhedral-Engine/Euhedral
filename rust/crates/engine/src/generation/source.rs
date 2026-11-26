@@ -2711,17 +2711,19 @@ mod passes_choice_tests {
 
 #[cfg(test)]
 mod kill_tests {
-    use std::sync::Mutex;
+    use std::cell::RefCell;
 
     use super::*;
 
     #[test]
     fn every_flag_is_set_and_told_also_one_that_was_set_already() {
         let (fresh, early) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)));
-        let told = Mutex::new(Vec::new());
-        kill_all([&fresh, &early].into_iter(), |flag| told.lock().unwrap().push(Arc::clone(flag)));
+        let told = RefCell::new(Vec::new());
+        kill_all([&fresh, &early].into_iter(), |flag| {
+            told.borrow_mut().push(Arc::clone(flag))
+        });
         assert!(fresh.load(Ordering::Acquire) && early.load(Ordering::Acquire));
-        let told = told.into_inner().unwrap();
+        let told = told.into_inner();
         assert_eq!(told.len(), 2);
         assert!(Arc::ptr_eq(&told[0], &fresh) && Arc::ptr_eq(&told[1], &early));
     }

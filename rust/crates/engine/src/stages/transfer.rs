@@ -394,8 +394,7 @@ impl DiskTransfer {
     /// The ledger the copy may run under: refused when none was registered, or when a read of the quantum failed, as
     /// the copy would move bytes that are not the weights.
     fn admit<'a>(&self, ledger: Option<&'a Arc<DiskLedger>>) -> Result<&'a Arc<DiskLedger>, StageError> {
-        let ledger = ledger
-            .ok_or_else(|| fatal(format!("{} was started with no disk reads registered", self.name)))?;
+        let ledger = ledger.ok_or_else(|| fatal(format!("{} was started with no disk reads registered", self.name)))?;
         if let Some(why) = ledger.failure() {
             return Err(fatal(why));
         }
@@ -611,7 +610,10 @@ mod tests {
         fn end(&self, slot: usize, result: io::Result<usize>) {
             let done = {
                 let mut pending = self.pending.lock().unwrap();
-                let index = pending.iter().position(|(held, _)| *held == slot).expect("a read of the slot");
+                let index = pending
+                    .iter()
+                    .position(|(held, _)| *held == slot)
+                    .expect("a read of the slot");
                 pending.remove(index).1
             };
             done(result);

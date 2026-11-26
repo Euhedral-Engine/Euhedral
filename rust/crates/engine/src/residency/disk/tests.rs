@@ -521,7 +521,10 @@ fn a_claim_between_the_owners_release_and_the_failure_is_never_ready() {
         .expect("accepted");
     rig.port.finish_with(0, Err(io::Error::other("no disk")));
     assert_eq!(*lock(&seen), [false], "the copy of a failed read was handed the slot");
-    assert!(matches!(rig.events().as_slice(), [GateEvent::Failed(StageError::Fatal(_))]));
+    assert!(matches!(
+        rig.events().as_slice(),
+        [GateEvent::Failed(StageError::Fatal(_))]
+    ));
 }
 
 #[test]

@@ -841,7 +841,10 @@ impl DiskOwner {
                 "a copy claimed an unknown window slot {slot}"
             )));
         };
-        if let State::Filled { ticket: filled, failure } = &mut state.state
+        if let State::Filled {
+            ticket: filled,
+            failure,
+        } = &mut state.state
             && *filled == ticket
         {
             let failure = failure.take();

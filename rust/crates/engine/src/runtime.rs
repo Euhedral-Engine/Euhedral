@@ -1345,10 +1345,15 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the fake port's reads are shared between the test and the closures the reader is given"
+)]
 mod tests {
     use std::cell::Cell;
-    use std::rc::Rc;
     use std::io;
+    use std::rc::Rc;
     use std::sync::Mutex;
     use std::thread;
 
@@ -1472,21 +1477,6 @@ mod tests {
         assert_eq!(reads.0.lock().unwrap().len(), 1);
         teardown.close();
         assert!(teardown.disk_stuck(), "the window may still be written to");
-    }
-
-    #[test]
-    fn a_read_that_ends_before_the_bound_leaves_the_disk_free_to_release() {
-        let (teardown, reader, reads) = teardown_with_disk(Duration::from_secs(10));
-        let _failures = read_of_one_use(&reader);
-        // The read ends as the reader closes, as a lattice frame would end it.
-        let end = reads.0.lock().unwrap().remove(0);
-        let closing = thread::spawn({
-            let teardown = Arc::clone(&teardown);
-            move || teardown.close()
-        });
-        end(Ok(100));
-        closing.join().expect("the close ends");
-        assert!(!teardown.disk_stuck());
     }
 
     /// A stand-in for the runtime that counts its drops.

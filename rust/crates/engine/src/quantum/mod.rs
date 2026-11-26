@@ -51,13 +51,13 @@ pub use input_record::{
 };
 
 use crate::plan::{MAX_CAPTURED_ROWS, Plan, Variant, View};
-use crate::residency::disk::DiskUse;
-use crate::stages::transfer::{DiskLedger, DiskTier};
 use crate::prefix::{Copier, CopyJob};
+use crate::residency::disk::DiskUse;
 use crate::stages::DraftSeed;
 use crate::stages::Quantum;
 use crate::stages::attention::{KvSource, takes_decode_scratch};
 use crate::stages::sampling::SelectedRows;
+use crate::stages::transfer::{DiskLedger, DiskTier};
 use crate::stages::{LaneTable, QuantumError, QuantumKind, StageLaunch, fatal};
 use crate::state::SequenceId;
 use crate::workspace::BufferSlot;
@@ -385,6 +385,10 @@ fn keyed_host_pages(source: Option<KvSource>, base: u64, mtp: u64) -> [u64; 2] {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "the fake port's reads are shared between the test and the closures the reader is given"
+)]
 mod disk_reads_tests {
     use std::io;
     use std::sync::Mutex;
@@ -461,8 +465,12 @@ mod disk_reads_tests {
     #[test]
     fn quanta_register_their_reads_in_the_order_they_start() {
         let (tier, port) = tier();
-        let first = register_reads(Some(&tier), &[use_at(0x1000)], &kill()).unwrap().unwrap();
-        let second = register_reads(Some(&tier), &[use_at(0x2000)], &kill()).unwrap().unwrap();
+        let first = register_reads(Some(&tier), &[use_at(0x1000)], &kill())
+            .unwrap()
+            .unwrap();
+        let second = register_reads(Some(&tier), &[use_at(0x2000)], &kill())
+            .unwrap()
+            .unwrap();
         assert_eq!((first.1.ticket(), second.1.ticket()), (0, 1));
         assert_eq!(*port.0.lock().unwrap(), [0x1000], "the second waits for the slot");
     }
@@ -476,7 +484,11 @@ mod disk_reads_tests {
         end_reads_if_refused(&waiting, &started);
         end_reads_if_refused(&None, &Err::<(), _>(StartError::Closed));
         port.end_oldest(100);
-        assert_eq!(*port.0.lock().unwrap(), [0x1000], "the first quantum's bytes still wait for its copy");
+        assert_eq!(
+            *port.0.lock().unwrap(),
+            [0x1000],
+            "the first quantum's bytes still wait for its copy"
+        );
         // Refused, the first quantum reads no more: its slot is free again once its read has ended.
         let failed: Result<(), StartError> = Err(StartError::Prepare("no record".to_string()));
         end_reads_if_refused(&refused, &failed);
@@ -797,13 +809,16 @@ pub enum StartError {
     Disk(String),
 }
 
+/// The tier a quantum's reads were registered with, and the ledger of what they owe it.
+type Registered = (Arc<DiskTier>, Arc<DiskLedger>);
+
 /// The reads of a quantum's disk uses, registered with `tier` (the one place quanta start, so the reader's tickets follow
 /// the order they start in): `None` when no view of the plan reads from disk or this view has no disk use.
 fn register_reads(
     tier: Option<&Arc<DiskTier>>,
     uses: &[DiskUse],
     kill: &Arc<AtomicBool>,
-) -> Result<Option<(Arc<DiskTier>, Arc<DiskLedger>)>, StartError> {
+) -> Result<Option<Registered>, StartError> {
     let Some(tier) = tier.filter(|_| !uses.is_empty()) else {
         return Ok(None);
     };
@@ -814,7 +829,7 @@ fn register_reads(
 }
 
 /// A quantum that registered reads and is then refused never runs a stage, so nothing else ends its reads: they end here.
-fn end_reads_if_refused<T>(reads: &Option<(Arc<DiskTier>, Arc<DiskLedger>)>, outcome: &Result<T, StartError>) {
+fn end_reads_if_refused<T>(reads: &Option<Registered>, outcome: &Result<T, StartError>) {
     if let (Some((tier, ledger)), Err(_)) = (reads, outcome) {
         ledger.end(tier.reader());
     }
