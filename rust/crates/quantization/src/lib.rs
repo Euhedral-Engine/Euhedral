@@ -25,6 +25,7 @@
 //! - [`checkpoint`]: the safetensors reader and writer and the fused objects of a Qwen 3.8 checkpoint, on `AsyncIo`.
 //! - [`recipe`]: the storage format of each quantized object of an artifact.
 //! - [`exl3`]: the bit allocation of the trellis quantizer and the writer of its EXL3 checkpoint.
+//! - [`calibrate`]: the layer-by-layer calibration of a BF16 checkpoint: its plan, Hessians, driver and device calls.
 //! - [`resume`]: the file a long run overwrites in place and resumes from, and [`durable`], the durability barrier,
 //!   truncation and removal it is built on.
 //! - [`package_tokenizer`]: gives an artifact a checkpoint's tokenizer, in place or as a copy.
@@ -32,6 +33,7 @@
 //!   uses them) and whether the next engine fits beside those running.
 
 pub mod assemble;
+pub mod calibrate;
 mod chain;
 pub mod checkpoint;
 pub mod durable;
