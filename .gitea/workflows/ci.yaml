@@ -365,9 +365,10 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
-      # Measured: 12.7 GB on the card (one engine at a time), 5.4 GB of host memory, 74 s.
+      # Measured: 12.7 GB on the card (one engine at a time), 5.4 GB of host memory; 185 s alone on the card, and past
+      # 280 s when other jobs share it, so the estimate leaves room for a shared card.
       ARBITER_ARGS: "--gpu shared:13.5 --mem 8G --no-learned-cap"
-      ARBITER_EST: "240"
+      ARBITER_EST: "480"
     steps:
       - uses: actions/checkout@v4
       - name: Download the device tests

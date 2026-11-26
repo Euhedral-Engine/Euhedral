@@ -6,6 +6,7 @@
 //! ([`Availability::Dropped`]).
 
 mod assemble;
+mod calibrate;
 mod generate;
 mod package;
 mod reference;
@@ -45,8 +46,8 @@ pub struct Command {
 pub const COMMANDS: [Command; 13] = [
     Command {
         name: "calibrate",
-        availability: Availability::Pending,
-        usage: "--model CHECKPOINT (--quantization nvfp4|q3 | --format trellis --bits 2.5|3.0|3.5) --tokens TOKENS.npy --draft-ids-from ARTIFACT --out DIR",
+        availability: Availability::Wired,
+        usage: "--model CHECKPOINT --quantization nvfp4|q3 [--compressed] [--output-head FORMAT] --tokens TOKENS.npy [--draft-ids-from ARTIFACT] --out DIR [--act-order] [--damp D] [--batch N] [--sequences N] [--layers N] [--nvfp4-above N] [--nvfp4-scale-max X] [--config YAML] [--cuda-library FILE] [--cuda-libraries DIR]",
     },
     Command {
         name: "score",
@@ -149,6 +150,7 @@ pub fn run(args: &[String]) -> Outcome {
     match command.availability {
         Availability::Wired => match command.name {
             "assemble" => assemble::run(&args[1..]),
+            "calibrate" => calibrate::run(&args[1..]),
             "generate" => generate::run(&args[1..]),
             "package-tokenizer" => package::run(&args[1..]),
             "reference" => reference::run(&args[1..]),
@@ -199,7 +201,13 @@ mod tests {
 
     #[test]
     fn a_pending_command_says_it_is_not_available() {
-        let outcome = run_words(&["calibrate", "--model", "x"]);
+        let Some(pending) = COMMANDS
+            .iter()
+            .find(|command| command.availability == Availability::Pending)
+        else {
+            return;
+        };
+        let outcome = run_words(&[pending.name, "--model", "x"]);
         assert_eq!(outcome.code, EXIT_NOT_AVAILABLE);
         assert!(outcome.message.contains("not available"));
     }
