@@ -19,7 +19,7 @@ fn usage_error(message: &str) -> Outcome {
 }
 
 /// Splits `--config FILE` (the settings') from the flags the library parses.
-fn split_config(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
+pub(crate) fn split_config(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
     let (mut config, mut rest) = (None, Vec::new());
     let mut words = args.iter();
     while let Some(word) = words.next() {

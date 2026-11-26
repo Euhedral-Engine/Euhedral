@@ -14,6 +14,7 @@
 //! the search needs of them is the narrow [`Sources`] trait.
 
 mod allocation;
+mod cost;
 mod cost_table;
 mod ensemble;
 mod error;
@@ -25,12 +26,17 @@ pub mod pareto;
 mod pretty;
 mod priors;
 pub mod rco;
+pub mod search;
 mod search_state;
 mod seeds;
 mod space;
 pub mod synthetic;
 
 pub use allocation::Allocation;
+pub use cost::{
+    Bench, DEFAULT_REPEATS, DEFAULT_ROTATE_MIB, DEFAULT_ROWS, Plan, Timed, VERIFY_MAX_ROWS, check_format,
+    hide_launches, launch_mode, measure, measured_objects,
+};
 pub use cost_table::{CostTable, Key, PREFILL_ROWS, Shape, shape_of};
 pub use ensemble::{Ensemble, MemberFit};
 pub use error::MixedError;

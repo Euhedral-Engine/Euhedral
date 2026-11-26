@@ -19,7 +19,7 @@ use euhedral_io::OwnedFile;
 use crate::{EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, Outcome};
 
 /// The longest a score takes: a bound on the wait, not a rate.
-const LONGEST_RUN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub(crate) const LONGEST_RUN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// The most forced rows in one pass.
 const MOST_ROWS: usize = 8;
 /// The most rows in flight at once: `--rows` times `--batch`.
@@ -101,7 +101,7 @@ fn flags(args: &[String]) -> Result<Flags, String> {
 }
 
 /// The library the build puts the CUDA layer in, where this platform has one; other platforms name it.
-fn default_library() -> Option<PathBuf> {
+pub(crate) fn default_library() -> Option<PathBuf> {
     (consts::OS == "linux" && consts::ARCH == "x86_64")
         .then(|| PathBuf::from("build/native/linux-x64/lib/libeuhedral_cuda.so"))
 }
@@ -116,14 +116,51 @@ fn failed(message: String) -> Outcome {
 /// The engine's settings for chunks of up to `context` tokens: the file `config` names, or the defaults, with the
 /// artifact, a context that holds a chunk and no prefix cache, which a fresh sequence per chunk does not use.
 fn settings(flags: &Flags, context: usize) -> Result<Settings, String> {
+    engine_settings(
+        &flags.artifact,
+        flags.config.as_deref(),
+        context,
+        Pass {
+            batch: flags.batch,
+            rows: flags.rows,
+        },
+        Memory {
+            host_mib: flags.host_mib,
+            workers: flags.workers,
+        },
+    )
+}
+
+/// How many chunks the engine holds at once and how many rows each verifies in a pass.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Pass {
+    pub batch: usize,
+    pub rows: usize,
+}
+
+/// The host's share of a run: memory for host-backed weights and the workers taking host work; unset keeps the
+/// engine's defaults.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Memory {
+    pub host_mib: Option<u64>,
+    pub workers: Option<u32>,
+}
+
+/// The engine's settings for scoring `artifact` in chunks of up to `context` tokens.
+pub(crate) fn engine_settings(
+    artifact: &Path,
+    config: Option<&Path>,
+    context: usize,
+    pass: Pass,
+    memory: Memory,
+) -> Result<Settings, String> {
     let model = ModelSettings {
-        artifact: flags.artifact.clone(),
-        name: flags
-            .artifact
+        artifact: artifact.to_path_buf(),
+        name: artifact
             .file_stem()
             .map_or_else(|| "model".to_owned(), |stem| stem.to_string_lossy().into_owned()),
     };
-    let mut settings = match &flags.config {
+    let mut settings = match config {
         None => Settings::with_model(model.clone()),
         Some(path) => load_file(path, &process_env).map_err(|errors| format!("{}: {errors}", path.display()))?,
     };
@@ -134,12 +171,12 @@ fn settings(flags: &Flags, context: usize) -> Result<Settings, String> {
     // Teacher-forced rows never draft: take no draft layer or draft state.
     settings.speculation.mode = SpeculationMode::None;
     // The engine holds a sequence for each chunk in flight, each sized to verify `rows` forced tokens in a pass.
-    settings.batching.max_sequences = u32::try_from(flags.batch).map_err(|_| "--batch is too large".to_owned())?;
-    settings.batching.forced_rows = u32::try_from(flags.rows).map_err(|_| "--rows is too large".to_owned())?;
-    if let Some(mib) = flags.host_mib {
+    settings.batching.max_sequences = u32::try_from(pass.batch).map_err(|_| "--batch is too large".to_owned())?;
+    settings.batching.forced_rows = u32::try_from(pass.rows).map_err(|_| "--rows is too large".to_owned())?;
+    if let Some(mib) = memory.host_mib {
         settings.memory.host_weights_limit = Auto::Value(ByteSize::mib(mib));
     }
-    if let Some(workers) = flags.workers {
+    if let Some(workers) = memory.workers {
         settings.host.task_parallelism = workers;
     }
     Ok(settings)
@@ -151,7 +188,7 @@ fn settings(flags: &Flags, context: usize) -> Result<Settings, String> {
     clippy::disallowed_methods,
     reason = "a binary: its main thread reads a header before the engine starts"
 )]
-fn dimensions(path: &Path) -> Result<(usize, usize), String> {
+pub(crate) fn dimensions(path: &Path) -> Result<(usize, usize), String> {
     let mut header = [0u8; 20];
     File::open(path)
         .and_then(|mut file| file.read_exact(&mut header))
