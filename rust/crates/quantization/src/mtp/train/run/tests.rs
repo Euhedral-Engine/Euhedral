@@ -29,7 +29,7 @@ use crate::checkpoint::io::open_read;
 use crate::corpus::Entry;
 use crate::mtp::train::data::Files;
 use crate::mtp::train::lane::Job;
-use crate::mtp::train::progress::{Found, Resume};
+use crate::mtp::train::progress::{Best, Found, Resume};
 use crate::mtp::train::settings::expected_steps;
 use crate::mtp::train::state::{Part, Piece};
 use crate::mtp::train::wait::{call, pair, then};
@@ -526,7 +526,7 @@ fn resumed(world: &World, out: &Path, ready: &Ready<Fake>) -> Progress {
         expected_steps(ready.data.lengths(), settings.tokens),
         &ready.identity,
         Found::Header(&header),
-        true,
+        Best::Unread,
         false,
     )
     .unwrap();
@@ -579,4 +579,90 @@ fn a_run_stopped_at_a_save_and_resumed_from_its_state_does_the_uninterrupted_run
         assert_eq!(together, wanted, "stopped after {stop} saves");
     }
     world.stop();
+}
+
+/// Rewrites the header of the file `name` in `out`: `change` is given what it holds.
+fn rewrite_header(world: &World, out: &Path, name: &str, change: impl FnOnce(&mut Header)) {
+    let file = call(|reply| ResumeFile::open(&world.io, &world.lake, &out.join(name), then(&reply))).unwrap();
+    let mut header = call(|reply| file.header(then(&reply))).unwrap();
+    change(&mut header);
+    call(|reply| file.set_header(&header, then(&reply))).unwrap();
+}
+
+/// The header of the file `name` in `out`. The handle is closed before this returns: Windows refuses to replace a
+/// file that another handle has open, and the run replaces these.
+fn header_of(world: &World, out: &Path, name: &str) -> Header {
+    let file = call(|reply| ResumeFile::open_read_only(&world.io, &world.lake, &out.join(name), then(&reply))).unwrap();
+    call(|reply| file.header(then(&reply))).unwrap()
+}
+
+/// A run stopped at its first saved state, whose best file is then made newer than the state knows: the state's best is
+/// two accepted drafts below the evaluation of this run's fake lane, and the best file holds `newer` less than it.
+/// Resumed, and given the whole run, what the resumed run did.
+fn resumed_with_a_newer_best(newer_below: f64) -> (Arc<Script>, f64, Header) {
+    let rows = SEQUENCES * (LENGTH - 1);
+    let (world, out) = (World::start(), tempfile::tempdir().unwrap());
+    let first = Arc::new(Script::default());
+    let ended = run(
+        &world,
+        ready(&world, out.path(), &first, Start::Initial, rows),
+        &options(out.path(), 1, 0),
+    );
+    // Every evaluation of the fake lane is the same: the one the run measures.
+    let measured = ended.outcome.unwrap().best;
+    rewrite_header(&world, out.path(), "resume.bin", |header| {
+        header.set("best", (measured - 2.0).to_string());
+        header.set("best.step", "0");
+    });
+    rewrite_header(&world, out.path(), "best.bin", |header| {
+        header.set("step", "1000");
+        header.set("accepted", (measured - newer_below).to_string());
+    });
+    let second = Arc::new(Script::default());
+    let mut next = ready(&world, out.path(), &second, Start::Continue, rows);
+    let state = header_of(&world, out.path(), "resume.bin");
+    let best = header_of(&world, out.path(), "best.bin");
+    let settings = settings();
+    let resume = Progress::resume(
+        settings,
+        next.data.training().to_vec(),
+        expected_steps(next.data.lengths(), settings.tokens),
+        &next.identity,
+        Found::Header(&state),
+        Best::Header(&best),
+        false,
+    )
+    .unwrap();
+    let Resume::Continue(progress) = resume else {
+        panic!("the saved state does not continue the run")
+    };
+    next.progress = progress;
+    run(&world, next, &options(out.path(), 0, 0)).outcome.unwrap();
+    let after = header_of(&world, out.path(), "best.bin");
+    world.stop();
+    (second, measured, after)
+}
+
+#[test]
+fn a_resumed_run_does_not_replace_a_newer_best_file_with_an_evaluation_that_is_not_better_than_it() {
+    let (script, measured, after) = resumed_with_a_newer_best(0.0);
+    assert!(
+        !reads(&script.calls())
+            .iter()
+            .any(|address| (BEST..BEST + 0x200).contains(address)),
+        "the best parameters were saved again"
+    );
+    assert_eq!(after.get("accepted"), Some(measured.to_string().as_str()));
+    assert_eq!(after.get("step"), Some("1000"));
+}
+
+#[test]
+fn a_resumed_run_replaces_a_newer_best_file_with_an_evaluation_strictly_better_than_it() {
+    let (script, measured, after) = resumed_with_a_newer_best(1.0);
+    assert!(
+        reads(&script.calls()).contains(&BEST),
+        "the better parameters were not saved"
+    );
+    assert_eq!(after.get("accepted"), Some(measured.to_string().as_str()));
+    assert_ne!(after.get("step"), Some("1000"));
 }
