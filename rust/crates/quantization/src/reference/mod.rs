@@ -20,10 +20,11 @@ use euhedral_inference_tokenizer::{Tokenizer, read_artifact_tokenizer};
 use thiserror::Error;
 
 pub use partial::{Mark, Partial, RowFile};
-pub use run::{Forcer, Options, Written, write};
+pub use run::{DEFAULT_BATCH, DEFAULT_ROWS, Forcer, Options, Written, write};
 
 use crate::kld::FLOOR;
 use crate::resume::ResumeError;
+use crate::tokenizer_files::read_checkpoint_tokenizer;
 
 /// The smallest context a reference can have: a prefix, and at least one forced token.
 pub const MIN_CONTEXT: usize = 4;
@@ -133,8 +134,9 @@ pub fn refuse_control(
     }
 }
 
-/// The chunks of `text` as the tokenizer in the artifact at `tokenizer` makes them. Reads the artifact's tokenizer
-/// section synchronously: call it on a thread that may wait, before the engine starts.
+/// The chunks of `text` as the tokenizer at `tokenizer` makes them: a checkpoint directory (its tokenizer files, as
+/// `package-tokenizer` reads them) or an artifact (its tokenizer section). Reads synchronously: call it on a thread
+/// that may wait, before the engine starts.
 pub fn tokenize(
     tokenizer: &Path,
     text: &str,
@@ -142,7 +144,11 @@ pub fn tokenize(
     limit: usize,
     parse_special: bool,
 ) -> Result<Vec<Vec<u32>>, ReferenceError> {
-    let tokenizer = read_artifact_tokenizer(tokenizer).map_err(|error| ReferenceError::Refused(error.to_string()))?;
+    let tokenizer = if tokenizer.is_dir() {
+        read_checkpoint_tokenizer(tokenizer).map_err(|error| ReferenceError::Refused(error.to_string()))?
+    } else {
+        read_artifact_tokenizer(tokenizer).map_err(|error| ReferenceError::Refused(error.to_string()))?
+    };
     chunk_text(&tokenizer, text, context, limit, parse_special)
 }
 
