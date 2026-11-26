@@ -12,7 +12,8 @@ use euhedral_io::AsyncIo;
 
 use super::CalibrateError;
 use super::driver::{Once, Then, end, single};
-use super::plan::resume_header;
+use super::manifest::Manifest;
+use super::plan::{resume_at, resume_header};
 use crate::resume::{HEADER, Header, ResumeError, ResumeFile, Then as FileThen};
 use crate::step::idle;
 
@@ -115,6 +116,8 @@ pub fn save(io: &Arc<AsyncIo>, host: &Arc<Lake>, path: PathBuf, bytes: Vec<u8>, 
 
 /// The calls of the resume file that the states use; the file implements them, and a test's fake records them.
 pub trait StatesFile: Clone + Send + 'static {
+    /// Reads the header.
+    fn header(&self, then: FileThen<Header>) -> Result<(), ResumeError>;
     /// Replaces the header.
     fn set_header(&self, header: &Header, then: FileThen<()>) -> Result<(), ResumeError>;
     /// Writes `bytes` at `offset`; `then` gets the offset after them.
@@ -124,6 +127,10 @@ pub trait StatesFile: Clone + Send + 'static {
 }
 
 impl StatesFile for ResumeFile {
+    fn header(&self, then: FileThen<Header>) -> Result<(), ResumeError> {
+        ResumeFile::header(self, then)
+    }
+
     fn set_header(&self, header: &Header, then: FileThen<()>) -> Result<(), ResumeError> {
         ResumeFile::set_header(self, header, then)
     }
@@ -134,6 +141,44 @@ impl StatesFile for ResumeFile {
 
     fn read(&self, offset: u64, len: usize, then: FileThen<Vec<u8>>) -> Result<(), ResumeError> {
         ResumeFile::read(self, offset, len, then)
+    }
+}
+
+/// Where a run of `layers` layers starts, from the resume file and the directory's `manifest` ([`resume_at`]): at a
+/// layer past 0 the file's states are read into `region` first; at 0 the region is left as it is, for the caller to
+/// fill from the tokens.
+pub fn resume<F: StatesFile>(
+    file: &F,
+    manifest: Manifest,
+    layers: usize,
+    region: Region,
+    chunk: usize,
+    then: Then<usize>,
+) {
+    let then = single(then);
+    let failed = Arc::clone(&then);
+    let reading = file.clone();
+    let started = file.header(Box::new(move |header| {
+        let at = header
+            .map_err(|error| CalibrateError::failed("the resume header", error))
+            .and_then(|header| resume_at(&header, &manifest, layers));
+        match at {
+            Ok(0) => end(&then, Ok(0)),
+            Ok(done) => {
+                let ended = Arc::clone(&then);
+                read_states(
+                    &reading,
+                    region,
+                    chunk,
+                    Box::new(move |read| end(&ended, read.map(|()| done))),
+                );
+            }
+            Err(error) => end(&then, Err(error)),
+        }
+        idle()
+    }));
+    if let Err(error) = started {
+        end(&failed, Err(CalibrateError::failed("the resume header", error)));
     }
 }
 

@@ -1,8 +1,10 @@
 //! The `calibrate` command for GPTQ: the BF16 checkpoint run layer by layer over calibration tokens, each layer's
 //! linears rounded from the Hessians of their inputs and written to the output directory, with `calibration.json`
-//! listing the files saved and how far the run got. The output directory must be empty or hold the same run's manifest
-//! (the run resumes); another run's manifest is refused unless `--fresh`, which removes only the files it lists; any
-//! other content is refused, and nothing is removed or written before the checkpoint and the device have opened. The
+//! listing the files saved (the resume file among them) and how far the run got. The output directory must be empty
+//! or hold the same run's manifest with every file it lists (the run resumes from what it lists); another run's
+//! manifest, or this run's with listed files missing, is refused unless `--fresh`, which removes only the files the
+//! manifest lists and starts over; any other content is refused, and nothing is removed or written before the
+//! checkpoint and the device have opened. The
 //! trellis arm is not part of this build. Nor is the rounding of the output head, the draft head and the MTP block: a
 //! run of fewer layers than the model's stops after them and exits 0, keeping its resume file; a run of every layer
 //! writes them all but the heads and the MTP block, then exits with an error naming that gap, and its manifest stays
@@ -91,7 +93,7 @@ pub(crate) struct Flags {
     pub lane_pinned_mib: Option<u64>,
     /// MiB of one upload copy.
     pub upload_chunk_mib: Option<u64>,
-    /// Remove the files of another run's manifest in `--out` instead of refusing.
+    /// Remove the files the manifest in `--out` lists and start over, instead of resuming or refusing.
     pub fresh: bool,
 }
 
@@ -424,7 +426,7 @@ fn calibrated(
     ]);
     let prepared =
         inspect(&flags.out, &key, model_layers, &KEY_FIELDS, flags.fresh).map_err(|error| error.to_string())?;
-    let mut run = RunSettings::new(flags.out.clone(), recipe, key, tokens, length);
+    let mut run = RunSettings::new(flags.out.clone(), recipe, prepared.manifest().clone(), tokens, length);
     run.search = search;
     run.damp = flags.damp;
     run.act_order = flags.act_order;
@@ -432,7 +434,6 @@ fn calibrated(
     if let Some(lanes) = flags.rounding_lanes {
         run.lanes = lanes;
     }
-    run.manifest = Some(prepared.manifest().clone());
     if let Some(mib) = flags.memory_reserve_mib {
         run.device_reserve = Some(mib_bytes("--memory-reserve-mib", mib)?);
     }

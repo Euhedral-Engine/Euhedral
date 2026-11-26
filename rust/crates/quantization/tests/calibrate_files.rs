@@ -14,6 +14,7 @@
 
 use std::fs;
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -25,8 +26,10 @@ use euhedral_core::generics::LatticeSource;
 use euhedral_graph::Lake;
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_quantization::calibrate::CalibrateError;
-use euhedral_inference_quantization::calibrate::files::{Region, StatesFile, read_states, save, write_checkpoint};
-use euhedral_inference_quantization::calibrate::plan::resume_at;
+use euhedral_inference_quantization::calibrate::files::{
+    Region, StatesFile, read_states, resume, save, write_checkpoint,
+};
+use euhedral_inference_quantization::calibrate::manifest::{Ledger, Manifest, inspect};
 use euhedral_inference_quantization::resume::{HEADER, Header, ResumeError, Then};
 use euhedral_inference_settings::{ModelSettings, Settings};
 use euhedral_io::AsyncIo;
@@ -45,6 +48,7 @@ enum Call {
 #[derive(Clone)]
 struct Fake {
     calls: Arc<Mutex<Vec<Call>>>,
+    header: Arc<Mutex<Header>>,
     bytes: Arc<Mutex<Vec<u8>>>,
     fail_write: Option<usize>,
 }
@@ -53,6 +57,7 @@ impl Fake {
     fn new(bytes: Vec<u8>, fail_write: Option<usize>) -> Fake {
         Fake {
             calls: Arc::new(Mutex::new(Vec::new())),
+            header: Arc::new(Mutex::new(Header::new())),
             bytes: Arc::new(Mutex::new(bytes)),
             fail_write,
         }
@@ -64,9 +69,16 @@ impl Fake {
 }
 
 impl StatesFile for Fake {
+    fn header(&self, then: Then<Header>) -> Result<(), ResumeError> {
+        let header = self.header.lock().unwrap().clone();
+        drop(then(Ok(header)));
+        Ok(())
+    }
+
     fn set_header(&self, header: &Header, then: Then<()>) -> Result<(), ResumeError> {
         let layers = header.get("layers").map(|layers| layers.parse().unwrap());
         self.calls.lock().unwrap().push(Call::Header(layers));
+        *self.header.lock().unwrap() = header.clone();
         drop(then(Ok(())));
         Ok(())
     }
@@ -147,16 +159,118 @@ fn a_checkpoint_that_fails_in_a_chunk_leaves_the_header_naming_no_layers() {
     assert_eq!(calls.len(), 3, "no chunk is written after the failure");
 }
 
+/// Where a run starts, from `fake` and `manifest`, over `states`.
+fn resumed(fake: &Fake, manifest: Manifest, states: &mut [u8]) -> Result<usize, CalibrateError> {
+    let into = region(states);
+    let (sender, receiver) = channel();
+    resume(
+        fake,
+        manifest,
+        64,
+        into,
+        4,
+        Box::new(move |at| sender.send(at).unwrap()),
+    );
+    receiver.recv_timeout(HANG).expect("the resume never ended")
+}
+
+const FIELDS: [&str; 1] = ["the key"];
+
+fn touch(directory: &Path, names: &[String]) {
+    for name in names {
+        fs::write(directory.join(name), name.as_bytes()).unwrap();
+    }
+}
+
+/// The files of layers `layers`, as a run names them.
+fn layer_files(layers: Range<usize>) -> Vec<String> {
+    layers
+        .map(|layer| format!("text.layers.{layer}.mlp.down.npz"))
+        .collect()
+}
+
+/// A directory of run `key` after 9 layers, with its checkpoint after 8 sealed and listed, and the resume file's
+/// states after those 8 layers in a fake.
+fn after_nine_layers(key: &str) -> (tempfile::TempDir, Fake) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manifest = Manifest::new(key, 64).after(9);
+    manifest.files = layer_files(0..9);
+    manifest.files.push("hidden.bin".to_owned());
+    touch(directory.path(), &manifest.files);
+    fs::write(directory.path().join("calibration.json"), manifest.to_bytes().unwrap()).unwrap();
+    let fake = Fake::new(vec![0; 10], None);
+    let mut states: Vec<u8> = (1..=10).collect();
+    let from = region(&mut states);
+    outcome(|then| write_checkpoint(&fake, key, from, 4, 8, then)).unwrap();
+    (directory, fake)
+}
+
 #[test]
-fn a_header_that_names_no_layers_resumes_from_the_start_and_the_valid_one_from_its_layers() {
-    let mut invalid = Header::new();
-    invalid.set("key", "run");
-    invalid.set("layers", "0");
-    assert_eq!(resume_at(&invalid, "run", 64), 0);
-    let mut valid = Header::new();
-    valid.set("key", "run");
-    valid.set("layers", "9");
-    assert_eq!(resume_at(&valid, "run", 64), 9);
+fn the_same_runs_directory_resumes_at_its_checkpoint_and_reads_the_states() {
+    let (directory, fake) = after_nine_layers("A");
+    let manifest = inspect(directory.path(), "A", 64, &FIELDS, false)
+        .unwrap()
+        .apply()
+        .unwrap();
+    let mut states = vec![0u8; 10];
+    assert_eq!(resumed(&fake, manifest, &mut states).unwrap(), 8);
+    assert_eq!(states, (1..=10).collect::<Vec<u8>>());
+}
+
+/// Run A reaches layer 9 with its checkpoint after 8; `--fresh` with key B removes A's files, and B rounds 4 layers
+/// with no checkpoint; `--fresh` back to A must start at layer 0, though the resume file left beside B's manifest
+/// (here: A's states after 8 layers, the worst it can hold) names A, and must never count layer 8 or 9.
+#[test]
+fn fresh_back_to_a_run_whose_states_survived_starts_at_layer_0_and_counts_no_later_layer() {
+    let (directory, fake) = after_nine_layers("A");
+    inspect(directory.path(), "B", 64, &FIELDS, true)
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert!(
+        !directory.path().join("hidden.bin").exists(),
+        "--fresh removed the listed resume file"
+    );
+    let mut b = Manifest::new("B", 64).after(4);
+    b.files = layer_files(0..4);
+    touch(directory.path(), &b.files);
+    touch(directory.path(), &["hidden.bin".to_owned()]);
+    fs::write(directory.path().join("calibration.json"), b.to_bytes().unwrap()).unwrap();
+    let manifest = inspect(directory.path(), "A", 64, &FIELDS, true)
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(manifest, Manifest::new("A", 64));
+    let mut states = vec![0u8; 10];
+    assert_eq!(resumed(&fake, manifest.clone(), &mut states).unwrap(), 0);
+    assert_eq!(states, vec![0u8; 10], "the states are left for the tokens");
+    let ledger = Arc::new(Ledger::new(manifest));
+    for layer in [8, 9] {
+        let (sender, receiver) = channel();
+        ledger.record(
+            layer,
+            Ok(()),
+            |_bytes, _saved| panic!("a layer past the first uncounted one was saved"),
+            Box::new(move |result| sender.send(result).unwrap()),
+        );
+        assert!(
+            receiver.recv_timeout(HANG).unwrap().is_err(),
+            "layer {layer} was counted"
+        );
+    }
+    assert_eq!(ledger.manifest().unwrap().layers_done, 0);
+}
+
+#[test]
+fn a_checkpoint_torn_before_its_header_named_the_layers_resumes_from_the_start() {
+    let fake = Fake::new(vec![0; 10], Some(2));
+    let mut written = vec![5u8; 10];
+    let from = region(&mut written);
+    outcome(|then| write_checkpoint(&fake, "run", from, 4, 8, then)).unwrap_err();
+    let mut manifest = Manifest::new("run", 64).after(9);
+    manifest.files.push("hidden.bin".to_owned());
+    let mut states = vec![0u8; 10];
+    assert_eq!(resumed(&fake, manifest, &mut states).unwrap(), 0);
 }
 
 #[test]

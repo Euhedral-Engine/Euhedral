@@ -36,10 +36,10 @@ use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerSpec, Planner
 
 use super::driver::{Once, Then, end, single};
 use super::embedding;
-use super::files::{Region, read_states, save, write_checkpoint};
+use super::files::{Region, resume, save, write_checkpoint};
 use super::hessians::HessianSet;
 use super::manifest::{Ledger, MANIFEST_FILE, Manifest, RESUME_FILE};
-use super::plan::{Plan, resume_at, round_order};
+use super::plan::{Plan, round_order};
 use super::rounding::{Ended, HEAD_ROWS, Linear, RoundSettings, Services, round_all};
 use super::{CalibrateError, Stages};
 use crate::checkpoint::CheckpointError;
@@ -95,8 +95,6 @@ pub struct Settings {
     pub length: usize,
     /// The calibration tokens, `sequences * length` of them.
     pub tokens: Vec<i32>,
-    /// What names this run in the resume file.
-    pub key: String,
     /// Linears rounded at once.
     pub lanes: usize,
     pub staging_bytes: u64,
@@ -105,13 +103,14 @@ pub struct Settings {
     /// [`DEVICE_RESERVE`].
     pub device_reserve: Option<u64>,
     pub chunk_bytes: usize,
-    /// The manifest the run starts from (a resumed directory's); none starts one that lists nothing.
-    pub manifest: Option<Manifest>,
+    /// The manifest the run starts from (a resumed directory's, or a new one): its key names the run in the resume
+    /// file, and it is all the run resumes from.
+    pub manifest: Manifest,
 }
 
 impl Settings {
     /// The settings of a run over `tokens` (`length` per sequence), everything else at its default.
-    pub fn new(out: PathBuf, recipe: Recipe, key: String, tokens: Vec<i32>, length: usize) -> Settings {
+    pub fn new(out: PathBuf, recipe: Recipe, manifest: Manifest, tokens: Vec<i32>, length: usize) -> Settings {
         Settings {
             out,
             recipe,
@@ -121,13 +120,12 @@ impl Settings {
             batch: DEFAULT_BATCH,
             length,
             tokens,
-            key,
             lanes: ROUNDING_LANES,
             staging_bytes: STAGING_BYTES,
             lane_pinned_bytes: LANE_PINNED_BYTES,
             device_reserve: None,
             chunk_bytes: UPLOAD_CHUNK_BYTES,
-            manifest: None,
+            manifest,
         }
     }
 
@@ -228,12 +226,7 @@ impl Calibration {
             ForwardKernels::new(&gptq, &rows).map_err(|error| CalibrateError::failed("the forward kernels", error))?,
         );
         let config = &objects.config;
-        let ledger = Arc::new(Ledger::new(
-            settings
-                .manifest
-                .clone()
-                .unwrap_or_else(|| Manifest::new(&settings.key, config.layers)),
-        ));
+        let ledger = Arc::new(Ledger::new(settings.manifest.clone()));
         let (hidden, length, batch) = (config.hidden as usize, settings.length, settings.batch);
         let max_rows = u32::try_from(batch * length)
             .map_err(|_| CalibrateError::Invalid(format!("{batch} sequences of {length} tokens are too many rows")))?;
@@ -510,25 +503,7 @@ impl Stages for Calibration {
     fn layer(&self, layer: usize, staged: StagedLayer, then: Then<()>) {
         let inner = Arc::clone(&self.inner);
         let recorded: Then<()> = Box::new(move |result| {
-            let (io, host) = (Arc::clone(&inner.services.io), Arc::clone(&inner.services.host));
-            let path = inner.settings.out.join(MANIFEST_FILE);
-            Arc::clone(&inner.ledger).record(
-                layer + 1,
-                result,
-                move |bytes, saved| {
-                    save(
-                        &io,
-                        &host,
-                        path,
-                        bytes,
-                        Box::new(move |result| {
-                            saved(result);
-                            idle()
-                        }),
-                    );
-                },
-                then,
-            );
+            Arc::clone(&inner.ledger).record(layer, result, save_manifest(&inner), then);
         });
         upload(Arc::clone(&self.inner), layer, staged, single(recorded));
     }
@@ -569,7 +544,7 @@ fn begin(inner: Arc<Inner>, layers: usize, then: Once<usize>) {
                 Err(error) => end(&then, Err(CalibrateError::failed("the resume file", error))),
                 Ok(file) => {
                     let _ = opening.resume.set(file.clone());
-                    read_header(opening, file, layers, then);
+                    resume_or_embed(opening, &file, layers, then);
                 }
             }
             idle()
@@ -580,32 +555,23 @@ fn begin(inner: Arc<Inner>, layers: usize, then: Once<usize>) {
     }
 }
 
-fn read_header(inner: Arc<Inner>, file: ResumeFile, layers: usize, then: Once<usize>) {
-    let failed = Arc::clone(&then);
-    let started = file.header(Box::new(move |header| {
-        match header {
-            Err(error) => end(&then, Err(CalibrateError::failed("the resume header", error))),
-            Ok(header) => match resume_at(&header, &inner.settings.key, layers) {
-                0 => embed(inner, then),
-                done => match inner.resume_file().cloned() {
-                    Ok(file) => {
-                        let ended = Arc::clone(&then);
-                        read_states(
-                            &file,
-                            inner.region(),
-                            STATES_CHUNK,
-                            Box::new(move |read| end(&ended, read.map(|()| done))),
-                        );
-                    }
-                    Err(error) => end(&then, Err(error)),
-                },
-            },
-        }
-        idle()
-    }));
-    if let Err(error) = started {
-        end(&failed, Err(CalibrateError::failed("the resume header", error)));
-    }
+/// Resumes from what the manifest lists, or embeds the tokens when that is layer 0.
+fn resume_or_embed(inner: Arc<Inner>, file: &ResumeFile, layers: usize, then: Once<usize>) {
+    let Some(manifest) = inner.ledger.manifest() else {
+        return end(&then, Err(CalibrateError::Failed("the manifest is in use".to_owned())));
+    };
+    let region = inner.region();
+    resume(
+        file,
+        manifest,
+        layers,
+        region,
+        STATES_CHUNK,
+        Box::new(move |at| match at {
+            Ok(0) => embed(inner, then),
+            done => end(&then, done),
+        }),
+    );
 }
 
 /// Looks the tokens up in the embedding table: each token's row is copied into the states.
@@ -649,10 +615,37 @@ fn embed(inner: Arc<Inner>, then: Once<usize>) {
 
 // ---- checkpoint ----
 
+/// The states after `done` layers into the resume file, then the manifest listing it.
 fn checkpoint(inner: &Arc<Inner>, done: usize, then: Then<()>) {
-    match inner.resume_file() {
-        Ok(file) => write_checkpoint(file, &inner.settings.key, inner.region(), STATES_CHUNK, done, then),
-        Err(error) => then(Err(error)),
+    let file = match inner.resume_file() {
+        Ok(file) => file,
+        Err(error) => return then(Err(error)),
+    };
+    let Some(manifest) = inner.ledger.manifest() else {
+        return then(Err(CalibrateError::Failed("the manifest is in use".to_owned())));
+    };
+    let listing = Arc::clone(inner);
+    let listed: Then<()> = Box::new(move |result| {
+        Arc::clone(&listing.ledger).checkpointed(result, save_manifest(&listing), then);
+    });
+    write_checkpoint(file, &manifest.key, inner.region(), STATES_CHUNK, done, listed);
+}
+
+/// The save of the manifest's bytes over its file, for the ledger.
+fn save_manifest(inner: &Arc<Inner>) -> impl FnOnce(Vec<u8>, Then<()>) + use<> {
+    let (io, host) = (Arc::clone(&inner.services.io), Arc::clone(&inner.services.host));
+    let path = inner.settings.out.join(MANIFEST_FILE);
+    move |bytes, saved| {
+        save(
+            &io,
+            &host,
+            path,
+            bytes,
+            Box::new(move |result| {
+                saved(result);
+                idle()
+            }),
+        );
     }
 }
 
@@ -819,9 +812,17 @@ fn round(
 fn swap(inner: Arc<Inner>, mut weights: LayerWeights, set: HessianSet<DeviceBuffer>, ended: Ended, then: Once<()>) {
     let Ended { lanes, linears } = ended;
     inner.lanes.send(lanes);
-    inner
+    if !inner
         .ledger
-        .list(linears.iter().map(|linear| QuantState::file_name(&linear.name)));
+        .list(linears.iter().map(|linear| QuantState::file_name(&linear.name)))
+    {
+        return end(
+            &then,
+            Err(CalibrateError::Failed(
+                "the manifest was in use when the layer's files were listed".to_owned(),
+            )),
+        );
+    }
     let submitted = inner.main.submit_marked(|queue| {
         let mut ops = RusteeOps::new(queue, &inner.table, Modes::default()).on_lane(&inner.library, inner.home);
         for linear in linears {

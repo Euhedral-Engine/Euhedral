@@ -1,10 +1,12 @@
 //! What an output directory holds, and of which run: the manifest names the run (its resume key), lists the files the
-//! run saved and says how much of the model it rounded, so a consumer takes the codes only when they are all there.
-//! A run starts in an empty directory or in its own, and refuses any other: nothing a run did not write is removed.
+//! run saved (the resume file among them, once a checkpoint sealed) and says how much of the model it rounded, so a
+//! consumer takes the codes only when they are all there. It is the one record of the directory: a run resumes only
+//! from what it lists, counts only layers whose files it lists, and `--fresh` removes only what it lists. A run starts
+//! in an empty directory or in its own, and refuses any other.
 
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use euhedral_inference_engine::Handoff;
@@ -21,6 +23,8 @@ pub const RESUME_FILE: &str = "hidden.bin";
 const TEMPORARY_SUFFIX: &str = ".tmp";
 /// The most names a refusal lists.
 const MOST_NAMED: usize = 5;
+/// Characters a listed name may not hold: the separators of every platform, and Windows' stream and drive mark.
+const NOT_IN_NAMES: [char; 4] = ['/', '\\', ':', '\0'];
 
 /// How far a run of one key got.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,10 +74,33 @@ impl Manifest {
         serde_json::to_vec_pretty(self).map_err(|error| CalibrateError::failed("the manifest", error))
     }
 
-    /// The manifest a file holds.
+    /// The manifest a file holds. Every listed name must be a plain file name of the directory (see [`plain`]): a
+    /// manifest that names anything else is refused, so nothing outside the directory is ever read or removed.
     pub fn parse(bytes: &[u8]) -> Result<Manifest, CalibrateError> {
-        serde_json::from_slice(bytes).map_err(|error| CalibrateError::failed("the manifest", error))
+        let manifest: Manifest =
+            serde_json::from_slice(bytes).map_err(|error| CalibrateError::failed("the manifest", error))?;
+        if let Some(name) = manifest.files.iter().find(|name| !plain(name)) {
+            return Err(CalibrateError::Invalid(format!(
+                "the manifest lists {name:?}, which is not a file name of the directory"
+            )));
+        }
+        Ok(manifest)
     }
+
+    /// Whether the run's resume file is one of the files it saved.
+    pub fn lists_resume_file(&self) -> bool {
+        self.files.iter().any(|name| name == RESUME_FILE)
+    }
+}
+
+/// Whether `name` names a file directly in the directory, on every platform: one normal path component, no separator,
+/// not `.` or `..`, not absolute or prefixed, and not the manifest itself.
+pub fn plain(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    !name.contains(NOT_IN_NAMES)
+        && name != MANIFEST_FILE
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
 }
 
 /// Names a run's key by its parts: the parts of `old` and `new` (joined with `|`) that differ, by the names of the
@@ -105,7 +132,7 @@ pub struct Prepared {
     manifest: Manifest,
     /// Whether the directory holds this run's manifest already.
     resumed: bool,
-    /// The files the manifest of another run listed, which `--fresh` removes.
+    /// The files the manifest `--fresh` replaces listed, which `apply` removes.
     clear: Vec<PathBuf>,
 }
 
@@ -167,14 +194,17 @@ fn named(names: &[String]) -> String {
 
 /// Decides what a run of `key` does with the directory `out`, and changes nothing there:
 /// - an empty (or missing) directory: the run starts;
+/// - a calibration's manifest and `fresh`: the files that manifest lists are removed (those that are there), and the
+///   run starts over with a manifest that lists nothing, whatever key the old one had;
 /// - this run's manifest (the same key and model) whose listed files all exist: the run resumes;
-/// - the manifest of another key: refused, naming the key's fields (`fields`, in the key's order) that differ, unless
-///   `fresh`, which removes the files that manifest lists and its manifest, and nothing else;
-/// - anything else (files and no manifest, a manifest that is not a calibration's or cannot be read, listed files
-///   missing): refused, naming what is there.
+/// - this run's manifest with listed files missing: refused, naming them and `--fresh`;
+/// - the manifest of another key: refused, naming the key's fields (`fields`, in the key's order) that differ and
+///   `--fresh`;
+/// - anything else (files and no manifest, a manifest that is not a calibration's, cannot be read or lists a name that
+///   is not a plain file name): refused, naming what is there, even with `fresh`.
 ///
-/// Files beside a calibration's manifest that it does not list (a note, the resume file, a state file of the layer a
-/// stop interrupted) are the run's neighbours: they are never removed, and a run writes over its own.
+/// Files beside a calibration's manifest that it does not list (a note, a state file of the layer a stop
+/// interrupted, a resume file no checkpoint of the run sealed) are never removed; a run writes over its own.
 ///
 /// Blocking: the run calls it before any of its work starts.
 #[allow(
@@ -231,26 +261,11 @@ pub fn inspect(
             format!("its {MANIFEST_FILE} is not a calibration's manifest or cannot be read ({error})"),
         )
     })?;
-    let listed: Vec<PathBuf> = existing.files.iter().map(|name| out.join(name)).collect();
-    if existing.key == key && existing.layers_total == layers_total {
-        let missing: Vec<String> = existing
-            .files
-            .iter()
-            .filter(|name| !out.join(name).is_file())
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            return Err(refuse(
-                out,
-                format!(
-                    "its {MANIFEST_FILE} lists files that are not there: {}",
-                    named(&missing)
-                ),
-            ));
-        }
-        return Ok(start(true, existing, Vec::new()));
+    if fresh {
+        let listed = existing.files.iter().map(|name| out.join(name)).collect();
+        return Ok(start(false, wanted, listed));
     }
-    if !fresh {
+    if existing.key != key || existing.layers_total != layers_total {
         return Err(refuse(
             out,
             format!(
@@ -259,11 +274,28 @@ pub fn inspect(
             ),
         ));
     }
-    Ok(start(false, wanted, listed))
+    let missing: Vec<String> = existing
+        .files
+        .iter()
+        .filter(|name| !out.join(name).is_file())
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        return Err(refuse(
+            out,
+            format!(
+                "its {MANIFEST_FILE} lists files that are not there: {}; pass --fresh to remove the files it lists and start over",
+                named(&missing)
+            ),
+        ));
+    }
+    Ok(start(true, existing, Vec::new()))
 }
 
-/// The manifest of a run in progress, which the layers update serially: a layer's files are listed once saved, and the
-/// layer is counted only when its manifest is on disk.
+/// The manifest of a run in progress, which the layers and the checkpoints update serially: a layer's files are listed
+/// once saved, and the layer is counted only when its manifest is on disk and every layer before it is counted, so
+/// the count is always the layers from the first whose files are all listed. The resume file is listed once a
+/// checkpoint sealed it, and that listing is saved before the run goes on.
 #[derive(Debug)]
 pub struct Ledger {
     current: Handoff<Manifest>,
@@ -277,16 +309,19 @@ impl Ledger {
         Ledger { current }
     }
 
-    /// Lists files whose saves have sealed.
-    pub fn list(&self, names: impl IntoIterator<Item = String>) {
-        if let Some(mut manifest) = self.current.take() {
-            for name in names {
-                if !manifest.files.contains(&name) {
-                    manifest.files.push(name);
-                }
+    /// Lists files whose saves have sealed. False, listing nothing, while a save of the manifest is in flight: the
+    /// caller fails its layer, which then is not counted.
+    pub fn list(&self, names: impl IntoIterator<Item = String>) -> bool {
+        let Some(mut manifest) = self.current.take() else {
+            return false;
+        };
+        for name in names {
+            if !manifest.files.contains(&name) {
+                manifest.files.push(name);
             }
-            self.current.send(manifest);
         }
+        self.current.send(manifest);
+        true
     }
 
     /// The manifest as the ledger holds it.
@@ -296,22 +331,67 @@ impl Ledger {
         Some(manifest)
     }
 
-    /// Counts the layers `done` once `result`, the end of the layer's work and its saves, is Ok: `write` saves the
+    /// Counts layer `layer` once `result`, the end of the layer's work and its saves, is Ok: `write` saves the
     /// manifest's bytes and gives its result to the callback; only an Ok save changes what the ledger holds. An Err
-    /// `result` writes nothing and goes on to `then`.
-    pub fn record<W>(self: &Arc<Self>, done: usize, result: Result<(), CalibrateError>, write: W, then: Then<()>)
+    /// `result` writes nothing and goes on to `then`. A layer past the first one not counted is refused, writing
+    /// nothing: counting it would count the layers between, whose files the manifest does not list. A layer already
+    /// counted (a resumed run redoing the layers after its checkpoint) leaves the count as it is.
+    pub fn record<W>(self: &Arc<Self>, layer: usize, result: Result<(), CalibrateError>, write: W, then: Then<()>)
     where
         W: FnOnce(Vec<u8>, Then<()>),
     {
         if let Err(error) = result {
             return then(Err(error));
         }
+        self.commit(
+            |held| {
+                if layer > held.layers_done {
+                    return Err(CalibrateError::Failed(format!(
+                        "layer {layer} cannot be counted: the manifest counts {} layers",
+                        held.layers_done
+                    )));
+                }
+                Ok(held.after(held.layers_done.max(layer + 1)))
+            },
+            write,
+            then,
+        );
+    }
+
+    /// Lists the resume file once `result`, the end of a checkpoint, is Ok, and saves the manifest through `write` as
+    /// [`Ledger::record`] does: the run resumes from the checkpoint only once the manifest on disk lists it. An Err
+    /// `result` writes nothing and goes on to `then`.
+    pub fn checkpointed<W>(self: &Arc<Self>, result: Result<(), CalibrateError>, write: W, then: Then<()>)
+    where
+        W: FnOnce(Vec<u8>, Then<()>),
+    {
+        if let Err(error) = result {
+            return then(Err(error));
+        }
+        self.commit(
+            |held| {
+                let mut next = held.clone();
+                if !next.lists_resume_file() {
+                    next.files.push(RESUME_FILE.to_owned());
+                }
+                Ok(next)
+            },
+            write,
+            then,
+        );
+    }
+
+    /// Saves the manifest `change` makes of the one held; the ledger holds the new one only once the save is Ok.
+    fn commit<C, W>(self: &Arc<Self>, change: C, write: W, then: Then<()>)
+    where
+        C: FnOnce(&Manifest) -> Result<Manifest, CalibrateError>,
+        W: FnOnce(Vec<u8>, Then<()>),
+    {
         let Some(held) = self.current.take() else {
             return then(Err(CalibrateError::Failed("the manifest is in use".to_owned())));
         };
-        let next = held.after(done);
-        let bytes = match next.to_bytes() {
-            Ok(bytes) => bytes,
+        let (bytes, next) = match change(&held).and_then(|next| next.to_bytes().map(|bytes| (bytes, next))) {
+            Ok(changed) => changed,
             Err(error) => {
                 self.current.send(held);
                 return then(Err(error));

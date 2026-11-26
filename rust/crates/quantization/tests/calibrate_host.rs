@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use euhedral_inference_engine::Handoff;
-use euhedral_inference_quantization::calibrate::device::refuse_finish;
 use euhedral_inference_quantization::calibrate::manifest::{Ledger, Manifest, differences, inspect};
 use euhedral_inference_quantization::calibrate::plan::{resume_at, resume_header, resume_key, tokens_digest};
 use euhedral_inference_quantization::calibrate::schedule::{Schedule, Settled};
@@ -200,16 +199,56 @@ fn a_run_resumed_past_its_last_layer_only_finishes() {
     assert_eq!(fake.events(), vec![Event::Finish]);
 }
 
+/// The manifest of a run of `key` that counts `layers_done` layers, listing the resume file when `listed`.
+fn counted(key: &str, layers_done: usize, listed: bool) -> Manifest {
+    let mut manifest = Manifest::new(key, 64).after(layers_done);
+    if listed {
+        manifest.files.push("hidden.bin".to_owned());
+    }
+    manifest
+}
+
 #[test]
-fn a_resume_file_of_another_run_or_of_more_layers_is_not_resumed() {
+fn a_listed_resume_file_of_the_manifests_run_resumes_at_its_header_unless_the_run_covers_fewer_layers() {
     let key = resume_key(&["tokens", "8", "512", "recipe", "false", "0.01"]);
     let header = resume_header(&key, 16);
-    assert_eq!(resume_at(&header, &key, 64), 16);
-    assert_eq!(resume_at(&header, &resume_key(&["other"]), 64), 0, "another run's file");
-    assert_eq!(resume_at(&header, &key, 8), 0, "more layers done than the run covers");
+    assert_eq!(resume_at(&header, &counted(&key, 17, true), 64).unwrap(), 16);
+    assert_eq!(resume_at(&header, &counted(&key, 16, true), 64).unwrap(), 16);
+    assert_eq!(
+        resume_at(&header, &counted(&key, 17, true), 8).unwrap(),
+        0,
+        "more layers done than the run covers"
+    );
     let mut broken = resume_header(&key, 0);
     broken.set("layers", "many");
-    assert_eq!(resume_at(&broken, &key, 64), 0, "an unreadable count");
+    assert_eq!(
+        resume_at(&broken, &counted(&key, 17, true), 64).unwrap(),
+        0,
+        "an unreadable count"
+    );
+}
+
+#[test]
+fn a_resume_file_the_manifest_does_not_list_is_never_resumed_whatever_it_holds() {
+    let header = resume_header("run", 8);
+    assert_eq!(resume_at(&header, &counted("run", 9, false), 64).unwrap(), 0);
+    assert_eq!(
+        resume_at(&header, &counted("run", 0, false), 64).unwrap(),
+        0,
+        "a new manifest"
+    );
+}
+
+#[test]
+fn states_past_the_layers_the_manifest_counts_are_not_resumed() {
+    let header = resume_header("run", 16);
+    assert_eq!(resume_at(&header, &counted("run", 9, true), 64).unwrap(), 0);
+}
+
+#[test]
+fn a_listed_resume_file_of_another_run_than_the_manifests_is_refused_naming_fresh() {
+    let why = refusal(resume_at(&resume_header("other", 8), &counted("run", 9, true), 64));
+    assert!(why.contains("hidden.bin") && why.contains("--fresh"), "{why}");
 }
 
 #[test]
@@ -847,11 +886,58 @@ fn a_manifest_that_is_not_a_calibrations_is_refused_and_nothing_is_removed() {
 }
 
 #[test]
-fn listed_files_that_are_missing_refuse_the_run_naming_them() {
-    let directory = run_directory("run", &["a.npz", "b.npz"], &[]);
+fn listed_files_that_are_missing_refuse_the_run_naming_them_and_fresh_clears_the_rest() {
+    let directory = run_directory("run", &["a.npz", "b.npz"], &["notes.txt"]);
     fs::remove_file(directory.path().join("b.npz")).unwrap();
     let why = refusal(inspect(directory.path(), "run", 64, &FIELDS, false));
     assert!(why.contains("b.npz") && !why.contains("a.npz"), "{why}");
+    assert!(why.contains("--fresh"), "the refusal names the way out: {why}");
+    let manifest = inspect(directory.path(), "run", 64, &FIELDS, true)
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(manifest, Manifest::new("run", 64));
+    assert_eq!(names(directory.path()), vec!["calibration.json", "notes.txt"]);
+}
+
+#[test]
+fn fresh_in_the_directory_of_the_same_key_starts_over_removing_what_its_manifest_lists() {
+    let directory = run_directory("run", &["a.npz", "hidden.bin"], &["stray.npz"]);
+    let manifest = inspect(directory.path(), "run", 64, &FIELDS, true)
+        .unwrap()
+        .apply()
+        .unwrap();
+    assert_eq!(manifest, Manifest::new("run", 64));
+    assert_eq!(names(directory.path()), vec!["calibration.json", "stray.npz"]);
+}
+
+#[test]
+fn a_manifest_listing_a_name_outside_the_directory_is_refused_even_with_fresh_and_nothing_is_removed() {
+    let parent = tempfile::tempdir().unwrap();
+    touch(parent.path(), &["outside.txt"]);
+    let out = parent.path().join("out");
+    fs::create_dir(&out).unwrap();
+    touch(&out, &["a.npz"]);
+    let outside = parent.path().join("outside.txt").display().to_string();
+    for name in [
+        "../outside.txt",
+        outside.as_str(),
+        "sub/a.npz",
+        "..\\outside.txt",
+        "..",
+        ".",
+        "",
+        "C:a.npz",
+        "calibration.json",
+    ] {
+        let mut manifest = Manifest::new("other", 64);
+        manifest.files = vec!["a.npz".to_owned(), name.to_owned()];
+        fs::write(out.join("calibration.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let why = refusal(inspect(&out, "run", 64, &FIELDS, true));
+        assert!(why.contains("not a file name of the directory"), "{name:?}: {why}");
+        assert!(parent.path().join("outside.txt").is_file(), "{name:?}");
+        assert_eq!(names(&out), vec!["a.npz", "calibration.json"], "{name:?}");
+    }
 }
 
 #[test]
@@ -923,13 +1009,13 @@ impl FakeWrite {
 
 fn recorded(
     ledger: &Arc<Ledger>,
-    done: usize,
+    layer: usize,
     result: Result<(), CalibrateError>,
     write: &FakeWrite,
 ) -> Result<(), CalibrateError> {
     let (sender, receiver) = channel();
     ledger.record(
-        done,
+        layer,
         result,
         write.call(),
         Box::new(move |result| sender.send(result).unwrap()),
@@ -944,9 +1030,9 @@ fn a_layer_is_counted_with_its_listed_files_after_its_manifest_is_saved() {
         written: Arc::default(),
         succeed: true,
     };
-    ledger.list(["a.npz".to_owned(), "b.npz".to_owned()]);
-    ledger.list(["b.npz".to_owned()]);
-    recorded(&ledger, 1, Ok(()), &write).unwrap();
+    assert!(ledger.list(["a.npz".to_owned(), "b.npz".to_owned()]));
+    assert!(ledger.list(["b.npz".to_owned()]));
+    recorded(&ledger, 0, Ok(()), &write).unwrap();
     let saved = write.written.lock().unwrap().clone();
     assert_eq!(saved.len(), 1);
     assert_eq!(
@@ -965,7 +1051,7 @@ fn a_failed_layer_records_nothing() {
     };
     let error = recorded(
         &ledger,
-        1,
+        0,
         Err(CalibrateError::Failed("layer failed".to_owned())),
         &write,
     )
@@ -982,15 +1068,97 @@ fn a_failed_manifest_save_does_not_count_the_layer_and_a_later_one_can() {
         written: Arc::default(),
         succeed: false,
     };
-    let error = recorded(&ledger, 1, Ok(()), &failing).unwrap_err();
+    let error = recorded(&ledger, 0, Ok(()), &failing).unwrap_err();
     assert!(error.to_string().contains("save failed"));
     assert_eq!(ledger.manifest().unwrap().layers_done, 0, "the layer is not counted");
     let working = FakeWrite {
         written: Arc::default(),
         succeed: true,
     };
-    recorded(&ledger, 1, Ok(()), &working).unwrap();
+    recorded(&ledger, 0, Ok(()), &working).unwrap();
     assert_eq!(ledger.manifest().unwrap().layers_done, 1);
+}
+
+fn saving() -> FakeWrite {
+    FakeWrite {
+        written: Arc::default(),
+        succeed: true,
+    }
+}
+
+#[test]
+fn a_layer_past_the_first_not_counted_is_refused_and_writes_nothing() {
+    let ledger = Arc::new(Ledger::new(Manifest::new("run", 64)));
+    let write = saving();
+    assert!(ledger.list(["layer8.npz".to_owned()]));
+    let why = refusal(recorded(&ledger, 8, Ok(()), &write));
+    assert!(why.contains("layer 8"), "{why}");
+    assert!(write.written.lock().unwrap().is_empty(), "no manifest was written");
+    assert_eq!(ledger.manifest().unwrap().layers_done, 0);
+    recorded(&ledger, 0, Ok(()), &write).unwrap();
+    assert_eq!(ledger.manifest().unwrap().layers_done, 1, "the next layer still counts");
+}
+
+#[test]
+fn a_layer_already_counted_redone_after_a_resume_keeps_the_count() {
+    let ledger = Arc::new(Ledger::new(Manifest::new("run", 64).after(9)));
+    let write = saving();
+    recorded(&ledger, 8, Ok(()), &write).unwrap();
+    assert_eq!(ledger.manifest().unwrap().layers_done, 9);
+    recorded(&ledger, 9, Ok(()), &write).unwrap();
+    assert_eq!(ledger.manifest().unwrap().layers_done, 10);
+}
+
+fn checkpointed(
+    ledger: &Arc<Ledger>,
+    result: Result<(), CalibrateError>,
+    write: &FakeWrite,
+) -> Result<(), CalibrateError> {
+    let (sender, receiver) = channel();
+    ledger.checkpointed(
+        result,
+        write.call(),
+        Box::new(move |result| sender.send(result).unwrap()),
+    );
+    receiver.recv_timeout(HANG).expect("the listing never ended")
+}
+
+#[test]
+fn a_sealed_checkpoint_lists_the_resume_file_once_and_saves_the_manifest_and_a_failed_one_lists_nothing() {
+    let ledger = Arc::new(Ledger::new(Manifest::new("run", 64).after(8)));
+    let write = saving();
+    let error = checkpointed(&ledger, Err(CalibrateError::Failed("chunk failed".to_owned())), &write).unwrap_err();
+    assert!(error.to_string().contains("chunk failed"));
+    assert!(write.written.lock().unwrap().is_empty());
+    assert!(!ledger.manifest().unwrap().lists_resume_file());
+    checkpointed(&ledger, Ok(()), &write).unwrap();
+    checkpointed(&ledger, Ok(()), &write).unwrap();
+    let saved = write.written.lock().unwrap().clone();
+    assert_eq!(saved.len(), 2);
+    assert_eq!(
+        (saved[1].layers_done, saved[1].files.clone()),
+        (8, vec!["hidden.bin".to_owned()])
+    );
+}
+
+#[test]
+fn files_are_not_listed_while_a_save_of_the_manifest_is_in_flight() {
+    let ledger = Arc::new(Ledger::new(Manifest::new("run", 64)));
+    let held: Arc<Mutex<Option<Then<()>>>> = Arc::default();
+    let holding = Arc::clone(&held);
+    let (sender, receiver) = channel();
+    ledger.record(
+        0,
+        Ok(()),
+        move |_bytes, saved| *holding.lock().unwrap() = Some(saved),
+        Box::new(move |result| sender.send(result).unwrap()),
+    );
+    assert!(!ledger.list(["a.npz".to_owned()]), "the manifest is out for its save");
+    let saved = held.lock().unwrap().take().expect("the save was never started");
+    saved(Ok(()));
+    receiver.recv_timeout(HANG).unwrap().unwrap();
+    assert!(ledger.list(["a.npz".to_owned()]));
+    assert_eq!(ledger.manifest().unwrap().files, vec!["a.npz"]);
 }
 
 #[test]
@@ -999,17 +1167,6 @@ fn the_fields_that_differ_are_named_and_a_key_of_another_shape_is_named_whole() 
     assert_eq!(differences(&old, &new, &FIELDS), vec!["the batch"]);
     assert_eq!(differences(&old, &Manifest::new("t|8|x", 4), &FIELDS), vec!["the key"]);
     assert!(differences(&old, &old, &FIELDS).is_empty());
-}
-
-#[test]
-fn a_run_of_the_whole_model_ends_with_an_error_naming_the_heads_and_the_mtp_block() {
-    let (sender, receiver) = channel();
-    refuse_finish(Box::new(move |result| sender.send(result).unwrap()));
-    let why = receiver.recv_timeout(HANG).unwrap().unwrap_err().to_string();
-    assert!(
-        why.contains("output head") && why.contains("MTP") && why.contains("incomplete"),
-        "{why}"
-    );
 }
 
 #[test]
