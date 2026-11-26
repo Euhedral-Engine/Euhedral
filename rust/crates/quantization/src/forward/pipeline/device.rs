@@ -51,7 +51,8 @@ impl HostStates {
     ///
     /// # Safety
     /// The memory is valid for reads and writes of `bytes` bytes, ideally pinned, and neither read nor written by
-    /// anything else, from the pass that is given this value until that pass's `done` was called.
+    /// anything else, from the pass that is given this value until that pass's `done` was called; when `done` got
+    /// `ForwardError::Unfenced` the device may still use the memory and it must never be freed or reused.
     pub unsafe fn new(address: *mut u8, bytes: usize) -> Self {
         HostStates { address, bytes }
     }
@@ -431,7 +432,8 @@ impl ForwardPipeline {
     }
 
     /// Starts one pass of `layer` (see [`Request`]). `done` is called once from a frame, after the device is through
-    /// with everything the pass queued, with the pass's result. An `Err` here started nothing.
+    /// with everything the pass queued (except on `Unfenced`: then the buffers must be leaked), with the pass's result.
+    /// An `Err` here started nothing.
     pub fn run(&self, request: Request, done: Done) -> Result<(), ForwardError> {
         let Request {
             layer,
@@ -475,7 +477,8 @@ impl ForwardPipeline {
     }
 
     /// Frees the layer's workspace and the states in stream order on the main lane and closes its handles, once no
-    /// pass is running (a pass is over when its `done` was called). Returns the marker after the frees; the lane has
+    /// pass is running (a pass is over when its `done` was called; one that ended `Unfenced` never is, and the
+    /// pipeline with its workspace is leaked). Returns the marker after the frees; the lane has
     /// retired them when it is reached.
     ///
     /// While a pass is still running the pipeline comes back in the `Err`, to be finished once the pass has ended.

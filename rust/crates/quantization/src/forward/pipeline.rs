@@ -20,6 +20,7 @@
 pub mod device;
 
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::mem::forget;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -46,7 +47,8 @@ pub enum LaneRef {
     Slot(u32),
 }
 
-/// What a pass ends with, called once from a frame of the lattice; it must not wait.
+/// What a pass ends with, called once from a frame of the lattice; it must not wait. `Unfenced` means the device
+/// may still use the pass's memory: it must be leaked.
 pub type Done = Box<dyn FnOnce(Result<(), ForwardError>) + Send>;
 
 /// The device-facing calls of a pass.
@@ -152,7 +154,8 @@ impl<S: Stages> Scheduler<S> {
     }
 
     /// Gives back the stages and the lanes' state once no pass is running, or the scheduler itself while one is (or
-    /// after one lost the state). A pass is over for this call when its `done` was called.
+    /// after one lost the state or ended `Unfenced`, which leaks the state and leaves the scheduler unusable). A pass
+    /// is over for this call when its `done` was called with anything but `Unfenced`.
     pub fn into_parts(self) -> Result<Parts<S>, Self> {
         match Arc::try_unwrap(self.stages) {
             Ok(stages) => match self.home.take() {
@@ -175,7 +178,8 @@ impl<S: Stages> Scheduler<S> {
 
     /// Starts a pass of `sequences` sequences, `batch` at a time. `done` is called once, from a frame, when the pass
     /// has ended and the device is through with it; `Err` here started nothing and `done` is dropped. One pass runs
-    /// at a time.
+    /// at a time. After `done` got `Unfenced` the device may still use the pass's memory: the caller must leak every
+    /// buffer it gave the pass, and the scheduler does not run again.
     pub fn run(&self, shared: S::Pass, sequences: u32, batch: u32, done: Done) -> Result<(), ForwardError> {
         if sequences == 0 || batch == 0 {
             return Err(ForwardError::Invalid("a pass of no sequences".to_owned()));
@@ -583,7 +587,17 @@ impl<S: Stages> Pass<S> {
             Ok(())
         };
         let retired = result.is_ok();
-        let lost = pass.give_back_with(retired);
+        let lost = if fenced {
+            pass.give_back_with(retired)
+        } else {
+            // The device may still use the lanes' state: it is leaked, `home` stays empty and the scheduler never
+            // runs or finishes again.
+            forget(pass.main.take());
+            for cell in &pass.slots {
+                forget(cell.take());
+            }
+            false
+        };
         drop(pass.unit.take());
         let result = match (result, lost) {
             (Ok(()), true) => Err(ForwardError::Invalid("the pass lost a lane's state".to_owned())),
