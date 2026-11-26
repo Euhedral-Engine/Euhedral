@@ -224,8 +224,10 @@ impl SequenceState {
         let selections = SelectionPool::new(library, (plan.draft_depth + 2).max(2), (verified_rows as usize).max(1))
             .map_err(|error| EngineError::Runtime(error.to_string()))?;
         // A sampled request keeps one quantum in flight: the readback is the owner's from its admission until the host
-        // has selected from the row, and the next quantum waits for that. The rows are those of a verification.
+        // has selected from the row, and the next quantum waits for that. The rows are those of a verification. A
+        // teacher-forced run that takes the hidden state leases the one that holds a hidden row too.
         let row_readbacks = RowReadbackPool::new(library, 1, (verified_rows as usize).max(1), config.vocab_size)
+            .and_then(|pool| pool.with_hidden(library, 1, config.vocab_size, config.hidden_size))
             .map_err(|error| EngineError::Runtime(error.to_string()))?;
         Ok(
             SequenceState::from_parts(kv, mtp_kv, Arc::new(SequenceDevice { gdn, scratch }), selections)

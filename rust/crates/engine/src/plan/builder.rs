@@ -337,7 +337,7 @@ impl Make {
             Make::Swiglu => (vec![GateUp], vec![SwigluSlot]),
             Make::MtpStem { .. } => (vec![HiddenState], vec![MtpNormed, MtpPacked]),
             Make::Argmax { .. } => (vec![Logits], vec![]),
-            Make::CopyRows => (vec![Logits], vec![]),
+            Make::CopyRows => (vec![Logits, FinalHiddenState], vec![]),
             Make::SelectedToken => (vec![], vec![]),
             Make::Staged { slot, inner } => {
                 return Access {
@@ -487,7 +487,7 @@ impl Make {
                 } else {
                     SelectedRows::Last
                 };
-                entry(self.kind(), CopyRows::new(Logits, rows))
+                entry(self.kind(), CopyRows::new(Logits, FinalHiddenState, rows))
             }
             Make::SelectedToken => entry(self.kind(), SelectedToken),
             Make::Staged { inner, .. } => inner.stage(variant, formats)?,
