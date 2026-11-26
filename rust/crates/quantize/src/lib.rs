@@ -7,6 +7,7 @@
 
 mod assemble;
 mod calibrate;
+mod export_drafter;
 mod generate;
 mod package;
 mod reference;
@@ -67,8 +68,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "export-drafter",
-        availability: Availability::Pending,
-        usage: "--model CHECKPOINT --artifact BASE_ARTIFACT --out ARTIFACT",
+        availability: Availability::Wired,
+        usage: "--model CHECKPOINT --artifact BASE_ARTIFACT --out ARTIFACT [--parameters PARAMETERS.bin] [--config YAML]",
     },
     Command {
         name: "train-blocks",
@@ -152,6 +153,7 @@ pub fn run(args: &[String]) -> Outcome {
         Availability::Wired => match command.name {
             "assemble" => assemble::run(&args[1..]),
             "calibrate" => calibrate::run(&args[1..]),
+            "export-drafter" => export_drafter::run(&args[1..]),
             "generate" => generate::run(&args[1..]),
             "package-tokenizer" => package::run(&args[1..]),
             "reference" => reference::run(&args[1..]),
