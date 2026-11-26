@@ -22,7 +22,7 @@ use euhedral_inference_bench::run::generation;
 use euhedral_inference_engine::sampling::SamplingConfig;
 
 fn configs_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../benchmark/configs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../resources/bench/configs")
 }
 
 fn parse(text: &str) -> Result<Options, String> {

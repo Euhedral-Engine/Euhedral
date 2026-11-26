@@ -66,6 +66,8 @@ fn two_chunks_are_written_and_a_stopped_run_resumes_to_the_same_bytes() {
     });
     settings.context.max_tokens = 512;
     settings.prefix_cache.size = ByteSize::mib(0);
+    settings.batching.forced_rows = 8;
+    settings.batching.max_sequences = 4;
     let (owner, ready) = EngineRuntime::start(&settings, &library);
     let runtime = ready
         .wait(WAIT)
@@ -76,7 +78,15 @@ fn two_chunks_are_written_and_a_stopped_run_resumes_to_the_same_bytes() {
     let whole = directory.path().join("whole.kld");
     let stopped = directory.path().join("stopped.kld");
     assert!(run(&runtime, &whole, &tokens, Options::default()).finished);
-    let first = run(&runtime, &stopped, &tokens, Options { stop_after: Some(1) });
+    let first = run(
+        &runtime,
+        &stopped,
+        &tokens,
+        Options {
+            stop_after: Some(1),
+            ..Options::default()
+        },
+    );
     assert_eq!((first.completed, first.finished), (1, false));
     assert!(partial_path(&stopped).exists());
     assert!(run(&runtime, &stopped, &tokens, Options::default()).finished);

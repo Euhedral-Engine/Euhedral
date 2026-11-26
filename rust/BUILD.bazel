@@ -8,3 +8,37 @@ exports_files([
     "Cargo.toml",
     "rust-toolchain.toml",
 ])
+
+# Files the crates include with include_str! from outside their package.
+exports_files([
+    "kernels/quantization/drafter.cu",
+    "kernels/quantization/gptq.cu",
+    "kernels/quantization/mtp.cu",
+    "kernels/quantization/rows.cu",
+    "kernels/quantization/score.cu",
+    "kernels/quantization/train.cu",
+    "kernels/quantization/trellis.cu",
+    "resources/bench/chat-corpus-v1-document.md",
+])
+
+# Files under rust/ that the tests of the crates read.
+
+filegroup(
+    name = "benchmark_configs",
+    srcs = glob(
+        [
+            "resources/bench/configs/**",
+        ],
+    ),
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "gptq_fixture",
+    srcs = glob(
+        [
+            "resources/fixtures/gptq-fixture/**",
+        ],
+    ),
+    visibility = ["//visibility:public"],
+)

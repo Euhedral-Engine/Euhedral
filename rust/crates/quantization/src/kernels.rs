@@ -73,13 +73,13 @@ impl Module {
     /// The source text as it is in the repository, before its includes are expanded.
     pub fn source(self) -> &'static str {
         match self {
-            Module::Gptq => include_str!("../../../../quantization/src/main/resources/cuda/gptq.cu"),
-            Module::Trellis => include_str!("../../../../quantization/src/main/resources/cuda/trellis.cu"),
-            Module::Score => include_str!("../../../../quantization/src/main/resources/cuda/score.cu"),
-            Module::Rows => include_str!("../../../../quantization/src/main/resources/cuda/rows.cu"),
-            Module::Mtp => include_str!("../../../../quantization/src/main/resources/cuda/mtp.cu"),
-            Module::Drafter => include_str!("../../../../quantization/src/main/resources/cuda/drafter.cu"),
-            Module::Train => include_str!("../../../../quantization/src/main/resources/cuda/train.cu"),
+            Module::Gptq => include_str!("../../../kernels/quantization/gptq.cu"),
+            Module::Trellis => include_str!("../../../kernels/quantization/trellis.cu"),
+            Module::Score => include_str!("../../../kernels/quantization/score.cu"),
+            Module::Rows => include_str!("../../../kernels/quantization/rows.cu"),
+            Module::Mtp => include_str!("../../../kernels/quantization/mtp.cu"),
+            Module::Drafter => include_str!("../../../kernels/quantization/drafter.cu"),
+            Module::Train => include_str!("../../../kernels/quantization/train.cu"),
         }
     }
 

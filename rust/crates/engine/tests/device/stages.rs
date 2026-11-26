@@ -1,7 +1,7 @@
 //! The layer operation stages on a GPU. The tests are `#[ignore]`d and run locally in a memory-capped scope:
 //! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored stages::`.
 //!
-//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or
+//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, in `~/.config/euhedral/test.properties`, or
 //! `gradle.properties`); a test skips with a message when it is absent. Each test builds its own library, lane and
 //! workspace, at the model's real dimensions with two layers (one GDN, one full attention): the stages are run
 //! directly, one at a time, with a lane the test synchronizes to read the results.
@@ -47,7 +47,7 @@ use euhedral_inference_cuda::{
 };
 use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::Handoff;
-use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Q3Embedding, ScratchRegion};
+use euhedral_inference_engine::formats::{LinearFormat, LinearMode, ScratchRegion, TokenEmbedding};
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_engine::model::{ModelConfig, Residence, WeightRef};
 use euhedral_inference_engine::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
@@ -1961,7 +1961,7 @@ fn embed_looks_up_the_ids_of_the_input_record_and_passes_step_tokens() {
     let reference = |ids: &[i32]| -> Vec<u8> {
         let input = upload(&rig.library, &id_bytes(ids));
         let output = DeviceBuffer::alloc(&rig.library, ids.len() * hidden * 2).unwrap();
-        rig.submit(|ops| Q3Embedding.submit(ops, &weight, input.ptr(), output.ptr(), ids.len()));
+        rig.submit(|ops| TokenEmbedding.submit(ops, &weight, input.ptr(), output.ptr(), ids.len()));
         download(&output)
     };
     let looked_up = |rows: usize| get(&workspace, BufferSlot::HiddenState, 0, rows * hidden * 2);

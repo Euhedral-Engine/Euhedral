@@ -1,7 +1,7 @@
 //! The linear formats on a GPU. The tests are `#[ignore]`d and run locally in a memory-capped scope:
 //! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored formats::`.
 //!
-//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or
+//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, in `~/.config/euhedral/test.properties`, or
 //! `gradle.properties`) and the real objects from `euhedral.qwen.rco-artifact`; a test skips with a message when one
 //! is absent (a skipped test passes in a hundredth of a second: read the output with `--nocapture`).
 //!
@@ -31,13 +31,14 @@ use crate::linear_gpu;
 use euhedral_inference_cuda::launch::nvfp4::skinny_target_ctas;
 use euhedral_inference_cuda::launch::q3::P2E2_EXPAND_LIMIT;
 use euhedral_inference_cuda::{DeviceBuffer, HostWeightsArena};
-use euhedral_inference_edrl::{WeightFormat, WeightLayout};
+use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{
-    LinearFormat, LinearKernel, LinearMode, Nvfp4Linear, Q3Embedding, Q3Linear, ROW_EXACT_KERNELS, ShapeRecorder,
+    LinearFormat, LinearKernel, LinearMode, Nvfp4Linear, Q3Linear, ROW_EXACT_KERNELS, ShapeRecorder, TokenEmbedding,
     TrellisLinear, nvfp4_native_scratch_bytes,
 };
 use euhedral_inference_engine::model::{Residence, WeightRef};
 use euhedral_inference_engine::residency::offload::{MAPPED_HEAD_MAX_ROWS, OUTPUT_HEAD};
+use euhedral_inference_engine::residency::planner::nvfp4;
 use euhedral_inference_settings::TrellisKernelSettings;
 use linear_gpu::{
     Artifact, Random, Rig, Trellis, activations, assert_close, bf16, bf16_value, compressed_head, relative_rms, rig,
@@ -358,7 +359,7 @@ fn q3_embedding_looks_up_token_rows() {
     let tokens = upload(&rig.library, &id_bytes);
     let sentinel = bf16(123.0).to_le_bytes();
     let output = upload(&rig.library, &sentinel.repeat(ids.len() * hidden));
-    rig.run(|ops| Q3Embedding.submit(ops, &weight, tokens.ptr(), output.ptr(), ids.len()));
+    rig.run(|ops| TokenEmbedding.submit(ops, &weight, tokens.ptr(), output.ptr(), ids.len()));
     let mut host = vec![0u8; ids.len() * hidden * 2];
     output.copy_to_host(0, &mut host).unwrap();
     let rows: Vec<Vec<f32>> = host
@@ -388,10 +389,103 @@ fn q3_embedding_looks_up_token_rows() {
     let mut refused = weight.clone();
     refused.format = WeightFormat::Nvfp4;
     let made = rig.typed.table.submit_ops(rig.typed.lane(0), false, |ops| {
-        Q3Embedding.submit(ops, &refused, tokens.ptr(), output.ptr(), 1)
+        TokenEmbedding.submit(ops, &refused, tokens.ptr(), output.ptr(), 1)
     });
     rig.typed.sync();
     assert!(made.is_err());
+}
+
+/// The value of an E4M3 scale byte (finite codes only).
+fn e4m3(code: u8) -> f32 {
+    let (exponent, mantissa) = (u32::from(code >> 3) & 15, u32::from(code) & 7);
+    let magnitude = if exponent == 0 {
+        mantissa as f32 * 0.001_953_125
+    } else {
+        f32::from_bits(((exponent + 120) << 23) | (mantissa << 20))
+    };
+    if code & 0x80 != 0 { -magnitude } else { magnitude }
+}
+
+/// A synthetic plain NVFP4 token table gathers the rows of its ids as the host dequantization of them, bit for bit,
+/// and an id outside the vocabulary leaves its row as it was.
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn nvfp4_embedding_gathers_the_dequantized_rows() {
+    let _light = common::light();
+    let Some(rig) = rig() else { return };
+    const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let (vocabulary, hidden) = (7usize, 256usize);
+    let layout = WeightLayout::RowSplitK128V1;
+    let (rows64, hidden64) = (vocabulary as u64, hidden as u64);
+    let bytes = nvfp4::byte_size(rows64, hidden64, layout).unwrap() as usize;
+    let (scale_at, global_at) = (
+        nvfp4::scale_offset(rows64, hidden64) as usize,
+        nvfp4::trailer_offset(rows64, hidden64, layout).unwrap() as usize,
+    );
+    let mut random = Random::new(0x004e_5646_5034);
+    let mut table = vec![0u8; bytes];
+    for byte in &mut table[..vocabulary * hidden / 2] {
+        *byte = random.next_u64() as u8;
+    }
+    // Scales of the E4M3 values from 2^-6 to 2^3 in both signs: finite, and none of them the same row to row.
+    for byte in &mut table[scale_at..scale_at + vocabulary * hidden / 16] {
+        *byte = (0x20 + random.next_u64() % 0x30) as u8 | if random.next_u64() & 1 == 0 { 0 } else { 0x80 };
+    }
+    let global = 0.0375f32;
+    table[global_at..global_at + 4].copy_from_slice(&global.to_le_bytes());
+    let expected = |row: usize| -> Vec<u16> {
+        (0..hidden)
+            .map(|column| {
+                let code = table[row * hidden / 2 + column / 2] >> (4 * (column % 2)) & 15;
+                let magnitude = E2M1[usize::from(code & 7)];
+                let value = if code & 8 != 0 { -magnitude } else { magnitude };
+                let scale = e4m3(table[scale_at + row * hidden / 16 + column / 16]) * global;
+                bf16(value * scale)
+            })
+            .collect()
+    };
+    let buffer = upload(&rig.library, &table);
+    let weight = WeightRef {
+        name: "text/token_embedding".to_string(),
+        shape: vec![rows64, hidden64],
+        dtype: TensorDataType::Bf16,
+        format: WeightFormat::Nvfp4,
+        layout,
+        ptr: buffer.ptr(),
+        bytes: bytes as u64,
+        residence: Residence::Device,
+        trellis: None,
+    };
+    // The first and the last row, a repeat, and one id outside the vocabulary and one below zero: those rows stay.
+    let ids: [i32; 6] = [0, vocabulary as i32 - 1, 3, 3, vocabulary as i32 + 5, -1];
+    let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+    let tokens = upload(&rig.library, &id_bytes);
+    let sentinel = bf16(123.0);
+    let output = upload(&rig.library, &sentinel.to_le_bytes().repeat(ids.len() * hidden));
+    rig.run(|ops| TokenEmbedding.submit(ops, &weight, tokens.ptr(), output.ptr(), ids.len()));
+    let mut host = vec![0u8; ids.len() * hidden * 2];
+    output.copy_to_host(0, &mut host).unwrap();
+    let got: Vec<Vec<u16>> = host
+        .chunks_exact(hidden * 2)
+        .map(|row| {
+            row.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .collect()
+        })
+        .collect();
+    for (index, id) in ids.iter().enumerate() {
+        if (0..vocabulary as i32).contains(id) {
+            assert_eq!(got[index], expected(*id as usize), "output row {index}, id {id}");
+        } else {
+            assert!(
+                got[index].iter().all(|bits| *bits == sentinel),
+                "output row {index}, id {id}"
+            );
+        }
+    }
+    assert_ne!(got[2], got[1], "different ids gather different rows");
 }
 
 #[test]

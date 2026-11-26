@@ -2,7 +2,7 @@
 //!
 //! [`LinearFormat`] is the contract the stages consume. [`TrellisLinear`] and [`Nvfp4Linear`] implement it with the
 //! kernel choice, grid and K split of the Java formats, [`Q3Linear`] runs the grouped Q3, Q4 and Q5 tensors and the
-//! P2E2 compressed Q3, and [`Q3Embedding`] looks up token rows of a Q3 table.
+//! P2E2 compressed Q3, and [`TokenEmbedding`] looks up token rows of a Q3 table.
 //! [`ShapeRecorder`] lists the launches a format queued, for the tests that compare them with Java's.
 
 mod embedding;
@@ -15,7 +15,7 @@ use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 
 use crate::model::WeightRef;
 
-pub use embedding::Q3Embedding;
+pub use embedding::TokenEmbedding;
 pub use nvfp4::{Nvfp4Linear, Nvfp4Route, nvfp4_native_scratch_bytes};
 pub use q3::{GATE_UP_MIN_ROWS, Q3Linear};
 pub use shapes::{KernelArguments, Launch, LinearKernel, ShapeRecorder, Table};

@@ -1,5 +1,9 @@
 //! The tokenizer files of a checkpoint as an artifact carries them, and the checks that come before they are written.
 
+use std::fs;
+use std::io;
+use std::path::Path;
+
 use euhedral_inference_api_protocol::template::check_template_source;
 use euhedral_inference_edrl::{
     FOOTER_BYTES, TokenizerFooter, TokenizerSection, TokenizerTexts, encode_tokenizer_section,
@@ -77,6 +81,16 @@ impl TokenizerFiles {
         }
     }
 
+    /// The tokenizer these files make, as the artifact's section would give it.
+    pub fn tokenizer(&self) -> Result<Tokenizer, PackageError> {
+        let bytes = encode_tokenizer_section(&self.texts())?;
+        let (body, footer) = bytes.split_at(bytes.len() - FOOTER_BYTES);
+        let footer: [u8; FOOTER_BYTES] = footer.try_into().map_err(|_| PackageError::Section)?;
+        let footer = TokenizerFooter::parse(&footer)?.ok_or(PackageError::Section)?;
+        let section = TokenizerSection::parse(body.to_vec(), &footer)?;
+        Tokenizer::from_section(&section).map_err(|error| PackageError::Tokenizer(error.to_string()))
+    }
+
     /// The section holding the files, body then footer, after the checks that must pass before any byte is written:
     /// the section reads back, the tokenizer loads from it, and its chat template is the one the server renders.
     pub fn encode_checked(&self) -> Result<Vec<u8>, PackageError> {
@@ -90,6 +104,25 @@ impl TokenizerFiles {
         check_template_source(source).map_err(|error| PackageError::Template(error.to_string()))?;
         Ok(bytes)
     }
+}
+
+/// The tokenizer of the checkpoint directory `directory`: the files `package-tokenizer` reads, read synchronously, so
+/// call it on a thread that may wait, before the engine starts.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blocking I/O at startup: the checkpoint's tokenizer files are read once, before the engine starts"
+)]
+pub fn read_checkpoint_tokenizer(directory: &Path) -> Result<Tokenizer, PackageError> {
+    let read = |what: &'static str, optional: bool| match fs::read(directory.join(what)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if optional && error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(PackageError::Io { what, source }),
+    };
+    let tokenizer = read("tokenizer.json", false)?.unwrap_or_default();
+    let tokenizer_config = read("tokenizer_config.json", false)?.unwrap_or_default();
+    let generation_config = read("generation_config.json", false)?.unwrap_or_default();
+    let chat_template = read("chat_template.jinja", true)?;
+    TokenizerFiles::from_checkpoint(tokenizer, tokenizer_config, chat_template, &generation_config)?.tokenizer()
 }
 
 fn text(file: &'static str, bytes: Vec<u8>) -> Result<String, PackageError> {

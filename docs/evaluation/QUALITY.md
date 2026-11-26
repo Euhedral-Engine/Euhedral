@@ -9,7 +9,7 @@ Four different quantities are measured, because they answer different questions 
 | Relaxed-execution drift | How far do the production kernels' relaxed accumulation orders move a given artifact from exact arithmetic on the same weights? | `RelaxedNumericsDriftCudaIntegrationTest` |
 | Exact speculative verifier | Does MTP decoding produce exactly the tokens and state that ordinary greedy decoding produces? | `SpeculativeVerifyCudaIntegrationTest`, `SpeculativeDecodeCudaIntegrationTest` |
 
-All teacher-forced measurements use the same 2560 tokens: `benchmark/src/main/resources/.../chat-corpus-v1-document.md`
+All teacher-forced measurements use the same 2560 tokens: `rust/resources/bench/chat-corpus-v1-document.md`
 tokenized with the Qwen tokenizer. A report is the model's BF16 logits at 1279 forced positions (a 1281-token prefill, then
 one decode step per token).
 

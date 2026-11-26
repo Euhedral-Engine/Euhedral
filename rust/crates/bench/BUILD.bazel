@@ -19,7 +19,7 @@ rust_library(
         exclude = ["src/**/*.rs"],
         allow_empty = True,
     ) + [
-        "//:benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
+        "//rust:resources/bench/chat-corpus-v1-document.md",
     ],
     crate_name = "euhedral_inference_bench",
     crate_root = "src/lib.rs",
@@ -129,7 +129,7 @@ rust_test(
         exclude = ["tests/**/*.rs", "src/**/*.rs"],
         allow_empty = True,
     ) + [
-        "//:benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
+        "//rust:resources/bench/chat-corpus-v1-document.md",
     ],
     crate_name = "config",
     crate_root = "tests/config.rs",
@@ -144,7 +144,7 @@ rust_test(
         allow_empty = True,
     ) + [
         ":euhedral-bench",
-        "//:benchmark_configs",
+        "//rust:benchmark_configs",
     ],
     deps = [
         ":euhedral_inference_bench",
@@ -193,7 +193,7 @@ rust_test(
         exclude = ["tests/**/*.rs", "src/**/*.rs"],
         allow_empty = True,
     ) + [
-        "//:benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
+        "//rust:resources/bench/chat-corpus-v1-document.md",
     ],
     crate_name = "drift",
     crate_root = "tests/drift.rs",
@@ -256,7 +256,7 @@ rust_test(
         exclude = ["tests/**/*.rs", "src/**/*.rs"],
         allow_empty = True,
     ) + [
-        "//:benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
+        "//rust:resources/bench/chat-corpus-v1-document.md",
     ],
     crate_name = "prompt_sizes",
     crate_root = "tests/prompt_sizes.rs",
@@ -319,7 +319,7 @@ rust_test(
         exclude = ["tests/**/*.rs", "src/**/*.rs"],
         allow_empty = True,
     ) + [
-        "//:benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
+        "//rust:resources/bench/chat-corpus-v1-document.md",
     ],
     crate_name = "result",
     crate_root = "tests/result.rs",
@@ -382,7 +382,7 @@ rust_test(
         exclude = ["tests/**/*.rs", "src/**/*.rs"],
         allow_empty = True,
     ) + [
-        "//:benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
+        "//rust:resources/bench/chat-corpus-v1-document.md",
     ],
     crate_name = "score_math",
     crate_root = "tests/score_math.rs",
