@@ -1,5 +1,5 @@
 //! The startup on a GPU, with the RCO artifact. The tests are `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test loader_gpu -- --ignored`.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored loader::`.
 //!
 //! The artifact comes from the `euhedral.qwen.rco-artifact` property and the library from `euhedral.cuda.library`
 //! (`EUHEDRAL_TEST_QWEN_RCO_ARTIFACT` and `EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or `gradle.properties`); a
@@ -20,10 +20,9 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads files, copies device memory and waits on the hand-off"
 )]
 
-#[path = "common/typed.rs"]
-mod typed;
+use crate::typed;
 
-mod common;
+use crate::common;
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -73,6 +72,7 @@ fn settings(artifact: &Path, max_tokens: u32) -> Settings {
 
 /// Starts the engine and waits for the hand-off, as `main` does.
 fn start(settings: &Settings, library: &Path) -> (Result<Arc<EngineRuntime>, EngineError>, RuntimeOwner) {
+    common::note_load();
     let (guard, ready) = EngineRuntime::start(settings, library);
     (ready.wait(WAIT).expect("the engine reports"), guard)
 }
@@ -93,6 +93,7 @@ fn sha(bytes: &[u8]) -> String {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn startup_loads_rco_and_reports_ready() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let settings = settings(&machine.artifact, 8192);
     let (runtime, owner) = start(&settings, &machine.library);
     let runtime = runtime.expect("the engine starts");
@@ -215,6 +216,7 @@ fn startup_loads_rco_and_reports_ready() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn uploaded_bytes_match_file_sha() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let settings = settings(&machine.artifact, 4096);
     let (runtime, owner) = start(&settings, &machine.library);
     let runtime = runtime.expect("the engine starts");
@@ -317,6 +319,7 @@ fn truncated_copy(artifact: &Path, bytes: u64) -> Truncated {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn host_backed_bytes_match_file_sha() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let mut settings = settings(&machine.artifact, 4096);
     let limit = common::limit_below_need(&machine.library, &settings, 256 << 20);
     common::limit_gpu(&mut settings, limit);
@@ -364,6 +367,7 @@ fn host_backed_bytes_match_file_sha() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn startup_fails_before_device_alloc_on_corrupt_artifact() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let truncated = truncated_copy(&machine.artifact, 64 << 20);
     let library = CudaLibrary::load(&machine.library).unwrap();
     let before = library.free_bytes().unwrap();
@@ -404,6 +408,7 @@ fn startup_fails_before_device_alloc_on_corrupt_artifact() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_plan_that_does_not_fit_fails_before_device_alloc() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let library = CudaLibrary::load(&machine.library).unwrap();
     let before = library.free_bytes().unwrap();
     let mut settings = settings(&machine.artifact, 4096);
@@ -499,6 +504,7 @@ fn a_nan_nvfp4_scale_stops_the_load_and_names_the_tensor() {
     use euhedral_inference_edrl::{Header, ReadPlan, Region, TensorTable, TokenizerFooter, content_end};
 
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let sparse = sparse_copy(&machine.artifact);
     let length = fs::metadata(&sparse.0).unwrap().len();
     let header_bytes = read_file(&sparse.0, 0, 48);
@@ -545,6 +551,7 @@ fn a_nan_nvfp4_scale_stops_the_load_and_names_the_tensor() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn startup_works_with_workers_that_poll_one_frame_at_a_time() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let mut settings = settings(&machine.artifact, 4096);
     settings.host.max_batch_size = euhedral_inference_settings::Auto::Value(2);
     let (runtime, owner) = start(&settings, &machine.library);
@@ -562,6 +569,7 @@ fn startup_works_with_workers_that_poll_one_frame_at_a_time() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn shutdown_reports_a_clean_leak_check() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let settings = settings(&machine.artifact, 4096);
     let (runtime, owner) = start(&settings, &machine.library);
     let runtime = runtime.expect("the engine starts");

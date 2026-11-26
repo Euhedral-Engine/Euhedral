@@ -1,6 +1,6 @@
 //! A captured quantum that fails in the middle of its body, on a GPU. The tests are `#[ignore]`d and run locally, one at a
 //! time (each loads the 12 GB artifact twice), through the system arbiter:
-//! `system-run --gpu shared:16 --mem 24G --est 300 --who <name> -- cargo test -p euhedral-inference-engine --test capture_fault_gpu -- --ignored --test-threads=1`.
+//! `system-run --gpu shared:16 --mem 24G --est 300 --who <name> -- cargo test -p euhedral-inference-engine --test device -- --ignored capture_fault::`.
 //!
 //! A test hook ends a captured quantum by a refusal or a panic: at its first sighting (a direct run), at its second (the
 //! recording pass) or at a later one (a replay, after the replay queued its work). A body fails after its first launch
@@ -22,11 +22,11 @@
 
 use std::mem;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
 use common::Closer;
 use euhedral_gpu::GraphStats;
@@ -60,7 +60,7 @@ fn machine() -> Option<Machine> {
     Some(Machine { artifact, library })
 }
 
-fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
+fn settings(machine: &Machine) -> Settings {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -68,12 +68,24 @@ fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
     settings.context.max_tokens = 4096;
     settings.kernels.graphs.captures_per_view = 8;
     settings.prefix_cache.size = ByteSize(0);
-    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    (Closer::new(owner, &runtime), runtime)
+    settings
+}
+
+/// A new engine of the test's own: a fault leaves it as the test is to leave it, and its graph cache starts empty.
+fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
+    common::start_engine(&settings(machine), &machine.library)
+}
+
+/// The tokens of the prompt on a healthy engine, which a fault must not change: taken once, on the engine the tests
+/// before left running or a new one.
+fn healthy_tokens(machine: &Machine) -> &'static [u32] {
+    static TOKENS: OnceLock<Vec<u32>> = OnceLock::new();
+    TOKENS.get_or_init(|| {
+        let (_card, runtime) = common::engine(&settings(machine), &machine.library);
+        let fresh = generate(&runtime);
+        assert_eq!(fresh.outcome.reason, FinishReason::Length);
+        fresh.tokens
+    })
 }
 
 fn prompt() -> Vec<u32> {
@@ -190,6 +202,7 @@ struct Case {
 fn fails_and_recovers(case: Case) {
     let Case { fault, sighting, keeps } = case;
     let Some(machine) = machine() else { return };
+    let card = common::card();
     let (closer, runtime) = start(&machine);
     let buffer = Arc::new(());
     let before = graphs(&runtime);
@@ -316,15 +329,13 @@ fn fails_and_recovers(case: Case) {
         }
     }
     closer.shutdown(runtime).unwrap();
+    drop(card);
 
-    let (closer, runtime) = start(&machine);
-    let fresh = generate(&runtime);
-    assert_eq!(fresh.outcome.reason, FinishReason::Length);
     assert_eq!(
-        after.tokens, fresh.tokens,
-        "{fault:?} at {sighting:?}: the tokens after the failure equal a fresh engine's"
+        after.tokens,
+        healthy_tokens(&machine),
+        "{fault:?} at {sighting:?}: the tokens after the failure equal a healthy engine's"
     );
-    closer.shutdown(runtime).unwrap();
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! Captured quanta on a GPU: the plan's stage graphs run on a lattice, with and without CUDA graphs. The tests are
 //! `#[ignore]`d and run locally in a memory-capped scope:
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test capture_gpu -- --ignored`.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored capture::`.
 //!
 //! The model is the first four layers of the RCO artifact (three GDN layers and one full-attention layer), its MTP
 //! layer, heads and embedding, loaded object by object from the artifact named by `euhedral.qwen.rco-artifact`; the
@@ -20,14 +20,14 @@
 )]
 #![allow(clippy::print_stdout, reason = "a test reports what it measured")]
 
-#[path = "common/linear_gpu.rs"]
-mod linear_gpu;
-#[path = "common/typed.rs"]
-mod typed;
+use crate::linear_gpu;
+use crate::typed;
 
 use typed::Typed;
 
-mod common;
+use crate::common;
+
+use common::Card;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
@@ -35,7 +35,7 @@ use std::mem;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
@@ -195,17 +195,20 @@ fn load_model(artifact: &mut Artifact, library: &Arc<CudaLibrary>) -> Model {
     }
 }
 
-/// The reduced model, loaded once for the tests of this binary: its weights are read-only, so every test's world
-/// reads the same buffers (each test still owns its library, lanes, lattice and workspace). It is never freed.
-fn shared_model() -> Option<&'static Model> {
-    static SHARED: OnceLock<Option<Model>> = OnceLock::new();
-    SHARED
-        .get_or_init(|| {
-            let library = library()?;
-            let mut artifact = Artifact::open()?;
-            Some(load_model(&mut artifact, &library))
-        })
-        .as_ref()
+/// The reduced model, loaded for the tests running now: its weights are read-only, so the worlds that exist together
+/// read the same buffers (each test still owns its library, lanes, lattice and workspace). The last world to end frees
+/// them, so the engines of the other tests find the card empty.
+fn shared_model() -> Option<Arc<Model>> {
+    static SHARED: Mutex<Weak<Model>> = Mutex::new(Weak::new());
+    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(model) = shared.upgrade() {
+        return Some(model);
+    }
+    let library = library()?;
+    let mut artifact = Artifact::open()?;
+    let model = Arc::new(load_model(&mut artifact, &library));
+    *shared = Arc::downgrade(&model);
+    Some(model)
 }
 
 /// A lattice, the lanes and the plan: what a test's quanta run on.
@@ -225,10 +228,16 @@ struct World {
     lattice: Arc<ControlPlaneLattice>,
     lake: Arc<Lake>,
     unit: Option<UnitGuard>,
+    /// The weights the plan addresses: freed before the card is let go.
+    _model: Arc<Model>,
+    /// The card, held until the world is gone: a capture in one thread fails when another thread of the process
+    /// allocates or synchronizes meanwhile, so the tests of this binary take turns.
+    _card: Card,
 }
 
 impl World {
     fn open() -> Option<World> {
+        let card = common::card();
         let model = shared_model()?;
         let library = library()?;
         let config = reduced_config();
@@ -283,6 +292,7 @@ impl World {
         let workspace = Arc::new(Workspace::allocate(&library, &config, residency.rows, &regions).unwrap());
         let unit = lake.admit().unwrap();
         Some(World {
+            _model: model,
             pinned: PinnedPool::new(&library, 64 << 20),
             released: Arc::new(ReleasedBuffers::new()),
             library,
@@ -297,6 +307,7 @@ impl World {
             lattice,
             lake,
             unit: Some(unit),
+            _card: card,
         })
     }
 
@@ -996,9 +1007,12 @@ struct Light {
     released: Arc<ReleasedBuffers>,
     config: Arc<ModelConfig>,
     workspace: Arc<Workspace>,
+    /// The card, held until the world is gone (see [`World`]).
+    _card: Card,
 }
 
 fn light() -> Option<Light> {
+    let card = common::card();
     let library = library()?;
     let config = reduced_config();
     let typed = Typed::plain(&library, 1, 1024);
@@ -1023,6 +1037,7 @@ fn light() -> Option<Light> {
         typed,
         config,
         workspace,
+        _card: card,
     })
 }
 

@@ -103,6 +103,7 @@ fn the_server_serves_the_engine_and_stops_on_sigterm() {
         if let Some(status) = child.try_wait().expect("a status") {
             break status.code();
         }
+        // Timing-based on purpose: the stop window is the product's promise about a real process; this bound checks it.
         if stopped_at.elapsed() > STOP * 2 {
             child.kill().ok();
             child.wait().ok();

@@ -24,16 +24,20 @@ pub fn gradle_property(key: &str) -> Option<String> {
     lookup(key, |name| env::var(name).ok(), gradle_user_home().as_deref())
 }
 
-/// Like [`gradle_property`], but prints a skip line and returns `None` when the key is absent, so a test can
+/// Like [`gradle_property`], but prints a skip line and returns `None` when the key is absent or names a path that does not exist, so a test can
 /// `let Some(path) = require_property(key) else { return };`. libtest captures the line from a passing test; run
 /// with `--nocapture` to see it.
 #[allow(clippy::print_stdout, reason = "the skip line is this helper's output")]
 pub fn require_property(key: &str) -> Option<String> {
-    let value = gradle_property(key);
-    if value.is_none() {
+    let Some(value) = gradle_property(key) else {
         println!("skipped: set {} or {key} in gradle.properties", env_name(key));
+        return None;
+    };
+    if !Path::new(&value).exists() {
+        println!("skipped: {key} names a path that does not exist here");
+        return None;
     }
-    value
+    Some(value)
 }
 
 /// The environment variable that overrides `key`.

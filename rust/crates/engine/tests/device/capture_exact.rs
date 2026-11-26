@@ -1,6 +1,6 @@
 //! Exact numerics is a switch of the whole process, so the test that sets it has a binary of its own (as
-//! `formats_oracle_gpu` has): no quantum is captured while it is on.
-//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test capture_exact_gpu -- --ignored`.
+//! `formats_oracle` has): no quantum is captured while it is on.
+//! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored capture_exact::`.
 
 #![allow(
     clippy::unwrap_used,
@@ -12,9 +12,8 @@
     reason = "no-wait, waiting calls: a test synchronizes a lane to read results"
 )]
 
-mod common;
-#[path = "common/typed.rs"]
-mod typed;
+use crate::common;
+use crate::typed;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +35,8 @@ use euhedral_inference_settings::KvFormat;
 #[test]
 #[ignore = "needs a GPU and the native library"]
 fn a_quantum_is_never_captured_under_exact_numerics() {
+    // The exact-numerics switch is process-wide: the test holds the card alone, so no other test runs under it.
+    let _card = common::card();
     let Some(path) = test_support::require_property("euhedral.cuda.library") else {
         return;
     };

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use euhedral_graph::Marker;
 use euhedral_inference_cuda::PinnedBuffer;
@@ -18,6 +18,7 @@ use super::{
     PrefixCacheHandle, PrefixCacheStats, Resolve, RestoreError, Speculation, Submit,
 };
 use crate::generation::Spawn;
+use crate::handoff::Handoff;
 use crate::state::SequenceId;
 
 pub(super) const FORMAT: KvFormat = KvFormat::Nvfp4;
@@ -947,18 +948,41 @@ fn a_group_that_fails_fails_the_job_at_the_last_group() {
     assert_eq!((stats.failed, stats.captures, stats.used_bytes), (1, 0, 0));
 }
 
+/// How long a test waits for something that must happen before it calls it a hang.
+const HANG_GUARD: Duration = Duration::from_secs(30);
+
 #[test]
 fn closing_waits_for_a_copy_in_flight_and_then_frees_the_cache() {
     let rig = Rig::new(64);
     let source = Device::new(FORMAT, 1024);
     let captured = rig.capture(&source, &tokens(0, 600), rig.cache.root(), 512, None);
     let mut job = rig.next_job();
+    let ended = AtomicBool::new(false);
     let closed = thread::scope(|scope| {
-        scope.spawn(move || {
-            thread::sleep(Duration::from_millis(100));
+        scope.spawn(|| {
+            // A cache that has taken the shutdown no longer counts a lookup: the copy is still in flight then.
+            let deadline = Instant::now() + HANG_GUARD;
+            loop {
+                let before = rig.stats().lookups;
+                let told = Arc::new(Handoff::new());
+                let answer = Arc::clone(&told);
+                rig.cache.lookup(tokens(0, 8).into(), None, move |_| answer.send(()));
+                told.wait(HANG_GUARD).expect("the lookup was never answered");
+                if rig.stats().lookups == before {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the cache never took the shutdown");
+                thread::yield_now();
+            }
+            ended.store(true, Ordering::SeqCst);
             job.finish(Ended::Done);
         });
-        rig.cache.close(Duration::from_secs(10))
+        let closed = rig.cache.close(HANG_GUARD);
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "the shutdown returned while the copy was in flight"
+        );
+        closed
     });
     assert!(closed, "the copy ended inside the bound");
     assert_ne!(

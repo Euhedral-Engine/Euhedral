@@ -504,6 +504,7 @@ impl Owner {
                     sleep(Duration::from_millis(1));
                 }
                 // The frame the queued end published has run and found the claim held by now.
+                // Timing-based on purpose: no event marks that a frame found the claim held, so the fault waits for it to have run.
                 sleep(Duration::from_millis(200));
                 panic!("a fault raised in a turn, after the end was queued");
             }

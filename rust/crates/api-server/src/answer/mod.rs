@@ -710,6 +710,11 @@ impl Debug for Answerer {
 }
 
 impl Answerer {
+    /// The moment now, on the clock of the admission the answers go through.
+    pub fn now(&self) -> Instant {
+        self.admission.now()
+    }
+
     /// An answerer over `backend`'s generations admitted by `admission`; its frames go through `sink`, which must be
     /// attached to the lattice and outlive the requests.
     pub fn new(

@@ -13,7 +13,7 @@
     reason = "no-wait, blocking I/O and waiting calls: a test waits on hand-offs and the device"
 )]
 
-mod common;
+use crate::common;
 
 use std::mem;
 use std::path::PathBuf;
@@ -95,6 +95,7 @@ fn the_device_loses_no_more_after_admission_than_the_reserve_the_claims_leave() 
     let Some(artifact) = test_support::require_property("euhedral.qwen.rco-artifact").map(PathBuf::from) else {
         return;
     };
+    let _card = common::card();
     let mut settings = Settings::with_model(ModelSettings {
         artifact,
         name: "test".to_string(),
@@ -107,6 +108,7 @@ fn the_device_loses_no_more_after_admission_than_the_reserve_the_claims_leave() 
     let limit = limit_below_need(&library, &settings, 0);
     limit_gpu(&mut settings, limit);
 
+    common::note_load();
     let (owner, ready) = EngineRuntime::start(&settings, &library);
     let runtime = ready
         .wait(WAIT)

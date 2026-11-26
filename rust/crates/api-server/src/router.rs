@@ -7,7 +7,6 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
-use std::time::Instant;
 
 use euhedral_core::frames::Frame;
 use euhedral_inference_api_protocol::{ApiError, Surface};
@@ -387,7 +386,7 @@ impl Router {
         }
         match endpoint {
             Some(endpoint) => {
-                let arrived = Instant::now();
+                let arrived = self.answerer.now();
                 let answerer = self.answerer.clone();
                 self.planner.plan(
                     endpoint,

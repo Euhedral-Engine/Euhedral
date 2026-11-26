@@ -1,7 +1,7 @@
 //! Hidden rows on a GPU: a generation hands the post-final-norm hidden state of every row it runs to a sink, with the
 //! logits of the rows that select. The tests are `#[ignore]`d and run locally, one at a time (each loads the 12 GB
 //! artifact), through the system arbiter:
-//! `system-run --gpu shared:14 --mem 24G --est 300 --who <name> -- cargo test -p euhedral-inference-engine --test hidden_gpu -- --ignored --test-threads=1`.
+//! `system-run --gpu shared:14 --mem 24G --est 300 --who <name> -- cargo test -p euhedral-inference-engine --test device -- --ignored hidden::`.
 //!
 //! The artifact comes from `euhedral.qwen.rco-artifact` and the library from `euhedral.cuda.library`.
 
@@ -24,9 +24,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
-use common::Closer;
+use common::Card;
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, HiddenSink,
     QuantumEvent, Speculation,
@@ -56,7 +56,12 @@ fn machine() -> Option<Machine> {
     Some(Machine { artifact, library })
 }
 
-fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
+/// The engine every test of this binary runs on, one at a time.
+fn shared_engine(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
+    start(machine)
+}
+
+fn start(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -64,12 +69,7 @@ fn start(machine: &Machine) -> (Closer, Arc<EngineRuntime>) {
     settings.context.max_tokens = 512;
     settings.kernels.graphs.captures_per_view = 8;
     settings.batching.prefill_chunk_tokens = CHUNK;
-    let (owner, ready) = EngineRuntime::start(&settings, &machine.library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    (Closer::new(owner, &runtime), runtime)
+    common::engine(&settings, &machine.library)
 }
 
 /// A prompt of `length` ordinary token ids.
@@ -308,7 +308,7 @@ fn hidden_bytes_of(delivered: &[Delivered]) -> usize {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     // A request that drafts runs its verification on the row of the token it has, and the seed rows then hold that
     // row's post-final-norm hidden state, which the next catch-up reads. The hidden request decodes the same row.
@@ -351,14 +351,13 @@ fn hidden_rows_are_the_seed_rows_the_catch_up_reads() {
     );
     assert!(heard[1].logits.is_some() && heard[0].logits.is_some());
     println!("the row of {hidden_bytes} bytes equals the seed row");
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn hidden_rows_cover_every_row_with_logits_where_a_token_is_selected() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     // Three chunks (64, 64, 22) and five decode rows.
     let ids = prompt(150);
@@ -400,14 +399,13 @@ fn hidden_rows_cover_every_row_with_logits_where_a_token_is_selected() {
         seed_rows(&runtime, 1, row_bytes),
         "the last decode row is the seed row"
     );
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn sampled_tokens_are_the_same_with_the_sink_on_and_off() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     let ids = prompt(100);
     for (name, sampling) in [("sampled", sampled()), ("greedy", greedy())] {
@@ -419,14 +417,13 @@ fn sampled_tokens_are_the_same_with_the_sink_on_and_off() {
         assert_eq!(rows, 100 + 23, "{name}: a row for every prompt token and every decode");
         println!("{name}: {} tokens equal", on.tokens.len());
     }
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_request_that_speculates_is_refused() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     let done = Handoff::new();
     let refused = runtime.generate_hidden(
@@ -439,14 +436,13 @@ fn a_request_that_speculates_is_refused() {
         CancelHandle::default(),
     );
     assert_eq!(refused.unwrap_err(), AdmissionError::HiddenWithSpeculation);
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_held_sink_holds_the_request_back_and_hears_every_row_in_order() {
     let Some(machine) = machine() else { return };
-    let (owner, runtime) = start(&machine);
+    let (_card, runtime) = shared_engine(&machine);
 
     // The sink's first call waits at a gate that opens when the third quantum retires: by then one quantum's rows are
     // in the sink and two wait, the most the owner may keep (the engine asserts it, and fails the request otherwise).
@@ -457,5 +453,4 @@ fn a_held_sink_holds_the_request_back_and_hears_every_row_in_order() {
     let positions: Vec<u64> = heard.iter().map(|call| call.first_position).collect();
     let expected: Vec<u64> = iter::once(0).chain(20..31).collect();
     assert_eq!(positions, expected, "every quantum's rows, once, in order");
-    owner.shutdown(runtime).unwrap();
 }

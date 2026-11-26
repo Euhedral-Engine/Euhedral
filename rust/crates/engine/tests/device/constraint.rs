@@ -1,7 +1,7 @@
 //! Constrained requests on a GPU: the host selects the best allowed token at each step, the request never speculates,
 //! and a constraint that fails ends the request with an error and leaves the sequence free. The tests are `#[ignore]`d
 //! and run locally (each loads the 12 GB artifact), through the system arbiter:
-//! `system-run --gpu shared:14 --mem 24G --est 600 --who <name> -- cargo test -p euhedral-inference-engine --test constraint_gpu -- --ignored --test-threads=1`.
+//! `system-run --gpu shared:14 --mem 24G --est 600 --who <name> -- cargo test -p euhedral-inference-engine --test device -- --ignored constraint::`.
 //!
 //! The artifact comes from `euhedral.qwen.rco-artifact` and the library from `euhedral.cuda.library`.
 
@@ -18,13 +18,13 @@
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::thread::sleep;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
-use common::Closer;
+use common::Card;
 use euhedral_inference_engine::generation::{
     ConstraintError, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
     TokenConstraint,
@@ -34,16 +34,14 @@ use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_settings::{ModelSettings, Settings};
 
-/// The longest a device test waits for the engine to start; past it the test fails.
-const WAIT: Duration = Duration::from_secs(20 * 60);
-
 /// The longest a test waits for a generation of a few tokens: a request that hangs fails the test inside the grant.
 const GENERATION_WAIT: Duration = Duration::from_secs(60);
 
 /// The prompt: any ids inside the vocabulary will do.
 const PROMPT: [u32; 6] = [3000, 1500, 2200, 800, 4100, 1200];
 
-fn start() -> Option<(Closer, Arc<EngineRuntime>)> {
+/// The engine every test of this binary runs on, one at a time; `None` without the card's settings.
+fn start() -> Option<(Card, Arc<EngineRuntime>)> {
     let library = PathBuf::from(test_support::require_property("euhedral.cuda.library")?);
     let artifact = PathBuf::from(test_support::require_property("euhedral.qwen.rco-artifact")?);
     if !artifact.is_file() {
@@ -55,19 +53,12 @@ fn start() -> Option<(Closer, Arc<EngineRuntime>)> {
     });
     settings.context.max_tokens = 256;
     settings.kernels.graphs.captures_per_view = 8;
-    let (owner, ready) = EngineRuntime::start(&settings, &library);
-    let runtime = ready
-        .wait(WAIT)
-        .expect("the engine reports")
-        .expect("the engine starts");
-    Some((Closer::new(owner, &runtime), runtime))
+    Some(common::engine(&settings, &library))
 }
 
 struct Recording {
     tokens: Vec<u32>,
     quanta: Vec<QuantumKind>,
-    /// When each decode quantum entered the engine.
-    decodes: Vec<Instant>,
     outcome: GenerationOutcome,
 }
 
@@ -76,6 +67,38 @@ struct Recorder {
     quanta: Vec<QuantumKind>,
     decodes: Vec<Instant>,
     done: Option<Arc<Handoff<Recording>>>,
+    /// Opened once this many decode quanta were reported.
+    opens: Option<(Arc<Gate>, usize)>,
+}
+
+/// A door a slow preparation waits at until the test's listener has seen the decode beside it retire.
+struct Gate {
+    door: AtomicBool,
+}
+
+impl Gate {
+    fn new() -> Arc<Gate> {
+        Arc::new(Gate {
+            door: AtomicBool::new(false),
+        })
+    }
+
+    fn open(&self) {
+        self.door.store(true, Ordering::Release);
+    }
+
+    /// Waits for the gate to open; `false` if it did not within the time a hung engine is given. The waiter is a
+    /// worker of the engine's lattice, which `Handoff::wait` refuses, so it yields on the flag.
+    fn wait(&self) -> bool {
+        let start = Instant::now();
+        while !self.door.load(Ordering::Acquire) {
+            if start.elapsed() > GENERATION_WAIT {
+                return false;
+            }
+            thread::yield_now();
+        }
+        true
+    }
 }
 
 impl GenerationListener for Recorder {
@@ -89,6 +112,11 @@ impl GenerationListener for Recorder {
         self.quanta.push(event.kind);
         if event.kind == QuantumKind::Decode {
             self.decodes.push(event.admitted);
+            if let Some((gate, count)) = &self.opens
+                && self.decodes.len() == *count
+            {
+                gate.open();
+            }
         }
     }
 
@@ -97,14 +125,10 @@ impl GenerationListener for Recorder {
         done.send(Recording {
             tokens: mem::take(&mut self.tokens),
             quanta: mem::take(&mut self.quanta),
-            decodes: mem::take(&mut self.decodes),
             outcome,
         });
     }
 }
-
-/// How long a slow preparation takes: long enough for the decode that runs beside it to retire first.
-const SLOW: Duration = Duration::from_millis(300);
 
 /// What a fake constraint does at its `fail_at`th step.
 #[derive(Clone, Copy, PartialEq)]
@@ -112,9 +136,12 @@ enum Fault {
     None,
     AcceptErrors,
     PrepareErrors,
-    PrepareSleepsThenPanics,
-    /// The preparation at `fail_at` takes a while and succeeds; the time it ended is kept.
-    PrepareSleeps,
+    /// The preparation at `fail_at` waits for the decode beside it to retire, so that the row of the decode after it
+    /// waits for the mask, and then panics.
+    PrepareWaitsThenPanics,
+    /// The preparation at `fail_at` waits for the decode beside it to retire and succeeds: the row of the decode
+    /// after it waits for the mask.
+    PrepareWaits,
 }
 
 /// A constraint that allows one token a step, the next of `cycle`.
@@ -125,9 +152,8 @@ struct Cycle {
     fail_at: usize,
     accepted: Arc<AtomicUsize>,
     prepared: Arc<AtomicUsize>,
-    /// Nanoseconds from `base` to the end of the slow preparation.
-    ended: Arc<AtomicU64>,
-    base: Instant,
+    /// Opened when `fail_at` decodes were reported, which the preparation at `fail_at` waits for.
+    gate: Arc<Gate>,
 }
 
 impl Cycle {
@@ -141,8 +167,7 @@ impl Cycle {
             fail_at,
             accepted: Arc::clone(&accepted),
             prepared: Arc::clone(&prepared),
-            ended: Arc::new(AtomicU64::new(0)),
-            base: Instant::now(),
+            gate: Gate::new(),
         };
         (constraint, accepted, prepared)
     }
@@ -160,15 +185,15 @@ impl TokenConstraint for Cycle {
         if self.step == self.fail_at {
             match self.fault {
                 Fault::PrepareErrors => return Err(ConstraintError::new("no mask")),
-                Fault::PrepareSleepsThenPanics => {
-                    // Long enough for the decode that follows to retire first: its row waits for this mask.
-                    sleep(SLOW);
+                Fault::PrepareWaitsThenPanics => {
+                    // The decode that follows retires first: its row waits for this mask.
+                    assert!(self.gate.wait(), "the decode never retired while the mask was prepared");
                     panic!("a constraint that cannot prepare");
                 }
-                Fault::PrepareSleeps => {
-                    sleep(SLOW);
-                    let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    self.ended.store(nanos, Ordering::SeqCst);
+                Fault::PrepareWaits if !self.gate.wait() => {
+                    return Err(ConstraintError::new(
+                        "the decode never retired while the mask was prepared",
+                    ));
                 }
                 _ => {}
             }
@@ -197,6 +222,27 @@ fn run(
     speculation: Speculation,
     constraint: Option<Box<dyn TokenConstraint>>,
 ) -> Recording {
+    run_opening(
+        runtime,
+        max_tokens,
+        stop_tokens,
+        sampling,
+        speculation,
+        constraint,
+        None,
+    )
+}
+
+/// As [`run`], with the gate `opens` opened once its count of decode quanta were reported.
+fn run_opening(
+    runtime: &EngineRuntime,
+    max_tokens: u32,
+    stop_tokens: Vec<u32>,
+    sampling: SamplingConfig,
+    speculation: Speculation,
+    constraint: Option<Box<dyn TokenConstraint>>,
+    opens: Option<(Arc<Gate>, usize)>,
+) -> Recording {
     let done = Handoff::new();
     runtime
         .generate(GenerationRequest {
@@ -211,6 +257,7 @@ fn run(
                 quanta: Vec::new(),
                 decodes: Vec::new(),
                 done: Some(Arc::clone(&done)),
+                opens,
             }),
         })
         .expect("the request is admitted");
@@ -229,7 +276,7 @@ fn sequence_free(runtime: &EngineRuntime) -> bool {
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn a_constraint_that_allows_one_token_a_step_decides_every_token_and_the_request_never_speculates() {
-    let Some((owner, runtime)) = start() else { return };
+    let Some((_card, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let sampled = SamplingConfig::new(1.0, 20, 0.95, 5, false).unwrap();
     for (what, sampling) in [("greedy", SamplingConfig::greedy(0)), ("sampled", sampled)] {
@@ -272,30 +319,31 @@ fn a_constraint_that_allows_one_token_a_step_decides_every_token_and_the_request
     );
     assert_eq!(free.outcome.reason, FinishReason::Length);
     assert_eq!(free.tokens.len(), 24);
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_sequence() {
-    let Some((owner, runtime)) = start() else { return };
+    let Some((_card, runtime)) = start() else { return };
     let cycle = [4000, 120];
     for (what, fault) in [
         ("accept", Fault::AcceptErrors),
         ("prepare", Fault::PrepareErrors),
         (
             "a panic in prepare while the next row waits",
-            Fault::PrepareSleepsThenPanics,
+            Fault::PrepareWaitsThenPanics,
         ),
     ] {
         let (constraint, _, _) = Cycle::new(&cycle, fault, 3);
-        let recording = run(
+        let gate = Arc::clone(&constraint.gate);
+        let recording = run_opening(
             &runtime,
             40,
             Vec::new(),
             SamplingConfig::greedy(0),
             Speculation::Off,
             Some(Box::new(constraint)),
+            Some((gate, 3)),
         );
         assert!(
             matches!(recording.outcome.reason, FinishReason::Failed(_)),
@@ -323,25 +371,26 @@ fn a_constraint_that_fails_ends_the_request_once_with_an_error_and_frees_the_seq
             "{what}: the next request runs"
         );
     }
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_first_waits_for_it() {
-    let Some((owner, runtime)) = start() else { return };
+    let Some((_card, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let slow_at = 5;
-    let (constraint, _, _) = Cycle::new(&cycle, Fault::PrepareSleeps, slow_at);
-    let ended = Arc::clone(&constraint.ended);
-    let base = constraint.base;
-    let recording = run(
+    let (constraint, _, _) = Cycle::new(&cycle, Fault::PrepareWaits, slow_at);
+    let gate = Arc::clone(&constraint.gate);
+    // The mask for step `slow_at` is prepared after token `slow_at - 1`, while the decode that feeds that token runs:
+    // the preparation waits until that decode retired, and a row that retires first waits for the mask.
+    let recording = run_opening(
         &runtime,
         12,
         Vec::new(),
         SamplingConfig::greedy(0),
         Speculation::Off,
         Some(Box::new(constraint)),
+        Some((gate, slow_at)),
     );
     assert_eq!(recording.outcome.reason, FinishReason::Length);
     let expected: Vec<u32> = (0..12).map(|index| cycle[index % cycle.len()]).collect();
@@ -349,22 +398,13 @@ fn the_next_mask_is_prepared_while_the_next_decode_runs_and_a_row_that_retires_f
         recording.tokens, expected,
         "a row that waited for its mask selects the same tokens"
     );
-    // The mask for step `slow_at` is prepared after token `slow_at - 1`, while the decode that feeds that token runs.
-    let ended = Duration::from_nanos(ended.load(Ordering::SeqCst));
-    assert!(ended > Duration::ZERO, "the slow preparation ran");
-    let admitted = recording.decodes[slow_at - 1].duration_since(base);
-    assert!(
-        admitted < ended,
-        "the decode ({admitted:?}) was admitted before the mask was ready ({ended:?})"
-    );
     assert!(sequence_free(&runtime));
-    owner.shutdown(runtime).unwrap();
 }
 
 #[test]
 #[ignore = "loads the artifact on the device"]
 fn a_constrained_request_ends_at_a_stop_token_it_chose_and_at_a_budget_of_one() {
-    let Some((owner, runtime)) = start() else { return };
+    let Some((_card, runtime)) = start() else { return };
     let cycle = [4000, 120, 9000, 77];
     let (constraint, accepted, _) = Cycle::new(&cycle, Fault::None, usize::MAX);
     let stopped = run(
@@ -397,5 +437,4 @@ fn a_constrained_request_ends_at_a_stop_token_it_chose_and_at_a_budget_of_one() 
     assert_eq!(single.tokens, vec![4000]);
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
     assert!(sequence_free(&runtime), "one token: every lease is back");
-    owner.shutdown(runtime).unwrap();
 }

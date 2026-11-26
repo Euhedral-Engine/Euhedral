@@ -214,7 +214,6 @@ fn family<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
 fn the_process_series_are_well_formed_and_the_uptime_does_not_go_back() {
     let fixture = Fixture::start();
     let first = text(&fixture.get("/metrics")).to_owned();
-    sleep(Duration::from_millis(30));
     let second = text(&fixture.get("/metrics")).to_owned();
     let mut names = vec![
         "process_cpu_time_ns_total",
@@ -392,10 +391,12 @@ fn a_stream_cut_after_its_head_is_timed_once() {
         assert!(Instant::now() < end, "{scrape}");
         sleep(Duration::from_millis(5));
     }
-    // Once, however long it takes to settle.
-    sleep(Duration::from_millis(100));
-    assert!(text(&fixture.get("/metrics")).contains(&counted));
-    fixture.finish();
+    // The stop returns once every connection has ended: nothing is left that could count the request again.
+    fixture.stop();
+    let mut last = fixture.server.metrics().render("m", 1, &EngineReport::default(), 0);
+    last.push_str(&fixture.server.metrics().render_platform(0));
+    assert!(last.contains(&counted), "{last}");
+    fixture.finish_after_stop();
 }
 
 #[test]

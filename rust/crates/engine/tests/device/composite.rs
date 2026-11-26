@@ -12,7 +12,7 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads files and waits on hand-offs"
 )]
 
-mod common;
+use crate::common;
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -81,6 +81,7 @@ impl GenerationListener for Collector {
 
 /// The greedy tokens the engine over `artifact` (and `composite`) generates after the prompt.
 fn generate(machine: &Machine, composite: Composite) -> Vec<u32> {
+    common::note_load();
     let (owner, ready) =
         EngineRuntime::start_composite(&settings(&machine.artifact), &machine.library, None, composite);
     let runtime = ready
@@ -199,6 +200,7 @@ fn write_source(base: &Path, path: &Path, objects: &[String], corrupt: bool) {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_composite_reads_each_object_from_its_own_file_and_generates_the_bases_tokens() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (_, _, entries) = index(&machine.artifact);
     let objects = projections(&entries, 8);
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("composite-weights");
@@ -241,6 +243,7 @@ fn a_composite_reads_each_object_from_its_own_file_and_generates_the_bases_token
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_source_that_cannot_be_opened_stops_the_start_naming_it() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     let (_, _, entries) = index(&machine.artifact);
     let composite = Composite {
         replacements: vec![Replacement {
@@ -249,6 +252,7 @@ fn a_source_that_cannot_be_opened_stops_the_start_naming_it() {
         }],
         draft_depth: None,
     };
+    common::note_load();
     let (owner, ready) =
         EngineRuntime::start_composite(&settings(&machine.artifact), &machine.library, None, composite);
     let error = ready
@@ -263,11 +267,13 @@ fn a_source_that_cannot_be_opened_stops_the_start_naming_it() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_draft_depth_the_artifact_cannot_take_stops_the_start() {
     let Some(machine) = machine() else { return };
+    let _card = common::card();
     for depth in [0, MAX_DRAFT_DEPTH + 1] {
         let composite = Composite {
             replacements: Vec::new(),
             draft_depth: Some(depth),
         };
+        common::note_load();
         let (owner, ready) =
             EngineRuntime::start_composite(&settings(&machine.artifact), &machine.library, None, composite);
         let error = ready

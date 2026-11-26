@@ -50,3 +50,11 @@ print_stdout = "warn"
 todo = "warn"
 undocumented_unsafe_blocks = "warn"
 unwrap_used = "warn"
+
+# The device tests run optimised, because the host side of a generation (tokenizing, sampling, planning, the lattice)
+# is slow unoptimised, with the assertions and the overflow checks of a debug build still on. Only `--profile device`
+# selects it.
+[profile.device]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
