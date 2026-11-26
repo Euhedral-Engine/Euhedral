@@ -101,7 +101,7 @@ fn flags(args: &[String]) -> Result<Flags, String> {
 }
 
 /// The library the build puts the CUDA layer in, where this platform has one; other platforms name it.
-fn default_library() -> Option<PathBuf> {
+pub(crate) fn default_library() -> Option<PathBuf> {
     (consts::OS == "linux" && consts::ARCH == "x86_64")
         .then(|| PathBuf::from("build/native/linux-x64/lib/libeuhedral_cuda.so"))
 }

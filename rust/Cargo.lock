@@ -563,7 +563,9 @@ name = "euhedral-inference-quantize"
 version = "0.1.0"
 dependencies = [
  "euhedral-core",
+ "euhedral-gpu",
  "euhedral-graph",
+ "euhedral-inference-cuda",
  "euhedral-inference-edrl",
  "euhedral-inference-engine",
  "euhedral-inference-quantization",
