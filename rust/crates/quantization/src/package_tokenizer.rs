@@ -88,7 +88,9 @@ pub struct Packaged {
     pub section_bytes: u64,
 }
 
-/// Receives the result of a run, on a worker.
+/// Receives the result of a run, once. It usually runs on a worker, but it may also run inside the discard of a frame
+/// or an I/O continuation (a closing engine or lake), or on the caller's thread when the first frame is discarded
+/// before [`package_tokenizer`] returns. It must only record the result and offer nothing.
 pub type Done = Box<dyn FnOnce(Result<Packaged, PackageError>) + Send>;
 
 /// The header's regions against a file of `file_len` bytes: the header, and where the table is.
@@ -114,8 +116,8 @@ pub fn content_end(header: &Header, table: &[u8], file_len: u64) -> Result<u64, 
         .fold(header.data_offset(), u64::max))
 }
 
-/// Starts packaging. The result goes to `done` on a worker; an `Err` here means nothing started, and `done` is never
-/// called.
+/// Starts packaging. The result goes to `done`, which may run inside a discard and must only record it (see [`Done`]);
+/// an `Err` here means nothing started, and `done` is never called.
 ///
 /// `io` does the reads and writes; `host` runs the checks (loading the tokenizer is CPU work) and the few file
 /// operations `AsyncIo` lacks.
@@ -182,7 +184,8 @@ pub fn package_tokenizer(
     Ok(())
 }
 
-/// The callback of a run, called once. A run dropped before it finished (a refused step) reports itself lost.
+/// The callback of a run, called once. A run dropped before it finished (a step discarded unrun) reports itself lost,
+/// from inside the discard.
 struct Completion {
     done: Option<Done>,
 }
@@ -1192,8 +1195,12 @@ mod tests {
         io.complete();
         let begun = Instant::now();
         let result = loop {
-            if let Ok(result) = receiver.try_recv() {
-                break result;
+            match receiver.try_recv() {
+                Ok(result) => break result,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("the length step's continuation was dropped without being called")
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
             assert!(
                 begun.elapsed() < Duration::from_secs(30),
