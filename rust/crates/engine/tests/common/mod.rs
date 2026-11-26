@@ -13,7 +13,7 @@
 )]
 #![allow(clippy::print_stdout, reason = "the log counts the engine loads")]
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -252,7 +252,7 @@ struct State {
 
 /// How long a test waits for the card with no test taking or leaving it, before it fails naming who holds it. The
 /// longest test holds it a few minutes.
-const HANG_GUARD: Duration = Duration::from_secs(15 * 60);
+const HANG_GUARD: Duration = Duration::from_secs(5 * 60);
 
 fn thread_name() -> String {
     thread::current().name().unwrap_or("?").to_owned()
@@ -299,18 +299,37 @@ static CHANGED: Condvar = Condvar::new();
 static LOADS: AtomicUsize = AtomicUsize::new(0);
 
 /// The longest an engine start waits for its latch.
-const START_WAIT: Duration = Duration::from_secs(20 * 60);
+const START_WAIT: Duration = Duration::from_secs(5 * 60);
 
 fn lock() -> MutexGuard<'static, State> {
     // A test that failed holding the card leaves it usable: the next one starts from what is left.
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The host memory the process holds and the machine can still spare, for the log: engines read the second at start to
+/// size their host budget, so a test process that keeps memory across engines starves the later ones.
+fn host_memory() -> String {
+    let read = |path: &str, key: &str| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(key).map(|rest| rest.trim().to_owned()))
+            })
+            .unwrap_or_default()
+    };
+    format!(
+        "process {}, machine available {}",
+        read("/proc/self/status", "VmRSS:"),
+        read("/proc/meminfo", "MemAvailable:")
+    )
+}
+
 /// Counts one model load in the log: a test that starts an engine itself, to see how the start ends, calls this.
 pub fn note_load() {
     require_free_card();
     let loads = LOADS.fetch_add(1, Ordering::Relaxed) + 1;
-    println!("ENGINE LOAD {loads}");
+    println!("ENGINE LOAD {loads} ({})", host_memory());
 }
 
 /// Starts an engine and waits for its latch, as `main` does, and counts the start: every engine of the device tests
@@ -320,7 +339,14 @@ pub fn start_engine(settings: &Settings, library: &Path) -> (Closer, Arc<EngineR
     let (owner, ready) = EngineRuntime::start(settings, library);
     let runtime = ready
         .wait(START_WAIT)
-        .expect("the engine reports")
+        .unwrap_or_else(|_| {
+            panic!(
+                "test {} waited {} s for its engine to report its start; the card is held by {:?}",
+                thread_name(),
+                START_WAIT.as_secs(),
+                lock().holders,
+            )
+        })
         .expect("the engine starts");
     note_load();
     (Closer::new(owner, &runtime), runtime)
