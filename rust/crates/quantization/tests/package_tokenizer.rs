@@ -33,6 +33,7 @@ use euhedral_inference_engine::lattice_config;
 use euhedral_inference_quantization::package_error::PackageError;
 use euhedral_inference_quantization::package_tokenizer::{PackageRequest, Packaged, package_tokenizer};
 use euhedral_inference_quantization::tokenizer_files::TokenizerFiles;
+use euhedral_inference_quantization::tokenizer_files::read_checkpoint_tokenizer;
 use euhedral_inference_settings::{ModelSettings, Settings};
 use euhedral_io::AsyncIo;
 use serde_json::{Value, json};
@@ -479,4 +480,19 @@ fn a_stale_temporary_output_of_an_earlier_run_is_replaced_not_extended() {
     run.package(fixture.to_output()).unwrap();
     assert_eq!(fs::read(fixture.path("out.edrl")).unwrap(), fs::read(twin).unwrap());
     assert!(!fixture.path("out.edrl.part").exists());
+}
+
+/// A reference reads the tokenizer of a checkpoint directory directly, as `package-tokenizer` would put it in an
+/// artifact: the same ids come out, and a directory without its files is refused naming the file.
+#[test]
+fn a_checkpoint_directory_gives_the_tokenizer_a_package_would_carry() {
+    let directory = tempfile::tempdir().unwrap();
+    Checkpoint::standard().write(directory.path());
+    let tokenizer = read_checkpoint_tokenizer(directory.path()).unwrap();
+    assert_eq!(tokenizer.encode("he").unwrap(), vec![256]);
+    assert_eq!(tokenizer.encode("<|im_end|>").unwrap(), vec![258]);
+
+    fs::remove_file(directory.path().join("generation_config.json")).unwrap();
+    let error = read_checkpoint_tokenizer(directory.path()).err().unwrap();
+    assert!(error.to_string().contains("generation_config.json"), "{error}");
 }

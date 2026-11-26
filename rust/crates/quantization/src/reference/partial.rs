@@ -74,6 +74,7 @@ pub struct RowFile {
 }
 
 /// The way to record chunks complete.
+#[derive(Clone)]
 pub struct Mark {
     file: ResumeFile,
     offset: u64,
