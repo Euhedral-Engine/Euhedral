@@ -30,7 +30,9 @@ use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::load::{KernelSources, KernelTable, load};
 use euhedral_inference_cuda::launch::ops::RusteeOps;
 use euhedral_inference_cuda::math::{LaneHandles, MathLibraries};
-use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, KernelOps, LaneOps, PinnedBuffer, PinnedPool, PooledPinned};
+use euhedral_inference_cuda::{
+    CudaLibrary, DeviceBuffer, KernelOps, LaneOps, PinnedBuffer, PinnedPool, PinnedRange, PooledPinned,
+};
 use euhedral_inference_engine::Handoff;
 use euhedral_io::AsyncIo;
 use euhedral_memory::{LocationId, LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope};
@@ -60,10 +62,12 @@ use crate::resume::ResumeFile;
 use crate::step::{Kind, idle, step};
 
 mod heads;
+mod staging;
 mod trellis;
 
 use super::head_state::HeadState;
-use heads::{DeviceHeads, OUTPUT_HEAD};
+use heads::{DeviceHeads, OUTPUT_HEAD, head_groups};
+use staging::HeadStaging;
 use trellis::{Opening, Trellis, TrellisDeviceHeads, round_layer};
 
 pub use trellis::TrellisRun;
@@ -189,6 +193,8 @@ struct Inner {
     completions: Arc<Completions>,
     pipeline: ForwardPipeline,
     staging: Arc<PinnedPool>,
+    /// The buffer the embedding read, the MTP block and the heads read their tensors into.
+    head_staging: HeadStaging<PinnedBuffer>,
     states: States,
     batch_states: DeviceBuffer,
     /// The main lane's second set of math handles: the pipeline holds the first.
@@ -324,6 +330,7 @@ impl Calibration {
                 .map_err(|error| CalibrateError::failed("the hidden states", error))?,
             bytes: states_bytes,
         };
+        let head_staging = HeadStaging::open(&library, &head_groups(&objects, settings.trellis.is_some()))?;
         let batch_states = DeviceBuffer::alloc(&library, batch * length * hidden * BF16_BYTES)
             .map_err(|error| CalibrateError::failed("the batch states", error))?;
 
@@ -440,6 +447,7 @@ impl Calibration {
             completions: Arc::clone(&completions),
             pipeline,
             staging,
+            head_staging,
             states,
             batch_states,
             handles: Handoff::empty(),
@@ -681,22 +689,32 @@ fn embed(inner: Arc<Inner>, then: Once<usize>) {
     if let Err(error) = checked {
         return end(&then, Err(error));
     }
-    // The staging pool's memory, which a drop returns to the pool: a plain pinned buffer is freed with a wait for the
-    // device, in the frame that ends the read.
-    let memory = match inner.staging.acquire(tensor.bytes as usize) {
+    // The heads' own buffer, allocated at open: a pooled loan of this size would be rounded up to a power of two and
+    // allocated in this frame.
+    let memory = match inner.head_staging.lease(&[tensor.bytes as usize]) {
         Ok(memory) => memory,
-        Err(error) => return end(&then, Err(CalibrateError::failed("the embedding table", error))),
+        Err(error) => return end(&then, Err(error)),
+    };
+    let Some(range) = memory.range(0) else {
+        return end(
+            &then,
+            Err(CalibrateError::Failed(
+                "the embedding table has no part to be read into".to_owned(),
+            )),
+        );
     };
     let failed = Arc::clone(&then);
     let started = store.read_tensor(
         EMBEDDING,
-        memory,
-        Arc::new(move |read: Result<PooledPinned, CheckpointError>| {
+        range,
+        Arc::new(move |read: Result<PinnedRange, CheckpointError>| {
             let outcome = read
                 .map_err(|error| CalibrateError::failed("the embedding table", error))
-                .and_then(|memory| {
-                    // SAFETY: the table was read whole into the buffer, which nothing else touches.
-                    let table = unsafe { slice::from_raw_parts(memory.buffer().as_ptr(), tensor.bytes as usize) };
+                .and_then(|range| {
+                    drop(range);
+                    let table = memory
+                        .bytes(0)
+                        .ok_or_else(|| CalibrateError::Failed("the embedding table was not read".to_owned()))?;
                     // SAFETY: the states are the run's own and nothing touches them before the run starts.
                     let states = unsafe { slice::from_raw_parts_mut(inner.states.pointer(), inner.states.bytes) };
                     embedding::copy_rows(&inner.settings.tokens, table, inner.row_bytes(), states)

@@ -18,9 +18,11 @@ use euhedral_gpu::{Lane, LaneEnqueue};
 use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::ops::RusteeOps;
 use euhedral_inference_cuda::math::LaneHandles;
-use euhedral_inference_cuda::{DeviceBuffer, KernelOps, LaneOps, PooledPinned};
+use euhedral_inference_cuda::{DeviceBuffer, KernelOps, LaneOps, PinnedRange};
 use euhedral_inference_engine::Handoff;
 
+use super::staging::HeadMemory;
+use super::trellis::mtp_tensors;
 use super::{BF16_BYTES, EMBEDDING, FP32_BYTES, Inner, after, gpu_error, run_target, save_manifest};
 use crate::calibrate::CalibrateError;
 use crate::calibrate::driver::{Once, Then, end, single};
@@ -29,7 +31,7 @@ use crate::calibrate::heads::{DraftHessian, Heads};
 use crate::calibrate::manifest::Part;
 use crate::calibrate::rounding::{Ended, Linear, round_all};
 use crate::checkpoint::CheckpointError;
-use crate::checkpoint::objects::MTP_OBJECTS;
+use crate::checkpoint::objects::{MTP_OBJECTS, Qwen38Objects};
 use crate::forward::{ForwardError, LaneContext, Target};
 use crate::gptq::state::QuantState;
 use crate::step::idle;
@@ -204,26 +206,32 @@ fn zeroed(context: &mut Context<'_, '_>, bytes: usize) -> Result<DeviceBuffer, F
     Ok(buffer)
 }
 
-/// Uploads `memory` to a new buffer on the lane, in copies of at most the run's chunk.
+/// Uploads part `index` of `memory` to a new buffer on the lane, in copies of at most the run's chunk.
 ///
 /// # Safety
 /// `memory` stays live, and unchanged, until the lane has retired the work queued up to this call.
-pub(super) unsafe fn upload_pinned(
+pub(super) unsafe fn upload_part(
     inner: &Inner,
     context: &mut Context<'_, '_>,
-    memory: &PooledPinned,
+    memory: &HeadMemory,
+    index: usize,
 ) -> Result<DeviceBuffer, ForwardError> {
-    let bytes = memory.len();
+    let Some((start, bytes)) = memory.part(index) else {
+        return Err(ForwardError::Invalid(format!("the head tensors have no part {index}")));
+    };
     let buffer = context.ops().alloc_async(bytes)?;
     let mut offset = 0;
     while offset < bytes {
         let chunk = inner.settings.chunk_bytes.min(bytes - offset);
         // SAFETY: the caller keeps `memory` as this function's contract says; the destination range lies in `buffer`,
-        // and `bytes` is at most the buffer the loan holds.
+        // and the part lies in the staging buffer.
         let queued = unsafe {
-            context
-                .ops()
-                .copy_upload_to_device(buffer.ptr().offset(offset as u64), memory.buffer(), offset, chunk)
+            context.ops().copy_upload_to_device(
+                buffer.ptr().offset(offset as u64),
+                memory.buffer(),
+                start + offset,
+                chunk,
+            )
         };
         if let Err(error) = queued {
             let _ = context.ops().free_async(buffer);
@@ -262,40 +270,58 @@ fn free_in_stream(inner: &Arc<Inner>, buffers: Vec<DeviceBuffer>) {
     }
 }
 
-/// Reads the tensors `names`, each whole, into the staging pool's pinned memory, in order.
-pub(super) fn read_tensors(inner: &Arc<Inner>, names: Vec<String>, then: Then<Vec<PooledPinned>>) {
-    let pending = names.into_iter().rev().collect();
-    read_next(Arc::clone(inner), pending, Vec::new(), single(then));
+/// The sizes of the tensors `names`, in order.
+fn sizes_of(inner: &Inner, names: &[String]) -> Result<Vec<usize>, CalibrateError> {
+    names
+        .iter()
+        .map(|name| {
+            let tensor = inner
+                .objects
+                .store()
+                .tensor(name)
+                .map_err(|error| CalibrateError::failed(name, error))?;
+            Ok(tensor.bytes as usize)
+        })
+        .collect()
 }
 
-fn read_next(inner: Arc<Inner>, mut pending: Vec<String>, read: Vec<PooledPinned>, then: Once<Vec<PooledPinned>>) {
-    let Some(name) = pending.pop() else {
-        return end(&then, Ok(read));
+/// Reads the tensors `names`, each whole, one after the other, into the parts of the heads' staging buffer.
+pub(super) fn read_tensors(inner: &Arc<Inner>, names: Vec<String>, then: Then<HeadMemory>) {
+    let cell = single(then);
+    let leased = sizes_of(inner, &names).and_then(|sizes| inner.head_staging.lease(&sizes));
+    match leased {
+        Ok(memory) => read_next(Arc::clone(inner), names, 0, memory, cell),
+        Err(error) => end(&cell, Err(error)),
+    }
+}
+
+/// Reads tensor `index` of `names` into its part, then the next one in the frame that ends the read.
+fn read_next(inner: Arc<Inner>, names: Vec<String>, index: usize, memory: HeadMemory, then: Once<HeadMemory>) {
+    let Some(name) = names.get(index).cloned() else {
+        return end(&then, Ok(memory));
+    };
+    let Some(range) = memory.range(index) else {
+        return end(
+            &then,
+            Err(CalibrateError::Failed(format!("{name} has no part to be read into"))),
+        );
     };
     let store = Arc::clone(inner.objects.store());
-    let bytes = match store.tensor(&name) {
-        Ok(tensor) => tensor.bytes as usize,
-        Err(error) => return end(&then, Err(CalibrateError::failed(&name, error))),
-    };
-    let memory = match inner.staging.acquire(bytes) {
-        Ok(memory) => memory,
-        Err(error) => return end(&then, Err(CalibrateError::failed(&name, error))),
-    };
     let rest = Arc::new(Handoff::empty());
-    rest.send((pending, read));
+    rest.send((names, memory));
     let (ended, failed, next) = (Arc::clone(&then), Arc::clone(&then), Arc::clone(&inner));
     let label = name.clone();
     let started = store.read_tensor(
         &label,
-        memory,
-        Arc::new(move |result: Result<PooledPinned, CheckpointError>| {
-            let Some((pending, mut read)) = rest.take() else {
+        range,
+        Arc::new(move |result: Result<PinnedRange, CheckpointError>| {
+            let Some((names, memory)) = rest.take() else {
                 return;
             };
             match result {
-                Ok(memory) => {
-                    read.push(memory);
-                    read_next(Arc::clone(&next), pending, read, Arc::clone(&ended));
+                Ok(range) => {
+                    drop(range);
+                    read_next(Arc::clone(&next), names, index + 1, memory, Arc::clone(&ended));
                 }
                 Err(error) => end(&ended, Err(CalibrateError::failed(&name, error))),
             }
@@ -306,10 +332,49 @@ fn read_next(inner: Arc<Inner>, mut pending: Vec<String>, read: Vec<PooledPinned
     }
 }
 
+/// The tensors the MTP block's stem reads, in the order of its parts: the embedding table, three norms, and the input
+/// projection.
+fn stem_tensors(objects: &Qwen38Objects) -> Result<Vec<String>, CalibrateError> {
+    let (projection, ..) = tensor_of(objects, INPUT_PROJECTION)?;
+    Ok([EMBEDDING, EMBEDDING_NORM, HIDDEN_NORM, MTP_NORM]
+        .into_iter()
+        .map(str::to_owned)
+        .chain([projection])
+        .collect())
+}
+
+/// The sizes of the tensors each call of the heads reads together, for the staging buffer: the embedding table, the
+/// final norm, the output head, and the MTP block's (the trellis arm's eight linears in a trellis run). A tensor the
+/// checkpoint lacks is left out here, and its call fails when it reads.
+pub(super) fn head_groups(objects: &Qwen38Objects, trellis: bool) -> Vec<Vec<usize>> {
+    let mtp = if trellis {
+        Ok(mtp_tensors())
+    } else {
+        stem_tensors(objects)
+    };
+    let output = tensor_of(objects, OUTPUT_HEAD).map(|(tensor, ..)| tensor);
+    let groups = [
+        Ok(vec![EMBEDDING.to_owned()]),
+        Ok(vec![FINAL_NORM.to_owned()]),
+        output.map(|tensor| vec![tensor]),
+        mtp,
+    ];
+    groups
+        .into_iter()
+        .map(|names| {
+            names
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|name| objects.store().tensor(name).ok())
+                .map(|tensor| tensor.bytes as usize)
+                .collect()
+        })
+        .collect()
+}
+
 /// The tensor of the single-piece object `name`.
-fn tensor_of(inner: &Inner, name: &str) -> Result<(String, u64, usize), CalibrateError> {
-    let source = inner
-        .objects
+fn tensor_of(objects: &Qwen38Objects, name: &str) -> Result<(String, u64, usize), CalibrateError> {
+    let source = objects
         .object(name)
         .map_err(|error| CalibrateError::failed(name, error))?;
     match source.pieces.as_slice() {
@@ -487,7 +552,7 @@ impl Stem<'_> {
 
 /// What the MTP call reads from the host: the tensors and the next tokens.
 struct MtpHost {
-    memory: Vec<PooledPinned>,
+    memory: HeadMemory,
     ids: Vec<i32>,
 }
 
@@ -508,15 +573,10 @@ impl Heads for DeviceHeads {
     fn mtp(&self, then: Then<Vec<String>>) {
         let then = self.cleaned(then);
         let inner = &self.inner;
-        let projection = match tensor_of(inner, INPUT_PROJECTION) {
-            Ok((tensor, ..)) => tensor,
+        let names = match stem_tensors(&inner.objects) {
+            Ok(names) => names,
             Err(error) => return then(Err(error)),
         };
-        let names = [EMBEDDING, EMBEDDING_NORM, HIDDEN_NORM, MTP_NORM]
-            .into_iter()
-            .map(str::to_owned)
-            .chain([projection])
-            .collect();
         let next = Arc::clone(inner);
         read_tensors(
             inner,
@@ -531,7 +591,7 @@ impl Heads for DeviceHeads {
     fn output_head(&self, then: Then<Vec<String>>) {
         let then = self.cleaned(then);
         let inner = &self.inner;
-        let (tensor, rows, columns) = match tensor_of(inner, OUTPUT_HEAD) {
+        let (tensor, rows, columns) = match tensor_of(&inner.objects, OUTPUT_HEAD) {
             Ok(found) => found,
             Err(error) => return then(Err(error)),
         };
@@ -587,7 +647,7 @@ fn remove_resume_file(inner: &Arc<Inner>, then: Then<()>) {
 }
 
 /// The Hessian of the final norm's output over every sequence, for the output head.
-fn observe_states(inner: Arc<Inner>, read: Vec<PooledPinned>, then: Then<()>) {
+fn observe_states(inner: Arc<Inner>, read: HeadMemory, then: Then<()>) {
     let (hidden, epsilon) = (inner.hidden, inner.objects.config.eps as f32);
     let length = inner.settings.length;
     let rows_of = |count: usize| (count * length) as u32;
@@ -604,7 +664,7 @@ fn observe_states(inner: Arc<Inner>, read: Vec<PooledPinned>, then: Then<()>) {
                     let mut context = lane(inner, queue, handles);
                     // Each buffer is the state's the moment it exists: a failure after it frees it in stream order.
                     // SAFETY: `read` is kept until the lane has retired this submission.
-                    state.norm = Some(unsafe { upload_pinned(inner, &mut context, &read[0]) }?);
+                    state.norm = Some(unsafe { upload_part(inner, &mut context, read, 0) }?);
                     state.normed = Some(context.ops().alloc_async(normed_bytes)?);
                     state.hessian = Some(zeroed(&mut context, FP32_BYTES * hidden * hidden)?);
                 }
@@ -640,7 +700,7 @@ fn observe_states(inner: Arc<Inner>, read: Vec<PooledPinned>, then: Then<()>) {
 }
 
 /// The MTP block, first step: the stem's Hessian over every sequence, the projection's decoded weight allocated.
-fn stem_states(inner: Arc<Inner>, memory: Vec<PooledPinned>, then: Then<Vec<String>>) {
+fn stem_states(inner: Arc<Inner>, memory: HeadMemory, then: Then<Vec<String>>) {
     let (hidden, length) = (inner.hidden, inner.settings.length);
     let Some(rows) = length.checked_sub(1).filter(|rows| *rows > 0) else {
         return then(Err(CalibrateError::Invalid(
@@ -664,11 +724,6 @@ fn stem_states(inner: Arc<Inner>, memory: Vec<PooledPinned>, then: Then<Vec<Stri
             let inner = &*working;
             let batch_rows = inner.settings.batch * rows;
             let row_bytes = inner.row_bytes();
-            let [table, embedding_norm, hidden_norm, mtp_norm, weight] = &host.memory[..] else {
-                return Err(ForwardError::Invalid(
-                    "the MTP block's tensors were not all read".to_owned(),
-                ));
-            };
             with_state(inner, |state| {
                 {
                     let mut context = lane(inner, queue, handles);
@@ -676,11 +731,11 @@ fn stem_states(inner: Arc<Inner>, memory: Vec<PooledPinned>, then: Then<Vec<Stri
                     // Each buffer is the state's the moment it exists: a failure after it frees it in stream order.
                     // SAFETY: the tensors are kept until the lane has retired this submission.
                     unsafe {
-                        mtp.table = Some(upload_pinned(inner, &mut context, table)?);
-                        mtp.embedding_norm = Some(upload_pinned(inner, &mut context, embedding_norm)?);
-                        mtp.hidden_norm = Some(upload_pinned(inner, &mut context, hidden_norm)?);
-                        state.mtp_norm = Some(upload_pinned(inner, &mut context, mtp_norm)?);
-                        mtp.weight = Some(upload_pinned(inner, &mut context, weight)?);
+                        mtp.table = Some(upload_part(inner, &mut context, &host.memory, 0)?);
+                        mtp.embedding_norm = Some(upload_part(inner, &mut context, &host.memory, 1)?);
+                        mtp.hidden_norm = Some(upload_part(inner, &mut context, &host.memory, 2)?);
+                        state.mtp_norm = Some(upload_part(inner, &mut context, &host.memory, 3)?);
+                        mtp.weight = Some(upload_part(inner, &mut context, &host.memory, 4)?);
                     }
                     mtp.decoded = Some(context.ops().alloc_async(BF16_BYTES * hidden * 2 * hidden)?);
                     mtp.ids = Some(context.ops().alloc_async(I32_BYTES * host.ids.len())?);
@@ -883,7 +938,7 @@ fn mtp_files() -> Vec<String> {
 }
 
 /// The output head: its weight uploaded and kept for the draft head, rounded under the head Hessian.
-fn round_output_head(inner: Arc<Inner>, read: Vec<PooledPinned>, shape: (u64, usize), then: Then<Vec<String>>) {
+fn round_output_head(inner: Arc<Inner>, read: HeadMemory, shape: (u64, usize), then: Then<Vec<String>>) {
     let working = Arc::clone(&inner);
     on_main(
         &Arc::clone(&inner),
@@ -895,7 +950,7 @@ fn round_output_head(inner: Arc<Inner>, read: Vec<PooledPinned>, shape: (u64, us
                 let hessian = held(&state.hessian, "output head Hessian")?.addr();
                 let mut context = lane(inner, queue, handles);
                 // SAFETY: `read` is kept until the lane has retired this submission.
-                let weight = unsafe { upload_pinned(inner, &mut context, &read[0]) }?;
+                let weight = unsafe { upload_part(inner, &mut context, read, 0) }?;
                 let weight = state.weight.insert(weight).addr();
                 let decoded = context.ops().alloc_async(BF16_BYTES * shape.0 as usize * shape.1)?;
                 Ok(((weight, hessian), decoded))
