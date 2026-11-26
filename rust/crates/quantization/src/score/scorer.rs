@@ -221,3 +221,150 @@ impl Scorer {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "a test: the pump is the worker, a failed unwrap is the failure, and the reports are read after the chunks end"
+)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use euhedral_gpu::cuda::CudaModule;
+    use euhedral_inference_cuda::CudaLibrary;
+    use euhedral_inference_engine::generation::{FinishReason, GenerationOutcome};
+
+    use super::*;
+
+    const VOCABULARY: usize = 64;
+    const RECORD_BYTES: usize = 2 * (VOCABULARY + 4);
+    const STEPS: usize = 7;
+
+    type Reports = Arc<Mutex<Vec<Result<Vec<f64>, String>>>>;
+
+    fn row(target: u32) -> ScoreRow {
+        let logits = (0..VOCABULARY)
+            .flat_map(|at| ((((at as f32) * 0.25).to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let mut record = vec![0u8; RECORD_BYTES];
+        record[..4].copy_from_slice(&(1.0f32 / 64.0).to_bits().to_le_bytes());
+        record[4..8].copy_from_slice(&(-8.0f32).to_bits().to_le_bytes());
+        for at in 0..VOCABULARY {
+            record[8 + 2 * at..10 + 2 * at].copy_from_slice(&((at * 3) as u16).to_le_bytes());
+        }
+        ScoreRow { logits, record, target }
+    }
+
+    fn chunk(reports: &Reports) -> Arc<ChunkScore> {
+        let sink = Arc::clone(reports);
+        let chunk = ChunkScore::new(STEPS, Arc::new(move |verdict| sink.lock().unwrap().push(verdict)));
+        chunk.finished(GenerationOutcome {
+            reason: FinishReason::Length,
+            prompt_tokens: 0,
+            generated: STEPS,
+            elapsed: Duration::ZERO,
+            cached_prompt_tokens: 0,
+        });
+        chunk
+    }
+
+    /// Pumps the lane's retirements until `reports` holds `count` verdicts.
+    fn pump(completions: &Arc<Completions>, reports: &Reports, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while reports.lock().unwrap().len() < count {
+            completions.reap();
+            completions.pull(
+                &mut |mut frame| {
+                    frame.execute().unwrap();
+                    frame.do_finally();
+                },
+                &mut |_| false,
+                u64::MAX,
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the chunks never ended: a group's retirement did not arrive"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU and the bundled NVRTC"]
+    fn rows_from_two_threads_all_land_through_one_lane_and_a_failed_group_poisons_it() {
+        let path = test_support::gradle_property("euhedral.cuda.library")
+            .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
+        let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
+        let gpu = open_device(&library).expect("the device opens");
+        let mut modules = Modules::<CudaModule>::open(&gpu, ModuleOptions::beside(&library).unwrap()).unwrap();
+        let kernels = ScoreKernels::load(&mut modules).unwrap();
+        let (pool, mut streams) = gpu.open_lanes(&["score"], StreamOptions::default()).unwrap();
+        let completions = Completions::new(&pool);
+        // A group of three: the fourteen rows below are at least five groups, so the lane goes away and comes back.
+        let geometry = Geometry {
+            vocabulary: VOCABULARY,
+            record_bytes: RECORD_BYTES,
+            group: 3,
+        };
+        let lane = ScoreLane::new(streams.remove(0), kernels, &library, geometry, Arc::clone(&completions)).unwrap();
+        let scorer = Scorer::with(lane, Some((Arc::clone(&gpu), pool)));
+
+        let reports: Reports = Arc::default();
+        let chunks = [chunk(&reports), chunk(&reports)];
+        thread::scope(|scope| {
+            for chunk in &chunks {
+                let (scorer, chunk) = (&scorer, Arc::clone(chunk));
+                scope.spawn(move || {
+                    for step in 0..STEPS {
+                        scorer.submit(Job {
+                            chunk: Arc::clone(&chunk),
+                            step,
+                            row: row(5),
+                        });
+                    }
+                });
+            }
+        });
+        drop(chunks);
+        pump(&completions, &reports, 2);
+        {
+            let reports = reports.lock().unwrap();
+            let first = reports[0].as_ref().expect("every row of the first chunk scored");
+            assert_eq!(first.len(), STEPS * FIELDS);
+            // The same row everywhere: every position has the same five values, whichever group it rode in.
+            assert!(first.chunks(FIELDS).all(|values| values == &first[..FIELDS]));
+            assert_eq!(reports[1].as_ref().unwrap(), first, "both chunks scored the same rows");
+        }
+
+        // A row the lane refuses poisons it: its chunk fails, and the next row fails at once with the same reason.
+        reports.lock().unwrap().clear();
+        let bad = chunk(&reports);
+        scorer.submit(Job {
+            chunk: Arc::clone(&bad),
+            step: 0,
+            row: row(u32::try_from(VOCABULARY).unwrap()),
+        });
+        drop(bad);
+        pump(&completions, &reports, 1);
+        let refused = reports.lock().unwrap()[0].clone().unwrap_err();
+        let later = chunk(&reports);
+        scorer.submit(Job {
+            chunk: Arc::clone(&later),
+            step: 0,
+            row: row(5),
+        });
+        drop(later);
+        pump(&completions, &reports, 2);
+        assert_eq!(
+            reports.lock().unwrap()[1],
+            Err(refused),
+            "a poisoned scorer fails later rows with its reason"
+        );
+        scorer.close();
+    }
+}

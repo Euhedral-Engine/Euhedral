@@ -9,33 +9,46 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use euhedral_inference_engine::EngineRuntime;
 use euhedral_inference_quantization::kld::{self, Reference};
+use euhedral_inference_quantization::reference::{DEFAULT_BATCH, DEFAULT_ROWS, Forcer};
 use euhedral_inference_quantization::score::device::Geometry;
 use euhedral_inference_quantization::score::summary::{self, FIELDS, Shape};
-use euhedral_inference_quantization::score::{RowForcer, Scorer, Source, batch_for, score};
-use euhedral_inference_settings::{ByteSize, ModelSettings, Settings, load_file, process_env};
+use euhedral_inference_quantization::score::{Scorer, Source, batch_for, score};
+use euhedral_inference_settings::{Auto, ByteSize, ModelSettings, Settings, load_file, process_env};
+use euhedral_io::OwnedFile;
 
 use crate::{EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, Outcome};
 
 /// The longest a score takes: a bound on the wait, not a rate.
 const LONGEST_RUN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// The rows of a verification when `--rows` is not given: one, as the reference command forces.
-const DEFAULT_ROWS: usize = 1;
+/// The most forced rows in one pass.
+const MOST_ROWS: usize = 8;
+/// The most rows in flight at once: `--rows` times `--batch`.
+const MOST_IN_FLIGHT: usize = 32;
+/// What the command line accepts, for the message that refuses another option.
+const OPTIONS: &str = "--artifact, --results, --reference and --name (each as often as needed, in pairs), --values, \
+--rows, --batch, --host-mib, --workers, --config, --library (or --cuda-library)";
 
 struct Flags {
     artifact: PathBuf,
     results: PathBuf,
     references: Vec<(PathBuf, String)>,
     values: Option<PathBuf>,
+    /// Forced rows in one pass.
     rows: usize,
-    batch: Option<usize>,
+    /// Chunks forced at once.
+    batch: usize,
     config: Option<PathBuf>,
     library: Option<PathBuf>,
+    /// Host memory for host-backed weights, in MiB; unset leaves the engine to size it.
+    host_mib: Option<u64>,
+    /// Workers taking host work at once; unset keeps the engine's default.
+    workers: Option<u32>,
 }
 
 fn flags(args: &[String]) -> Result<Flags, String> {
     let (mut artifact, mut results, mut values, mut config, mut library) = (None, None, None, None, None);
     let (mut paths, mut names) = (Vec::new(), Vec::new());
-    let (mut rows, mut batch) = (DEFAULT_ROWS, None);
+    let (mut rows, mut batch, mut host_mib, mut workers) = (DEFAULT_ROWS, DEFAULT_BATCH, None, None);
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         let value = rest.next().ok_or_else(|| format!("{arg} needs a value"))?;
@@ -51,10 +64,12 @@ fn flags(args: &[String]) -> Result<Flags, String> {
             "--name" => names.push(value.clone()),
             "--values" => values = Some(PathBuf::from(value)),
             "--rows" => rows = number()?,
-            "--batch" => batch = Some(number()?),
+            "--batch" => batch = number()?,
             "--config" => config = Some(PathBuf::from(value)),
-            "--cuda-library" => library = Some(PathBuf::from(value)),
-            other => return Err(format!("unknown score option {other}")),
+            "--cuda-library" | "--library" => library = Some(PathBuf::from(value)),
+            "--host-mib" => host_mib = Some(number()?.try_into().map_err(|_| format!("{arg} is too large"))?),
+            "--workers" => workers = Some(number()?.try_into().map_err(|_| format!("{arg} is too large"))?),
+            other => return Err(format!("unknown score option {other}; the options are {OPTIONS}")),
         }
     }
     let (Some(artifact), Some(results)) = (artifact, results) else {
@@ -63,8 +78,13 @@ fn flags(args: &[String]) -> Result<Flags, String> {
     if paths.is_empty() || paths.len() != names.len() {
         return Err("score needs as many --name as --reference, and at least one".to_owned());
     }
-    if rows == 0 {
-        return Err("--rows must be at least 1".to_owned());
+    if batch < 1 || !(1..=MOST_ROWS).contains(&rows) || rows * batch > MOST_IN_FLIGHT {
+        return Err(format!(
+            "--rows (1 to {MOST_ROWS}) times --batch (at least 1) must be at most {MOST_IN_FLIGHT}"
+        ));
+    }
+    if host_mib == Some(0) || workers == Some(0) {
+        return Err("--host-mib and --workers need a positive number".to_owned());
     }
     Ok(Flags {
         artifact,
@@ -75,6 +95,8 @@ fn flags(args: &[String]) -> Result<Flags, String> {
         batch,
         config,
         library,
+        host_mib,
+        workers,
     })
 }
 
@@ -109,6 +131,15 @@ fn settings(flags: &Flags, context: usize) -> Result<Settings, String> {
     settings.context.max_tokens = u32::try_from(context.next_multiple_of(512))
         .map_err(|_| format!("a context of {context} tokens is too long"))?;
     settings.prefix_cache.size = ByteSize::mib(0);
+    // The engine holds a sequence for each chunk in flight, each sized to verify `rows` forced tokens in a pass.
+    settings.batching.max_sequences = u32::try_from(flags.batch).map_err(|_| "--batch is too large".to_owned())?;
+    settings.batching.forced_rows = u32::try_from(flags.rows).map_err(|_| "--rows is too large".to_owned())?;
+    if let Some(mib) = flags.host_mib {
+        settings.memory.host_weights_limit = Auto::Value(ByteSize::mib(mib));
+    }
+    if let Some(workers) = flags.workers {
+        settings.host.task_parallelism = workers;
+    }
     Ok(settings)
 }
 
@@ -199,14 +230,7 @@ pub fn run(args: &[String]) -> Outcome {
 /// Scores every reference on the started engine, printing and appending each summary as its reference completes.
 fn scored(flags: &Flags, runtime: &Arc<EngineRuntime>, most_chunks: usize) -> Result<(), String> {
     let vocabulary = runtime.config().vocab_size;
-    let verified = usize::try_from(runtime.plan().verified_rows()).unwrap_or(usize::MAX);
-    if flags.rows > verified {
-        return Err(format!(
-            "--rows {} is more than the {verified} rows the engine verifies",
-            flags.rows
-        ));
-    }
-    let batch = batch_for(flags.batch, runtime.sequences(), most_chunks)?;
+    let batch = batch_for(Some(flags.batch), runtime.sequences(), most_chunks)?;
     let io = runtime.io();
     let mut references = Vec::new();
     for (path, name) in &flags.references {
@@ -263,7 +287,7 @@ fn score_one(
     path: &Path,
     name: &str,
     reference: Reference,
-    records: euhedral_io::OwnedFile,
+    records: OwnedFile,
 ) -> Result<(), String> {
     let shape = Shape {
         context: reference.context,
@@ -271,7 +295,7 @@ fn score_one(
     };
     let chunks = reference.chunks();
     let started = Instant::now();
-    let forcer: Arc<dyn RowForcer> = Arc::clone(runtime) as Arc<dyn RowForcer>;
+    let forcer: Arc<dyn Forcer> = Arc::clone(runtime) as Arc<dyn Forcer>;
     let source = Source {
         forcer,
         io: Arc::clone(runtime.io()),
@@ -321,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn references_pair_with_their_names_and_the_forcing_defaults_to_one_row() {
+    fn references_pair_with_their_names_and_the_forcing_defaults_to_the_references() {
         let parsed = flags(&words(
             "--artifact a.edrl --results r.txt --reference x.kld --name x --reference y.kld --name y --batch 2",
         ))
@@ -333,8 +357,25 @@ mod tests {
                 (PathBuf::from("y.kld"), "y".to_owned())
             ]
         );
-        assert_eq!((parsed.rows, parsed.batch), (1, Some(2)));
+        assert_eq!((parsed.rows, parsed.batch), (DEFAULT_ROWS, 2));
+        assert_eq!(parsed.library, None);
         assert!(parsed.values.is_none());
+    }
+
+    #[test]
+    fn rows_and_batch_keep_to_the_caps_of_the_reference_command() {
+        let with = |extra: &str| {
+            flags(&words(&format!(
+                "--artifact a --results r --reference x --name n --library lib.so {extra}"
+            )))
+        };
+        let ok = with("--rows 8 --batch 4 --host-mib 512 --workers 2").unwrap();
+        assert_eq!((ok.rows, ok.batch, ok.host_mib, ok.workers), (8, 4, Some(512), Some(2)));
+        assert_eq!(ok.library, Some(PathBuf::from("lib.so")));
+        for refused in ["--rows 9", "--rows 0", "--batch 0", "--rows 8 --batch 5", "--workers 0"] {
+            assert!(with(refused).is_err(), "{refused}");
+        }
+        assert!(with("--rows 4 --batch 8").is_ok());
     }
 
     #[test]

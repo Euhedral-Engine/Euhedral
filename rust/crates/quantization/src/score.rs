@@ -15,7 +15,7 @@ mod run;
 mod scorer;
 pub mod summary;
 
-pub use run::{RowForcer, Scored, Source, score};
+pub use run::{Scored, Source, score};
 pub use scorer::Scorer;
 
 /// The chunks a run forces together: `requested`, or as many as the engine holds sequences and the reference has

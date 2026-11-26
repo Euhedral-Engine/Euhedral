@@ -5,47 +5,23 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::generation::{GenerationOutcome, LogitsSink};
-use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_io::{AsyncIo, IoDoneOwned, OwnedFile};
 
 use super::chunk::ChunkScore;
 use super::device::ScoreRow;
 use super::scorer::{Job, Scorer};
 use crate::kld::Reference;
+use crate::reference::Forcer;
 use crate::rows::{Kind, frame, raw_file};
-
-/// What the engine is asked to force: the part of the engine a run uses.
-pub trait RowForcer: Send + Sync + 'static {
-    /// Starts a teacher-forced run of `forced` after `prefix`, `rows` rows to a verification, the rows going to `sink`.
-    fn force_rows(
-        &self,
-        prefix: Vec<u32>,
-        forced: Vec<u32>,
-        rows: usize,
-        sink: Box<dyn LogitsSink>,
-    ) -> Result<(), String>;
-}
-
-impl RowForcer for EngineRuntime {
-    fn force_rows(
-        &self,
-        prefix: Vec<u32>,
-        forced: Vec<u32>,
-        rows: usize,
-        sink: Box<dyn LogitsSink>,
-    ) -> Result<(), String> {
-        self.teacher_forced_rows(prefix, forced, rows, sink)
-            .map_err(|error| error.to_string())
-    }
-}
 
 /// What a run hands over: the values of every chunk, in chunk order, or why it stopped.
 pub type Scored = Result<Vec<Vec<f64>>, String>;
 
 /// Where a run reads from and sends to.
 pub struct Source {
-    pub forcer: Arc<dyn RowForcer>,
+    pub forcer: Arc<dyn Forcer>,
     pub io: Arc<AsyncIo>,
     pub scorer: Arc<Scorer>,
     pub reference: Reference,
@@ -63,7 +39,7 @@ impl Debug for Source {
 
 struct Drive {
     /// Let go before the result is sent, so that nothing of the run holds the engine once the caller wakes.
-    forcer: Option<Arc<dyn RowForcer>>,
+    forcer: Option<Arc<dyn Forcer>>,
     io: Arc<AsyncIo>,
     scorer: Arc<Scorer>,
     reference: Reference,
@@ -125,7 +101,7 @@ impl Drive {
             drive: Arc::clone(self),
             index,
         };
-        let started = forcer.force_rows(
+        let started = forcer.force(
             reference.prefix(index).to_vec(),
             reference.forced(index).to_vec(),
             self.rows,

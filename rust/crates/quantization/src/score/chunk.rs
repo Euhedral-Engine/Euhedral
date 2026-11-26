@@ -97,3 +97,102 @@ impl Drop for ChunkScore {
         (self.ended)(self.verdict());
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_types,
+    reason = "a test: a failed unwrap is the failure, and the reports are read after the chunk ends"
+)]
+mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use super::*;
+
+    type Reports = Arc<Mutex<Vec<Result<Vec<f64>, String>>>>;
+
+    fn fresh(steps: usize) -> (Arc<ChunkScore>, Reports) {
+        let reports: Reports = Arc::default();
+        let sink = Arc::clone(&reports);
+        let ended: Ended = Arc::new(move |verdict| sink.lock().unwrap().push(verdict));
+        (ChunkScore::new(steps, ended), reports)
+    }
+
+    fn outcome(reason: FinishReason, generated: usize) -> GenerationOutcome {
+        GenerationOutcome {
+            reason,
+            prompt_tokens: 0,
+            generated,
+            elapsed: Duration::ZERO,
+            cached_prompt_tokens: 0,
+        }
+    }
+
+    fn only(reports: &Reports) -> Result<Vec<f64>, String> {
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1, "a chunk reports exactly once");
+        reports[0].clone()
+    }
+
+    #[test]
+    fn a_chunk_reports_once_when_the_last_holder_lets_go_and_not_before() {
+        let (chunk, reports) = fresh(1);
+        let other = Arc::clone(&chunk);
+        chunk.finished(outcome(FinishReason::Length, 1));
+        chunk.store(0, &[1.0; FIELDS]);
+        drop(chunk);
+        assert!(reports.lock().unwrap().is_empty(), "a holder is still working");
+        drop(other);
+        assert_eq!(only(&reports), Ok(vec![1.0; FIELDS]));
+    }
+
+    #[test]
+    fn a_fault_wins_over_a_complete_run_and_the_first_fault_is_kept() {
+        let (chunk, reports) = fresh(1);
+        chunk.finished(outcome(FinishReason::Length, 1));
+        chunk.store(0, &[1.0; FIELDS]);
+        chunk.fail("first".to_owned());
+        chunk.fail("second".to_owned());
+        drop(chunk);
+        assert_eq!(only(&reports), Err("first".to_owned()));
+    }
+
+    #[test]
+    fn a_run_that_did_not_end_by_length_or_fell_short_is_not_a_result() {
+        for (stopped, generated) in [(true, 2), (false, 1)] {
+            let reason = if stopped {
+                FinishReason::Stop
+            } else {
+                FinishReason::Length
+            };
+            let (chunk, reports) = fresh(2);
+            chunk.finished(outcome(reason, generated));
+            chunk.store(0, &[1.0; FIELDS]);
+            chunk.store(1, &[1.0; FIELDS]);
+            drop(chunk);
+            assert!(only(&reports).is_err(), "{generated} steps, stopped: {stopped}");
+        }
+        let (chunk, reports) = fresh(1);
+        chunk.store(0, &[1.0; FIELDS]);
+        drop(chunk);
+        assert!(only(&reports).is_err(), "no outcome from the engine");
+    }
+
+    #[test]
+    fn a_step_never_scored_names_itself_and_a_step_out_of_range_is_a_fault() {
+        let (chunk, reports) = fresh(2);
+        chunk.finished(outcome(FinishReason::Length, 2));
+        chunk.store(1, &[2.0; FIELDS]);
+        drop(chunk);
+        let why = only(&reports).unwrap_err();
+        assert!(why.contains("step 0"), "{why}");
+
+        let (chunk, reports) = fresh(1);
+        chunk.finished(outcome(FinishReason::Length, 1));
+        chunk.store(0, &[1.0; FIELDS]);
+        chunk.store(5, &[1.0; FIELDS]);
+        drop(chunk);
+        assert!(only(&reports).is_err(), "a value for a step the chunk does not have");
+    }
+}

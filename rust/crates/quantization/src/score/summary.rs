@@ -200,10 +200,12 @@ mod tests {
 
     #[test]
     fn the_lines_keep_the_columns_and_the_digits_of_the_java_summary() {
-        // Two chunks of two positions: the candidate equals the reference except for the KL.
-        let row = |kl: f64| [1.0, 1.0, kl, 1.0, 0.0];
-        let chunk = |a: f64, b: f64| row(a).into_iter().chain(row(b)).collect::<Vec<f64>>();
-        let scored = vec![chunk(0.0, 0.5), chunk(0.5, 1.0)];
+        // Two chunks of two positions: the candidate is worse than the reference by half a nat everywhere, so the sign
+        // of the NLL difference shows, and the probability differences are unequal either side of zero, so the sign
+        // of those shows.
+        let row = |kl: f64, dp: f64| [1.5, 1.0, kl, 1.0, dp];
+        let chunk = |a: (f64, f64), b: (f64, f64)| row(a.0, a.1).into_iter().chain(row(b.0, b.1)).collect::<Vec<f64>>();
+        let scored = vec![chunk((0.0, -0.2), (0.5, 0.0)), chunk((0.5, 0.0), (1.0, 0.4))];
         let shape = Shape { context: 6, steps: 2 };
         let text = lines(
             "cand",
@@ -226,8 +228,8 @@ mod tests {
         assert_eq!(
             data,
             [
-                "cand", "1.00000", "2.7183", "+0.00000", "0.00000", "0.500000", "0.250000", "1.0000", "0.50000",
-                "0.92500", "0.98500", "1.0000", "0.00000", "+0.00000", "0.00000", "+0.00000", "+0.00000"
+                "cand", "1.50000", "4.4817", "+0.50000", "0.00000", "0.500000", "0.250000", "1.0000", "0.50000",
+                "0.92500", "0.98500", "1.0000", "0.00000", "+0.05000", "0.22361", "-0.19400", "+0.38800"
             ]
         );
     }
