@@ -1063,7 +1063,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use euhedral_core::control_plane::ControlPlaneLattice;
     use euhedral_inference_engine::lattice_config;
@@ -1176,6 +1176,68 @@ mod tests {
         io.complete();
         lattice.close();
         assert!(part.exists(), "a discard removed the output");
+    }
+
+    // Mutant caught: a refused length step that drops its continuation instead of calling it with the refusal. The I/O
+    // closes after the open was accepted and before it is reaped, so the length is the operation that is refused.
+    #[test]
+    fn a_length_step_the_io_refuses_calls_its_continuation_once_with_the_error() {
+        let io = AsyncIo::open().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        read_all(
+            &io,
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+            Box::new(move |result| sender.send(result).unwrap()),
+        );
+        io.complete();
+        let begun = Instant::now();
+        let result = loop {
+            if let Ok(result) = receiver.try_recv() {
+                break result;
+            }
+            assert!(
+                begun.elapsed() < Duration::from_secs(30),
+                "the refused length step never called its continuation"
+            );
+            io.reap();
+            io.pull(&mut |frame| drop(frame), &mut |_| false, u64::MAX);
+        };
+        assert!(result.is_err(), "the length step was accepted");
+        assert!(receiver.try_recv().is_err(), "the continuation ran twice");
+    }
+
+    // Mutant caught: a refused rename that leaves the output, or reports `Lost` instead of the refusal.
+    #[test]
+    fn a_rename_the_io_refuses_removes_the_output_and_ends_the_run_once_with_the_error() {
+        let lattice =
+            ControlPlaneLattice::new(lattice_config(&Settings::with_model(ModelSettings::default()))).unwrap();
+        let host = Lake::new(
+            Arc::clone(&lattice),
+            NonZeroUsize::new(2).unwrap(),
+            Duration::from_secs(1),
+        );
+        let io = AsyncIo::open().unwrap();
+        io.complete();
+        let directory = tempfile::tempdir().unwrap();
+        let part = directory.path().join("out.edrl.part");
+        fs::write(&part, b"partial").unwrap();
+        let (job, receiver) = armed_job(&host, Arc::clone(&io), &part);
+        job.finish(
+            Written::Part {
+                part: part.clone(),
+                out: directory.path().join("out.edrl"),
+            },
+            0,
+            0,
+        );
+        let result = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the refused rename never ended the run");
+        assert!(matches!(&result, Err(PackageError::Io { .. })), "{result:?}");
+        assert!(receiver.try_recv().is_err(), "the run reported twice");
+        assert!(!part.exists(), "the output was left");
+        host.complete_gracefully();
+        lattice.close();
     }
 
     // Mutant caught: a refused step that drops its continuation (the step is never told, and reports `Lost`) instead
