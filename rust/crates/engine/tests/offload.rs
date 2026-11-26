@@ -232,23 +232,28 @@ fn the_tier_summary_counts_what_each_tier_holds_and_states_it_in_one_line() {
     assert_eq!(summary.host_bytes + summary.disk_bytes, plan.offloaded_bytes());
     assert_eq!(summary.device_bytes, plan.weights_bytes);
     assert_eq!(summary.window_bytes, plan.offload.window_bytes());
-    assert_eq!(
-        summary.to_string(),
-        format!(
-            "weights: device {} objects {} bytes, host {} objects {} bytes, disk {} objects {} bytes (window {} bytes)",
-            summary.device_objects,
-            summary.device_bytes,
-            summary.host_objects,
-            summary.host_bytes,
-            summary.disk_objects,
-            summary.disk_bytes,
-            summary.window_bytes
-        )
-    );
     let resident = TierSummary::of(&self::resident(4096));
     assert_eq!(
         (resident.host_objects, resident.disk_objects, resident.window_bytes),
         (0, 0, 0)
+    );
+}
+
+#[test]
+fn the_tier_summary_line_names_each_tier_its_objects_and_bytes_and_the_window() {
+    let summary = TierSummary {
+        device_objects: 1641,
+        device_bytes: 10_238_669_664,
+        host_objects: 49,
+        host_bytes: 938_557_440,
+        disk_objects: 56,
+        disk_bytes: 835_584_000,
+        window_bytes: 125_861_888,
+    };
+    assert_eq!(
+        summary.to_string(),
+        "weights: device 1641 objects 10238669664 bytes, host 49 objects 938557440 bytes, disk 56 objects 835584000 \
+         bytes (window 125861888 bytes)"
     );
 }
 
