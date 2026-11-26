@@ -4,6 +4,9 @@
 //! - [`stage`]: the device inputs of a window and the rows its drafts are checked against.
 //! - [`settings`]: the run's settings and their refusals, and the host arithmetic of windows, shuffle and schedule.
 
+pub mod error;
+pub mod lane;
 pub mod progress;
 pub mod settings;
 pub mod stage;
+pub mod window;
