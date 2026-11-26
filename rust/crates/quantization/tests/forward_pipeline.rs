@@ -12,13 +12,15 @@
 
 mod checkpoint_support;
 
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
 use checkpoint_support::World;
-use euhedral_core::frames::Frame;
+use euhedral_core::frames::{Frame, FrameError, FrameHeader};
+use euhedral_hashing::hasher_api;
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_quantization::forward::ForwardError;
 use euhedral_inference_quantization::forward::pipeline::{Attempt, LaneRef, Scheduler, Stages};
@@ -225,6 +227,48 @@ impl Stages for Fake {
 }
 
 type Outcome = Handoff<Result<(), ForwardError>>;
+
+/// A frame that runs a closure: offered to the lake, it runs after every frame offered before it.
+struct Probe {
+    header: FrameHeader,
+    work: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Debug for Probe {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.debug_struct("Probe").finish_non_exhaustive()
+    }
+}
+
+impl Frame for Probe {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        if let Some(work) = self.work.take() {
+            work();
+        }
+        Ok(())
+    }
+}
+
+/// Waits until the lake has run everything offered to it so far, and everything those frames offered. The lake of a
+/// test has one sink, which takes frames in the order they were offered, so a probe offered now runs after them.
+fn drained(world: &World) {
+    let ran = Handoff::new();
+    let sender = Arc::clone(&ran);
+    let probe = Probe {
+        header: FrameHeader::new(hasher_api::mix(0x0fe5_7a11 | 1 << 63)),
+        work: Some(Box::new(move || sender.send(()))),
+    };
+    assert!(world.host.offer(Box::new(probe)).is_ok(), "the lake refused a probe");
+    ran.wait(LONGEST).expect("the probe never ran");
+}
 
 fn pipeline(world: &World, fake: Fake, slots: u32) -> Scheduler<Fake> {
     let fake = Fake { slots, ..fake };
@@ -447,7 +491,7 @@ fn a_busy_lane_is_asked_again_only_after_a_completion_and_nothing_is_lost() {
 /// A sequence held behind a gate holds the batch's tail: it runs after the gate opened, with every sequence's mark.
 #[test]
 fn the_tail_of_a_batch_waits_for_its_slowest_sequence() {
-    let world = World::start();
+    let world = World::with_sinks(1);
     let fake = Fake {
         held: Some(0),
         ..Fake::default()
@@ -471,7 +515,19 @@ fn the_tail_of_a_batch_waits_for_its_slowest_sequence() {
             "sequence 1 never ran or sequence 0 never parked"
         );
     }
-    assert!(!outcome.is_set());
+    // Sequence 1 arrived after its event: the lake runs what that offered (a tail, were one wrongly published) before
+    // anything offered from here, one probe for the arrival and one for the frame it offered.
+    drained(&world);
+    drained(&world);
+    assert!(!outcome.is_set(), "the batch ended before its held sequence ran");
+    assert!(
+        !scheduler
+            .stages()
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Tail { .. } | Event::Fence)),
+        "the tail or a fence ran before the held sequence was released"
+    );
     scheduler.stages().gate.store(true, Ordering::SeqCst);
     settle(&world, &scheduler, &outcome);
     ended(&outcome).expect("the batch ends once its held sequence ran");
