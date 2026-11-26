@@ -5,8 +5,10 @@
 //! wired yet says so and exits with [`EXIT_NOT_AVAILABLE`]; three commands are not part of this tool at all
 //! ([`Availability::Dropped`]).
 
+mod assemble;
 mod package;
 mod reference;
+mod rig;
 
 /// The process exit code of a run that finished.
 pub const EXIT_OK: u8 = 0;
@@ -81,8 +83,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "assemble",
-        availability: Availability::Pending,
-        usage: "--allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT",
+        availability: Availability::Wired,
+        usage: "--allocation FILE --source OPTION=ARTIFACT... --base OPTION --out ARTIFACT [--draft-depth N] [--copy-buffer-mib N] [--config YAML]",
     },
     Command {
         name: "cost",
@@ -144,6 +146,7 @@ pub fn run(args: &[String]) -> Outcome {
     };
     match command.availability {
         Availability::Wired => match command.name {
+            "assemble" => assemble::run(&args[1..]),
             "package-tokenizer" => package::run(&args[1..]),
             "reference" => reference::run(&args[1..]),
             _ => Outcome {

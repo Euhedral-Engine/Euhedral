@@ -4,20 +4,13 @@
 //! run and waits for its one completion.
 
 use std::ffi::OsString;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, mpsc};
 
-use euhedral_core::control_plane::ControlPlaneLattice;
-use euhedral_core::generics::LatticeSource;
-use euhedral_graph::Lake;
-use euhedral_inference_engine::lattice_config;
 use euhedral_inference_quantization::package_tokenizer::{PackageRequest, Packaged, package_tokenizer};
 use euhedral_inference_settings::{Settings, load_for_tool, process_env};
-use euhedral_io::AsyncIo;
 
+use crate::rig::Rig;
 use crate::{EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, Outcome};
 
 /// The flags of the command.
@@ -104,16 +97,7 @@ pub fn run(args: &[String]) -> Outcome {
 
 /// Starts the runtime, runs the packaging and stops the runtime.
 fn package(settings: &Settings, args: PackageArgs) -> Result<Packaged, String> {
-    let lattice = ControlPlaneLattice::new(lattice_config(settings)).map_err(|error| format!("{error:?}"))?;
-    let io = AsyncIo::open().map_err(|error| error.to_string())?;
-    lattice
-        .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
-        .map_err(|error| format!("{error:?}"))?;
-    let host = Lake::new(
-        Arc::clone(&lattice),
-        NonZeroUsize::new(settings.host.task_parallelism as usize).unwrap_or(NonZeroUsize::MIN),
-        settings.host.idle_release.max(Duration::from_millis(1)),
-    );
+    let rig = Rig::start(settings)?;
     let mut request = match args.out {
         Some(out) => PackageRequest::to_output(args.artifact, args.checkpoint, out),
         None => PackageRequest::in_place(args.artifact, args.checkpoint),
@@ -122,8 +106,8 @@ fn package(settings: &Settings, args: PackageArgs) -> Result<Packaged, String> {
 
     let (sender, receiver) = mpsc::channel();
     let started = package_tokenizer(
-        Arc::clone(&io),
-        Arc::clone(&host),
+        Arc::clone(&rig.io),
+        Arc::clone(&rig.host),
         request,
         Box::new(move |result| {
             // The receiver is gone only when the run was abandoned.
@@ -137,8 +121,6 @@ fn package(settings: &Settings, args: PackageArgs) -> Result<Packaged, String> {
             .and_then(|result| result.map_err(|error| error.to_string())),
         Err(error) => Err(error.to_string()),
     };
-    host.complete_gracefully();
-    io.complete();
-    lattice.close();
+    rig.stop();
     result
 }
