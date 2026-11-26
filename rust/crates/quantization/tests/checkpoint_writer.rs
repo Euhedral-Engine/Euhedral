@@ -13,11 +13,15 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use checkpoint_support::{Spec, World, safetensors, write};
+use euhedral_core::generics::LatticeSource;
+use euhedral_inference_engine::Handoff;
 use euhedral_inference_quantization::checkpoint::CheckpointError;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
 use euhedral_inference_quantization::checkpoint::writer::{SafetensorsWriter, Source, bytes_source, write_file};
+use euhedral_io::AsyncIo;
 use serde_json::Value;
 
 fn finish(world: &World, writer: SafetensorsWriter) -> Result<(), CheckpointError> {
@@ -402,4 +406,77 @@ fn write_file_writes_whole_and_names_the_file_when_it_fails() {
     assert!(!target.exists());
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1, "no part is left");
     world.finish();
+}
+
+/// Runs `writer` on an `AsyncIo` that this test drives by hand, running the frames of its steps in order and dropping
+/// the one numbered `dropped` unrun, as a closing engine does. Returns the results the continuation was given, once the
+/// call has ended and nothing more was delivered.
+fn finish_dropping(directory: &Path, dropped: usize) -> (Result<(), String>, u64) {
+    let world = World::start();
+    let io = AsyncIo::open().unwrap();
+    let mut writer = SafetensorsWriter::with_buffer(&directory.join("model.safetensors"), 8).unwrap();
+    writer.add("a", "U8", &[16], (0..16).collect()).unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&calls);
+    let results = Handoff::new();
+    let sink = Arc::clone(&results);
+    writer
+        .finish(
+            &io,
+            &world.host,
+            Arc::new(move |result| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                sink.send(result.map_err(|error| error.to_string()));
+            }),
+        )
+        .unwrap();
+    let begun = Instant::now();
+    let mut seen = 0;
+    let result = loop {
+        if let Some(result) = results.take() {
+            break result;
+        }
+        assert!(
+            begun.elapsed() < Duration::from_secs(20),
+            "the call never ended after frame {dropped} was dropped unrun"
+        );
+        io.reap();
+        let mut frames = Vec::new();
+        io.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+        for mut frame in frames {
+            seen += 1;
+            if seen - 1 == dropped {
+                drop(frame);
+                continue;
+            }
+            let _ = frame.execute();
+            frame.do_finally();
+        }
+    };
+    world.finish();
+    io.complete();
+    (result, calls.load(Ordering::SeqCst))
+}
+
+// Mutants caught: a step discarded unrun that drops the continuation with it (the caller waits for ever); a chain that
+// ends twice (once by the drop, once by the step); a write that completes and does not call the continuation once.
+#[test]
+fn a_step_accepted_and_discarded_unrun_ends_the_call_once_with_the_closing_error() {
+    let closed = CheckpointError::LakeClosed.to_string();
+    let mut dropped = 0;
+    loop {
+        let directory = tempfile::tempdir().unwrap();
+        let (result, calls) = finish_dropping(directory.path(), dropped);
+        assert_eq!(calls, 1, "frame {dropped} dropped unrun: the continuation runs once");
+        if result == Ok(()) {
+            assert!(
+                dropped >= 3,
+                "open, header, data and rename are steps: only {dropped} were dropped"
+            );
+            assert!(directory.path().join("model.safetensors").exists());
+            return;
+        }
+        assert_eq!(result, Err(closed.clone()), "frame {dropped} dropped unrun");
+        dropped += 1;
+    }
 }
