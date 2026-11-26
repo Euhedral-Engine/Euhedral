@@ -2,7 +2,8 @@
 //!
 //! Layer `i` runs while layer `i + 1` is read from the checkpoint, as Java's chain does; the two calls end in either
 //! order and the later one goes on, so no thread waits for the other. The loop checkpoints after every
-//! [`Plan::checkpoint_every`] layers and, at the end of a run of the whole model, finishes.
+//! [`Plan::checkpoint_every`] layers and, at the end of a run of the whole model, checkpoints the last layer's states
+//! and finishes.
 
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
@@ -53,8 +54,8 @@ pub trait Stages: Send + Sync + 'static {
     /// Saves the states after `done` layers as the point to resume from.
     fn checkpoint(&self, done: usize, then: Then<()>);
 
-    /// After the last layer of a run of the whole model: what is left to write besides the layers. A run that stops
-    /// early does not call it.
+    /// After the last layer of a run of the whole model, whose states are checkpointed (or were resumed): the heads
+    /// and the MTP block. A run that stops early does not call it.
     fn finish(&self, then: Then<()>);
 }
 
@@ -127,6 +128,23 @@ impl<S: Stages> Run<S> {
         self.complete(Err(error));
     }
 
+    /// The last layer of the run ran. A run of the whole model checkpoints the states first (unless it never
+    /// checkpoints), so that a failure of the heads resumes at the heads, not at an earlier layer; Java's last
+    /// checkpoint is before the last layers.
+    fn last_layer_done(self: &Arc<Self>) {
+        if self.plan.stops_early() || self.plan.checkpoint_every == 0 {
+            return self.end();
+        }
+        let run = Arc::clone(self);
+        self.stages.checkpoint(
+            self.plan.layers,
+            Box::new(move |saved| match saved {
+                Ok(()) => run.end(),
+                Err(error) => run.fail(error),
+            }),
+        );
+    }
+
     /// Every layer ran: a full run finishes, one that stopped early ends with its checkpoint left.
     fn end(self: &Arc<Self>) {
         if self.plan.stops_early() {
@@ -184,7 +202,7 @@ impl<S: Stages> Run<S> {
         let next = layer + 1;
         let run = Arc::clone(self);
         let onward = move || match staged {
-            None => run.end(),
+            None => run.last_layer_done(),
             Some(Ok(staged)) => run.step(next, staged),
             Some(Err(error)) => run.fail(error),
         };

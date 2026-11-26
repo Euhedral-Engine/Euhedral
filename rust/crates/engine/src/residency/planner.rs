@@ -368,7 +368,7 @@ pub fn plan_closest(
 ) -> Result<(ResidencyPlan, Option<PlanError>), PlanError> {
     config.check_supported()?;
     validate_inventory(config, table)?;
-    let profile = ArtifactProfile::of(table, config)?;
+    let profile = ArtifactProfile::of(table, config)?.under(settings.speculation.mode);
     let draft_depth = profile.speculative_depth()?;
     if draft_depth > 0 && profile.speculation != Speculation::Mtp {
         return Err(PlanError::Unsupported(

@@ -30,7 +30,7 @@ use euhedral_inference_engine::runtime::resolve_sequences;
 use euhedral_inference_engine::workspace::{
     BufferSlot, WorkspaceError, WorkspaceRows, input_records, slot_bytes, workspace_bytes, workspace_bytes_with_records,
 };
-use euhedral_inference_settings::{Auto, ByteSize, KvFormat, Settings};
+use euhedral_inference_settings::{Auto, ByteSize, KvFormat, Settings, SpeculationMode};
 
 mod common;
 
@@ -535,6 +535,47 @@ fn a_plan_without_the_mtp_layer_counts_no_mtp_cache() {
     assert_eq!(footprint::mtp_cache_bytes_of(&plan, &config), 0);
     assert_eq!(plan.runtime_reserve_bytes, DEFAULT_RUNTIME_RESERVE_BYTES);
     assert!(reserve_demand(&plan) < DEFAULT_RUNTIME_RESERVE_BYTES);
+}
+
+fn names_a_draft_object(plan: &ResidencyPlan) -> bool {
+    plan.device
+        .iter()
+        .any(|placed| placed.name.starts_with("mtp/") || placed.name.starts_with("text/draft_head"))
+}
+
+#[test]
+fn speculation_none_plans_no_drafts_and_no_draft_tensors_on_an_mtp_artifact() {
+    let mut none = settings(8192);
+    none.speculation.mode = SpeculationMode::None;
+    let plan = plan_with(&config(), &rco_table(), &none, inputs(64 * GIB)).unwrap();
+    assert_eq!(plan.draft_depth, 0);
+    assert_eq!(plan.profile.speculation, Speculation::None);
+    assert!(!names_a_draft_object(&plan));
+    assert_eq!(footprint::mtp_cache_bytes_of(&plan, &config()), 0);
+}
+
+#[test]
+fn speculation_follows_the_artifact_unless_the_setting_says_none() {
+    let plan = plan_with(&config(), &rco_table(), &settings(8192), inputs(64 * GIB)).unwrap();
+    assert_eq!(plan.draft_depth, 4);
+    assert_eq!(plan.profile.speculation, Speculation::Mtp);
+    assert!(names_a_draft_object(&plan));
+    assert_eq!(SpeculationMode::default(), SpeculationMode::Artifact);
+}
+
+#[test]
+fn an_artifact_with_heads_and_no_stored_depth_loads_with_none_and_is_refused_without_it() {
+    let mixed = ArtifactProfile {
+        quantization: Quantization::Mixed,
+        compressed: false,
+        speculation: Speculation::Mtp,
+        draft_depth: None,
+    };
+    assert!(matches!(mixed.speculative_depth(), Err(PlanError::Inventory(_))));
+    let none = mixed.under(SpeculationMode::None);
+    assert_eq!(none.speculative_depth().unwrap(), 0);
+    assert!(!none.uploads("mtp/layer/mlp/down") && !none.uploads("text/draft_head"));
+    assert_eq!(mixed.under(SpeculationMode::Artifact), mixed);
 }
 
 #[test]

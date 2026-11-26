@@ -320,6 +320,9 @@ public final class SettingsLoader {
         m.put("context.kv-cache-format", optional(SettingsLoader::kvFormat));
         m.put("context.kv-cache-on-gpu-tokens", fixed(integer(0, Integer.MAX_VALUE)));
 
+        // Read only by the Rust engine; accepted so the shared example file loads here.
+        m.put("speculation.mode", fixed(SettingsLoader::speculationMode));
+
         m.put("prefix-cache.size", fixed(size(0)));
         m.put("prefix-cache.checkpoint-tokens", fixed(SettingsLoader::checkpoint));
         // Read only by the Rust engine; accepted so the shared example file loads here.
@@ -463,6 +466,13 @@ public final class SettingsLoader {
             case "nvfp4" -> KvFormat.NVFP4;
             case "bf16" -> KvFormat.BF16;
             default -> throw new IllegalArgumentException("must be nvfp4, bf16 or auto: " + text);
+        };
+    }
+
+    private static Object speculationMode(String text) {
+        return switch (text.toLowerCase(Locale.ROOT)) {
+            case "artifact", "none" -> text.toLowerCase(Locale.ROOT);
+            default -> throw new IllegalArgumentException("must be artifact or none: " + text);
         };
     }
 
