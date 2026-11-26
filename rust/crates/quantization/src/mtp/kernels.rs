@@ -59,6 +59,13 @@ impl<M: GpuModule> DrafterKernels<M> {
                     // SAFETY: the caller vouches for the addresses and the handles; the stream is the lane's own.
                     unsafe { gemm.enqueue(handles, &stream) }?;
                 }
+                Work::Head(product) => {
+                    let stream = lane
+                        .raw_stream()
+                        .ok_or_else(|| TrainError::Gpu("the lane lends no stream".to_owned()))?;
+                    // SAFETY: as for the FP32 product.
+                    unsafe { product.enqueue(handles, &stream) }?;
+                }
             }
         }
         Ok(())

@@ -65,7 +65,7 @@ fn kernels(work: &[Work]) -> Vec<&'static str> {
     work.iter()
         .flat_map(|piece| match piece {
             Work::Steps(steps) => steps.iter().map(Step::kernel).collect::<Vec<_>>(),
-            Work::Product(_) => vec!["gemm"],
+            Work::Product(_) | Work::Head(_) => vec!["gemm"],
         })
         .collect()
 }
