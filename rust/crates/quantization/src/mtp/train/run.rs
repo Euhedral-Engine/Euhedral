@@ -163,8 +163,8 @@ impl<L: Lane> Claim<L> {
         let Some((run, lane)) = self.0.take() else {
             return;
         };
-        run.reply.beat();
-        match result {
+        let beat = run.reply.beat();
+        match result.map_err(Into::into).and_then(|value| beat.map(|()| value)) {
             Ok(value) => then(run, lane, value),
             Err(error) => fail(run, lane, error),
         }
@@ -260,8 +260,8 @@ fn lane_done<L: Lane, T: Send + 'static>(
     then: impl FnOnce(Step<L>, L, T) + Send + 'static,
 ) -> Done<L, T> {
     Box::new(move |finished| {
-        run.reply.beat();
-        match finished.result {
+        let beat = run.reply.beat();
+        match finished.result.and_then(|value| beat.map(|()| value)) {
             Ok(value) => then(run, finished.lane, value),
             Err(error) => fail(run, finished.lane, error),
         }

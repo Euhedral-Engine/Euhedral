@@ -23,6 +23,7 @@ pub mod wait;
 pub mod window;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use error::RunError;
 pub use lane::Lane;
@@ -34,16 +35,19 @@ use wait::{Reply, pair};
 /// binary's own thread, never a worker.
 pub fn train(options: &Options, host: &Host<'_>, log: &Log) -> Result<Summary, RunError> {
     let ready = load::load(options, host, log)?;
-    drive(|reply| run::start(ready, options, host, Arc::clone(log), reply))
+    drive(options.stall, |reply| {
+        run::start(ready, options, host, Arc::clone(log), reply)
+    })
 }
 
 /// Starts a run with `start`, follows it until it ends and closes the lane it gives back, here on the calling
-/// thread. The run's error comes before the close's. A run that gives no answer for a long time fails, naming that no
-/// window, update, read or write finished.
-pub fn drive<L: Lane>(start: impl FnOnce(Arc<Reply<Ended<L>>>)) -> Result<Summary, RunError> {
+/// thread. The run's error comes before the close's. A run that finishes no call over `stall` is told to end at its
+/// next one, which returns its lane to be closed; one that never finishes a call fails, naming that no window, update,
+/// read or write finished.
+pub fn drive<L: Lane>(stall: Duration, start: impl FnOnce(Arc<Reply<Ended<L>>>)) -> Result<Summary, RunError> {
     let (wait, reply) = pair();
     start(reply);
-    let ended = wait.follow()?;
+    let ended = wait.follow(stall)?;
     let closed = ended.lane.close();
     let summary = ended.outcome?;
     closed?;
@@ -58,6 +62,7 @@ mod tests {
 
     use super::lane::{Done, Job, Outcome};
     use super::progress::Update;
+    use super::wait::STALL;
     use super::*;
 
     /// A lane that only counts its closes.
@@ -94,7 +99,7 @@ mod tests {
             closes: Arc::clone(&closes),
             close_error,
         };
-        let result = drive(|reply| reply.send(Ok(Ended { lane, outcome })));
+        let result = drive(STALL, |reply| reply.send(Ok(Ended { lane, outcome })));
         (result, closes.load(Ordering::SeqCst))
     }
 
@@ -121,7 +126,7 @@ mod tests {
 
     #[test]
     fn a_run_dropped_without_an_answer_fails_without_a_lane_to_close() {
-        let result = drive::<Counting>(drop);
+        let result = drive::<Counting>(STALL, drop);
         assert!(matches!(result, Err(RunError::Broken(message)) if message.contains("without answering")));
     }
 }

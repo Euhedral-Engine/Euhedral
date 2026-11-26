@@ -1,5 +1,6 @@
 //! Device test of the training lane: a window and an optimiser step through the lane's own staging and chains equal the
-//! same planned work run directly on a second lane, gradients and values included. `#[ignore]`d like the crate's other
+//! same planned work run directly on a second lane, gradients and values included; and the draft head decoded on the
+//! lane equals a host decode. `#[ignore]`d like the crate's other
 //! device tests:
 //! `cargo test -p euhedral-inference-quantization --test train_lane_gpu -- --ignored --nocapture`.
 //!
@@ -27,7 +28,7 @@ use euhedral_graph::{Completions, LanePool};
 use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, HostWeightsArena};
 use euhedral_inference_quantization::kernels::{Compiled, Module, ModuleOptions, Modules};
-use euhedral_inference_quantization::mtp::train::lane::{Finished, Job, Lane, Resources, TrainLane};
+use euhedral_inference_quantization::mtp::train::lane::{Finished, Job, Lane, PackedHead, Resources, TrainLane};
 use euhedral_inference_quantization::mtp::train::load::Keep;
 use euhedral_inference_quantization::mtp::train::progress::Update;
 use euhedral_inference_quantization::mtp::train::settings::Window;
@@ -216,6 +217,9 @@ impl Rig {
             ),
             poison: Some(POISON),
         };
+        // The copies above come from pageable memory and may return before they land; the lane's stream does not wait
+        // for them, so the device is waited for before the lane first runs.
+        library.synchronize().unwrap();
         let mut lane = TrainLane::new(self.streams.remove(0), library, resources).unwrap();
         // The lane's own drafter has its parameters measured and its gradients zeroed; so has the planning copy.
         lane.prepare(true).unwrap();
@@ -305,9 +309,8 @@ fn close(label: &str, actual: &[f32], wanted: &[f32]) {
     }
 }
 
-#[test]
-#[ignore = "needs a GPU and the bundled NVRTC"]
-fn a_window_and_a_step_through_the_lane_equal_the_same_work_run_directly() {
+/// The engine library, the math libraries, the device and two lanes' streams.
+fn rig() -> Rig {
     let path = test_support::gradle_property("euhedral.cuda.library")
         .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
     let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
@@ -323,7 +326,7 @@ fn a_window_and_a_step_through_the_lane_equal_the_same_work_run_directly() {
         .open_lanes(&["lane", "direct"], StreamOptions::default())
         .expect("two lanes open");
     let completions = Completions::new(&pool);
-    let mut rig = Rig {
+    Rig {
         gpu,
         pool,
         library,
@@ -332,7 +335,13 @@ fn a_window_and_a_step_through_the_lane_equal_the_same_work_run_directly() {
         drafter: drafter_module,
         completions,
         streams,
-    };
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU and the bundled NVRTC"]
+fn a_window_and_a_step_through_the_lane_equal_the_same_work_run_directly() {
+    let mut rig = rig();
     let through = rig.model(None);
     let direct = rig.model(Some(&job()));
 
@@ -389,5 +398,66 @@ fn a_window_and_a_step_through_the_lane_equal_the_same_work_run_directly() {
     let (direct_lane, direct_step) = snapshot(&rig, direct_lane);
     close("after the step", &after_step, &direct_step);
     direct_lane.close().unwrap();
+    lane.close().unwrap();
+}
+
+/// The decode of `rows` NVFP4 rows of 40 values (padded to 128), on the host. The scale codes are E4M3 values that are
+/// powers of two times 1 or 1.5, and the global scale is 0.5, so every decoded value is exact in BF16.
+fn host_decode(bytes: &[u8], head: &PackedHead) -> Vec<u8> {
+    const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let e4m3 = |code: u8| {
+        let (exponent, mantissa) = (i32::from(code >> 3 & 15), f32::from(code & 7));
+        2f32.powi(exponent - 7) * (1.0 + mantissa / 8.0)
+    };
+    let global = f32::from_le_bytes(bytes[head.global_offset as usize..][..4].try_into().unwrap());
+    let (k, k_pad) = (head.k as usize, head.k_pad as usize);
+    let mut out = Vec::new();
+    for row in 0..head.rows as usize {
+        for column in 0..k {
+            let byte = bytes[row * k_pad / 2 + column / 2];
+            let code = if column % 2 == 1 { byte >> 4 } else { byte & 15 };
+            let scale = e4m3(bytes[head.scale_offset as usize + row * k_pad / 16 + column / 16]) * global;
+            let sign = if code & 8 == 0 { 1.0 } else { -1.0 };
+            let value = E2M1[usize::from(code & 7)] * sign * scale;
+            out.extend_from_slice(&(value.to_bits() >> 16).to_le_bytes()[..2]);
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "needs a GPU and the bundled NVRTC"]
+fn the_head_decoded_on_the_lane_equals_a_host_decode_into_poisoned_memory() {
+    let mut rig = rig();
+    let library = Arc::clone(&rig.library);
+    let model = rig.model(None);
+    let (rows, k, k_pad) = (5u32, 40u32, 128u32);
+    let codes = (rows * k_pad / 2) as usize;
+    let scale_offset = codes.next_multiple_of(256);
+    let global_offset = (scale_offset + (rows * k_pad / 16) as usize).next_multiple_of(256);
+    let mut bytes = vec![0u8; global_offset + 4];
+    for (at, byte) in bytes[..codes].iter_mut().enumerate() {
+        *byte = (at * 37 % 251) as u8;
+    }
+    for (at, byte) in bytes[scale_offset..global_offset].iter_mut().enumerate() {
+        *byte = [0x30, 0x38, 0x40, 0x44][at % 4];
+    }
+    bytes[global_offset..].copy_from_slice(&0.5f32.to_le_bytes());
+    let head = PackedHead {
+        bytes,
+        rows,
+        k,
+        k_pad,
+        scale_offset: scale_offset as u64,
+        global_offset: global_offset as u64,
+    };
+    let wanted = host_decode(&head.bytes, &head);
+    // Never written but by the decode, so that a decode that did not run, or ran before its input landed, shows.
+    let destination = take(&library, wanted.len(), &[]);
+    library.synchronize().unwrap();
+    let Model { mut lane, .. } = model;
+    lane.decode_head(&head, destination.addr()).unwrap();
+    let (lane, decoded) = rig.read(lane, destination.addr(), wanted.len());
+    assert_eq!(decoded, wanted, "the decoded head");
     lane.close().unwrap();
 }

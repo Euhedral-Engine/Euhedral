@@ -29,9 +29,10 @@ use crate::checkpoint::io::open_read;
 use crate::corpus::Entry;
 use crate::mtp::train::data::Files;
 use crate::mtp::train::lane::Job;
+use crate::mtp::train::progress::{Found, Resume};
 use crate::mtp::train::settings::expected_steps;
 use crate::mtp::train::state::{Part, Piece};
-use crate::mtp::train::wait::{call, pair};
+use crate::mtp::train::wait::{call, pair, then};
 
 /// The hang deadline of a run: it fails if no call finishes over this long, which a run of fakes never does.
 const HANG: Duration = Duration::from_secs(20);
@@ -57,10 +58,10 @@ fn settings() -> Settings {
 }
 
 /// What the lane was asked, in order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Call {
-    Window(Mode),
-    Update,
+    Window(Mode, Window),
+    Update(Update),
     Read(u64),
 }
 
@@ -105,7 +106,9 @@ fn answer<T>(lane: Fake, result: Result<T, RunError>, done: Done<Fake, T>) {
 
 impl Lane for Fake {
     fn window(self, job: Job, done: Done<Self, Outcome>) {
-        let failed = self.script.record(Call::Window(job.mode), self.script.fail_window);
+        let failed = self
+            .script
+            .record(Call::Window(job.mode, job.window), self.script.fail_window);
         let result = if failed {
             Err(RunError::Broken("the window failed".to_owned()))
         } else {
@@ -121,8 +124,8 @@ impl Lane for Fake {
         answer(self, result, done);
     }
 
-    fn update(self, _update: Update, done: Done<Self, ()>) {
-        self.script.record(Call::Update, None);
+    fn update(self, update: Update, done: Done<Self, ()>) {
+        self.script.record(Call::Update(update), None);
         answer(self, Ok(()), done);
     }
 
@@ -264,6 +267,7 @@ fn options(out: &Path, stop_after_saves: u32, fail_in_save: u32) -> Options {
         fresh: false,
         poison: None,
         fail_in_save,
+        stall: HANG,
     }
 }
 
@@ -277,14 +281,14 @@ fn run(world: &World, ready: Ready<Fake>, options: &Options) -> Ended<Fake> {
     };
     let (wait, reply) = pair();
     start(ready, options, &host, Arc::new(|_| {}), reply);
-    wait.follow_within(HANG).expect("the run never ended")
+    wait.follow(HANG).expect("the run never ended")
 }
 
 fn modes(calls: &[Call]) -> Vec<Mode> {
     calls
         .iter()
         .filter_map(|call| match call {
-            Call::Window(mode) => Some(*mode),
+            Call::Window(mode, _) => Some(*mode),
             _ => None,
         })
         .collect()
@@ -319,7 +323,7 @@ fn a_run_from_the_checkpoint_evaluates_first_trains_and_ends_with_its_lane_and_b
         "the evaluation before any training"
     );
     assert!(modes.contains(&Mode::Train));
-    assert!(calls.contains(&Call::Update));
+    assert!(calls.iter().any(|call| matches!(call, Call::Update(_))));
     // The first evaluation always improves: the best parameters are read, all of them, before the state is.
     let reads = reads(&calls);
     assert_eq!(&reads[..2], &[BEST, BEST + 0x100], "the best parameters first");
@@ -393,7 +397,7 @@ fn a_run_asked_to_stop_after_a_save_ends_at_that_saved_state() {
     let calls = script.calls();
     assert_eq!(calls.last(), Some(&Call::Read(STATE + 0x200)), "{calls:?}");
     assert!(
-        calls.contains(&Call::Update),
+        calls.iter().any(|call| matches!(call, Call::Update(_))),
         "the state saved is of a run that trained"
     );
     world.stop();
@@ -498,5 +502,81 @@ fn a_save_that_cannot_open_its_file_ends_the_run_with_the_lane_and_writes_nothin
     );
     ended.lane.close().unwrap();
     assert_eq!(script.closed.load(Ordering::SeqCst), 1);
+    world.stop();
+}
+
+/// The windows and updates of `calls`, in order: what the run did to the drafter.
+fn work(calls: &[Call]) -> Vec<Call> {
+    calls
+        .iter()
+        .filter(|call| !matches!(call, Call::Read(_)))
+        .copied()
+        .collect()
+}
+
+/// What a run saved at its first save: its `resume.bin`, read as the next start reads it.
+fn resumed(world: &World, out: &Path, ready: &Ready<Fake>) -> Progress {
+    let file = call(|reply| ResumeFile::open_read_only(&world.io, &world.lake, &out.join("resume.bin"), then(&reply)))
+        .unwrap();
+    let header = call(|reply| file.header(then(&reply))).unwrap();
+    let settings = settings();
+    let resume = Progress::resume(
+        settings,
+        ready.data.training().to_vec(),
+        expected_steps(ready.data.lengths(), settings.tokens),
+        &ready.identity,
+        Found::Header(&header),
+        true,
+        false,
+    )
+    .unwrap();
+    match resume {
+        Resume::Continue(progress) => progress,
+        other => panic!("the saved state does not continue the run: {other:?}"),
+    }
+}
+
+#[test]
+fn a_run_stopped_at_a_save_and_resumed_from_its_state_does_the_uninterrupted_runs_work_with_nothing_lost_or_repeated() {
+    let rows = SEQUENCES * (LENGTH - 1);
+    let world = World::start();
+    let whole = tempfile::tempdir().unwrap();
+    let whole_script = Arc::new(Script::default());
+    run(
+        &world,
+        ready(&world, whole.path(), &whole_script, Start::Initial, rows),
+        &options(whole.path(), 0, 0),
+    )
+    .outcome
+    .unwrap();
+    let wanted = work(&whole_script.calls());
+    // Stopped at each of the saves of the uninterrupted run but the last, then resumed: the work of both halves put
+    // together is the whole run's.
+    let saves = {
+        let all = whole_script.calls();
+        all.iter().filter(|call| matches!(call, Call::Read(STATE))).count() as u32
+    };
+    assert!(
+        saves >= 2,
+        "the run saves more than once, or there is nothing to resume"
+    );
+    for stop in 1..saves {
+        let out = tempfile::tempdir().unwrap();
+        let first = Arc::new(Script::default());
+        let ended = run(
+            &world,
+            ready(&world, out.path(), &first, Start::Initial, rows),
+            &options(out.path(), stop, 0),
+        );
+        assert!(ended.outcome.unwrap().stopped, "the stop after {stop} saves");
+        let second = Arc::new(Script::default());
+        let mut next = ready(&world, out.path(), &second, Start::Continue, rows);
+        next.progress = resumed(&world, out.path(), &next);
+        let finished = run(&world, next, &options(out.path(), 0, 0));
+        assert!(!finished.outcome.unwrap().stopped);
+        let mut together = work(&first.calls());
+        together.extend(work(&second.calls()));
+        assert_eq!(together, wanted, "stopped after {stop} saves");
+    }
     world.stop();
 }

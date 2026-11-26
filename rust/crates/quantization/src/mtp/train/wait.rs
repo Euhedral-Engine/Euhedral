@@ -19,14 +19,15 @@ use crate::step::idle;
 /// The longest the startup or the shutdown waits for one call: a bound on the wait, not a rate.
 const LONGEST_CALL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// How long a run may go without finishing any call before it counts as hung: a window, an update, a read or a write
-/// takes seconds, and the largest piece of a save a few more.
-const STALL: Duration = Duration::from_secs(30 * 60);
+/// How long a run may go without finishing any call before it counts as hung, unless the run is asked otherwise: a
+/// window, an update, a read or a write takes seconds, and the largest piece of a save a few more.
+pub const STALL: Duration = Duration::from_secs(30 * 60);
 
 /// The waiting end.
 pub struct Wait<T> {
     cell: Arc<Handoff<Result<T, RunError>>>,
     beats: Arc<AtomicU64>,
+    halted: Arc<AtomicBool>,
 }
 
 /// The answering end: the first answer counts, and a call dropped without one answers that it ended.
@@ -34,6 +35,7 @@ pub struct Reply<T> {
     cell: Arc<Handoff<Result<T, RunError>>>,
     sent: AtomicBool,
     beats: Arc<AtomicU64>,
+    halted: Arc<AtomicBool>,
 }
 
 impl<T> Debug for Wait<T> {
@@ -50,13 +52,18 @@ impl<T> Debug for Reply<T> {
 
 /// A waiting end and the answering end that reaches it.
 pub fn pair<T>() -> (Wait<T>, Arc<Reply<T>>) {
-    let (cell, beats) = (Handoff::new(), Arc::new(AtomicU64::new(0)));
+    let (cell, beats, halted) = (
+        Handoff::new(),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicBool::new(false)),
+    );
     let reply = Arc::new(Reply {
         cell: Arc::clone(&cell),
         sent: AtomicBool::new(false),
         beats: Arc::clone(&beats),
+        halted: Arc::clone(&halted),
     });
-    (Wait { cell, beats }, reply)
+    (Wait { cell, beats, halted }, reply)
 }
 
 /// Tells whether a run has stopped finishing calls: it has when the beats are the same at two looks.
@@ -75,9 +82,16 @@ impl Watch {
 }
 
 impl<T> Reply<T> {
-    /// Tells the waiting end that the run finished a call, so that it is not hung.
-    pub fn beat(&self) {
+    /// Tells the waiting end that the run finished a call, so that it is not hung. Fails when the waiting end had given
+    /// the run up as hung before this call finished: the run then ends here, with its lane, instead of going on.
+    pub fn beat(&self) -> Result<(), RunError> {
         self.beats.fetch_add(1, Ordering::Relaxed);
+        if self.halted.load(Ordering::Acquire) {
+            return Err(RunError::Broken(
+                "the run was given up as hung, and ended at the first call that finished after".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Answers, unless an answer has been given.
@@ -108,18 +122,14 @@ impl<T: Send + 'static> Wait<T> {
 }
 
 impl<T: Send + 'static> Wait<T> {
-    /// Blocks until the run answers, however long it takes, and fails only when it stops finishing calls: the error
-    /// names what never happened.
-    pub fn follow(self) -> Result<T, RunError> {
-        self.follow_within(STALL)
-    }
-
-    /// [`follow`](Wait::follow) with `stall` as the look interval: fails when the beats did not move over one.
+    /// Blocks until the run answers, however long it takes, and gives it up only when it stops finishing calls: when
+    /// the beats did not move over `stall`, the run is told to end at its next finished call, so that its lane comes
+    /// back in the answer, and is waited for one more `stall`. The error names what never happened.
     #[allow(
         clippy::disallowed_methods,
         reason = "shutdown: the calling thread is the binary's own, never a worker"
     )]
-    pub(crate) fn follow_within(self, stall: Duration) -> Result<T, RunError> {
+    pub fn follow(self, stall: Duration) -> Result<T, RunError> {
         let mut watch = Watch {
             last: self.beats.load(Ordering::Relaxed),
         };
@@ -128,10 +138,14 @@ impl<T: Send + 'static> Wait<T> {
                 return answer;
             }
             if watch.stalled(self.beats.load(Ordering::Relaxed)) {
-                return Err(RunError::Broken(format!(
-                    "the run finished no window, update, read or write in {} seconds and did not end",
-                    stall.as_secs()
-                )));
+                self.halted.store(true, Ordering::Release);
+                return self.cell.wait(stall).unwrap_or_else(|_| {
+                    Err(RunError::Broken(format!(
+                        "the run finished no window, update, read or write in {} seconds and did not end; its lane \
+                         is in the call that never finished and was not closed",
+                        stall.as_secs()
+                    )))
+                });
             }
         }
     }
@@ -186,27 +200,39 @@ mod tests {
     #[test]
     fn an_answer_already_given_ends_the_following_at_once() {
         let (wait, reply) = pair();
-        reply.beat();
+        reply.beat().unwrap();
         reply.send(Ok(3));
-        assert_eq!(wait.follow().unwrap(), 3);
+        assert_eq!(wait.follow(STALL).unwrap(), 3);
     }
 
     #[test]
     fn a_run_dropped_without_an_answer_ends_the_following_with_the_reason() {
         let (wait, reply) = pair::<u32>();
         drop(reply);
-        assert!(matches!(wait.follow(), Err(RunError::Broken(message)) if message.contains("without answering")));
+        assert!(matches!(wait.follow(STALL), Err(RunError::Broken(message)) if message.contains("without answering")));
     }
 
     #[test]
     fn a_run_that_finishes_no_call_and_gives_no_answer_fails_naming_what_never_happened() {
         let (wait, reply) = pair::<u32>();
-        let error = wait.follow_within(Duration::from_millis(20)).unwrap_err();
+        let error = wait.follow(Duration::from_millis(20)).unwrap_err();
         assert!(
             matches!(&error, RunError::Broken(message) if message.contains("finished no window, update, read or write")),
             "{error}"
         );
         drop(reply);
+    }
+
+    #[test]
+    fn a_run_given_up_as_hung_is_told_so_at_its_next_finished_call() {
+        let (wait, reply) = pair::<u32>();
+        reply.beat().unwrap();
+        wait.follow(Duration::from_millis(20)).unwrap_err();
+        let error = reply.beat().unwrap_err();
+        assert!(
+            matches!(&error, RunError::Broken(message) if message.contains("given up as hung")),
+            "{error}"
+        );
     }
 
     #[test]

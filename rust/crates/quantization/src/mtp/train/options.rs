@@ -3,6 +3,7 @@
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use euhedral_core::generics::LatticeSource;
 use euhedral_graph::Lake;
@@ -36,6 +37,9 @@ pub struct Options {
     /// Fails the state save of this number (from 1) after half of its pieces are written, to prove that a save which
     /// does not finish leaves the saved state whole; 0 never fails.
     pub fail_in_save: u32,
+    /// How long the run may go without finishing a window, an update, a read or a write before it counts as hung and is
+    /// ended; no time limit applies to the run as a whole.
+    pub stall: Duration,
 }
 
 /// The runtime a run goes on: the asynchronous I/O, the host lake and the way to have the lattice take the lane's

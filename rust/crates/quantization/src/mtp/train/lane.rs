@@ -23,10 +23,22 @@ use super::progress::Update;
 use super::settings::Window;
 use super::window::{Addresses, Mode, plan};
 use crate::chain::{self, Next, Parts, Scratch, Unsettled};
-use crate::mtp::{Drafter, DrafterKernels, Work};
+use crate::mtp::{Drafter, DrafterKernels, Work, plan_nvfp4_decode_bf16};
 
 /// The bytes of device memory a read of the lane moves at a time.
 pub const CHUNK_BYTES: usize = 32 << 20;
+
+/// An artifact's draft head as stored: NVFP4 rows (row-split-k128-v1) of `k` values padded to `k_pad`, then their scale
+/// codes at `scale_offset` and the FP32 global scale at `global_offset`.
+#[derive(Debug)]
+pub struct PackedHead {
+    pub bytes: Vec<u8>,
+    pub rows: u32,
+    pub k: u32,
+    pub k_pad: u32,
+    pub scale_offset: u64,
+    pub global_offset: u64,
+}
 
 /// What a lane is made of, built by the loader: the drafter and the buffers it plans over.
 pub struct Resources {
@@ -256,6 +268,41 @@ impl TrainLane {
         Ok(())
     }
 
+    /// Decodes an artifact's NVFP4 draft head into BF16 at `head`, on the lane. For startup: it waits.
+    ///
+    /// The packed bytes go to the device from pinned memory, on the lane's own stream and in the same submission as the
+    /// decode kernel, so the stream orders the decode after the upload. (A copy from pageable memory may return before
+    /// its transfer lands, and a non-blocking stream does not wait for it.)
+    pub fn decode_head(&mut self, stored: &PackedHead, head: u64) -> Result<(), RunError> {
+        let library = self.parts.keep.library();
+        let mut pinned = PinnedBuffer::alloc(library, stored.bytes.len().max(1))?;
+        pinned.as_mut_slice()[..stored.bytes.len()].copy_from_slice(&stored.bytes);
+        let device = DeviceBuffer::alloc(library, stored.bytes.len().max(1))?;
+        let base = device.addr();
+        let work = [Work::Steps(plan_nvfp4_decode_bf16(
+            base,
+            base + stored.scale_offset,
+            base + stored.global_offset,
+            stored.rows,
+            stored.k_pad,
+            stored.k,
+            head,
+        )?)];
+        let parts = &mut self.parts;
+        let submitted = chain::submit(&mut self.stream, |queue| {
+            // SAFETY: the pinned and device buffers are live and `bytes` long, and are kept until the stream is waited
+            // for below; the work names them and the lane's own buffers and handles.
+            unsafe {
+                queue.copy_to_device(base, pinned.as_ptr(), stored.bytes.len())?;
+                parts.kernels.enqueue(queue, &mut parts.handles, &work)?;
+            }
+            Ok::<(), RunError>(())
+        });
+        // Waited for whether or not the submission failed: nothing may still be reading the buffers when they drop.
+        Stream::quiesce(&mut self.stream);
+        submitted
+    }
+
     /// Plans and runs the drafter's start: its gradients and moments zeroed when `fresh`, and its scales measured from
     /// the values. For startup.
     pub fn prepare(&mut self, fresh: bool) -> Result<(), RunError> {
@@ -359,11 +406,35 @@ impl Lane for TrainLane {
         let TrainLane { mut stream, mut parts } = self;
         parts.unsettled.settle(&mut stream, || {});
         Stream::quiesce(&mut stream);
-        // The handles close first; the rest of the parts, the buffers among them, are freed at the end of the block.
-        let (closed, keep) = {
-            let LaneParts { handles, keep, .. } = parts;
-            (handles.close().map_err(RunError::from), keep)
-        };
+        let LaneParts {
+            kernels,
+            handles,
+            drafter,
+            addresses,
+            rows,
+            arena,
+            _buffers,
+            _table,
+            staging,
+            completions,
+            unsettled,
+            keep,
+        } = parts;
+        // The handles close first, then the rest of the parts, the buffers among them, then the stream; the device
+        // outlives everything the lane holds, so `keep` goes last.
+        let closed = handles.close().map_err(RunError::from);
+        drop((
+            kernels,
+            drafter,
+            addresses,
+            rows,
+            arena,
+            _buffers,
+            _table,
+            staging,
+            completions,
+            unsettled,
+        ));
         drop(stream);
         drop(keep);
         closed

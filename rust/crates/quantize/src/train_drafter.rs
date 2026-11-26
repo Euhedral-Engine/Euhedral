@@ -5,9 +5,10 @@
 use std::env::consts;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use euhedral_inference_quantization::mtp::train::settings::Settings as Training;
+use euhedral_inference_quantization::mtp::train::wait::STALL;
 use euhedral_inference_quantization::mtp::train::{Host, Log, Options, train};
 use euhedral_inference_settings::{Settings, load_for_tool, process_env};
 
@@ -17,7 +18,7 @@ use crate::{EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, Outcome};
 /// What the command line accepts, for the message that refuses another option.
 const OPTIONS: &str = "--corpus, --model, --artifact, --out, --cuda-libraries, --depths, --rows, --keys, --tokens, \
 --epochs, --projection-rate, --norm-rate, --warmup, --holdout, --evaluate-every, --limit, --stop-after-saves, \
---library, --fresh, --poison-memory, --fail-in-save";
+--library, --fresh, --poison-memory, --fail-in-save, --stall-seconds";
 
 /// The flags of the command.
 #[derive(Debug, PartialEq)]
@@ -33,6 +34,7 @@ struct Flags {
     fresh: bool,
     poison: Option<u8>,
     fail_in_save: u32,
+    stall: Duration,
 }
 
 /// What `--poison-memory` fills unwritten memory with: a NaN in every float format.
@@ -41,7 +43,7 @@ const POISON: u8 = 0xff;
 fn flags(args: &[String]) -> Result<Flags, String> {
     let (mut corpus, mut model, mut artifact, mut out, mut math, mut library) = (None, None, None, None, None, None);
     let (mut settings, mut stop_after_saves) = (Training::default(), 0);
-    let (mut fresh, mut poison, mut fail_in_save) = (false, None, 0);
+    let (mut fresh, mut poison, mut fail_in_save, mut stall) = (false, None, 0, STALL);
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         // The flags that take no value.
@@ -95,6 +97,12 @@ fn flags(args: &[String]) -> Result<Flags, String> {
             }
             "--stop-after-saves" => stop_after_saves = whole()?,
             "--fail-in-save" => fail_in_save = whole()?,
+            "--stall-seconds" => {
+                stall = match whole()? {
+                    0 => return Err(format!("{arg} needs at least 1 second")),
+                    seconds => Duration::from_secs(u64::from(seconds)),
+                };
+            }
             other => {
                 return Err(format!(
                     "unknown train-drafter option {other}; the options are {OPTIONS}"
@@ -119,6 +127,7 @@ fn flags(args: &[String]) -> Result<Flags, String> {
         fresh,
         poison,
         fail_in_save,
+        stall,
     })
 }
 
@@ -183,6 +192,7 @@ pub fn run(args: &[String]) -> Outcome {
         fresh: flags.fresh,
         poison: flags.poison,
         fail_in_save: flags.fail_in_save,
+        stall: flags.stall,
     };
     let attach = |source| rig.attach(source);
     let host = Host {
@@ -355,6 +365,20 @@ mod tests {
         assert_eq!(parsed.settings, Training::default());
         let plain = flags(&with(&[])).unwrap();
         assert!((plain.fresh, plain.poison, plain.fail_in_save) == (false, None, 0));
+    }
+
+    #[test]
+    fn the_stall_is_half_an_hour_unless_asked_for_and_never_nothing() {
+        assert_eq!(flags(&with(&[])).unwrap().stall, STALL);
+        assert_eq!(
+            flags(&with(&["--stall-seconds", "90"])).unwrap().stall,
+            Duration::from_secs(90)
+        );
+        assert!(
+            flags(&with(&["--stall-seconds", "0"]))
+                .unwrap_err()
+                .contains("at least 1 second")
+        );
     }
 
     #[test]

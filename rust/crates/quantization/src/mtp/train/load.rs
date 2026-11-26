@@ -23,7 +23,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::data::{Data, Files};
 use super::error::RunError;
-use super::lane::{CHUNK_BYTES, Lane, Resources, TrainLane};
+use super::lane::{CHUNK_BYTES, Lane, PackedHead, Resources, TrainLane};
 use super::options::{Host, Log, Options};
 use super::progress::{Found, Identity, Progress, Resume};
 use super::run::{Ready, Start};
@@ -38,7 +38,7 @@ use crate::checkpoint::safetensors::Safetensors;
 use crate::corpus::{self, Entry};
 use crate::kernels::{Module, ModuleOptions, Modules};
 use crate::mtp::layout::{NORMS, PROJECTIONS};
-use crate::mtp::{Config, Drafter, DrafterKernels, Shape, Work, plan_nvfp4_decode_bf16};
+use crate::mtp::{Config, Drafter, DrafterKernels, Shape};
 use crate::resume::{ResumeError, ResumeFile};
 
 /// The checkpoint tensors of the drafter's norms, in the order of [`NORMS`].
@@ -62,6 +62,11 @@ pub struct Keep {
 }
 
 impl Keep {
+    /// The engine library the lane's device memory was allocated from.
+    pub fn library(&self) -> &Arc<CudaLibrary> {
+        &self._library
+    }
+
     /// Keeps `gpu`, its lane pool, the math libraries and the engine library open for as long as it lives.
     pub fn new(gpu: Arc<CudaGpu>, pool: Arc<LanePool>, math: Arc<MathLibraries>, library: Arc<CudaLibrary>) -> Keep {
         Keep {
@@ -264,7 +269,7 @@ fn read_artifact(
     library: &Arc<CudaLibrary>,
     width: u32,
     vocabulary: u64,
-) -> Result<(ArtifactBytes, Artifact), RunError> {
+) -> Result<(PackedHead, Artifact), RunError> {
     let artifact = call(|reply| ArtifactFile::open(host.io, &options.artifact, false, done(&reply)))?;
     let entry = |name: &str| {
         artifact
@@ -344,8 +349,9 @@ fn read_artifact(
     table.as_mut_slice().copy_from_slice(&bytes);
     let head_address = 0;
     Ok((
-        ArtifactBytes {
-            packed,
+        PackedHead {
+            bytes: packed,
+            rows: draft_rows,
             scale_offset,
             global_offset,
             k,
@@ -360,45 +366,6 @@ fn read_artifact(
             digest: digest.hex(),
         },
     ))
-}
-
-/// The draft head as the artifact stores it.
-struct ArtifactBytes {
-    packed: Vec<u8>,
-    scale_offset: u64,
-    global_offset: u64,
-    k: u32,
-    k_pad: u32,
-}
-
-/// Decodes the artifact's NVFP4 head into BF16 at `head`, once, on the lane. For startup.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "startup: a synchronous copy before any frame runs on the lane"
-)]
-fn decode_head(
-    lane: &mut TrainLane,
-    library: &Arc<CudaLibrary>,
-    stored: &ArtifactBytes,
-    rows: u32,
-    head: u64,
-) -> Result<(), RunError> {
-    let staging = DeviceBuffer::alloc(library, stored.packed.len())?;
-    staging.copy_from_host(0, &stored.packed)?;
-    // The copy from pageable memory may return before the transfer lands, and the lane's stream does not wait for it:
-    // without this the decode kernel can read the staging buffer before its bytes are there.
-    library.synchronize()?;
-    let base = staging.addr();
-    let steps = plan_nvfp4_decode_bf16(
-        base,
-        base + stored.scale_offset,
-        base + stored.global_offset,
-        rows,
-        stored.k_pad,
-        stored.k,
-        head,
-    )?;
-    lane.run_blocking(&[Work::Steps(steps)])
 }
 
 /// The checkpoint's drafter tensors as BF16 bytes, by the name of the parameter each starts.
@@ -487,8 +454,7 @@ fn open_state(host: &Host<'_>, path: &Path) -> Result<Option<ResumeFile>, RunErr
 /// What the start brings the lane from, and where from.
 struct Source<'a> {
     library: &'a Arc<CudaLibrary>,
-    stored: &'a ArtifactBytes,
-    draft_rows: u32,
+    stored: &'a PackedHead,
     head: u64,
     checkpoint: &'a [(&'static str, Vec<u8>)],
     state: Option<&'a ResumeFile>,
@@ -506,7 +472,7 @@ fn bring_up(
     fresh: Progress,
     from: &Source<'_>,
 ) -> Result<(Progress, Start), RunError> {
-    decode_head(lane, from.library, from.stored, from.draft_rows, from.head)?;
+    lane.decode_head(from.stored, from.head)?;
     match resume {
         Resume::Fresh => {
             load_checkpoint(from.checkpoint, lane)?;
@@ -668,7 +634,6 @@ pub fn load(options: &Options, host: &Host<'_>, log: &Log) -> Result<Ready<Train
     let source = Source {
         library: &library,
         stored: &stored,
-        draft_rows: artifact.draft_rows,
         head,
         checkpoint: &checkpoint,
         state: state.as_ref(),
