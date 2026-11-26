@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_engine::formats::LinearMode;
 
 use super::cost_table::{CostTable, Key, Shape};
@@ -32,6 +33,22 @@ pub fn launch_mode(rows: u32) -> LinearMode {
         row_exact: rows > 1 && rows <= VERIFY_MAX_ROWS,
         prefill: rows > VERIFY_MAX_ROWS,
     }
+}
+
+/// Refuses a source whose objects are not stored in the format `option` names: the cost of an option is the cost of
+/// its own format's launch, so an artifact of another format under its name would time the wrong kernels.
+pub fn check_format(option: QuantOption, format: WeightFormat) -> Result<(), MixedError> {
+    let wanted = if option == QuantOption::Nvfp4 {
+        WeightFormat::Nvfp4
+    } else {
+        WeightFormat::Trellis
+    };
+    if format == wanted {
+        return Ok(());
+    }
+    Err(MixedError::invalid(format!(
+        "the source of {option} stores {format:?} objects, not {wanted:?}"
+    )))
 }
 
 /// The device side of a measurement: the launches of one option's linear of one object. A bench holds one object at
@@ -404,6 +421,22 @@ mod tests {
         .unwrap_err();
         assert_eq!(failure, MixedError::invalid("the launch failed"));
         assert_eq!((seen, bench.timed), (2, 3));
+    }
+
+    #[test]
+    fn a_source_of_another_format_than_its_option_is_refused() {
+        assert!(check_format(QuantOption::Nvfp4, WeightFormat::Nvfp4).is_ok());
+        for option in [
+            QuantOption::Trellis2_5,
+            QuantOption::Trellis3_0,
+            QuantOption::Trellis3_5,
+            QuantOption::Trellis4_0,
+        ] {
+            assert!(check_format(option, WeightFormat::Trellis).is_ok(), "{option}");
+            assert!(check_format(option, WeightFormat::Nvfp4).is_err(), "{option}");
+        }
+        let failure = check_format(QuantOption::Nvfp4, WeightFormat::Trellis).unwrap_err();
+        assert!(failure.to_string().contains("nvfp4"), "{failure}");
     }
 
     #[test]

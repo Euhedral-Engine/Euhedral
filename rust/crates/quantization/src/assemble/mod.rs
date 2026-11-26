@@ -27,7 +27,9 @@ use crate::checkpoint::CheckpointError;
 use crate::mixed::MixedError;
 
 pub use artifact::ArtifactFile;
+// What `SourceSet::descriptor` returns and the companions of a trellis object are read with.
 pub use command::{Assembled, Request, run};
+pub use euhedral_inference_edrl::{TensorEntry, TrellisCompanions, WeightFormat};
 pub use sources::{COMPANION_SUFFIXES, SourceSet};
 pub use view::{Piece, View, view};
 pub use write::write;

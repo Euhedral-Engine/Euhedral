@@ -7,6 +7,7 @@
 
 mod assemble;
 mod calibrate;
+mod cost;
 mod generate;
 mod package;
 mod reference;
@@ -92,8 +93,8 @@ pub const COMMANDS: [Command; 13] = [
     },
     Command {
         name: "cost",
-        availability: Availability::Pending,
-        usage: "--source OPTION=ARTIFACT... --base OPTION --out COSTS.json",
+        availability: Availability::Wired,
+        usage: "--source OPTION=ARTIFACT... --base OPTION --out COSTS.json [--rows A,B,...] [--repeats N] [--rotate-mib N] [--config YAML] [--cuda-library FILE]",
     },
     Command {
         name: "allocate",
@@ -152,6 +153,7 @@ pub fn run(args: &[String]) -> Outcome {
         Availability::Wired => match command.name {
             "assemble" => assemble::run(&args[1..]),
             "calibrate" => calibrate::run(&args[1..]),
+            "cost" => cost::run(&args[1..]),
             "generate" => generate::run(&args[1..]),
             "package-tokenizer" => package::run(&args[1..]),
             "reference" => reference::run(&args[1..]),
