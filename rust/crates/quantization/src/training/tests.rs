@@ -344,6 +344,10 @@ fn arguments_match_the_parameter_lists_the_loaded_source_declares() {
             vec![("width", Scalar::Int(8)), ("offset", Scalar::Float(0.25))],
         ),
         (
+            plan_squared_error(1, 2, 35, 0.75, Some(3), 4).unwrap(),
+            vec![("count", Scalar::Long(35)), ("scale", Scalar::Float(0.75))],
+        ),
+        (
             plan_swiglu_forward(1, 2, 3, 5).unwrap(),
             vec![("rows", Scalar::Int(3)), ("width", Scalar::Int(5))],
         ),
@@ -713,6 +717,7 @@ fn every_listed_kernel_has_a_planner_that_names_it() {
         plan_qk_norm_rope_backward(1, 1, 1, 1, 1, 1, None, None, &heads()),
         plan_rms_norm_forward(1, 1, 1, 1, 1, 1, 1e-6, 0.0),
         plan_rms_norm_backward(1, 1, 1, 1, 1, None, 1, 1, 0.0),
+        plan_squared_error(1, 1, 1, 1.0, None, 1),
         plan_swiglu_forward(1, 1, 1, 1),
         plan_swiglu_backward(1, 1, 1, 1, 1),
     ]

@@ -43,6 +43,7 @@ pub mod kernels;
 pub mod kld;
 pub mod memory;
 pub mod mixed;
+pub mod mtp;
 pub mod npy;
 pub mod npz;
 pub mod package_error;

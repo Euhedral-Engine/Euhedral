@@ -26,8 +26,9 @@ pub use gemm::{
 pub use plan::{
     AdamSettings, Heads, plan_adam, plan_bf16_to_float, plan_copy, plan_fill, plan_gate_backward, plan_gate_forward,
     plan_qk_norm_rope_backward, plan_qk_norm_rope_forward, plan_rms_norm_backward, plan_rms_norm_forward,
-    plan_swiglu_backward, plan_swiglu_forward, plan_zero,
+    plan_squared_error, plan_swiglu_backward, plan_swiglu_forward, plan_zero,
 };
+pub(crate) use plan::{THREADS, address, count64, dimension, elementwise, out_of_range};
 pub use run::TrainKernels;
 
 /// Why an operation cannot be planned or run.

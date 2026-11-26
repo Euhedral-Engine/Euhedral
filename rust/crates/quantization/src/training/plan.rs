@@ -6,7 +6,7 @@ use super::{Step, TrainError};
 use crate::kernels::Module;
 
 /// Threads of an elementwise or row-wise launch.
-const THREADS: u32 = 256;
+pub(crate) const THREADS: u32 = 256;
 /// The widest head the rotary kernels hold in shared memory.
 const MOST_HEAD: u32 = 512;
 
@@ -20,7 +20,7 @@ fn step(kernel: &str, blocks: u32, threads: u32, args: Args) -> Result<Step, Tra
     Step::new(Module::Train, kernel, launch, args).ok_or_else(|| TrainError::NoKernel(kernel.to_owned()))
 }
 
-pub(super) fn address(name: &'static str, value: u64) -> Result<u64, TrainError> {
+pub(crate) fn address(name: &'static str, value: u64) -> Result<u64, TrainError> {
     if value == 0 {
         Err(TrainError::NullAddress(name))
     } else {
@@ -29,12 +29,12 @@ pub(super) fn address(name: &'static str, value: u64) -> Result<u64, TrainError>
 }
 
 /// An address that may be absent: null stays null.
-fn optional(value: Option<u64>) -> u64 {
+pub(crate) fn optional(value: Option<u64>) -> u64 {
     value.unwrap_or(0)
 }
 
 /// `value` as the kernel's positive signed 32-bit parameter.
-pub(super) fn dimension(name: &'static str, value: u32) -> Result<i32, TrainError> {
+pub(crate) fn dimension(name: &'static str, value: u32) -> Result<i32, TrainError> {
     match i32::try_from(value) {
         Ok(signed) if signed > 0 => Ok(signed),
         _ => Err(TrainError::OutOfRange {
@@ -45,7 +45,7 @@ pub(super) fn dimension(name: &'static str, value: u32) -> Result<i32, TrainErro
 }
 
 /// The refusal of `value`, saturated to what the error holds.
-fn out_of_range(name: &'static str, value: u64) -> TrainError {
+pub(crate) fn out_of_range(name: &'static str, value: u64) -> TrainError {
     TrainError::OutOfRange {
         name,
         value: i64::try_from(value).unwrap_or(i64::MAX),
@@ -53,7 +53,7 @@ fn out_of_range(name: &'static str, value: u64) -> TrainError {
 }
 
 /// `value` as the kernel's positive signed 64-bit count.
-fn count64(name: &'static str, value: u64) -> Result<i64, TrainError> {
+pub(crate) fn count64(name: &'static str, value: u64) -> Result<i64, TrainError> {
     match i64::try_from(value) {
         Ok(signed) if signed > 0 => Ok(signed),
         _ => Err(out_of_range(name, value)),
@@ -61,7 +61,7 @@ fn count64(name: &'static str, value: u64) -> Result<i64, TrainError> {
 }
 
 /// Blocks of an elementwise launch over `count` values.
-fn elementwise(name: &'static str, count: u64) -> Result<u32, TrainError> {
+pub(crate) fn elementwise(name: &'static str, count: u64) -> Result<u32, TrainError> {
     let blocks = count.div_ceil(u64::from(THREADS));
     match i32::try_from(blocks) {
         Ok(_) => Ok(blocks as u32),
@@ -452,4 +452,32 @@ pub fn plan_adam(
         .arg(settings.decay)
         .arg(dimension("step", step_number)?);
     Ok(vec![step("adam", elementwise("count", count)?, THREADS, args)?])
+}
+
+/// `loss += sum (y - target)^2` over `count` floats (`loss` is one double on the device), and `dy = 2 (y - target) scale`
+/// when `dy` is given. The loss sums per block and adds with atomics, so its last bits depend on the order the blocks
+/// run in.
+pub fn plan_squared_error(
+    y: u64,
+    target: u64,
+    count: u64,
+    scale: f32,
+    dy: Option<u64>,
+    loss: u64,
+) -> Result<Vec<Step>, TrainError> {
+    let (y, target, loss) = (address("y", y)?, address("target", target)?, address("loss", loss)?);
+    let signed = count64("count", count)?;
+    let args = Args::new()
+        .device(y)
+        .device(target)
+        .arg(signed)
+        .arg(scale)
+        .device(optional(dy))
+        .device(loss);
+    Ok(vec![step(
+        "squared_error",
+        elementwise("count", count)?,
+        THREADS,
+        args,
+    )?])
 }
