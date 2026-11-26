@@ -12,6 +12,7 @@
 //! The lanes' width is fixed when the device opens, from the memory the largest step of the model takes.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 use std::mem::forget;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,13 +107,36 @@ fn dimension(value: u64) -> Result<u32, CalibrateError> {
     u32::try_from(value).map_err(|_| CalibrateError::Invalid(format!("{value} does not fit a 32-bit dimension")))
 }
 
+/// A quantized linear as the device sizes it: its rows, its columns and its rate.
+struct Shape {
+    n: u64,
+    k: u64,
+    bits: f64,
+}
+
 /// What the model's linears take of the card: the distinct steps, the layer that holds most weights, and the most
-/// linears a layer rounds.
-fn steps_of(objects: &Qwen38Objects, run: &TrellisRun) -> Result<(Shapes, u64, usize), CalibrateError> {
+/// linears a layer rounds. `layers` holds each layer's quantized linears, `mtp` the MTP block's (rounded without a
+/// Hessian at the MTP rate).
+fn steps(layers: &[Vec<Shape>], mtp: &[(u64, u64)]) -> Result<(Shapes, u64, usize), CalibrateError> {
     let mut shapes = Shapes::new();
     let (mut held, mut most) = (0, 1);
+    for linears in layers {
+        for linear in linears {
+            shapes.insert((dimension(linear.n)?, dimension(linear.k)?, linear.bits.to_bits(), true));
+        }
+        most = most.max(linears.len());
+        held = held.max(held_bytes(linears.iter().map(|linear| linear.n * linear.k)));
+    }
+    for &(n, k) in mtp {
+        shapes.insert((dimension(n)?, dimension(k)?, f64::from(MTP_BITS).to_bits(), false));
+    }
+    Ok((shapes, held, most.min(MOST_LINEARS)))
+}
+
+fn steps_of(objects: &Qwen38Objects, run: &TrellisRun) -> Result<(Shapes, u64, usize), CalibrateError> {
+    let mut layers = Vec::new();
     for index in 0..objects.config.layers {
-        let mut numel = Vec::new();
+        let mut linears = Vec::new();
         for linear in layer(objects, index).map_err(|error| CalibrateError::failed("the layer's linears", error))? {
             if !linear.quantized {
                 continue;
@@ -121,17 +145,15 @@ fn steps_of(objects: &Qwen38Objects, run: &TrellisRun) -> Result<(Shapes, u64, u
                 .allocation
                 .rate(&linear.tensor)
                 .ok_or_else(|| CalibrateError::Failed(format!("{} has no rate in the allocation", linear.tensor)))?;
-            shapes.insert((
-                dimension(linear.rows)?,
-                dimension(linear.columns)?,
-                bits.to_bits(),
-                true,
-            ));
-            numel.push(linear.rows * linear.columns);
+            linears.push(Shape {
+                n: linear.rows,
+                k: linear.columns,
+                bits,
+            });
         }
-        most = most.max(numel.len());
-        held = held.max(held_bytes(numel));
+        layers.push(linears);
     }
+    let mut mtp = Vec::new();
     for name in MTP_LINEARS {
         let tensor = objects
             .store()
@@ -140,9 +162,30 @@ fn steps_of(objects: &Qwen38Objects, run: &TrellisRun) -> Result<(Shapes, u64, u
         let [n, k] = tensor.shape[..] else {
             return Err(CalibrateError::Failed(format!("{name} is not a matrix")));
         };
-        shapes.insert((dimension(n)?, dimension(k)?, f64::from(MTP_BITS).to_bits(), false));
+        mtp.push((n, k));
     }
-    Ok((shapes, held, most.min(MOST_LINEARS)))
+    steps(&layers, &mtp)
+}
+
+/// How many of `opened` lanes the card holds when each takes `peak`, beside the `held` bytes of a layer's weights, of
+/// `capacity` device bytes and `pinned` pinned ones. Refused, naming the sizes, when not even one fits.
+fn width_of(
+    peak: StepBytes,
+    (capacity, held, pinned): (u64, u64, u64),
+    opened: usize,
+) -> Result<usize, CalibrateError> {
+    lanes_that_fit(
+        (peak.device, peak.pinned),
+        (capacity.saturating_sub(held), pinned),
+        opened,
+    )
+    .ok_or_else(|| {
+        CalibrateError::Failed(format!(
+            "the device holds no trellis step: one takes {} device and {} pinned bytes beside the {held} the layer's \
+             weights hold, of {capacity} and {pinned}",
+            peak.device, peak.pinned
+        ))
+    })
 }
 
 /// Opens the trellis lanes and the writer. The lane pool stays open for the lanes' life: the queues hold it weakly.
@@ -202,18 +245,7 @@ pub(super) fn open(opening: Opening<'_>, run: &TrellisRun) -> Result<(Trellis, A
                 pinned: peak.pinned.max(bytes.pinned),
             };
         }
-        let width = lanes_that_fit(
-            (peak.device, peak.pinned),
-            (capacity.saturating_sub(held), settings.lane_pinned_bytes),
-            lanes.len(),
-        )
-        .ok_or_else(|| {
-            CalibrateError::Failed(format!(
-                "the device holds no trellis step: one takes {} device and {} pinned bytes beside the {held} the layer's \
-                 weights hold, of {capacity} and {}",
-                peak.device, peak.pinned, settings.lane_pinned_bytes
-            ))
-        })?;
+        let width = width_of(peak, (capacity, held, settings.lane_pinned_bytes), lanes.len())?;
         lanes.truncate(width);
     }
     let writer = Exl3Writer::new(
@@ -440,16 +472,27 @@ fn settle(inner: &Inner, lanes: Vec<TrellisLane>, results: Vec<Quantized>) -> Re
             written(trellis, suh, svh)
         })
         .collect();
-    let mut reclaimed = Ok(());
+    let (returned, reclaimed) = reclaim_all(lanes, |lane| lane.reclaim().map(drop));
+    trellis_of(inner)?.lanes.send(returned);
+    reclaimed.map(|()| written_results)
+}
+
+/// Has every lane free what it holds, even after one failed, and gives all of them back with the first failure.
+fn reclaim_all<L, E: Display>(
+    lanes: Vec<L>,
+    mut reclaim: impl FnMut(&mut L) -> Result<(), E>,
+) -> (Vec<L>, Result<(), CalibrateError>) {
+    let mut outcome = Ok(());
     let mut returned = Vec::with_capacity(lanes.len());
     for mut lane in lanes {
-        if let Err(error) = lane.reclaim() {
-            reclaimed = Err(CalibrateError::failed("freeing a trellis lane's buffers", error));
+        if let Err(error) = reclaim(&mut lane)
+            && outcome.is_ok()
+        {
+            outcome = Err(CalibrateError::failed("freeing a trellis lane's buffers", error));
         }
         returned.push(lane);
     }
-    trellis_of(inner)?.lanes.send(returned);
-    reclaimed.map(|()| written_results)
+    (returned, outcome)
 }
 
 // ---- the writer ----
@@ -727,29 +770,49 @@ fn write_layer(
     };
     let held = Arc::new(Handoff::empty());
     held.send(weights);
-    let next = Arc::clone(&inner);
-    let failed = Arc::clone(&then);
-    write(
-        &inner,
-        |writer, done| writer.layer(index, results, &bits, done),
-        Box::new(move |written| match written {
-            Err(error) => end(&failed, Err(error)),
-            Ok(()) => {
-                if !next.ledger.list([layer_file(index)]) {
-                    return end(
-                        &failed,
-                        Err(CalibrateError::Failed(
-                            "the manifest was in use when the layer's file was listed".to_owned(),
-                        )),
-                    );
-                }
-                match held.take() {
-                    Some(weights) => write_pass(next, weights, then),
-                    None => end(&failed, Err(CalibrateError::Failed("the layer was lost".to_owned()))),
-                }
-            }
-        }),
+    let (listing, passing) = (Arc::clone(&inner), Arc::clone(&inner));
+    let writing = Arc::clone(&inner);
+    written_layer(
+        move |done| {
+            write(
+                &writing,
+                |writer, ended| writer.layer(index, results, &bits, ended),
+                done,
+            )
+        },
+        move || listing.ledger.list([layer_file(index)]),
+        move |then| match held.take() {
+            Some(weights) => write_pass(passing, weights, then),
+            None => end(&then, Err(CalibrateError::Failed("the layer was lost".to_owned()))),
+        },
+        then,
     );
+}
+
+/// The steps after a layer is rounded and scattered: the writer writes its file, the manifest lists it, and only then
+/// the write pass runs over the rounded weights. A failed write lists nothing and runs no pass; a manifest in use
+/// ends the layer without the pass.
+fn written_layer(
+    write: impl FnOnce(Then<()>),
+    list: impl FnOnce() -> bool + Send + 'static,
+    pass: impl FnOnce(Once<()>) + Send + 'static,
+    then: Once<()>,
+) {
+    let failed = Arc::clone(&then);
+    write(Box::new(move |written| match written {
+        Err(error) => end(&failed, Err(error)),
+        Ok(()) => {
+            if !list() {
+                return end(
+                    &failed,
+                    Err(CalibrateError::Failed(
+                        "the manifest was in use when the layer's file was listed".to_owned(),
+                    )),
+                );
+            }
+            pass(then);
+        }
+    }));
 }
 
 // ---- the heads ----
@@ -811,6 +874,15 @@ impl Heads for TrellisDeviceHeads {
     }
 }
 
+/// What the writer checks its closing against: the source's files, and the output's files, which are the manifest's
+/// without those in the heads directory (the heads' files are not the checkpoint's).
+fn listing_of(manifest_files: Vec<String>, source_files: &[String]) -> Listing {
+    Listing {
+        source: source_files.to_vec(),
+        out: manifest_files.into_iter().filter(|file| !file.contains('/')).collect(),
+    }
+}
+
 impl TrellisHeads for TrellisDeviceHeads {
     fn close_checkpoint(&self, then: Then<Vec<String>>) {
         let inner = Arc::clone(&self.inner);
@@ -819,11 +891,7 @@ impl TrellisHeads for TrellisDeviceHeads {
                 .ledger
                 .manifest()
                 .ok_or_else(|| CalibrateError::Failed("the manifest is in use".to_owned()))?;
-            let out = manifest.files.into_iter().filter(|file| !file.contains('/')).collect();
-            let listing = Listing {
-                source: trellis.source_files.clone(),
-                out,
-            };
+            let listing = listing_of(manifest.files, &trellis.source_files);
             Ok((trellis.bits.clone(), listing, trellis.closing.clone()))
         });
         let (bits, listing, closing) = match prepared {
@@ -941,4 +1009,172 @@ fn free_mtp(inner: Arc<Inner>, rounded: Rounded, then: Then<Vec<String>>) {
             Err(error) => then(Err(error)),
         },
     );
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_types,
+    reason = "a test: the fakes record in a mutex and a failed unwrap is the failure"
+)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    fn shape(n: u64, k: u64, bits: f64) -> Shape {
+        Shape { n, k, bits }
+    }
+
+    #[test]
+    fn the_steps_are_the_distinct_shapes_and_the_layer_that_holds_most() {
+        let layers = [
+            vec![shape(4, 8, 3.0), shape(4, 8, 3.0)],
+            vec![shape(4, 8, 3.0), shape(16, 8, 3.0), shape(4, 8, 4.0)],
+        ];
+        let (shapes, held, most) = steps(&layers, &[(2, 8)]).unwrap();
+        // 4x8 at 3 bits twice is one shape; 4x8 at 4 bits and 16x8 are two more; the MTP shape has no Hessian.
+        assert_eq!(shapes.len(), 4);
+        assert!(shapes.contains(&(2, 8, f64::from(MTP_BITS).to_bits(), false)));
+        assert!(shapes.contains(&(16, 8, 3.0f64.to_bits(), true)));
+        // the second layer holds a gathered and a decoded copy of 32 + 128 + 32 weights, 2 bytes each.
+        assert_eq!(held, 2 * 2 * (32 + 128 + 32));
+        assert_eq!(most, 3);
+    }
+
+    #[test]
+    fn a_layer_with_more_linears_than_a_lane_pool_has_is_capped_and_a_model_with_none_has_one() {
+        let many = [(0..12).map(|_| shape(4, 8, 3.0)).collect::<Vec<_>>()];
+        assert_eq!(steps(&many, &[]).unwrap().2, MOST_LINEARS);
+        assert_eq!(steps(&[], &[]).unwrap().2, 1);
+    }
+
+    #[test]
+    fn a_dimension_past_32_bits_is_refused() {
+        assert!(steps(&[vec![shape(1 << 33, 8, 3.0)]], &[]).is_err());
+        assert!(steps(&[], &[(2, 1 << 33)]).is_err());
+    }
+
+    #[test]
+    fn the_width_is_what_the_scarcer_memory_holds_after_the_layer_s_weights() {
+        let peak = StepBytes { device: 10, pinned: 4 };
+        // 100 device bytes less 30 held: 7 steps; 12 pinned bytes: 3 steps.
+        assert_eq!(width_of(peak, (100, 30, 12), 8).unwrap(), 3);
+        assert_eq!(width_of(peak, (100, 30, 1000), 5).unwrap(), 5);
+    }
+
+    #[test]
+    fn a_card_that_holds_no_step_is_refused_with_the_sizes() {
+        let peak = StepBytes { device: 10, pinned: 4 };
+        let refused = width_of(peak, (35, 30, 12), 8).unwrap_err().to_string();
+        assert!(refused.contains("10 device and 4 pinned"), "{refused}");
+        assert!(refused.contains("30"), "{refused}");
+        assert!(
+            width_of(peak, (20, 30, 12), 8).is_err(),
+            "the weights alone fill the card"
+        );
+    }
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    fn log(events: &Log, event: &str) {
+        events.lock().unwrap().push(event.to_owned());
+    }
+
+    fn outcome(events: &Log) -> Once<()> {
+        let events = Arc::clone(events);
+        single(Box::new(move |result| {
+            log(&events, if result.is_ok() { "ended ok" } else { "ended failed" });
+        }))
+    }
+
+    fn written_with(written: Result<(), CalibrateError>, listed: bool) -> Vec<String> {
+        let events: Log = Arc::default();
+        let (writing, listing, passing) = (Arc::clone(&events), Arc::clone(&events), Arc::clone(&events));
+        written_layer(
+            move |done| {
+                log(&writing, "write");
+                done(written);
+            },
+            move || {
+                log(&listing, "list");
+                listed
+            },
+            move |then| {
+                log(&passing, "pass");
+                end(&then, Ok(()));
+            },
+            outcome(&events),
+        );
+        events.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_layer_is_written_then_listed_then_passed() {
+        assert_eq!(written_with(Ok(()), true), ["write", "list", "pass", "ended ok"]);
+    }
+
+    #[test]
+    fn a_layer_that_failed_to_write_is_not_listed_and_has_no_pass() {
+        let failed = written_with(Err(CalibrateError::Failed("disk".to_owned())), true);
+        assert_eq!(failed, ["write", "ended failed"]);
+    }
+
+    #[test]
+    fn a_manifest_in_use_ends_the_layer_without_its_pass() {
+        assert_eq!(written_with(Ok(()), false), ["write", "list", "ended failed"]);
+    }
+
+    #[test]
+    fn every_lane_is_given_back_and_the_first_failure_is_reported_after_all_were_freed() {
+        let mut freed = Vec::new();
+        let (returned, outcome) = reclaim_all(vec![0, 1, 2, 3], |lane: &mut i32| {
+            freed.push(*lane);
+            if *lane == 1 || *lane == 2 {
+                Err(format!("lane {lane}"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(returned, [0, 1, 2, 3]);
+        assert_eq!(freed, [0, 1, 2, 3]);
+        let refused = outcome.unwrap_err().to_string();
+        assert!(refused.contains("lane 1") && !refused.contains("lane 2"), "{refused}");
+    }
+
+    #[test]
+    fn lanes_that_all_freed_are_given_back_with_no_failure() {
+        let (returned, outcome) = reclaim_all(vec![7, 8], |_: &mut i32| Ok::<(), String>(()));
+        assert_eq!(returned, [7, 8]);
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn the_output_listing_leaves_out_the_heads_directory_and_keeps_the_source_as_given() {
+        let manifest = ["a.safetensors", "heads/text/output_head.safetensors", "mtp.safetensors"]
+            .map(str::to_owned)
+            .to_vec();
+        let source = ["config.json".to_owned()];
+        let listing = listing_of(manifest, &source);
+        assert_eq!(listing.out, ["a.safetensors", "mtp.safetensors"]);
+        assert_eq!(listing.source, ["config.json"]);
+    }
+
+    type Listed = Arc<Mutex<Vec<Result<Vec<String>, CalibrateError>>>>;
+
+    #[test]
+    fn the_heads_files_are_listed_in_the_heads_directory_and_a_failure_passes_through() {
+        let seen = Listed::default();
+        let (first, second) = (Arc::clone(&seen), Arc::clone(&seen));
+        listed_in_heads(Box::new(move |result| first.lock().unwrap().push(result)))(Ok(vec![
+            "a".to_owned(),
+            "b.json".to_owned(),
+        ]));
+        listed_in_heads(Box::new(move |result| second.lock().unwrap().push(result)))(Err(CalibrateError::Failed(
+            "x".to_owned(),
+        )));
+        let mut seen = seen.lock().unwrap().drain(..).collect::<Vec<_>>().into_iter();
+        assert_eq!(seen.next().unwrap().unwrap(), ["heads/a", "heads/b.json"]);
+        assert!(seen.next().unwrap().is_err());
+    }
 }

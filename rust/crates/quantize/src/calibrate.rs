@@ -543,7 +543,9 @@ fn run_key(
     resume_key(&parts.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
-/// The regular files of the source checkpoint's directory, by name, which the checkpoint's copied files come from.
+/// The regular files of the source checkpoint's directory, by name, which the checkpoint's copied files come from. A
+/// symbolic link to a file counts, as in a Hugging Face cache snapshot, where every file is one; a link to nothing does
+/// not. A source without `config.json` is refused, since the checkpoint it would write has no config to copy.
 #[allow(
     clippy::disallowed_methods,
     reason = "a binary: the directory is listed on its main thread before the run starts"
@@ -552,7 +554,7 @@ fn source_files(model: &Path) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
     for entry in fs::read_dir(model).map_err(|error| format!("{}: {error}", model.display()))? {
         let entry = entry.map_err(|error| format!("{}: {error}", model.display()))?;
-        if entry.file_type().map_err(|error| error.to_string())?.is_file() {
+        if entry.path().is_file() {
             let name = entry
                 .file_name()
                 .into_string()
@@ -561,6 +563,12 @@ fn source_files(model: &Path) -> Result<Vec<String>, String> {
         }
     }
     files.sort();
+    if !files.iter().any(|name| name == "config.json") {
+        return Err(format!(
+            "--model {} has no config.json, which the trellis checkpoint copies",
+            model.display()
+        ));
+    }
     Ok(files)
 }
 
@@ -613,6 +621,10 @@ fn calibrated(
     let plan = plan_for(flags.layers, model_layers);
     let draft_ids = draft_ids(draft_ids_flag(flags)?, objects.config.vocabulary)?;
     // The rates are refused before the directory or the device is touched.
+    let source_files = match &flags.trellis {
+        Some(_) => source_files(&flags.model)?,
+        None => Vec::new(),
+    };
     let allocation = match &flags.trellis {
         Some(trellis) => {
             let linears = qwen38_of(&objects).map_err(|error| error.to_string())?;
@@ -658,7 +670,7 @@ fn calibrated(
                     .map_err(|_| "--write-buffer-mib is too many bytes".to_owned())?,
                 rounding_lanes: flags.rounding_lanes,
                 source: flags.model.clone(),
-                source_files: source_files(&flags.model)?,
+                source_files,
             });
         }
         _ => {
@@ -720,6 +732,46 @@ mod tests {
     use euhedral_inference_quantization::calibrate::manifest::{Manifest, differences};
     use euhedral_inference_quantization::exl3::allocation::Linear;
     use euhedral_inference_quantization::npy::encode_elements;
+
+    #[cfg(unix)]
+    fn snapshot(files: &[&str]) -> tempfile::TempDir {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = dir.path().join("blobs");
+        fs::create_dir(&blobs).unwrap();
+        let snapshot = dir.path().join("snapshot");
+        fs::create_dir(&snapshot).unwrap();
+        for file in files {
+            fs::write(blobs.join(file), b"x").unwrap();
+            symlink(blobs.join(file), snapshot.join(file)).unwrap();
+        }
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_whose_files_are_all_symbolic_links_lists_them_all() {
+        let dir = snapshot(&["config.json", "tokenizer.json"]);
+        let listed = source_files(&dir.path().join("snapshot")).unwrap();
+        assert_eq!(listed, ["config.json", "tokenizer.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_nothing_is_not_a_source_file() {
+        use std::os::unix::fs::symlink;
+        let dir = snapshot(&["config.json"]);
+        symlink(dir.path().join("gone"), dir.path().join("snapshot").join("vocab.json")).unwrap();
+        assert_eq!(source_files(&dir.path().join("snapshot")).unwrap(), ["config.json"]);
+    }
+
+    #[test]
+    fn a_source_without_a_config_is_refused_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("tokenizer.json"), b"x").unwrap();
+        let refused = source_files(dir.path()).unwrap_err();
+        assert!(refused.contains("config.json"), "{refused}");
+    }
 
     fn words(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| word.to_string()).collect()
