@@ -36,13 +36,22 @@ pub struct Device {
 
 /// The device and the compiled `module`, or a panic naming the missing setting: a device test that skips is no check.
 pub fn device(module: Module, name: &'static str) -> (Device, Arc<Compiled<CudaModule>>) {
+    let (device, mut compiled) = device_with(&[module], name);
+    (device, compiled.remove(0))
+}
+
+/// The device and each of `modules` compiled, in order, on one lane.
+pub fn device_with(modules_wanted: &[Module], name: &'static str) -> (Device, Vec<Arc<Compiled<CudaModule>>>) {
     let path = test_support::gradle_property("euhedral.cuda.library")
         .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
     let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
     let options = ModuleOptions::beside(&library).expect("the product directory");
     let gpu = CudaGpu::open(0).expect("the device opens");
     let mut modules = Modules::<CudaModule>::open(&gpu, options).expect("the compiler gives machine code");
-    let compiled = modules.load(module).unwrap_or_else(|error| panic!("{error}"));
+    let compiled = modules_wanted
+        .iter()
+        .map(|module| modules.load(*module).unwrap_or_else(|error| panic!("{error}")))
+        .collect();
     let lanes = open_shared_lanes(&gpu, &[(name, StreamOptions::default())]).expect("a lane opens");
     let lane = Arc::clone(lanes.pool.lane(LaneId(0)));
     let device = Device {
