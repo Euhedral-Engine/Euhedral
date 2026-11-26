@@ -57,12 +57,12 @@ impl Plan {
     }
 }
 
-/// A digest of the calibration tokens' contents, in the resume key: the same file name over other tokens is another
-/// run.
-pub fn tokens_digest(tokens: &[i32]) -> String {
+/// A digest of the calibration tokens' contents, or of the draft ids', in the resume key: the same file name over
+/// other values is another run.
+pub fn values_digest(values: &[i32]) -> String {
     let mut hash = Sha256::new();
-    for token in tokens {
-        hash.update(token.to_le_bytes());
+    for value in values {
+        hash.update(value.to_le_bytes());
     }
     format!("{:x}", hash.finalize())
 }

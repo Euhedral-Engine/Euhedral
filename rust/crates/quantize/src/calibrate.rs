@@ -4,21 +4,27 @@
 //! or hold the same run's manifest with every file it lists (the run resumes from what it lists); another run's
 //! manifest, or this run's with listed files missing, is refused unless `--fresh`, which removes only the files the
 //! manifest lists and starts over; any other content is refused, and nothing is removed or written before the
-//! checkpoint and the device have opened. The
-//! trellis arm is not part of this build. Nor is the rounding of the output head, the draft head and the MTP block: a
-//! run of fewer layers than the model's stops after them and exits 0, keeping its resume file; a run of every layer
-//! writes them all but the heads and the MTP block, then exits with an error naming that gap, and its manifest stays
-//! incomplete, so the converter refuses its output. The resume file is not removed.
+//! checkpoint and the device have opened. The trellis arm is not part of this build.
+//!
+//! A run of every layer then rounds, as Java does, the MTP block (unless `--skip-mtp`), `mtp/input_projection`, the
+//! output head and the draft head, and lists each in the manifest as it is written; the resume file is dropped after
+//! the last. The draft head keeps the rows of the output head that `text/draft_head_token_ids` of the artifact named
+//! by `--draft-ids-from` select, so a run of every layer needs that flag. A run of fewer layers than the model's stops
+//! after them and exits 0, keeping its resume file. A head that fails leaves the resume file, and the next run starts
+//! at the heads.
 
 use std::env::consts;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 use euhedral_inference_quantization::calibrate::device::{Calibration, Settings as RunSettings};
+use euhedral_inference_quantization::calibrate::draft_ids::read_draft_ids;
 use euhedral_inference_quantization::calibrate::manifest::inspect;
-use euhedral_inference_quantization::calibrate::plan::{resume_key, tokens_digest};
+use euhedral_inference_quantization::calibrate::plan::{resume_key, values_digest};
 use euhedral_inference_quantization::calibrate::{Plan, drive};
 use euhedral_inference_quantization::checkpoint::objects::Qwen38Objects;
 use euhedral_inference_quantization::checkpoint::safetensors::Safetensors;
@@ -41,7 +47,7 @@ const MOST_LANES: usize = 64;
 /// The most mebibytes a size flag takes: its bytes fit in 64 bits.
 const MOST_MIB: u64 = u64::MAX >> 20;
 /// The parts of the resume key, in order, for the refusal that names what differs.
-const KEY_FIELDS: [&str; 10] = [
+const KEY_FIELDS: [&str; 12] = [
     "the tokens file",
     "the sequences",
     "the sequence length",
@@ -52,6 +58,8 @@ const KEY_FIELDS: [&str; 10] = [
     "the NVFP4 search",
     "the batch",
     "the tokens' contents",
+    "--skip-mtp",
+    "the draft ids",
 ];
 /// What the trellis arm takes: refused by name.
 const TRELLIS_OPTIONS: [&str; 3] = ["--bits", "--viterbi-scratch-mib", "--write-buffer-mib"];
@@ -95,6 +103,11 @@ pub(crate) struct Flags {
     pub upload_chunk_mib: Option<u64>,
     /// Remove the files the manifest in `--out` lists and start over, instead of resuming or refusing.
     pub fresh: bool,
+    /// Leave the MTP block out; the draft head is rounded under the output head's Hessian.
+    pub skip_mtp: bool,
+    /// The artifact whose `text/draft_head_token_ids` name the output head's rows the draft head keeps; a run of
+    /// every layer needs it.
+    pub draft_ids_from: Option<PathBuf>,
 }
 
 fn trellis_refusal(option: &str) -> String {
@@ -103,7 +116,8 @@ fn trellis_refusal(option: &str) -> String {
 
 pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
     let (mut model, mut quantization, mut output_head, mut tokens, mut out) = (None, None, None, None, None);
-    let (mut compressed, mut act_order, mut fresh) = (false, false, false);
+    let (mut compressed, mut act_order, mut fresh, mut skip_mtp) = (false, false, false, false);
+    let mut draft_ids_from = None;
     let (mut damp, mut batch, mut sequences, mut layers) = (DEFAULT_DAMP, DEFAULT_BATCH, 0, DEFAULT_LAYERS);
     let (mut above, mut scale_max) = (Nvfp4Search::DEFAULT.above(), Nvfp4Search::DEFAULT.scale_max());
     let (mut config, mut library) = (None, None);
@@ -124,8 +138,10 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
                 fresh = true;
                 continue;
             }
-            // The MTP block is not rounded by this build either way.
-            "--skip-mtp" => continue,
+            "--skip-mtp" => {
+                skip_mtp = true;
+                continue;
+            }
             _ => {}
         }
         if TRELLIS_OPTIONS.contains(&arg.as_str()) {
@@ -161,8 +177,7 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
             },
             "--output-head" => output_head = Some(value.clone()),
             "--tokens" => tokens = Some(PathBuf::from(value)),
-            // Only the heads read the draft ids, and the heads are not part of this build.
-            "--draft-ids-from" => {}
+            "--draft-ids-from" => draft_ids_from = Some(PathBuf::from(value)),
             "--out" => out = Some(PathBuf::from(value)),
             "--damp" => damp = real()?,
             "--batch" => batch = number()?,
@@ -232,6 +247,8 @@ pub(crate) fn flags(args: &[String]) -> Result<Flags, String> {
         lane_pinned_mib: lane_pinned,
         upload_chunk_mib: chunk,
         fresh,
+        skip_mtp,
+        draft_ids_from,
     })
 }
 
@@ -285,6 +302,27 @@ fn read_tokens(path: &Path, limit: usize) -> Result<(Vec<i32>, usize), String> {
     Ok((tokens, length))
 }
 
+/// The draft head's token ids from the artifact at `path`, each in `[0, vocabulary)`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a binary: its main thread reads the ids before the run starts"
+)]
+pub(crate) fn draft_ids(path: &Path, vocabulary: u64) -> Result<Vec<i32>, String> {
+    let shown = path.display();
+    let file = fs::File::open(path).map_err(|error| format!("{shown}: {error}"))?;
+    let length = file.metadata().map_err(|error| format!("{shown}: {error}"))?.len();
+    let read = |range: Range<u64>| -> Result<Vec<u8>, String> {
+        let size = usize::try_from(range.end - range.start).map_err(|_| "a region is too large".to_owned())?;
+        let mut bytes = vec![0; size];
+        let mut file = &file;
+        file.seek(SeekFrom::Start(range.start))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|error| error.to_string())?;
+        Ok(bytes)
+    };
+    read_draft_ids(length, read, vocabulary).map_err(|why| format!("{shown}: {why}"))
+}
+
 /// `mib` mebibytes as bytes of the flag `flag`, refusing a size that does not fit.
 fn mib_bytes(flag: &str, mib: u64) -> Result<u64, String> {
     mib.checked_mul(1 << 20)
@@ -314,6 +352,12 @@ pub fn run(args: &[String]) -> Outcome {
             };
         }
     };
+    if let Err(message) = draft_ids_flag(&flags) {
+        return Outcome {
+            code: EXIT_USAGE,
+            message: format!("{message}\n"),
+        };
+    }
     let (library, math_directory) = match (
         resolved(flags.library.clone(), default_library(), "--cuda-library"),
         resolved(
@@ -355,12 +399,63 @@ pub fn run(args: &[String]) -> Outcome {
     let result = calibrated(&rig, &flags, (&library, &math_directory), tokens, length);
     rig.stop();
     match result {
-        Ok(()) => Outcome {
+        Ok(Ended::Ran) => Outcome {
             code: EXIT_OK,
             message: String::new(),
         },
+        Ok(Ended::AlreadyComplete) => Outcome {
+            code: EXIT_OK,
+            message: format!(
+                "{}: the calibration is already complete and was left as it is; pass --fresh to redo it\n",
+                flags.out.display()
+            ),
+        },
         Err(message) => failed(message),
     }
+}
+
+/// How a start that did not fail ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// The run ran to its end.
+    Ran,
+    /// The directory holds this run's complete output: nothing was done.
+    AlreadyComplete,
+}
+
+/// The path of the artifact the draft head's ids are read from. Every run needs it, whatever `--layers` is, as Java's
+/// does: the ids are in the resume key, so that a start with other ids is not a resume of the run.
+fn draft_ids_flag(flags: &Flags) -> Result<&Path, String> {
+    flags
+        .draft_ids_from
+        .as_deref()
+        .ok_or_else(|| "a calibration rounds the draft head: it needs --draft-ids-from".to_owned())
+}
+
+/// What names a run, in the order of [`KEY_FIELDS`].
+fn run_key(
+    flags: &Flags,
+    recipe: &Recipe,
+    search: &Nvfp4Search,
+    (tokens, length): (&[i32], usize),
+    draft_ids: &[i32],
+) -> String {
+    let tokens_path = fs::canonicalize(&flags.tokens).unwrap_or_else(|_| flags.tokens.clone());
+    let model_path = fs::canonicalize(&flags.model).unwrap_or_else(|_| flags.model.clone());
+    resume_key(&[
+        &tokens_path.display().to_string(),
+        &(tokens.len() / length).to_string(),
+        &length.to_string(),
+        &format!("{recipe:?}"),
+        &flags.act_order.to_string(),
+        &flags.damp.to_string(),
+        &model_path.display().to_string(),
+        &format!("{search:?}"),
+        &flags.batch.to_string(),
+        &values_digest(tokens),
+        &flags.skip_mtp.to_string(),
+        &values_digest(draft_ids),
+    ])
 }
 
 #[allow(
@@ -373,7 +468,7 @@ fn calibrated(
     (library, math_directory): (&Path, &Path),
     tokens: Vec<i32>,
     length: usize,
-) -> Result<(), String> {
+) -> Result<Ended, String> {
     let (sender, receiver) = mpsc::channel();
     let sent = sender.clone();
     Safetensors::open(
@@ -409,28 +504,21 @@ fn calibrated(
     let recipe = Recipe::new(flags.quantization, flags.compressed, flags.output_head.as_deref())
         .map_err(|error| error.to_string())?;
     let search = Nvfp4Search::new(flags.nvfp4_above, flags.nvfp4_scale_max).map_err(|error| error.to_string())?;
-    let sequences = tokens.len() / length;
-    let tokens_path = fs::canonicalize(&flags.tokens).unwrap_or_else(|_| flags.tokens.clone());
-    let model_path = fs::canonicalize(&flags.model).unwrap_or_else(|_| flags.model.clone());
-    let key = resume_key(&[
-        &tokens_path.display().to_string(),
-        &sequences.to_string(),
-        &length.to_string(),
-        &format!("{recipe:?}"),
-        &flags.act_order.to_string(),
-        &flags.damp.to_string(),
-        &model_path.display().to_string(),
-        &format!("{search:?}"),
-        &flags.batch.to_string(),
-        &tokens_digest(&tokens),
-    ]);
+    let plan = plan_for(flags.layers, model_layers);
+    let draft_ids = draft_ids(draft_ids_flag(flags)?, objects.config.vocabulary)?;
+    let key = run_key(flags, &recipe, &search, (&tokens, length), &draft_ids);
     let prepared =
         inspect(&flags.out, &key, model_layers, &KEY_FIELDS, flags.fresh).map_err(|error| error.to_string())?;
+    if prepared.finished() {
+        return Ok(Ended::AlreadyComplete);
+    }
     let mut run = RunSettings::new(flags.out.clone(), recipe, prepared.manifest().clone(), tokens, length);
     run.search = search;
     run.damp = flags.damp;
     run.act_order = flags.act_order;
     run.batch = flags.batch;
+    run.skip_mtp = flags.skip_mtp;
+    run.draft_ids = draft_ids;
     if let Some(lanes) = flags.rounding_lanes {
         run.lanes = lanes;
     }
@@ -461,7 +549,6 @@ fn calibrated(
     }
     // Everything the run needs is open: only now does it change the directory.
     prepared.apply().map_err(|error| error.to_string())?;
-    let plan = plan_for(flags.layers, model_layers);
     let (sender, receiver) = mpsc::channel();
     drive(
         Arc::new(calibration),
@@ -474,7 +561,7 @@ fn calibrated(
         .recv()
         .map_err(|_| "the run ended without a result".to_owned())?
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(Ended::Ran)
 }
 
 #[cfg(test)]
@@ -485,6 +572,7 @@ fn calibrated(
 )]
 mod tests {
     use super::*;
+    use euhedral_inference_quantization::calibrate::manifest::{Manifest, differences};
     use euhedral_inference_quantization::npy::encode_elements;
 
     fn words(words: &[&str]) -> Vec<String> {
@@ -536,6 +624,10 @@ mod tests {
         assert_eq!((flags.layers, flags.batch, flags.sequences), (2, 4, 16));
         assert!(flags.act_order && flags.compressed);
         assert_eq!(flags.damp, 0.05);
+        assert!(flags.skip_mtp);
+        assert_eq!(flags.draft_ids_from, Some(PathBuf::from("a")));
+        let plain = super::flags(&with(&[])).unwrap();
+        assert!(!plain.skip_mtp && plain.draft_ids_from.is_none());
     }
 
     #[test]
@@ -599,6 +691,40 @@ mod tests {
         );
         assert_eq!(mib_bytes("--x", MOST_MIB).unwrap(), MOST_MIB << 20);
         assert!(mib_bytes("--x", MOST_MIB + 1).unwrap_err().contains("--x"));
+    }
+
+    #[test]
+    fn a_run_without_draft_ids_is_refused_for_any_layer_count_naming_the_flag() {
+        for layers in ["1", "10", "64"] {
+            let given = flags(&with(&["--layers", layers])).unwrap();
+            let why = draft_ids_flag(&given).unwrap_err();
+            assert!(why.contains("--draft-ids-from"), "{why}");
+        }
+        let given = flags(&with(&["--draft-ids-from", "a"])).unwrap();
+        assert_eq!(draft_ids_flag(&given).unwrap(), Path::new("a"));
+    }
+
+    fn key_of(extra: &[&str], draft_ids: &[i32]) -> String {
+        let given = flags(&with(extra)).unwrap();
+        let recipe = Recipe::new(given.quantization, given.compressed, given.output_head.as_deref()).unwrap();
+        let search = Nvfp4Search::new(given.nvfp4_above, given.nvfp4_scale_max).unwrap();
+        run_key(&given, &recipe, &search, (&[1, 2, 3, 4], 2), draft_ids)
+    }
+
+    #[test]
+    fn the_key_has_one_part_per_field_and_changes_with_the_skip_and_with_the_draft_ids() {
+        let key = key_of(&[], &[1, 2]);
+        assert_eq!(key.split('|').count(), KEY_FIELDS.len());
+        assert_eq!(key, key_of(&[], &[1, 2]));
+        assert_ne!(
+            key,
+            key_of(&["--skip-mtp"], &[1, 2]),
+            "a start with the MTP block skipped"
+        );
+        assert_ne!(key, key_of(&[], &[1, 3]), "a start with other ids");
+        let fields = |other: &str| differences(&Manifest::new(&key, 4), &Manifest::new(other, 4), &KEY_FIELDS);
+        assert_eq!(fields(&key_of(&["--skip-mtp"], &[1, 2])), vec!["--skip-mtp"]);
+        assert_eq!(fields(&key_of(&[], &[1, 3])), vec!["the draft ids"]);
     }
 
     #[test]

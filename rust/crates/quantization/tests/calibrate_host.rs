@@ -10,14 +10,14 @@
 use std::fmt::Debug;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_quantization::calibrate::manifest::{Ledger, Manifest, differences, inspect};
-use euhedral_inference_quantization::calibrate::plan::{resume_at, resume_header, resume_key, tokens_digest};
+use euhedral_inference_quantization::calibrate::plan::{resume_at, resume_header, resume_key, values_digest};
 use euhedral_inference_quantization::calibrate::schedule::{Schedule, Settled};
 use euhedral_inference_quantization::calibrate::{
     CalibrateError, HessianSet, Plan, Stages, Then, drive, embedding, round_order,
@@ -37,6 +37,8 @@ enum Event {
 struct Fake {
     events: Mutex<Vec<Event>>,
     fail_layer: Option<usize>,
+    /// Makes the heads fail, leaving the checkpoint as the drop would not.
+    fail_heads: AtomicBool,
     saved: AtomicUsize,
 }
 
@@ -45,6 +47,7 @@ impl Fake {
         Arc::new(Fake {
             events: Mutex::new(Vec::new()),
             fail_layer,
+            fail_heads: AtomicBool::new(false),
             saved: AtomicUsize::new(saved),
         })
     }
@@ -88,6 +91,9 @@ impl Stages for Fake {
 
     fn finish(&self, then: Then<()>) {
         self.log(Event::Finish);
+        if self.fail_heads.load(Ordering::Acquire) {
+            return then(Err(CalibrateError::Failed("a head failed".to_owned())));
+        }
         self.saved.store(0, Ordering::Release);
         then(Ok(()));
     }
@@ -131,8 +137,19 @@ fn a_full_run_reads_ahead_checkpoints_every_eighth_layer_and_finishes() {
             }
         })
         .collect();
-    assert_eq!(checkpoints, vec![8, 16]);
-    assert_eq!(events.last(), Some(&Event::Finish), "the heads come last");
+    assert_eq!(
+        checkpoints,
+        vec![8, 16, 17],
+        "the last layer's states are checkpointed too, for the heads"
+    );
+    let [.., last, finish] = &events[..] else {
+        panic!("too few events")
+    };
+    assert_eq!(
+        (last, finish),
+        (&Event::Checkpoint(17), &Event::Finish),
+        "the heads come last"
+    );
     let read_before = |layer: usize| {
         let stage = events.iter().position(|event| *event == Event::Stage(layer)).unwrap();
         let run = events.iter().position(|event| *event == Event::Layer(layer)).unwrap();
@@ -190,6 +207,32 @@ fn a_failure_mid_layer_stops_the_run_and_a_resume_starts_after_the_last_checkpoi
         vec![8, 9, 10, 11],
         "the resume repeats only the layers after the checkpoint"
     );
+}
+
+#[test]
+fn a_run_that_never_checkpoints_finishes_without_one() {
+    let fake = Fake::new(None, 0);
+    let mut plan = Plan::new(3);
+    plan.checkpoint_every = 0;
+    run(&fake, plan).unwrap();
+    assert!(!fake.events().iter().any(|event| matches!(event, Event::Checkpoint(_))));
+    assert_eq!(fake.events().last(), Some(&Event::Finish));
+}
+
+#[test]
+fn a_failure_of_the_heads_leaves_the_last_checkpoint_and_the_next_run_starts_at_the_heads() {
+    let fake = Fake::new(None, 0);
+    fake.fail_heads.store(true, Ordering::Release);
+    let error = run(&fake, Plan::new(12)).unwrap_err();
+    assert!(error.to_string().contains("a head failed"));
+    assert_eq!(
+        fake.saved.load(Ordering::Acquire),
+        12,
+        "the resume point is every layer's output, not an earlier layer"
+    );
+    let again = Fake::new(None, fake.saved.load(Ordering::Acquire));
+    run(&again, Plan::new(12)).unwrap();
+    assert_eq!(again.events(), vec![Event::Finish], "no layer runs again");
 }
 
 #[test]
@@ -1187,7 +1230,58 @@ fn a_manifest_is_complete_only_when_every_layer_and_both_heads_and_the_mtp_block
 
 #[test]
 fn the_token_digest_follows_the_tokens_contents() {
-    assert_eq!(tokens_digest(&[1, 2, 3]), tokens_digest(&[1, 2, 3]));
-    assert_ne!(tokens_digest(&[1, 2, 3]), tokens_digest(&[1, 2, 4]));
-    assert_ne!(tokens_digest(&[1, 2]), tokens_digest(&[1, 2, 0]));
+    assert_eq!(values_digest(&[1, 2, 3]), values_digest(&[1, 2, 3]));
+    assert_ne!(values_digest(&[1, 2, 3]), values_digest(&[1, 2, 4]));
+    assert_ne!(values_digest(&[1, 2]), values_digest(&[1, 2, 0]));
+}
+
+#[test]
+fn a_directory_whose_own_manifest_is_complete_is_finished_and_inspecting_it_changes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut done = Manifest::new("run", 4).after(4);
+    done.heads_done = true;
+    done.mtp_skipped = true;
+    fs::write(directory.path().join("calibration.json"), done.to_bytes().unwrap()).unwrap();
+    let before = names(directory.path());
+    let prepared = inspect(directory.path(), "run", 4, &FIELDS, false).unwrap();
+    assert!(prepared.finished());
+    assert_eq!(names(directory.path()), before);
+    assert_eq!(
+        Manifest::parse(&fs::read(directory.path().join("calibration.json")).unwrap()).unwrap(),
+        done
+    );
+    assert!(
+        !inspect(directory.path(), "run", 4, &FIELDS, true).unwrap().finished(),
+        "--fresh redoes it"
+    );
+    let mut unfinished = done.clone();
+    unfinished.heads_done = false;
+    fs::write(
+        directory.path().join("calibration.json"),
+        unfinished.to_bytes().unwrap(),
+    )
+    .unwrap();
+    assert!(!inspect(directory.path(), "run", 4, &FIELDS, false).unwrap().finished());
+    assert!(!inspect(directory.path(), "other", 4, &FIELDS, false).is_ok_and(|prepared| prepared.finished()));
+}
+
+#[test]
+fn a_new_directory_is_not_finished() {
+    let directory = tempfile::tempdir().unwrap();
+    assert!(!inspect(directory.path(), "run", 4, &FIELDS, false).unwrap().finished());
+}
+
+#[test]
+fn a_change_of_the_skip_or_the_draft_ids_is_a_difference_named_by_its_field() {
+    let fields = ["tokens", "--skip-mtp", "the draft ids"];
+    let run = |key: &str| Manifest::new(key, 4);
+    assert_eq!(
+        differences(&run("8|false|7"), &run("8|true|7"), &fields),
+        vec!["--skip-mtp"]
+    );
+    assert_eq!(
+        differences(&run("8|false|7"), &run("8|false|9"), &fields),
+        vec!["the draft ids"]
+    );
+    assert!(differences(&run("8|false|7"), &run("8|false|7"), &fields).is_empty());
 }

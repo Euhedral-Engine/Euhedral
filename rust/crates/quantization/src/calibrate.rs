@@ -13,15 +13,22 @@
 //! - [`files`], [`embedding`], [`manifest`]: a file saved whole and the resume states in chunks; the checked rows of
 //!   the embedding table; the manifest of how far a run got, and the output directory of a run of another key cleared.
 //!
-//! A run of the whole model writes every layer's objects but not the heads, the MTP block or a final cleanup:
-//! [`Stages::finish`] ends it with an error, the manifest stays incomplete and the resume file stays.
+//! - [`heads`]: what a run of the whole model writes after its layers (the MTP block, the output head, the draft head)
+//!   and the order they and the dropping of the resume file happen in; [`head_state`]: what the heads keep on the card,
+//!   and the bookkeeping around a call that holds whatever the card does.
+//!
+//! A run of the whole model checkpoints its last layer's states, rounds the heads and drops the resume file once the
+//! heads are listed; a head that fails leaves the checkpoint, and the next run starts at the heads.
 //!
 //! The rounding arm is the GPTQ one. A format whose rounding differs (trellis) plugs in at [`Stages::layer`].
 
 pub mod device;
+pub mod draft_ids;
 pub mod driver;
 pub mod embedding;
 pub mod files;
+pub mod head_state;
+pub mod heads;
 pub mod hessians;
 pub mod manifest;
 pub mod plan;
