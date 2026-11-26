@@ -322,9 +322,9 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
-      # Measured (a run stopped at 15 GB asked): 25.4 GB on the card, because two tests of the API server binary hold an engine each, 8 GB of host memory.
-      ARBITER_ARGS: "--gpu shared:26.5 --mem 12G"
-      ARBITER_EST: "400"
+      # Measured: 12.7 GB on the card (one engine at a time), 5.4 GB of host memory, 74 s.
+      ARBITER_ARGS: "--gpu shared:13.5 --mem 8G"
+      ARBITER_EST: "240"
     steps:
       - uses: actions/checkout@v4
       - name: Download the device tests
@@ -454,7 +454,7 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
-      # From the whole engine binary's run (22.1 GB on the card, 30 to 32 GB of host memory over all its tests, 740 s): what remains after the other two groups.
+      # Measured: 22.1 GB on the card, 23.4 GB of host memory, 53 model loads, 582 s.
       ARBITER_ARGS: "--gpu shared:22.5 --mem 28G"
       ARBITER_EST: "700"
     steps:
