@@ -3,6 +3,7 @@
 //!
 //! - [`SourceSet`]: the source artifacts, opened and checked against each other. It answers the search's questions
 //!   about the objects ([`Sources`](crate::mixed::Sources)).
+//! - [`read_object`]: one object of a source in host memory, with its trellis companions checked.
 //! - [`view`]: which object comes from which source, in the order the written artifact holds them.
 //! - [`write`]: the artifact as a file, each payload copied from its source in chunks, through `AsyncIo`.
 //!
@@ -14,6 +15,7 @@
 mod artifact;
 mod chunks;
 mod command;
+mod object;
 mod sources;
 mod view;
 mod write;
@@ -27,9 +29,8 @@ use crate::checkpoint::CheckpointError;
 use crate::mixed::MixedError;
 
 pub use artifact::ArtifactFile;
-// What `SourceSet::descriptor` returns and the companions of a trellis object are read with.
 pub use command::{Assembled, Request, run};
-pub use euhedral_inference_edrl::{TensorEntry, TrellisCompanions, WeightFormat};
+pub use object::{ObjectBytes, TrellisBytes, read_object};
 pub use sources::{COMPANION_SUFFIXES, SourceSet};
 pub use view::{Piece, View, view};
 pub use write::write;

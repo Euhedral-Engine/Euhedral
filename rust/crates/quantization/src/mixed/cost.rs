@@ -113,6 +113,11 @@ impl Plan {
         })
     }
 
+    /// The options of the plan, in order.
+    pub fn options(&self) -> impl Iterator<Item = QuantOption> + '_ {
+        self.options.iter().copied()
+    }
+
     fn max_rows(&self) -> u32 {
         self.rows.iter().copied().max().unwrap_or(1)
     }
@@ -134,6 +139,47 @@ fn copies_for(payload: i64, rotate_bytes: u64) -> Result<usize, MixedError> {
     usize::try_from(rotate_bytes.div_ceil(payload).max(1)).map_err(|_| MixedError::invalid("too many copies"))
 }
 
+/// The objects `measure` loads, in order: the first projection of the base of each distinct shape.
+pub fn measured_objects(sources: &dyn Sources) -> Result<Vec<(Shape, &str)>, MixedError> {
+    let mut first_of_shape: Vec<(Shape, &str)> = Vec::new();
+    for name in sources.projections() {
+        let shape = sources.shape(sources.base(), name)?;
+        if first_of_shape.iter().all(|(known, _)| *known != shape) {
+            first_of_shape.push((shape, name));
+        }
+    }
+    Ok(first_of_shape)
+}
+
+/// The time of the launches of one timed run, behind a gate of as many copies as it takes to hide them.
+///
+/// `attempt(copies)` makes one timed run behind a gate of `copies` and returns the time of the launches, or `None` when
+/// the gate had ended before the last launch was queued (the time then holds a host gap and is not a measurement). A
+/// run that was not hidden is repeated behind a gate twice as long, up to `max_copies`, which is where it is refused.
+/// Refuses a gate of no copies. Returns the time and the length of the gate that hid the launches, which the next run may start from. An attempt's
+/// own error ends the loop at once and is returned as it is.
+pub fn hide_launches(
+    start_copies: usize,
+    max_copies: usize,
+    mut attempt: impl FnMut(usize) -> Result<Option<Duration>, MixedError>,
+) -> Result<(Duration, usize), MixedError> {
+    if start_copies == 0 {
+        return Err(MixedError::invalid("a gate of 0 copies hides nothing"));
+    }
+    let mut copies = start_copies;
+    loop {
+        if let Some(elapsed) = attempt(copies)? {
+            return Ok((elapsed, copies));
+        }
+        if copies >= max_copies {
+            return Err(MixedError::invalid(format!(
+                "the launches outran a gate of {copies} copies, so their time holds a host gap: use fewer --repeats"
+            )));
+        }
+        copies = copies.saturating_mul(2).min(max_copies);
+    }
+}
+
 /// Times one launch of each option's linear for every distinct projection shape of `sources`, at each row count of
 /// `plan`, on `bench`: the cost table (with no fixed terms) the allocation search reads.
 ///
@@ -148,15 +194,8 @@ pub fn measure(
     bench: &mut dyn Bench,
     report: &mut dyn FnMut(&Timed),
 ) -> Result<CostTable, MixedError> {
-    let mut first_of_shape: Vec<(Shape, &str)> = Vec::new();
-    for name in sources.projections() {
-        let shape = sources.shape(sources.base(), name)?;
-        if first_of_shape.iter().all(|(known, _)| *known != shape) {
-            first_of_shape.push((shape, name));
-        }
-    }
     let mut micros = BTreeMap::new();
-    for (shape, name) in first_of_shape {
+    for (shape, name) in measured_objects(sources)? {
         for option in QuantOption::ALL
             .into_iter()
             .filter(|option| plan.options.contains(option))
@@ -286,6 +325,52 @@ mod tests {
 
     fn measured(bench: &mut Recorder, plan: &Plan) -> Result<CostTable, MixedError> {
         measure(&Fake::new(), plan, bench, &mut |_| {})
+    }
+
+    #[test]
+    fn a_run_not_hidden_is_repeated_behind_a_gate_twice_as_long_until_it_is() {
+        let mut seen = Vec::new();
+        let result = hide_launches(4, 8192, |copies| {
+            seen.push(copies);
+            Ok((seen.len() == 3).then_some(Duration::from_micros(7)))
+        });
+        assert_eq!(result.unwrap(), (Duration::from_micros(7), 16));
+        assert_eq!(seen, [4, 8, 16]);
+    }
+
+    #[test]
+    fn launches_that_are_never_hidden_are_refused_at_the_bound_naming_the_cause() {
+        let mut seen = Vec::new();
+        let error = hide_launches(4, 32, |copies| {
+            seen.push(copies);
+            Ok(None)
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(seen, [4, 8, 16, 32]);
+        assert!(error.contains("outran a gate of 32 copies"), "{error}");
+        assert!(error.contains("fewer --repeats"), "{error}");
+    }
+
+    #[test]
+    fn a_gate_of_no_copies_is_refused_before_any_attempt() {
+        let error = hide_launches(0, 32, |_| panic!("attempted")).unwrap_err().to_string();
+        assert!(error.contains("0 copies"), "{error}");
+    }
+
+    #[test]
+    fn an_attempts_error_passes_through_and_ends_the_loop() {
+        let mut attempts = 0;
+        let error = hide_launches(4, 8192, |_| {
+            attempts += 1;
+            if attempts == 2 {
+                return Err(MixedError::invalid("the span was lost"));
+            }
+            Ok(None)
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), MixedError::invalid("the span was lost").to_string());
+        assert_eq!(attempts, 2);
     }
 
     #[test]

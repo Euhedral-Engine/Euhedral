@@ -1,9 +1,10 @@
 //! The `cost` command: times each option's linear launch per projection shape and row count on the card, through the
 //! engine's own linear formats, and writes the cost table `allocate --costs` reads.
 //!
-//! The measurement is [`measure`]; this command parses the flags, opens the sources, checks each against its option,
-//! runs the measurement on a [`DeviceBench`] and writes the table through a `.part` file renamed into place, so a run
-//! that fails leaves no output (an earlier output stays as it was).
+//! The measurement is [`measure`]; this command parses the flags, checks that the output can be written, opens the
+//! sources, checks each against its option and every trellis object it will time, runs the measurement on a
+//! [`DeviceBench`] and writes the table through a `.part` file renamed into place, so a run that fails leaves no output
+//! (an earlier output stays as it was). Everything it can refuse is refused before the card is opened.
 
 mod bench;
 
@@ -17,11 +18,11 @@ use euhedral_inference_cuda::CudaLibrary;
 use euhedral_inference_quantization::assemble::SourceSet;
 use euhedral_inference_quantization::mixed::{
     CostTable, DEFAULT_REPEATS, DEFAULT_ROTATE_MIB, DEFAULT_ROWS, MixedError, Plan, QuantOption, Timed, check_format,
-    measure,
+    measure, measured_objects,
 };
 use euhedral_inference_settings::{Settings, load_for_tool, process_env};
 
-use self::bench::DeviceBench;
+use self::bench::{DeviceBench, fetch};
 use crate::rig::Rig;
 use crate::score::default_library;
 use crate::{EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, Outcome};
@@ -115,6 +116,9 @@ pub fn run(args: &[String]) -> Outcome {
         Ok(flags) => flags,
         Err(message) => return usage_error(&message),
     };
+    if let Err(message) = check_out(&flags.out) {
+        return usage_error(&message);
+    }
     let Some(library) = flags.library.clone().or_else(default_library) else {
         return usage_error("cost needs --cuda-library on this platform");
     };
@@ -139,12 +143,18 @@ pub fn run(args: &[String]) -> Outcome {
     }
 }
 
-/// Opens the sources on the host runtime, then measures on the card on the calling thread.
+/// Measures with the host runtime up, so the bench reads each object through its asynchronous I/O, and stops it after.
 fn measured(settings: &Settings, flags: &Flags, library: &Path) -> Result<CostTable, String> {
     let rig = Rig::start(settings)?;
+    let table = measured_on(&rig, settings, flags, library);
+    rig.stop();
+    table
+}
+
+fn measured_on(rig: &Rig, settings: &Settings, flags: &Flags, library: &Path) -> Result<CostTable, String> {
     let chunk_bytes = usize::try_from(settings.host.copy_chunk_bytes.bytes()).unwrap_or(usize::MAX);
     let (sender, receiver) = mpsc::channel();
-    let started = SourceSet::open(
+    SourceSet::open(
         &rig.io,
         &flags.sources,
         flags.base,
@@ -153,16 +163,12 @@ fn measured(settings: &Settings, flags: &Flags, library: &Path) -> Result<CostTa
             // The receiver is gone only when the run was abandoned.
             let _ = sender.send(opened);
         }),
-    );
-    let opened = match started {
-        Ok(()) => receiver
-            .recv()
-            .map_err(|_| "the sources were not opened".to_owned())
-            .and_then(|opened| opened.map_err(|error| error.to_string())),
-        Err(error) => Err(error.to_string()),
-    };
-    rig.stop();
-    let sources = opened?;
+    )
+    .map_err(|error| error.to_string())?;
+    let sources = receiver
+        .recv()
+        .map_err(|_| "the sources were not opened".to_owned())?
+        .map_err(|error| error.to_string())?;
     let plan = Plan::new(
         sources.options(),
         flags.rows.clone(),
@@ -171,9 +177,21 @@ fn measured(settings: &Settings, flags: &Flags, library: &Path) -> Result<CostTa
     )
     .map_err(|error| error.to_string())?;
     check_sources(&sources).map_err(|error| error.to_string())?;
+    check_trellis_objects(rig, &sources, &plan).map_err(|error| error.to_string())?;
     let library = CudaLibrary::load(library).map_err(|error| format!("the CUDA library: {error}"))?;
-    let mut bench = DeviceBench::open(&library, settings, &sources).map_err(|error| error.to_string())?;
+    let mut bench = DeviceBench::open(&library, settings, &sources, &rig.io).map_err(|error| error.to_string())?;
     measure(&sources, &plan, &mut bench, &mut report).map_err(|error| error.to_string())
+}
+
+/// Reads every trellis object the measurement will load, so that one whose companions do not fit it is refused now and
+/// not after the card has timed the objects before it.
+fn check_trellis_objects(rig: &Rig, sources: &SourceSet, plan: &Plan) -> Result<(), MixedError> {
+    for (_, name) in measured_objects(sources)? {
+        for option in plan.options().filter(|option| *option != QuantOption::Nvfp4) {
+            fetch(&rig.io, sources, option, name)?;
+        }
+    }
+    Ok(())
 }
 
 /// Each source stores every projection of the base in the format its option names.
@@ -201,11 +219,28 @@ fn report(timed: &Timed) {
     );
 }
 
-/// Writes `table` to `out` through `out.part`, which a failure removes: `out` is complete or as it was.
-fn write(out: &Path, table: &CostTable) -> Result<(), String> {
+/// The file `out` is written through.
+fn part_of(out: &Path) -> PathBuf {
     let mut part = out.as_os_str().to_owned();
     part.push(".part");
-    let part = PathBuf::from(part);
+    PathBuf::from(part)
+}
+
+/// Refuses an output that cannot be written, before anything is measured: its directory must exist and take a
+/// `.part` file, which is removed again.
+fn check_out(out: &Path) -> Result<(), String> {
+    let part = part_of(out);
+    File::create(&part)
+        .and_then(|file| {
+            drop(file);
+            remove_file(&part)
+        })
+        .map_err(|error| format!("--out {} cannot be written: {error}", out.display()))
+}
+
+/// Writes `table` to `out` through `out.part`, which a failure removes: `out` is complete or as it was.
+fn write(out: &Path, table: &CostTable) -> Result<(), String> {
+    let part = part_of(out);
     let written = File::create(&part)
         .and_then(|mut file| {
             file.write_all(table.render().as_bytes())?;
@@ -300,8 +335,35 @@ mod tests {
         write_file(out.join("keep"), b"earlier").unwrap();
         assert!(write(&out, &table()).is_err());
         assert!(out.join("keep").is_file());
-        let mut part = out.as_os_str().to_owned();
-        part.push(".part");
-        assert!(!Path::new(&part).exists());
+        assert!(!part_of(&out).exists());
+    }
+
+    #[test]
+    fn an_output_in_a_missing_directory_is_refused_before_any_source_is_opened() {
+        let directory = tempfile::tempdir().unwrap();
+        let out = directory.path().join("missing").join("COSTS.json");
+        let outcome = run(&words(&[
+            "--source",
+            "nvfp4=no-such-artifact.edrl",
+            "--base",
+            "nvfp4",
+            "--out",
+            out.to_str().unwrap(),
+            "--cuda-library",
+            "no-such-library.so",
+        ]));
+        assert_eq!(outcome.code, EXIT_USAGE);
+        assert!(
+            outcome.message.contains("--out") && outcome.message.contains("COSTS.json"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    #[test]
+    fn a_writable_output_passes_the_check_and_leaves_nothing_behind() {
+        let directory = tempfile::tempdir().unwrap();
+        check_out(&directory.path().join("COSTS.json")).unwrap();
+        assert_eq!(read_dir(directory.path()).unwrap().count(), 0);
     }
 }

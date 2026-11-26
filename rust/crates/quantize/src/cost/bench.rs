@@ -4,13 +4,13 @@
 //! The launches of a timed run are queued behind a gate, a long device copy, so the host finishes queueing them while
 //! the card is still busy and the time between the span's two events holds the launches and no host gap. A run is
 //! valid only if the gate had not ended when the last launch was queued; a run that fails this is repeated behind a
-//! longer gate.
+//! longer gate ([`hide_launches`]).
+//!
+//! An object's bytes are read through the asynchronous I/O of the rig the command keeps up while it measures
+//! ([`fetch`]), and uploaded once for each copy.
 
-use std::collections::BTreeMap;
 use std::fmt::Display;
-use std::fs::File;
-use std::os::unix::fs::FileExt;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use euhedral_gpu::cuda::{CudaGpu, CudaStream};
@@ -19,17 +19,19 @@ use euhedral_graph::DeviceQueue;
 use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::load::{KernelTable, load};
 use euhedral_inference_cuda::launch::ops::RusteeOps;
-use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, KernelOps};
+use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, DevicePtr, KernelOps};
 use euhedral_inference_engine::formats::{LinearFormat, LinearMode, Nvfp4Linear, ScratchRegion, TrellisLinear};
 use euhedral_inference_engine::kernels::kernel_sources;
 use euhedral_inference_engine::model::{Residence, TrellisParts, WeightRef};
 use euhedral_inference_engine::runtime::open_device;
-use euhedral_inference_quantization::assemble::{SourceSet, TensorEntry, TrellisCompanions, WeightFormat};
-use euhedral_inference_quantization::mixed::{Bench, MixedError, QuantOption, Shape, launch_mode};
+use euhedral_inference_quantization::assemble::{ObjectBytes, SourceSet, TrellisBytes, read_object};
+use euhedral_inference_quantization::mixed::{Bench, MixedError, QuantOption, Shape, hide_launches, launch_mode};
 use euhedral_inference_settings::Settings;
+use euhedral_io::AsyncIo;
 
-/// BF16 1.0: what the input is filled with, so the launches read real values and not denormals or zeros.
-const BF16_ONE: u16 = 0x3C00;
+/// BF16 0.0078125 (2^-7), the bits the input is filled with: a normal, nonzero value, so the launches read real values
+/// and not denormals or zeros. (Java fills with the same bits.)
+const BF16_INPUT_FILL: u16 = 0x3C00;
 /// One gate copy moves this many bytes each way.
 const GATE_CHUNK_BYTES: usize = 64 << 20;
 /// The gate's first length, in copies.
@@ -42,6 +44,32 @@ const BUSY_TRIES: usize = 1 << 20;
 
 fn failed(what: &str, error: impl Display) -> MixedError {
     MixedError::Invalid(format!("{what}: {error}"))
+}
+
+/// Reads the object `name` of `option`'s source through `io`, from a thread that is not one of the lattice's workers,
+/// and returns when it was read.
+pub fn fetch(
+    io: &Arc<AsyncIo>,
+    sources: &SourceSet,
+    option: QuantOption,
+    name: &str,
+) -> Result<ObjectBytes, MixedError> {
+    let artifact = sources.artifact(option).map_err(|error| failed(name, error))?;
+    let (sender, receiver) = mpsc::channel();
+    read_object(
+        io,
+        artifact,
+        name,
+        Arc::new(move |read| {
+            // The receiver is gone only when the run was abandoned.
+            let _ = sender.send(read);
+        }),
+    )
+    .map_err(|error| failed(name, error))?;
+    receiver
+        .recv()
+        .map_err(|_| failed(name, "the read did not finish"))?
+        .map_err(|error| failed(name, error))
 }
 
 /// The engine's format for the objects `option` stores.
@@ -67,7 +95,7 @@ struct Operands {
 /// The card, its kernels and the stream the launches run on.
 pub struct DeviceBench<'a> {
     sources: &'a SourceSet,
-    files: BTreeMap<QuantOption, File>,
+    io: Arc<AsyncIo>,
     library: Arc<CudaLibrary>,
     table: Arc<KernelTable>,
     stream: CudaStream,
@@ -86,6 +114,7 @@ impl<'a> DeviceBench<'a> {
         library: &Arc<CudaLibrary>,
         settings: &Settings,
         sources: &'a SourceSet,
+        io: &Arc<AsyncIo>,
     ) -> Result<DeviceBench<'a>, MixedError> {
         let gpu: Arc<CudaGpu> = open_device(library).map_err(|error| failed("the device", error))?;
         let kernel_sources = kernel_sources(library, settings).map_err(|error| failed("the kernel sources", error))?;
@@ -102,7 +131,7 @@ impl<'a> DeviceBench<'a> {
         ];
         Ok(DeviceBench {
             sources,
-            files: BTreeMap::new(),
+            io: Arc::clone(io),
             library: Arc::clone(library),
             table,
             stream,
@@ -114,25 +143,6 @@ impl<'a> DeviceBench<'a> {
             loaded: None,
             operands: None,
         })
-    }
-
-    /// The bytes of `entry` in `option`'s source.
-    fn read(&mut self, option: QuantOption, entry: &TensorEntry) -> Result<Vec<u8>, MixedError> {
-        if !self.files.contains_key(&option) {
-            let path = self.sources.path(option).map_err(|error| failed("the source", error))?;
-            let file = File::open(path).map_err(|error| failed("the source", error))?;
-            self.files.insert(option, file);
-        }
-        let range = entry.range();
-        let length = usize::try_from(range.end - range.start).map_err(|_| failed(entry.name(), "too large to read"))?;
-        let mut bytes = vec![0; length];
-        let file = self
-            .files
-            .get(&option)
-            .ok_or_else(|| failed("the source", "not open"))?;
-        file.read_exact_at(&mut bytes, range.start)
-            .map_err(|error| failed(entry.name(), error))?;
-        Ok(bytes)
     }
 
     fn upload(&self, bytes: &[u8]) -> Result<DeviceBuffer, MixedError> {
@@ -149,45 +159,39 @@ impl<'a> DeviceBench<'a> {
         self.library.synchronize().map_err(|error| failed("the card", error))
     }
 
-    /// The weights of one copy of `object` from the bytes already read, uploaded into `buffers`.
+    /// The weights of one copy of `object`, uploaded into `buffers`: `weight` is told the addresses of the copy.
     fn copy_of(
         &self,
-        entry: &TensorEntry,
-        payload: &[u8],
-        companions: Option<[&[u8]; 3]>,
+        weight: &dyn Fn(DevicePtr, Option<TrellisParts>) -> WeightRef,
+        object: &ObjectBytes,
         buffers: &mut Vec<DeviceBuffer>,
     ) -> Result<WeightRef, MixedError> {
-        let body = self.upload(payload)?;
-        let (ptr, bytes) = (body.ptr(), payload.len() as u64);
+        let body = self.upload(&object.bytes)?;
+        let ptr = body.ptr();
         buffers.push(body);
-        let trellis = match companions {
+        let trellis = match &object.trellis {
             None => None,
-            Some([suh, svh, segments]) => {
-                let ends = TrellisCompanions::parse(segments).map_err(|error| failed(entry.name(), error))?;
-                let [suh, svh, segments_buffer] = [suh, svh, segments].map(|bytes| self.upload(bytes));
-                let (suh, svh, segments_buffer) = (suh?, svh?, segments_buffer?);
+            Some(TrellisBytes {
+                suh,
+                svh,
+                segments,
+                segment_ends,
+                suh_rows,
+            }) => {
+                let [suh, svh, segments] = [suh, svh, segments].map(|bytes| self.upload(bytes));
+                let (suh, svh, segments) = (suh?, svh?, segments?);
                 let parts = TrellisParts {
                     suh: suh.ptr(),
                     svh: svh.ptr(),
-                    segments: segments_buffer.ptr(),
-                    suh_rows: ends.len() as u64,
-                    segment_ends: Arc::from(ends),
+                    segments: segments.ptr(),
+                    suh_rows: *suh_rows,
+                    segment_ends: Arc::clone(segment_ends),
                 };
-                buffers.extend([suh, svh, segments_buffer]);
+                buffers.extend([suh, svh, segments]);
                 Some(parts)
             }
         };
-        Ok(WeightRef {
-            name: entry.name().to_owned(),
-            shape: entry.shape().to_vec(),
-            dtype: entry.dtype(),
-            format: entry.format(),
-            layout: entry.layout(),
-            ptr,
-            bytes,
-            residence: Residence::Device,
-            trellis,
-        })
+        Ok(weight(ptr, trellis))
     }
 
     /// Queues one launch of the linear of each copy in `order`, `rows` rows each.
@@ -266,7 +270,7 @@ impl Bench for DeviceBench<'_> {
     fn load(
         &mut self,
         option: QuantOption,
-        object: &str,
+        name: &str,
         shape: Shape,
         copies: usize,
         max_rows: u32,
@@ -274,27 +278,24 @@ impl Bench for DeviceBench<'_> {
         self.settle()?;
         self.loaded = None;
         self.operands = None;
-        let parts = self
-            .sources
-            .object_with_companions(option, object)
-            .map_err(|error| failed(object, error))?;
-        let entries: Vec<TensorEntry> = parts.into_iter().cloned().collect();
-        let mut bytes = Vec::new();
-        for entry in &entries {
-            bytes.push(self.read(option, entry)?);
-        }
-        let main = entries.first().ok_or_else(|| failed(object, "no descriptor"))?;
-        let companions = match (main.format(), bytes.as_slice()) {
-            (WeightFormat::Trellis, [_, suh, svh, segments]) => {
-                Some([suh.as_slice(), svh.as_slice(), segments.as_slice()])
-            }
-            (WeightFormat::Trellis, _) => return Err(failed(object, "a trellis object lacks a companion")),
-            _ => None,
+        let object = fetch(&self.io, self.sources, option, name)?;
+        let sources = self.sources;
+        let entry = sources.descriptor(option, name).map_err(|error| failed(name, error))?;
+        let weight = |ptr: DevicePtr, trellis: Option<TrellisParts>| WeightRef {
+            name: entry.name().to_owned(),
+            shape: entry.shape().to_vec(),
+            dtype: entry.dtype(),
+            format: entry.format(),
+            layout: entry.layout(),
+            ptr,
+            bytes: object.bytes.len() as u64,
+            residence: Residence::Device,
+            trellis,
         };
         let mut buffers = Vec::new();
         let mut weights = Vec::with_capacity(copies);
         for _ in 0..copies {
-            weights.push(self.copy_of(main, &bytes[0], companions, &mut buffers)?);
+            weights.push(self.copy_of(&weight, &object, &mut buffers)?);
         }
         let rows = max_rows as usize;
         let (input, output) = (shape.input as usize, shape.output as usize);
@@ -314,7 +315,7 @@ impl Bench for DeviceBench<'_> {
         .map(|mode| format.scratch_bytes(&weights[0], rows, mode))
         .max()
         .unwrap_or(0);
-        let ones: Vec<u8> = (0..rows * input).flat_map(|_| BF16_ONE.to_le_bytes()).collect();
+        let ones: Vec<u8> = (0..rows * input).flat_map(|_| BF16_INPUT_FILL.to_le_bytes()).collect();
         let operands = Operands {
             x: self.upload(&ones)?,
             y: DeviceBuffer::alloc(&self.library, (rows * output * 2).max(256))
@@ -338,20 +339,11 @@ impl Bench for DeviceBench<'_> {
     }
 
     fn time(&mut self, rows: u32, order: &[usize]) -> Result<Duration, MixedError> {
-        loop {
-            if let Some(elapsed) = self.timed_once(rows, order)? {
-                return Ok(elapsed);
-            }
-            if self.gate_copies >= GATE_MAX_COPIES {
-                return Err(failed(
-                    "the timed run",
-                    format!(
-                        "the launches could not be queued behind a gate of {} copies",
-                        self.gate_copies
-                    ),
-                ));
-            }
-            self.gate_copies *= 2;
-        }
+        let (elapsed, copies) = hide_launches(self.gate_copies, GATE_MAX_COPIES, |copies| {
+            self.gate_copies = copies;
+            self.timed_once(rows, order)
+        })?;
+        self.gate_copies = copies;
+        Ok(elapsed)
     }
 }
