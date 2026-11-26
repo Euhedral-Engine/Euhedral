@@ -8,9 +8,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::mem;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::thread;
 
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 
@@ -50,8 +52,15 @@ pub type Outcome<B> = Result<Lease<B>, Arc<LoadError>>;
 
 type Done<B> = Box<dyn FnOnce(Outcome<B>) + Send>;
 
+/// What is called after an object's memory is back.
+type Freed = Box<dyn Fn() + Send + Sync>;
+
 struct Inner<B: Backend> {
     backend: B,
+    /// Where the free of an object runs: a pinned or device free must not block the worker that dropped the last lease.
+    frames: Arc<dyn Frames>,
+    freed: Option<Freed>,
+    frees: AtomicUsize,
     table: LifecycleMutex<HashMap<Key, Weak<Slot<B>>>>,
     resident: AtomicU64,
     loads: AtomicUsize,
@@ -88,8 +97,18 @@ impl<B: Backend> Slot<B> {
             }
             mem::take(&mut *waiting)
         };
+        // One callback that panics must not leave the others uncalled: each runs, and the first panic is raised after.
+        let mut first = None;
         for done in waiting {
-            self.deliver(done);
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| self.deliver(done))) {
+                first.get_or_insert(payload);
+            }
+        }
+        // A completion that runs while a panic unwinds (a load that panicked) raises nothing more.
+        if let Some(payload) = first
+            && !thread::panicking()
+        {
+            panic::resume_unwind(payload);
         }
     }
 
@@ -104,14 +123,44 @@ impl<B: Backend> Slot<B> {
 
 impl<B: Backend> Drop for Slot<B> {
     fn drop(&mut self) {
+        // The last lease is gone: the object ends in a frame of its own. Until it does, its bytes still count as held,
+        // so that an engine is not admitted into memory that is not yet back.
+        let free = Free {
+            cache: Arc::clone(&self.cache),
+            key: self.key.clone(),
+            bytes: self.bytes,
+            object: self.result.take(),
+        };
+        self.cache.frees.fetch_add(1, Ordering::AcqRel);
+        // A frame source that refuses the task drops it, which frees the object all the same.
+        self.cache.frames.submit(Box::new(move || drop(free)));
+    }
+}
+
+/// The end of one object: dropping it frees the object (with no lock held: its drop may do anything, a new acquisition
+/// of the same key included, which finds the slot dead and makes its own), gives its bytes back, takes its key out of
+/// the table and tells the cache's observer.
+struct Free<B: Backend> {
+    cache: Arc<Inner<B>>,
+    key: Key,
+    bytes: u64,
+    object: Option<Result<B::Handle, Arc<LoadError>>>,
+}
+
+impl<B: Backend> Drop for Free<B> {
+    fn drop(&mut self) {
         let _cold = HotScope::leave();
-        // The object goes first, with no lock held: its drop may do anything, a new acquisition of the same key
-        // included, which then finds this slot dead and makes its own.
-        drop(self.result.take());
+        drop(self.object.take());
         self.cache.resident.fetch_sub(self.bytes, Ordering::AcqRel);
-        let mut table = self.cache.table.lock();
-        if table.get(&self.key).is_some_and(|slot| slot.strong_count() == 0) {
-            table.remove(&self.key);
+        {
+            let mut table = self.cache.table.lock();
+            if table.get(&self.key).is_some_and(|slot| slot.strong_count() == 0) {
+                table.remove(&self.key);
+            }
+        }
+        self.cache.frees.fetch_sub(1, Ordering::AcqRel);
+        if let Some(freed) = &self.cache.freed {
+            freed();
         }
     }
 }
@@ -124,11 +173,13 @@ struct Loader<B: Backend> {
 
 impl<B: Backend> Loader<B> {
     fn run(mut self) {
+        // The slot stays here while the backend loads: a load that panics drops this loader, which fails the waiters.
+        let Some(slot) = &self.slot else { return };
+        let result = slot.cache.backend.load(&slot.key, slot.bytes).map_err(Arc::new);
+        if result.is_ok() {
+            slot.cache.loads.fetch_add(1, Ordering::AcqRel);
+        }
         if let Some(slot) = self.slot.take() {
-            let result = slot.cache.backend.load(&slot.key, slot.bytes).map_err(Arc::new);
-            if result.is_ok() {
-                slot.cache.loads.fetch_add(1, Ordering::AcqRel);
-            }
             slot.complete(result);
         }
     }
@@ -190,10 +241,24 @@ pub struct WeightCache<B: Backend> {
 }
 
 impl<B: Backend> WeightCache<B> {
-    pub fn new(backend: B) -> WeightCache<B> {
+    /// A cache over `backend`; the objects that end are freed in frames of `frames`.
+    pub fn new(backend: B, frames: Arc<dyn Frames>) -> WeightCache<B> {
+        Self::build(backend, frames, None)
+    }
+
+    /// As [`new`](Self::new), and `freed` is called each time an object's memory is back (after its handle dropped and
+    /// its bytes left [`resident_bytes`](Self::resident_bytes)): the moment to run admission again.
+    pub fn with_freed(backend: B, frames: Arc<dyn Frames>, freed: impl Fn() + Send + Sync + 'static) -> WeightCache<B> {
+        Self::build(backend, frames, Some(Box::new(freed)))
+    }
+
+    fn build(backend: B, frames: Arc<dyn Frames>, freed: Option<Freed>) -> WeightCache<B> {
         WeightCache {
             inner: Arc::new(Inner {
                 backend,
+                frames,
+                freed,
+                frees: AtomicUsize::new(0),
                 table: LifecycleMutex::new(HashMap::new()),
                 resident: AtomicU64::new(0),
                 loads: AtomicUsize::new(0),
@@ -242,7 +307,7 @@ impl<B: Backend> WeightCache<B> {
             .is_some_and(|slot| slot.strong_count() > 0)
     }
 
-    /// Bytes of the objects held, those still loading included, until the memory of an object that ended is free.
+    /// Bytes of the objects held, those still loading included, until the memory of an object that ended is back.
     pub fn resident_bytes(&self) -> u64 {
         self.inner.resident.load(Ordering::Acquire)
     }
@@ -250,6 +315,11 @@ impl<B: Backend> WeightCache<B> {
     /// Objects loaded so far.
     pub fn loads(&self) -> usize {
         self.inner.loads.load(Ordering::Acquire)
+    }
+
+    /// Objects that ended and whose memory is not back yet.
+    pub fn frees_in_flight(&self) -> usize {
+        self.inner.frees.load(Ordering::Acquire)
     }
 
     /// Objects held.

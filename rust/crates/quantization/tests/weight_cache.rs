@@ -48,7 +48,14 @@ fn engines_asking_through_the_host_lake_share_one_load() {
     );
     let frames = HostFrames::new(Arc::clone(&host));
     let reads = Arc::new(AtomicUsize::new(0));
-    let cache = WeightCache::new(Reads(Arc::clone(&reads)));
+    let (freed_to, freed) = mpsc::channel();
+    let cache = WeightCache::with_freed(
+        Reads(Arc::clone(&reads)),
+        Arc::new(HostFrames::new(Arc::clone(&host))),
+        move || {
+            freed_to.send(()).ok();
+        },
+    );
     let key = Key {
         file: PathBuf::from("base.edrl"),
         name: "norm".to_string(),
@@ -74,6 +81,11 @@ fn engines_asking_through_the_host_lake_share_one_load() {
     assert!(leases.iter().all(|lease| ptr::eq(lease.handle(), leases[0].handle())));
     assert_eq!(*leases[0].handle(), 7);
     drop(leases);
+    // The object's free is a frame too: the cache says when its memory is back.
+    freed
+        .recv_timeout(DEADLINE)
+        .expect("the object's memory never came back");
+    assert_eq!(cache.frees_in_flight(), 0);
     assert_eq!(cache.size(), 0);
     assert_eq!(cache.resident_bytes(), 0);
 

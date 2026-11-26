@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -160,8 +161,12 @@ impl Frames for Refusing {
 type Cache = WeightCache<Arc<Fake>>;
 
 fn rig(fake: Fake) -> (Cache, Arc<Fake>) {
+    rig_with(fake, Arc::new(Inline))
+}
+
+fn rig_with(fake: Fake, frees: Arc<dyn Frames>) -> (Cache, Arc<Fake>) {
     let fake = Arc::new(fake);
-    (WeightCache::new(Arc::clone(&fake)), fake)
+    (WeightCache::new(Arc::clone(&fake), frees), fake)
 }
 
 type Answer = Arc<Mutex<Option<Outcome<Arc<Fake>>>>>;
@@ -485,9 +490,95 @@ fn a_refusal_says_by_how_much_the_engine_does_not_fit() {
     assert_eq!(refusal.short_by(), 300 * MIB);
     assert!(refusal.to_string().ends_with(&format!("short by {}", 300 * MIB)));
     // With no room at all it is short by everything it adds.
-    assert_eq!(Admission::check(1, 0, 5, -100).unwrap_err().short_by(), 5);
+    assert_eq!(Admission::check(1, 0, 5, -100).unwrap_err().short_by(), 105);
     // A refusal by the limit is not about bytes.
     let limit = Admission::check(2, 2, 1, 1000).unwrap_err();
     assert_eq!(limit, Refusal::Limit { running: 2, limit: 2 });
     assert_eq!(limit.short_by(), 0);
+}
+
+/// Frames whose worker survives a panicking task, as the lattice's do.
+struct Catching;
+
+impl Frames for Catching {
+    fn submit(&self, task: Box<dyn FnOnce() + Send>) {
+        let _ = panic::catch_unwind(AssertUnwindSafe(task));
+    }
+}
+
+struct Panics;
+
+impl Backend for Panics {
+    type Handle = u64;
+    fn load(&self, _key: &Key, _bytes: u64) -> Result<u64, LoadError> {
+        panic!("the load panics");
+    }
+}
+
+#[test]
+fn a_panicking_load_still_answers_the_waiter() {
+    let cache = WeightCache::new(Panics, Arc::new(Inline));
+    let answer: Arc<Mutex<Option<bool>>> = Arc::default();
+    let put = Arc::clone(&answer);
+    cache.acquire(key("base", "norm"), 64, &Catching, move |outcome| {
+        *put.lock().unwrap() = Some(outcome.is_ok());
+    });
+    assert!(
+        answer.lock().unwrap().is_some(),
+        "the waiter of a panicking load was never called"
+    );
+}
+
+#[test]
+fn a_panicking_callback_does_not_starve_the_other_waiters() {
+    let (cache, _) = rig(Fake::default());
+    let frames = Deferred::default();
+    cache.acquire(key("base", "norm"), 64, &frames, |_| {
+        panic!("the first callback panics")
+    });
+    let second = ask(&cache, &frames, key("base", "norm"), 64);
+    let _ = panic::catch_unwind(AssertUnwindSafe(|| frames.run_all()));
+    assert!(answered(&second), "the second waiter was never called");
+}
+
+/// Frames shared with the cache, so the test can run the frees it holds back.
+struct Held(Arc<Deferred>);
+
+impl Frames for Held {
+    fn submit(&self, task: Box<dyn FnOnce() + Send>) {
+        self.0.submit(task);
+    }
+}
+
+#[test]
+fn an_object_is_freed_in_a_frame_and_counted_until_it_is() {
+    let frees = Arc::new(Deferred::default());
+    let told = Arc::new(AtomicUsize::new(0));
+    let fake = Arc::new(Fake::default());
+    let observer = Arc::clone(&told);
+    let cache = WeightCache::with_freed(Arc::clone(&fake), Arc::new(Held(Arc::clone(&frees))), move || {
+        observer.fetch_add(1, Ordering::AcqRel);
+    });
+    let held = lease(&ask(&cache, &Inline, key("base", "norm"), 64));
+    drop(held);
+    // The last lease is gone, the memory is not back: the object is still counted, and nobody was told.
+    assert!(!cache.contains(&key("base", "norm")));
+    assert_eq!(cache.frees_in_flight(), 1);
+    assert_eq!(cache.resident_bytes(), 64);
+    assert_eq!(fake.live.load(Ordering::Acquire), 1);
+    assert_eq!(told.load(Ordering::Acquire), 0);
+    frees.run_all();
+    assert_eq!(cache.frees_in_flight(), 0);
+    assert_eq!(cache.resident_bytes(), 0);
+    assert_eq!(fake.live.load(Ordering::Acquire), 0);
+    assert_eq!(told.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn a_free_no_frame_runs_still_frees_the_object() {
+    let (cache, fake) = rig_with(Fake::default(), Arc::new(Refusing));
+    drop(lease(&ask(&cache, &Inline, key("base", "norm"), 64)));
+    assert_eq!(fake.live.load(Ordering::Acquire), 0);
+    assert_eq!(cache.resident_bytes(), 0);
+    assert_eq!(cache.frees_in_flight(), 0);
 }

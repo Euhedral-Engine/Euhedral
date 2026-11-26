@@ -47,7 +47,7 @@ impl Refusal {
         match *self {
             Refusal::Limit { .. } => 0,
             Refusal::Short { additional, available } => {
-                additional.saturating_sub(u64::try_from(available).unwrap_or(0))
+                u64::try_from(i128::from(additional) - i128::from(available)).unwrap_or(0)
             }
         }
     }
