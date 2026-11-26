@@ -25,7 +25,10 @@ use euhedral_gpu::cuda::CudaModule;
 use euhedral_inference_cuda::DeviceBuffer;
 use euhedral_inference_cuda::math::MathLibraries;
 use euhedral_inference_quantization::kernels::Module;
-use euhedral_inference_quantization::mtp::{Config, Drafter, DrafterKernels, Shape, Window, Work};
+use euhedral_inference_quantization::mtp::{
+    Config, Drafter, DrafterKernels, Lineage, Shape, Window, Work, plan_lineage_dot, plan_lineage_gather,
+    plan_lineage_spread, plan_nvfp4_round,
+};
 use euhedral_inference_quantization::training::plan_squared_error;
 use support::{Device, device_with, gaussians};
 
@@ -142,6 +145,7 @@ impl Model {
                 .copy_from_host((parameter.values - arena.addr()) as usize, &bytes)
                 .unwrap();
         }
+        rig.run(&drafter.initialise().unwrap());
         rig.run(&drafter.measure().unwrap());
         let inputs = Inputs {
             context_hidden: rows(rig, CONTEXT, 1),
@@ -170,10 +174,9 @@ impl Model {
         words.iter().map(|word| f32::from_le_bytes(*word)).collect()
     }
 
-    fn poke(&self, address: u64, value: f32) {
-        self.arena
-            .copy_from_host(self.offset(address), &value.to_le_bytes())
-            .unwrap();
+    fn write(&self, address: u64, values: &[f32]) {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.arena.copy_from_host(self.offset(address), &bytes).unwrap();
     }
 
     /// The depth-1 forward over the context rows, which leaves their keys and values.
@@ -257,39 +260,228 @@ fn depth_one_of_a_deeper_drafter_equals_a_drafter_of_one_depth() {
     }
 }
 
+/// The loss of the window after its forward pass.
+fn loss_of(model: &mut Model, rig: &Rig) -> f64 {
+    model.forward(rig);
+    model.loss(rig, false)
+}
+
+/// The relative error of the directional derivative of the loss along each parameter's own gradient, by central
+/// differences, at depths 3; the largest of them and the parameter it is of.
+#[allow(clippy::print_stdout, reason = "the measured errors are the result a run reports")]
+fn directional_error(rig: &Rig) -> (f64, &'static str) {
+    const STEP: f32 = 2e-3;
+    let mut model = Model::new(rig, 3, false);
+    model.context(rig);
+    model.gradients(rig);
+    let mut worst = (0.0f64, "");
+    for parameter in model.drafter.parameters().to_vec() {
+        let count = parameter.count() as usize;
+        let gradient = model.read(parameter.gradient, count);
+        let largest = gradient.iter().fold(0.0f32, |m, g| m.max(g.abs()));
+        assert!(largest > 1e-4, "{}: a gradient of zeros proves nothing", parameter.name);
+        // The step is along the gradient, scaled so that its largest element moves by STEP.
+        let direction: Vec<f32> = gradient.iter().map(|g| g / largest).collect();
+        let analytic: f64 = gradient
+            .iter()
+            .zip(&direction)
+            .map(|(g, d)| f64::from(*g) * f64::from(*d))
+            .sum();
+        let values = model.read(parameter.values, count);
+        let moved = |sign: f32| -> Vec<f32> {
+            values
+                .iter()
+                .zip(&direction)
+                .map(|(v, d)| v + sign * STEP * d)
+                .collect()
+        };
+        model.write(parameter.values, &moved(1.0));
+        let up = loss_of(&mut model, rig);
+        model.write(parameter.values, &moved(-1.0));
+        let down = loss_of(&mut model, rig);
+        model.write(parameter.values, &values);
+        let numeric = (up - down) / (2.0 * f64::from(STEP));
+        let error = (numeric - analytic).abs() / analytic.abs();
+        println!(
+            "{}: analytic {analytic:.4} numeric {numeric:.4} error {error:.2e}",
+            parameter.name
+        );
+        if error > worst.0 {
+            worst = (error, parameter.name);
+        }
+    }
+    worst
+}
+
 #[test]
 #[ignore = "needs the device"]
 fn gradients_match_finite_differences_of_the_loss() {
-    const STEP: f32 = 1e-2;
     let rig = rig();
-    let mut model = Model::new(&rig, 2, false);
-    model.context(&rig);
-    model.gradients(&rig);
-    let parameters = model.drafter.parameters().to_vec();
-    for parameter in &parameters {
-        let gradient = model.read(parameter.gradient, parameter.count() as usize);
-        let largest = gradient.iter().fold(0.0f32, |m, g| m.max(g.abs()));
+    let (error, name) = directional_error(&rig);
+    assert!(error < 3e-3, "{name}: the directional derivative is off by {error}");
+}
+
+#[test]
+#[ignore = "needs the device"]
+fn rounded_gradients_are_the_straight_through_gradients_of_the_rounded_weights() {
+    let rig = rig();
+    let mut rounded = Model::new(&rig, 3, true);
+    let mut plain = Model::new(&rig, 3, false);
+    // The plain drafter holds the rounded drafter's weights as its values, so what it computes forward and back is what
+    // the straight-through pass computes: the gradients with respect to the rounded weights.
+    let mut moved = 0;
+    for parameter in rounded
+        .drafter
+        .parameters()
+        .to_vec()
+        .iter()
+        .filter(|p| p.maximum.is_some())
+    {
+        let count = parameter.count() as usize;
+        let output = rig.buffer(4 * count);
+        rig.run(&[Work::Steps(
+            plan_nvfp4_round(
+                parameter.values,
+                output.addr(),
+                None,
+                parameter.rows,
+                parameter.columns,
+                parameter.maximum.unwrap(),
+            )
+            .unwrap(),
+        )]);
+        let weights = rig.download_f32(&output, count);
+        moved += usize::from(weights != rounded.read(parameter.values, count));
+        plain.write(plain.drafter.parameter(parameter.name).unwrap().values, &weights);
+    }
+    assert_eq!(moved, 5, "rounding changes every projection, or the test shows nothing");
+    for model in [&mut rounded, &mut plain] {
+        model.context(&rig);
+        model.gradients(&rig);
+    }
+    for parameter in rounded.drafter.parameters().to_vec() {
+        let count = parameter.count() as usize;
+        let got = rounded.read(parameter.gradient, count);
+        let expected = plain.read(plain.drafter.parameter(parameter.name).unwrap().gradient, count);
+        let largest = expected.iter().fold(0.0f32, |m, g| m.max(g.abs()));
         assert!(largest > 1e-4, "{}: a gradient of zeros proves nothing", parameter.name);
-        let mut indices: Vec<usize> = (0..gradient.len()).collect();
-        indices.sort_by(|a, b| gradient[*b].abs().total_cmp(&gradient[*a].abs()));
-        for index in indices.into_iter().take(3) {
-            let address = parameter.values + 4 * index as u64;
-            let value = model.read(address, 1)[0];
-            model.poke(address, value + STEP);
-            model.forward(&rig);
-            let up = model.loss(&rig, false);
-            model.poke(address, value - STEP);
-            model.forward(&rig);
-            let down = model.loss(&rig, false);
-            model.poke(address, value);
-            let numeric = (up - down) / (2.0 * f64::from(STEP));
-            let error = (numeric - f64::from(gradient[index])).abs() / f64::from(largest);
-            assert!(
-                error < 0.03,
-                "{}[{index}]: analytic {} numeric {numeric} (error {error} of the largest {largest})",
-                parameter.name,
-                gradient[index]
-            );
+        // The norms' gradients add with atomics, so their last bits depend on the order the blocks ran in.
+        let tolerance = if parameter.maximum.is_some() { 0.0 } else { 1e-5 };
+        let worst = got.iter().zip(&expected).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            worst <= tolerance * largest,
+            "{}: differs by {worst} of {largest}",
+            parameter.name
+        );
+    }
+}
+
+/// Lineage tensors `[heads, rows, stride]` and rows `[rows, width]` of the test below.
+const HEADS: usize = 4;
+const GROUP: usize = 2;
+const D: usize = 32;
+const STRIDE: usize = 3;
+const SLOT: usize = 1;
+
+#[test]
+#[ignore = "needs the device"]
+fn lineage_kernels_read_and_write_only_their_slot() {
+    let rig = rig();
+    let rows = ROWS as usize;
+    let (query_width, key_width) = (HEADS * D, HEADS / GROUP * D);
+    let lineage = Lineage {
+        heads: HEADS as u32,
+        group: GROUP as u32,
+        d: D as u32,
+        rows: ROWS,
+        stride: STRIDE as u32,
+        slot: SLOT as u32,
+    };
+    let queries = gaussians(rows * query_width, 1);
+    let keys = gaussians(rows * key_width, 2);
+    let tensor = gaussians(HEADS * rows * STRIDE, 3);
+    let at = |h: usize, r: usize, slot: usize| (h * rows + r) * STRIDE + slot;
+    let (queries_buffer, keys_buffer) = (rig.upload_f32(&queries), rig.upload_f32(&keys));
+
+    // Dot: slot SLOT of the output gets the score, the others keep what they held.
+    let output = rig.upload_f32(&tensor);
+    rig.run(&[Work::Steps(
+        plan_lineage_dot(
+            (queries_buffer.addr(), query_width as u32),
+            (keys_buffer.addr(), key_width as u32),
+            output.addr(),
+            &lineage,
+        )
+        .unwrap(),
+    )]);
+    let got = rig.download_f32(&output, tensor.len());
+    for h in 0..HEADS {
+        for r in 0..rows {
+            let dot: f32 = (0..D)
+                .map(|i| queries[r * query_width + h * D + i] * keys[r * key_width + h / GROUP * D + i])
+                .sum();
+            for slot in 0..STRIDE {
+                let expected = if slot == SLOT { dot } else { tensor[at(h, r, slot)] };
+                assert!(
+                    (got[at(h, r, slot)] - expected).abs() <= 1e-5,
+                    "dot h{h} r{r} slot{slot}"
+                );
+            }
+        }
+    }
+
+    // Spread: y += c[slot] x over each head, reading nothing of the other slots.
+    let target = gaussians(rows * query_width, 4);
+    let spread = rig.upload_f32(&target);
+    let coefficients = rig.upload_f32(&tensor);
+    rig.run(&[Work::Steps(
+        plan_lineage_spread(
+            coefficients.addr(),
+            (keys_buffer.addr(), key_width as u32),
+            (spread.addr(), query_width as u32),
+            &lineage,
+        )
+        .unwrap(),
+    )]);
+    let got = rig.download_f32(&spread, target.len());
+    for r in 0..rows {
+        for h in 0..HEADS {
+            for i in 0..D {
+                let expected = target[r * query_width + h * D + i]
+                    + tensor[at(h, r, SLOT)] * keys[r * key_width + h / GROUP * D + i];
+                assert!(
+                    (got[r * query_width + h * D + i] - expected).abs() <= 1e-5,
+                    "spread r{r} h{h} i{i}"
+                );
+            }
+        }
+    }
+
+    // Gather: y[kv] += the group's sum of c[slot] x.
+    let target = gaussians(rows * key_width, 5);
+    let gathered = rig.upload_f32(&target);
+    rig.run(&[Work::Steps(
+        plan_lineage_gather(
+            coefficients.addr(),
+            (queries_buffer.addr(), query_width as u32),
+            (gathered.addr(), key_width as u32),
+            &lineage,
+        )
+        .unwrap(),
+    )]);
+    let got = rig.download_f32(&gathered, target.len());
+    for r in 0..rows {
+        for kv in 0..HEADS / GROUP {
+            for i in 0..D {
+                let sum: f32 = (kv * GROUP..(kv + 1) * GROUP)
+                    .map(|h| tensor[at(h, r, SLOT)] * queries[r * query_width + h * D + i])
+                    .sum();
+                let expected = target[r * key_width + kv * D + i] + sum;
+                assert!(
+                    (got[r * key_width + kv * D + i] - expected).abs() <= 1e-5,
+                    "gather r{r} kv{kv} i{i}"
+                );
+            }
         }
     }
 }

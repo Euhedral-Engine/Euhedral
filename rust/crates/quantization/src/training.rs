@@ -67,4 +67,4 @@ impl From<GpuError> for TrainError {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -29,7 +29,7 @@ pub(crate) fn address(name: &'static str, value: u64) -> Result<u64, TrainError>
 }
 
 /// An address that may be absent: null stays null.
-pub(crate) fn optional(value: Option<u64>) -> u64 {
+fn optional(value: Option<u64>) -> u64 {
     value.unwrap_or(0)
 }
 

@@ -199,7 +199,7 @@ fn adam() -> AdamSettings {
 
 /// A scalar parameter's value as the test planned it, to be found in the slot the source gives that name.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Scalar {
+pub(crate) enum Scalar {
     Int(i32),
     Long(i64),
     Float(f32),
@@ -207,11 +207,11 @@ enum Scalar {
 }
 
 /// A planned kernel launch and the values its scalar parameters were given, by parameter name.
-type Case<'a> = (Vec<Step>, Vec<(&'a str, Scalar)>);
+pub(crate) type Case<'a> = (Vec<Step>, Vec<(&'a str, Scalar)>);
 
 /// A parameter of a kernel as `train.cu` declares it.
 #[derive(Debug)]
-struct Parameter {
+pub(crate) struct Parameter {
     name: String,
     pointer: bool,
     bytes: usize,
@@ -219,7 +219,7 @@ struct Parameter {
 }
 
 /// The parameter lists of the module's `extern "C" __global__` kernels, read from the source the crate loads.
-fn declared(source: &str) -> HashMap<String, Vec<Parameter>> {
+pub(crate) fn declared(source: &str) -> HashMap<String, Vec<Parameter>> {
     const MARK: &str = "extern \"C\" __global__ void ";
     let mut kernels = HashMap::new();
     for part in source.split(MARK).skip(1) {
@@ -259,6 +259,34 @@ fn read_scalar(args: &Args, index: usize, parameter: &Parameter) -> Scalar {
         (false, _) => args.read::<i64>(index).map(Scalar::Long),
     };
     value.unwrap()
+}
+
+/// Checks the first step of each case against the parameter lists `declared`: argument count, widths, pointers (given
+/// 1, 2, 3, ... in the order of the kernel's pointer parameters) and the scalars the case names. Returns the kernels seen.
+pub(crate) fn assert_arguments(declared: &HashMap<String, Vec<Parameter>>, cases: &[Case<'_>]) -> Vec<&'static str> {
+    let mut seen = Vec::new();
+    for (steps, expected) in cases {
+        let step = &steps[0];
+        let parameters = &declared[step.kernel()];
+        let args = step.args();
+        assert_eq!(args.len(), parameters.len(), "{}: argument count", step.kernel());
+        let mut next_pointer = 1;
+        for (index, parameter) in parameters.iter().enumerate() {
+            let at = format!("{} argument {index} ({})", step.kernel(), parameter.name);
+            assert_eq!(args.sizes().nth(index), Some(parameter.bytes), "{at}: width");
+            if parameter.pointer {
+                // The pointers were given 1, 2, 3, ... in the order of the kernel's pointer parameters.
+                assert_eq!(args.read::<u64>(index), Some(next_pointer), "{at}: address");
+                next_pointer += 1;
+            } else if let Some((_, value)) = expected.iter().find(|(name, _)| *name == parameter.name) {
+                assert_eq!(read_scalar(args, index, parameter), *value, "{at}");
+            } else {
+                panic!("{at}: a scalar parameter the case does not give a value");
+            }
+        }
+        seen.push(step.kernel());
+    }
+    seen
 }
 
 #[test]
@@ -356,28 +384,7 @@ fn arguments_match_the_parameter_lists_the_loaded_source_declares() {
             vec![("rows", Scalar::Int(3)), ("width", Scalar::Int(5))],
         ),
     ];
-    let mut seen = Vec::new();
-    for (steps, expected) in &cases {
-        let step = &steps[0];
-        let parameters = &declared[step.kernel()];
-        let args = step.args();
-        assert_eq!(args.len(), parameters.len(), "{}: argument count", step.kernel());
-        let mut next_pointer = 1;
-        for (index, parameter) in parameters.iter().enumerate() {
-            let at = format!("{} argument {index} ({})", step.kernel(), parameter.name);
-            assert_eq!(args.sizes().nth(index), Some(parameter.bytes), "{at}: width");
-            if parameter.pointer {
-                // The pointers were given 1, 2, 3, ... in the order of the kernel's pointer parameters.
-                assert_eq!(args.read::<u64>(index), Some(next_pointer), "{at}: address");
-                next_pointer += 1;
-            } else if let Some((_, value)) = expected.iter().find(|(name, _)| *name == parameter.name) {
-                assert_eq!(read_scalar(args, index, parameter), *value, "{at}");
-            } else {
-                panic!("{at}: a scalar parameter the case does not give a value");
-            }
-        }
-        seen.push(step.kernel());
-    }
+    let mut seen = assert_arguments(&declared, &cases);
     seen.sort_unstable();
     let mut listed = Module::Train.kernels().to_vec();
     listed.sort_unstable();

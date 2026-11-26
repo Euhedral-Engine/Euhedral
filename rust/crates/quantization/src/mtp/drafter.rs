@@ -55,6 +55,15 @@ pub struct Forward {
     pub output: u64,
 }
 
+/// What a depth's forward pass was planned over: the backward pass needs the same window, rounding and input rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pass {
+    window: Window,
+    hidden: u64,
+    embedded: u64,
+    rounded: bool,
+}
+
 /// The buffers of one depth: what its forward pass leaves for its backward pass, and its gradients.
 #[derive(Clone, Copy, Debug)]
 struct Depth {
@@ -85,8 +94,8 @@ struct Depth {
     d_m: u64,
     d_qkn: u64,
     d_gv: u64,
-    /// The input hidden and embedded rows of the depth's last planned forward pass, for its backward pass.
-    inputs: Option<(u64, u64)>,
+    /// The depth's last planned forward pass, which its backward pass goes back through.
+    pass: Option<Pass>,
 }
 
 /// The buffers one depth's backward pass uses and the next depth's reuses.
@@ -153,7 +162,10 @@ pub struct Drafter {
     value_gradients: u64,
     depth: Vec<Depth>,
     shared: Shared,
+    regions: Vec<(u64, u64)>,
     bytes: u64,
+    zeroed: bool,
+    measured: bool,
 }
 
 impl Drafter {
@@ -224,7 +236,7 @@ impl Drafter {
                 d_m: arena.take(rows * h),
                 d_qkn: arena.take(rows * width),
                 d_gv: arena.take(rows * width),
-                inputs: None,
+                pass: None,
             })
             .collect();
         let shared = Shared {
@@ -256,6 +268,9 @@ impl Drafter {
             depth,
             shared,
             bytes: arena.bytes(),
+            regions: arena.regions(),
+            zeroed: false,
+            measured: false,
         })
     }
 
@@ -290,10 +305,31 @@ impl Drafter {
         self.bytes
     }
 
-    /// Recomputes each projection's NVFP4 global-scale source after its values changed.
-    pub fn measure(&self) -> Result<Vec<Work>, DrafterError> {
+    /// Every region of the arena as `(address, bytes)`, in allocation order: parameters, their gradients and moments,
+    /// then the buffers of the passes.
+    pub fn regions(&self) -> &[(u64, u64)] {
+        &self.regions
+    }
+
+    /// Zeroes the gradients and the optimiser's moments: the first work of a drafter, before any backward pass or step.
+    /// Backward passes and steps are refused until this was planned. Enqueue it before them.
+    pub fn initialise(&mut self) -> Result<Vec<Work>, DrafterError> {
+        let mut plan = Plan::default();
+        for parameter in &self.parameters {
+            for address in [parameter.gradient, parameter.first, parameter.second] {
+                plan.steps(plan_zero(address, parameter.count()))?;
+            }
+        }
+        self.zeroed = true;
+        Ok(plan.0)
+    }
+
+    /// Recomputes each projection's NVFP4 global-scale source after its values changed. A rounded forward pass is refused
+    /// until this was planned; plan it again after the caller changes projection values (a [`step`](Self::step) does).
+    pub fn measure(&mut self) -> Result<Vec<Work>, DrafterError> {
         let mut plan = Plan::default();
         self.plan_measure(&mut plan)?;
+        self.measured = true;
         Ok(plan.0)
     }
 
@@ -376,7 +412,12 @@ impl Drafter {
                 rows: config.rows,
             });
         }
-        let end = window.position + u64::from(window.count);
+        let Some(end) = window.position.checked_add(u64::from(window.count)) else {
+            return Err(DrafterError::Position {
+                position: window.position,
+                max: config.max_positions,
+            });
+        };
         if window.first_key > window.position {
             return Err(DrafterError::FirstKey {
                 first_key: window.first_key,
@@ -453,8 +494,11 @@ impl Drafter {
 
     /// Plans depth `depth` (from 1) over `window`: `hidden` `[count, H]` is the depth's input hidden (the base model's
     /// for depth 1, the previous depth's output otherwise) and `embedded` `[count, H]` the embedding of each row's input
-    /// token. Remembers both addresses for the backward pass. The depth-1 keys and values of the window are written
-    /// into the sequence's keys and values at `position`.
+    /// token. Remembers the pass for the backward pass. The depth-1 keys and values of the window are written into the
+    /// sequence's keys and values at `position`.
+    ///
+    /// A depth after the first needs the previous depth's forward pass over the same window; planning a depth drops the
+    /// remembered passes of every deeper depth, which read what it writes. A rounded pass needs [`measure`](Self::measure).
     pub fn forward(
         &mut self,
         depth: u32,
@@ -463,13 +507,35 @@ impl Drafter {
         embedded: u64,
     ) -> Result<Forward, DrafterError> {
         let keys = self.check(depth, window)?;
+        if self.rounded && !self.measured {
+            return Err(DrafterError::NotMeasured);
+        }
+        if depth > 1 && !self.forwarded(depth - 1, window) {
+            return Err(DrafterError::NotForwarded(depth - 1));
+        }
         let work = self.plan_forward(depth, window, keys, hidden, embedded)?;
+        for deeper in &mut self.depth[depth as usize..] {
+            deeper.pass = None;
+        }
+        let rounded = self.rounded;
         let buffers = &mut self.depth[depth as usize - 1];
-        buffers.inputs = Some((hidden, embedded));
+        buffers.pass = Some(Pass {
+            window: *window,
+            hidden,
+            embedded,
+            rounded,
+        });
         Ok(Forward {
             work,
             output: buffers.m,
         })
+    }
+
+    /// Whether depth `depth` has a planned forward pass over `window` with the current rounding.
+    fn forwarded(&self, depth: u32, window: &Window) -> bool {
+        self.depth[depth as usize - 1]
+            .pass
+            .is_some_and(|pass| pass.window == *window && pass.rounded == self.rounded)
     }
 
     fn plan_forward(
@@ -683,8 +749,11 @@ impl Drafter {
     /// forward passes of all of them.
     pub fn backward(&self, depth: u32, window: &Window) -> Result<Vec<Work>, DrafterError> {
         let key_count = self.check(depth, window)?;
+        if !self.zeroed {
+            return Err(DrafterError::NotInitialised);
+        }
         for shallower in 1..=depth {
-            if self.depth[shallower as usize - 1].inputs.is_none() {
+            if !self.forwarded(shallower, window) {
                 return Err(DrafterError::NotForwarded(shallower));
             }
         }
@@ -897,8 +966,12 @@ impl Drafter {
             h,
         ))?;
         self.weight_gradient(&mut plan, INPUT_PROJECTION, (0, h), s.d_c, b.cat, count)?;
-        let (input_hidden, input_embedded) = self.depth[depth as usize - 1]
-            .inputs
+        let Pass {
+            hidden: input_hidden,
+            embedded: input_embedded,
+            ..
+        } = self.depth[depth as usize - 1]
+            .pass
             .ok_or(DrafterError::NotForwarded(depth))?;
         plan.steps(plan_copy_columns((s.d_cat, 2 * h), (s.d_part, h), count, h, false))?;
         plan.steps(plan_rms_norm_backward(
@@ -940,7 +1013,10 @@ impl Drafter {
 
     /// One AdamW step (numbered from 1) of every parameter, which zeroes the gradients, then the projections' global-scale
     /// sources.
-    pub fn step(&self, projection_rate: f32, norm_rate: f32, step: u32) -> Result<Vec<Work>, DrafterError> {
+    pub fn step(&mut self, projection_rate: f32, norm_rate: f32, step: u32) -> Result<Vec<Work>, DrafterError> {
+        if !self.zeroed {
+            return Err(DrafterError::NotInitialised);
+        }
         let mut plan = Plan::default();
         for parameter in &self.parameters {
             let rate = if parameter.maximum.is_some() {
@@ -966,6 +1042,7 @@ impl Drafter {
             ))?;
         }
         self.plan_measure(&mut plan)?;
+        self.measured = true;
         Ok(plan.0)
     }
 

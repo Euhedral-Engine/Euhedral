@@ -127,6 +127,32 @@ impl Config {
         if !shape.rotary_dim.is_multiple_of(2) || shape.rotary_dim > shape.head_dim {
             return Err(refuse("rotary_dim", shape.rotary_dim));
         }
+        // The kernels index the floats of a region with signed 32-bit values in places (row and column products), so
+        // no region may hold more than `i32::MAX` floats. Checked in 64 bits, before any width is multiplied in 32.
+        let (rows, hidden, intermediate) = (
+            u64::from(self.rows),
+            u64::from(shape.hidden),
+            u64::from(shape.intermediate),
+        );
+        let (heads, kv_heads, head) = (
+            u64::from(shape.heads),
+            u64::from(shape.kv_heads),
+            u64::from(shape.head_dim),
+        );
+        let most = [
+            rows * 2 * hidden,
+            rows * 2 * intermediate,
+            rows * (heads + kv_heads) * head,
+            heads * rows * u64::from(self.max_keys),
+            u64::from(self.max_positions) * kv_heads * head,
+            2 * (heads + kv_heads) * head * hidden,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        if most > i32::MAX as u64 {
+            return Err(refuse("rows", self.rows));
+        }
         for (what, value) in [
             ("hidden", shape.hidden),
             ("intermediate", shape.intermediate),
@@ -137,20 +163,15 @@ impl Config {
             }
         }
         if !(shape.theta.is_finite() && shape.theta > 0.0) {
-            return Err(DrafterError::Config {
+            return Err(DrafterError::Setting {
                 what: "theta",
-                value: shape.theta as u64,
+                value: shape.theta,
             });
         }
         if !(shape.eps.is_finite() && shape.eps > 0.0) {
-            return Err(DrafterError::Config { what: "eps", value: 0 });
-        }
-        // Every float offset of the arena and of a launch is a signed 32-bit value in the kernels.
-        let most = u64::from(self.rows) * u64::from(shape.hidden.max(shape.intermediate * 2).max(shape.qk_width()));
-        if most > i32::MAX as u64 {
-            return Err(DrafterError::Config {
-                what: "rows",
-                value: u64::from(self.rows),
+            return Err(DrafterError::Setting {
+                what: "eps",
+                value: f64::from(shape.eps),
             });
         }
         Ok(())
@@ -194,18 +215,30 @@ const ALIGN_FLOATS: u64 = 64;
 pub(super) struct Arena {
     base: u64,
     floats: u64,
+    regions: Vec<(u64, u64)>,
 }
 
 impl Arena {
     pub(super) fn new(base: u64) -> Self {
-        Self { base, floats: 0 }
+        Self {
+            base,
+            floats: 0,
+            regions: Vec::new(),
+        }
     }
 
     /// The address of a region of `floats` floats (at least one).
     pub(super) fn take(&mut self, floats: u64) -> u64 {
         let address = self.base + 4 * self.floats;
-        self.floats += floats.max(1).next_multiple_of(ALIGN_FLOATS);
+        let floats = floats.max(1);
+        self.regions.push((address, 4 * floats));
+        self.floats += floats.next_multiple_of(ALIGN_FLOATS);
         address
+    }
+
+    /// The regions taken so far as `(address, bytes)`.
+    pub(super) fn regions(&self) -> Vec<(u64, u64)> {
+        self.regions.clone()
     }
 
     /// The bytes taken so far.

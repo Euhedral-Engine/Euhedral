@@ -67,9 +67,19 @@ pub enum DrafterError {
     /// A window that reaches past the positions the drafter was built for.
     #[error("position {position} is too far, at most {max} fit")]
     Position { position: u64, max: u32 },
-    /// A backward pass of a depth whose forward pass, or one of the shallower depths', was not planned.
-    #[error("depth {0} has no forward pass to go back through")]
+    /// A pass that needs the forward pass of depth `.0` over the same window and rounding, which was not planned (or was
+    /// planned over another window, with the other rounding, or has since been dropped by a shallower depth's pass).
+    #[error("depth {0} has no forward pass over this window and rounding")]
     NotForwarded(u32),
+    /// A backward pass or a step before the gradients and moments were zeroed with `initialise`.
+    #[error("the gradients and moments were not zeroed: plan `initialise` first")]
+    NotInitialised,
+    /// A rounded forward pass before `measure`: every rounded weight would decode to zero.
+    #[error("the projections' global scales were not measured: plan `measure` first")]
+    NotMeasured,
+    /// A floating-point setting that is not finite and positive.
+    #[error("{what} {value} is not valid for the drafter")]
+    Setting { what: &'static str, value: f64 },
     /// A training operation refused its shape or an address.
     #[error(transparent)]
     Train(#[from] TrainError),
