@@ -35,6 +35,7 @@ pub mod manifest;
 pub mod plan;
 pub mod rounding;
 pub mod schedule;
+pub mod trellis_plan;
 
 use std::fmt::Display;
 use thiserror::Error;

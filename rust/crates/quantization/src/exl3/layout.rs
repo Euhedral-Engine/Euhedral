@@ -356,6 +356,37 @@ pub fn auxiliary_files<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Stri
     chosen
 }
 
+/// The file of decoder layer `index`.
+pub fn layer_file(index: usize) -> String {
+    format!("{TEXT}layers.{index}.safetensors")
+}
+
+/// The file of the MTP layer.
+pub const MTP_FILE: &str = "mtp.safetensors";
+
+/// The files [`Exl3Writer::finish`](super::Exl3Writer::finish) writes after the layers and the MTP layer: the embedding,
+/// `lm_head`, the vision tower when the source has one, the auxiliary files of `source` (the names of its directory)
+/// and the three documents. In the order they are written.
+pub fn closing_files<'a>(vision: bool, source: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut files = vec![
+        format!("{TEXT}embed_tokens.safetensors"),
+        "lm_head.safetensors".to_owned(),
+    ];
+    if vision {
+        files.push("model.visual.safetensors".to_owned());
+    }
+    files.extend(auxiliary_files(source));
+    files.extend(DOCUMENTS.map(str::to_owned));
+    files
+}
+
+/// The documents `finish` writes last.
+const DOCUMENTS: [&str; 3] = [
+    "model.safetensors.index.json",
+    "config.json",
+    "quantization_config.json",
+];
+
 /// `value` as the layout's JSON files write a float: the shortest digits that read back as `value`, plain from `1e-3` up to
 /// `1e7` and as `d.dddE<exponent>` outside, always with a digit after the point.
 pub fn double_text(value: f64) -> String {
