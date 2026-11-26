@@ -29,7 +29,8 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from euhedral_artifacts import device  # noqa: E402
-from euhedral_artifacts.codes import QuantState, export_state, finish_export, state_size, write_state  # noqa: E402
+from euhedral_artifacts.codes import (QuantState, export_key, export_state, finish_export, state_size,  # noqa: E402
+                                      write_state)
 from euhedral_artifacts.edrl import FORMAT_ORDINAL, LAYOUT_ORDINAL, align_up, read_table  # noqa: E402
 from euhedral_artifacts.importance import ImportanceMatrix  # noqa: E402
 from euhedral_artifacts.inventory import build_plans, draft_token_ids  # noqa: E402
@@ -132,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
     device.set_device(device.default_device())
     importance = ImportanceMatrix(args.imatrix) if args.imatrix is not None else None
     pattern = re.compile(args.objects)
+    # What names this export: an export into a directory of another key is refused.
+    key = export_key(args.model.resolve(), args.artifact.resolve(), args.quantization, args.compressed,
+                     args.imatrix.resolve() if args.imatrix is not None else None, args.objects)
     if args.export is not None:
         args.export.mkdir(parents=True, exist_ok=True)
     formats = {ordinal: name for name, ordinal in FORMAT_ORDINAL.items()}
@@ -161,12 +165,12 @@ def main(argv: list[str] | None = None) -> int:
             if not (equal and forward_equal):
                 mismatched += 1
             if args.export is not None:
-                export_state(args.export, plan.name, state)
+                export_state(args.export, plan.name, state, key)
             verdict = "ok" if equal and forward_equal else ("BYTES DIFFER" if not equal else "FORWARD DIFFERS")
             print(f"[{index + 1}/{len(plans)}] {plan.name} {plan.format_name}/{plan.layout} {verdict} "
                   f"({time.monotonic() - start:.1f} s)", flush=True)
     if args.export is not None and checked:
-        finish_export(args.export)
+        finish_export(args.export, key)
     print(f"{checked} objects checked, {mismatched} mismatched", flush=True)
     return 1 if mismatched else 0
 

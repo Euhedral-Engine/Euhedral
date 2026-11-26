@@ -114,9 +114,13 @@ PRODUCER_FAKE_QUANT = "fake_quant"
 # The manifest of a codes directory (MANIFEST_FILE) says which files are the producer's and whether they are whole.
 # `quantization calibrate` writes {"key", "layers_done", "layers_total", "heads_done", "mtp_done", "files"}: the state
 # files it saved (file names), and how far it got. A producer that rounds the objects it chooses (fake_quant's export)
-# writes {"producer", "objects", "complete"}: the object names it saved, and whether the export is finished. The
+# writes {"producer", "key", "objects", "complete"}: the run it exports (its key), the object names it saved, and
+# whether the export is finished; an export into a directory of another key is refused, so two runs never mix. The
 # converter takes a directory only when its manifest says it is whole and every file in it is listed, and refuses
-# listed files that are missing.
+# listed files that are missing and listed names that are not plain file names of the directory.
+
+# Characters a listed file name may not hold: the separators of every platform, and Windows' stream and drive mark.
+_NOT_IN_NAMES = ("/", "\\", ":", "\0")
 
 
 def _read_manifest(directory: Path) -> dict:
@@ -139,26 +143,50 @@ def _write_manifest(directory: Path, manifest: dict) -> None:
     temporary.replace(path)
 
 
-def export_state(directory: Path, name: str, state: QuantState, producer: str = PRODUCER_FAKE_QUANT) -> None:
-    """Saves `state` as the file of object `name` in `directory` and lists the object in the manifest as one of
-    `producer`'s, not yet complete: finish_export says the export is whole. Refuses a directory whose manifest is
-    another producer's (calibrate's included), so an export never overwrites it."""
-    directory.mkdir(parents=True, exist_ok=True)
+def _plain(name) -> bool:
+    """Whether `name` is a file name directly in the directory, on every platform."""
+    return (isinstance(name, str) and name not in ("", ".", "..", MANIFEST_FILE)
+            and not any(mark in name for mark in _NOT_IN_NAMES))
+
+
+def export_key(*parts) -> str:
+    """The key of an export: what names the run whose objects it holds (the source model, the artifact, the recipe,
+    the selection), joined as calibrate joins its key."""
+    return "|".join(str(part) for part in parts)
+
+
+def _own_export(directory: Path, key: str, producer: str) -> dict:
+    """The manifest of `directory` when it is `producer`'s export of `key` or there is none; fails otherwise."""
     manifest = _read_manifest(directory)
     if manifest and manifest.get("producer") != producer:
         fail(f"{directory} holds the {MANIFEST_FILE} of another producer ({manifest.get('producer', 'calibrate')}): "
              "export to another directory")
+    if manifest and manifest.get("key") != key:
+        fail(f"{directory} holds the export of another run (key {manifest.get('key')!r}, not {key!r}): export to "
+             "another directory or empty this one")
+    return manifest
+
+
+def export_state(directory: Path, name: str, state: QuantState, key: str, producer: str = PRODUCER_FAKE_QUANT) -> None:
+    """Saves `state` as the file of object `name` in `directory` and lists the object in the manifest as one of the
+    export of `key` by `producer`, not yet complete: finish_export says the export is whole. Refuses, before it writes
+    anything, a directory whose manifest is another producer's (calibrate's included) or another key's, so an export
+    never overwrites another run's output or mixes with it."""
+    if not _plain(state_file(directory, name).name):
+        fail(f"object {name!r} has no plain file name")
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = _own_export(directory, key, producer)
     state.save(state_file(directory, name))
     objects = list(manifest.get("objects", []))
     if name not in objects:
         objects.append(name)
-    _write_manifest(directory, {"producer": producer, "objects": sorted(objects), "complete": False})
+    _write_manifest(directory, {"producer": producer, "key": key, "objects": sorted(objects), "complete": False})
 
 
-def finish_export(directory: Path, producer: str = PRODUCER_FAKE_QUANT) -> None:
-    """Marks the export in `directory` complete: call it last, after every export_state."""
-    manifest = _read_manifest(directory)
-    if manifest.get("producer") != producer:
+def finish_export(directory: Path, key: str, producer: str = PRODUCER_FAKE_QUANT) -> None:
+    """Marks the export of `key` in `directory` complete: call it last, after every export_state."""
+    manifest = _own_export(directory, key, producer)
+    if not manifest:
         fail(f"{directory} has no {MANIFEST_FILE} of {producer}: nothing was exported")
     _write_manifest(directory, {**manifest, "complete": True})
 
@@ -182,16 +210,24 @@ def require_complete_codes(directory: Path, layers: int | None = None) -> None:
     if "producer" in manifest:
         if manifest["producer"] != PRODUCER_FAKE_QUANT:
             fail(f"{path} is from producer {manifest['producer']!r}, which is not a known producer")
+        _strict(manifest, "key", str, path)
         if not _strict(manifest, "complete", bool, path):
             fail(f"{directory} is not complete: the export did not finish")
         objects = _strict(manifest, "objects", list, path)
+        named = [name for name in objects if not isinstance(name, str) or not _plain(state_file(directory, name).name)]
+        if named:
+            fail(f"{path} is unreadable: it lists objects that are not plain names: {named!r}")
         listed = {state_file(directory, name).name for name in objects}
     else:
         layers_done = _strict(manifest, "layers_done", int, path)
         layers_total = _strict(manifest, "layers_total", int, path)
         heads_done = _strict(manifest, "heads_done", bool, path)
         mtp_done = _strict(manifest, "mtp_done", bool, path)
-        listed = set(_strict(manifest, "files", list, path))
+        files = _strict(manifest, "files", list, path)
+        named = [name for name in files if not _plain(name)]
+        if named:
+            fail(f"{path} is unreadable: it lists names that are not file names of the directory: {named!r}")
+        listed = set(files)
         if layers is not None and layers_total != layers:
             fail(f"{directory} is calibrate output of a model of {layers_total} layers, not {layers}")
         missing = []

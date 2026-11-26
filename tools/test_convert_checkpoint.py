@@ -353,11 +353,11 @@ class PipelineTest(unittest.TestCase):
                                  np.zeros((1, 2), np.float16))
         with tempfile.TemporaryDirectory() as tmp:
             exported = Path(tmp) / "exported"
-            codes.export_state(exported, "text/layers/0/mlp/down", state)
-            codes.export_state(exported, "text/layers/1/mlp/down", state)
+            codes.export_state(exported, "text/layers/0/mlp/down", state, "run")
+            codes.export_state(exported, "text/layers/1/mlp/down", state, "run")
             with tempfile.TemporaryDirectory() as other, self.assertRaisesRegex(ValueError, "did not finish"):
                 self.convert(recipes.Recipe("q3", False), Path(other), codes_from=exported)
-            codes.finish_export(exported)
+            codes.finish_export(exported, "run")
             manifest = json.loads((exported / "calibration.json").read_text(encoding="utf-8"))
             self.assertEqual((manifest["producer"], manifest["objects"], manifest["complete"]),
                              ("fake_quant", ["text/layers/0/mlp/down", "text/layers/1/mlp/down"], True))
@@ -378,7 +378,7 @@ class PipelineTest(unittest.TestCase):
             calibrated = self.codes_directory(tmp, manifest)
             before = (calibrated / "calibration.json").read_bytes()
             with self.assertRaisesRegex(ValueError, "another producer"):
-                codes.export_state(calibrated, "text/layers/0/mlp/down", state)
+                codes.export_state(calibrated, "text/layers/0/mlp/down", state, "run")
             self.assertEqual((calibrated / "calibration.json").read_bytes(), before)
             self.assertEqual(sorted(path.name for path in calibrated.iterdir()), ["calibration.json"])
 
@@ -386,11 +386,11 @@ class PipelineTest(unittest.TestCase):
         state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
                                  np.zeros((1, 2), np.float16))
         with tempfile.TemporaryDirectory() as tmp:
-            codes.export_state(Path(tmp), "text/layers/0/mlp/down", state)
+            codes.export_state(Path(tmp), "text/layers/0/mlp/down", state, "run")
             self.assertFalse(json.loads((Path(tmp) / "calibration.json").read_text())["complete"])
             with self.assertRaisesRegex(ValueError, "did not finish"):
                 codes.require_complete_codes(Path(tmp))
-            codes.finish_export(Path(tmp))
+            codes.finish_export(Path(tmp), "run")
             codes.require_complete_codes(Path(tmp))
 
     def test_listed_files_must_be_there_and_every_state_file_must_be_listed_for_both_producers(self):
@@ -410,8 +410,8 @@ class PipelineTest(unittest.TestCase):
                                  np.zeros((1, 2), np.float16))
         with tempfile.TemporaryDirectory() as tmp:
             exported = Path(tmp)
-            codes.export_state(exported, "text/layers/0/mlp/down", state)
-            codes.finish_export(exported)
+            codes.export_state(exported, "text/layers/0/mlp/down", state, "run")
+            codes.finish_export(exported, "run")
             codes.require_complete_codes(exported)
             codes.state_file(exported, "text/layers/0/mlp/down").unlink()
             with self.assertRaisesRegex(ValueError, "not there"):
@@ -420,6 +420,49 @@ class PipelineTest(unittest.TestCase):
             state.save(codes.state_file(exported, "text/layers/5/mlp/down"))
             with self.assertRaisesRegex(ValueError, "does not list"):
                 codes.require_complete_codes(exported)
+
+    def test_an_export_into_another_keys_export_is_refused_before_it_writes_and_the_same_key_adds_to_it(self):
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = Path(tmp)
+            codes.export_state(exported, "text/layers/0/mlp/down", state, "run")
+            codes.finish_export(exported, "run")
+            before = {path.name: path.read_bytes() for path in exported.iterdir()}
+            with self.assertRaisesRegex(ValueError, "another run"):
+                codes.export_state(exported, "text/layers/1/mlp/down", state, "other")
+            with self.assertRaisesRegex(ValueError, "another run"):
+                codes.finish_export(exported, "other")
+            self.assertEqual({path.name: path.read_bytes() for path in exported.iterdir()}, before)
+            codes.export_state(exported, "text/layers/1/mlp/down", state, "run")
+            manifest = json.loads((exported / "calibration.json").read_text(encoding="utf-8"))
+            self.assertEqual((manifest["key"], manifest["objects"], manifest["complete"]),
+                             ("run", ["text/layers/0/mlp/down", "text/layers/1/mlp/down"], False))
+
+    def test_an_export_manifest_without_a_key_is_another_runs_and_is_not_taken(self):
+        state = codes.QuantState("Q4G64_F16S", "row-split", (1, 128), np.zeros((1, 128), np.int8),
+                                 np.zeros((1, 2), np.float16))
+        with tempfile.TemporaryDirectory() as tmp:
+            keyless = self.codes_directory(tmp, {"producer": "fake_quant", "objects": [], "complete": True})
+            with self.assertRaisesRegex(ValueError, "key is None, not str"):
+                codes.require_complete_codes(keyless)
+            with self.assertRaisesRegex(ValueError, "another run"):
+                codes.export_state(keyless, "text/layers/0/mlp/down", state, "run")
+
+    def test_listed_names_that_are_not_plain_file_names_of_the_directory_are_refused(self):
+        complete = {"key": "k", "layers_done": 64, "layers_total": 64, "heads_done": True, "mtp_done": True}
+        for name in (7, None, "../a.npz", "/abs/a.npz", "sub/a.npz", "..\\a.npz", "C:a.npz", "..", "", "calibration.json"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                codes_dir = self.codes_directory(tmp, {**complete, "files": []})
+                (codes_dir / "calibration.json").write_text(json.dumps({**complete, "files": ["a.npz", name]}))
+                with self.assertRaisesRegex(ValueError, "not file names of the directory"):
+                    codes.require_complete_codes(codes_dir, 64)
+        for objects in ([7], ["text\\layers"]):
+            with self.subTest(objects=objects), tempfile.TemporaryDirectory() as tmp:
+                codes_dir = self.codes_directory(tmp, {"producer": "fake_quant", "key": "run", "objects": objects,
+                                                       "complete": True})
+                with self.assertRaisesRegex(ValueError, "not plain names"):
+                    codes.require_complete_codes(codes_dir)
 
     def test_the_manifests_flags_are_read_strictly_and_its_layers_must_be_the_models(self):
         manifest = {"key": "k", "layers_done": 64, "layers_total": 64, "heads_done": "false", "mtp_done": True,
