@@ -14,5 +14,5 @@ pub mod layout;
 pub mod linears;
 pub mod writer;
 
-pub use layout::{MTP_BITS, MUL1, Quantized, auxiliary_files};
+pub use layout::{MTP_BITS, MTP_FILE, MUL1, Quantized, auxiliary_files, closing_files, layer_file};
 pub use writer::{Done, Exl3Settings, Exl3Writer, Listing};

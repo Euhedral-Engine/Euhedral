@@ -21,7 +21,7 @@ use checkpoint_support::{Spec, World, bf16, safetensors, write};
 use euhedral_core::generics::LatticeSource;
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_quantization::checkpoint::CheckpointError;
-use euhedral_inference_quantization::exl3::{Exl3Writer, Listing};
+use euhedral_inference_quantization::exl3::{Exl3Writer, Listing, MTP_FILE, closing_files, layer_file};
 use euhedral_io::AsyncIo;
 use exl3_support::{
     ATTENTION, CONFIG, GDN, MTP, all_rates, layer_results, listing, miniature, miniature_with, mtp_results, names,
@@ -193,6 +193,15 @@ fn a_full_write_holds_every_source_tensor_in_the_layout() {
     );
 
     let files: BTreeSet<String> = names(&f.out).into_iter().collect();
+    let source = listing(&f.source, &f.out).source;
+    let mut declared: BTreeSet<String> = closing_files(true, source.iter().map(String::as_str))
+        .into_iter()
+        .collect();
+    declared.extend([layer_file(0), layer_file(1), MTP_FILE.to_owned()]);
+    assert_eq!(
+        files, declared,
+        "the files a calibration lists are the files the writer wrote"
+    );
     for copied in ["tokenizer.json", "LICENSE"] {
         assert!(files.contains(copied), "{copied}");
     }
