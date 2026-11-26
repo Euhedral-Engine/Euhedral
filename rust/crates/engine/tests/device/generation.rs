@@ -1461,10 +1461,8 @@ fn forced_rows_equal_the_one_row_path(forced_rows: u32, rows_of: impl Fn(usize) 
     engine.batching.forced_rows = forced_rows;
     let (_card, runtime) = common::engine(&engine, &machine.library);
     let tokenizer = tokenizer(&machine.artifact);
-    let document = fs::read_to_string(repository_root().join(
-        "benchmark/src/main/resources/io/euhedral_execution/inference/benchmark/prompt/chat-corpus-v1-document.md",
-    ))
-    .unwrap();
+    let document =
+        fs::read_to_string(repository_root().join("rust/resources/bench/chat-corpus-v1-document.md")).unwrap();
     let document = tokenizer.encode(&document).unwrap();
     let (prefix, steps) = (96, 37);
     let first = &document[..prefix];

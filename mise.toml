@@ -59,15 +59,15 @@ run = "./gradlew :core:cudaTest :api:cudaTest --rerun-tasks"
 
 [tasks."benchmark-validate"]
 description = "Validate the baseline benchmark configuration without running it."
-run = "./gradlew :benchmark:run --args='run benchmark/configs/baseline.json --validate-only'"
+run = "./gradlew :benchmark:run --args='run rust/resources/bench/configs/baseline.json --validate-only'"
 
 [tasks."benchmark-smoke"]
 description = "Run a short model benchmark; reserve the GPU first."
-run = "./gradlew :benchmark:run --args='run benchmark/configs/smoke.json'"
+run = "./gradlew :benchmark:run --args='run rust/resources/bench/configs/smoke.json'"
 
 [tasks."benchmark-baseline"]
 description = "Run the full baseline; reserve the GPU first."
-run = "./gradlew :benchmark:run --args='run benchmark/configs/baseline.json'"
+run = "./gradlew :benchmark:run --args='run rust/resources/bench/configs/baseline.json'"
 
 [tasks."full-build"]
 description = "Build, format-check, test, verify and package both CUDA products and the API."

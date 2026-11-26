@@ -1,4 +1,4 @@
-//! The `run` configuration: the Java benchmark's JSON file (`benchmark/configs/*.json`), read with the same field names,
+//! The `run` configuration: the Java benchmark's JSON file (`rust/resources/bench/configs/*.json`), read with the same field names,
 //! defaults and checks. Unknown fields are rejected, as Java rejects them, except `tokenizer`, which older files carry and
 //! the Rust benchmark ignores (it reads the tokenizer from the artifact).
 //!

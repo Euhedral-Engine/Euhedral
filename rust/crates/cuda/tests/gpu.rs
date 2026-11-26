@@ -1,7 +1,7 @@
 //! Tests that run on a GPU. They are `#[ignore]`d and run locally in a memory-capped scope:
 //! `systemd-run --user --scope -p MemoryMax=8G cargo test -p euhedral-inference-cuda -- --ignored`.
 //!
-//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or
+//! The library comes from the `euhedral.cuda.library` property (`EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, in `~/.config/euhedral/test.properties`, or
 //! `gradle.properties`); a test skips with a message when it is absent.
 
 #![allow(

@@ -2,7 +2,7 @@
 //! `systemd-run --user --scope -p MemoryMax=16G cargo test -p euhedral-inference-engine --test device -- --ignored loader::`.
 //!
 //! The artifact comes from the `euhedral.qwen.rco-artifact` property and the library from `euhedral.cuda.library`
-//! (`EUHEDRAL_TEST_QWEN_RCO_ARTIFACT` and `EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, or `gradle.properties`); a
+//! (`EUHEDRAL_TEST_QWEN_RCO_ARTIFACT` and `EUHEDRAL_TEST_CUDA_LIBRARY` in the environment, in `~/.config/euhedral/test.properties`, or `gradle.properties`); a
 //! test skips with a message when either is absent. The corrupt copies of the artifact are sparse files under cargo's
 //! `CARGO_TARGET_TMPDIR` (inside the target directory, on the work drive), deleted afterwards.
 
