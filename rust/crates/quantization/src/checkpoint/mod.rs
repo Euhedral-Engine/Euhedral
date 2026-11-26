@@ -3,6 +3,7 @@
 //! - [`safetensors`]: the tensors of a checkpoint directory, read with positioned reads into memory the caller owns
 //!   (a pinned arena, say). Nothing is memory-mapped.
 //! - [`writer`]: one safetensors file, written as `<name>.part` and renamed when complete.
+//! - [`overlay`]: a directory that reads as a checkpoint with some tensors replaced.
 //! - [`objects`]: the quantized objects of a Qwen 3.8 checkpoint as row ranges of its BF16 tensors.
 //!
 //! Every operation that touches a file goes through `AsyncIo` (the writer's durability barrier and cleanup, which it
@@ -12,6 +13,7 @@
 
 pub(crate) mod io;
 pub mod objects;
+pub mod overlay;
 pub mod safetensors;
 pub mod writer;
 

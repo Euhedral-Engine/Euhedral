@@ -2,10 +2,12 @@
 
 use std::ffi::c_void;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::mem;
 use std::sync::Arc;
 
 use euhedral_gpu::cuda::CudaKernel;
 use euhedral_gpu::{LaneEnqueue, LaneStream};
+use euhedral_inference_cuda::launch::ops::RusteeOps;
 use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool};
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
 use euhedral_inference_engine::state::released::ReleasedBuffers;
@@ -35,7 +37,8 @@ pub struct Observation<'a> {
 /// What the observer is: called with each quantized linear's input, on the lane's context, before the linear.
 pub type Observer<'o, Q> = &'o mut dyn FnMut(&Observation<'_>, &mut LaneContext<'_, Q>) -> Result<(), ForwardError>;
 
-struct Slot {
+/// One sequence's recurrent state and attention cache: owned by the sequence that runs on it.
+pub struct Slot {
     convolution: DeviceBuffer,
     recurrent: DeviceBuffer,
     cache: KvCache,
@@ -67,6 +70,21 @@ pub struct LayerForward {
     library: Arc<CudaLibrary>,
     pool: Arc<PinnedPool>,
     released: Arc<ReleasedBuffers>,
+}
+
+impl Debug for Slot {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.debug_struct("Slot").finish_non_exhaustive()
+    }
+}
+
+impl Slot {
+    /// Publishes the attention rows the finished work appended and drops the staging its table uploads read: as
+    /// [`LayerForward::retire`], for one slot.
+    pub fn retire(&mut self) {
+        self.cache.commit_submitted();
+        self.retained.staging.clear();
+    }
 }
 
 impl LayerForward {
@@ -267,7 +285,7 @@ impl LayerForward {
 
     /// The rows of all sequences at once: the input norm and the mixer's input projections (with GDN's a/b control).
     pub fn head<Q>(
-        &mut self,
+        &self,
         context: &mut LaneContext<'_, Q>,
         layer: &LayerWeights,
         hidden: DevicePtr,
@@ -370,6 +388,30 @@ impl LayerForward {
     where
         Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
     {
+        let mut slots = mem::take(&mut self.slots);
+        let result = match slots.get_mut(s as usize) {
+            Some(slot) => self.sequence_in(context.ops(), layer, slot, s, length),
+            None => Err(ForwardError::Invalid(format!(
+                "sequence {s} has no slot; prepare slots first"
+            ))),
+        };
+        self.slots = slots;
+        result
+    }
+
+    /// [`sequence`](Self::sequence) with the slot handed in and only the lane's kernel operations: sequences that run
+    /// on different lanes at once each own their slot ([`take_slots`](Self::take_slots)) and share the workspace.
+    pub fn sequence_in<Q>(
+        &self,
+        ops: &mut RusteeOps<'_, Q>,
+        layer: &LayerWeights,
+        slot: &mut Slot,
+        s: u32,
+        length: u32,
+    ) -> Result<(), ForwardError>
+    where
+        Q: LaneEnqueue<Kernel = CudaKernel> + LaneStream<Raw = *mut c_void>,
+    {
         let shape = self.shape;
         let offset = u64::from(s) * u64::from(length);
         let end = offset + u64::from(length);
@@ -379,13 +421,8 @@ impl LayerForward {
                 self.max_rows
             )));
         }
-        let slot = self
-            .slots
-            .get_mut(s as usize)
-            .ok_or_else(|| ForwardError::Invalid(format!("sequence {s} has no slot; prepare slots first")))?;
         let at = |buffer: &DeviceBuffer, width: u32, bytes: u64| buffer.ptr().offset(bytes * offset * u64::from(width));
         if !layer.attention() {
-            let ops = context.ops();
             ops.zero_device_memory(slot.convolution.ptr(), slot.convolution.bytes() as u64)?;
             ops.zero_device_memory(slot.recurrent.ptr(), slot.recurrent.bytes() as u64)?;
             ops.gdn_convolution_bf16(
@@ -419,7 +456,7 @@ impl LayerForward {
         let query_key = at(&self.first, width, BF16_BYTES);
         let gate_value = at(&self.second, width, BF16_BYTES);
         let normed = at(&self.mixed, width, BF16_BYTES);
-        context.ops().attention_qk_norm_rope_bf16(
+        ops.attention_qk_norm_rope_bf16(
             query_key,
             required(layer, &Part::QueryNorm)?,
             required(layer, &Part::KeyNorm)?,
@@ -438,12 +475,11 @@ impl LayerForward {
         slot.cache.discard();
         slot.cache.truncate(0)?;
         slot.cache
-            .reserve(context.ops(), &self.pool, 0, u64::from(length), &mut slot.retained)?;
+            .reserve(&mut *ops, &self.pool, 0, u64::from(length), &mut slot.retained)?;
         let (keys, values) = match (slot.cache.key_table(0), slot.cache.value_table(0)) {
             (Some(keys), Some(values)) => (keys, values),
             _ => return Err(ForwardError::Invalid("the cache has no page tables".to_owned())),
         };
-        let ops = context.ops();
         ops.attention_kv_append_nvfp4(
             normed,
             gate_value,
@@ -476,7 +512,7 @@ impl LayerForward {
 
     /// The rows of all sequences at once: the mixer's output (GDN's gated norm first), the residual and the MLP.
     pub fn tail<Q>(
-        &mut self,
+        &self,
         context: &mut LaneContext<'_, Q>,
         layer: &LayerWeights,
         hidden: DevicePtr,
@@ -558,9 +594,20 @@ impl LayerForward {
     /// once the lane has retired everything queued since the last call.
     pub fn retire(&mut self) {
         for slot in &mut self.slots {
-            slot.cache.commit_submitted();
-            slot.retained.staging.clear();
+            slot.retire();
         }
+    }
+
+    /// Hands out the slots, one per sequence a batch holds: each is used by one sequence at a time, on any lane, with
+    /// [`sequence_in`](Self::sequence_in). [`put_slots`](Self::put_slots) takes them back (to
+    /// [`release`](Self::release) them).
+    pub fn take_slots(&mut self) -> Vec<Slot> {
+        mem::take(&mut self.slots)
+    }
+
+    /// Takes back the slots [`take_slots`](Self::take_slots) gave out.
+    pub fn put_slots(&mut self, slots: Vec<Slot>) {
+        self.slots = slots;
     }
 
     /// Frees the workspace and the slots in stream order on `lane`, every buffer even when one refuses (the first
