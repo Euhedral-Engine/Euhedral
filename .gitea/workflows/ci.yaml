@@ -188,8 +188,6 @@ jobs:
     env:
       ARBITER_ARGS: "--mem 12G"
       ARBITER_EST: "1800"
-      # apt waits forever on a stalled mirror; bound each request and retry it.
-      APT_OPTS: "-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true"
       # local/ci-base trusts only its own build directory.
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
     steps:
@@ -197,10 +195,9 @@ jobs:
       - name: Install the Rust toolchain
         run: mise install rust >/dev/null
       - name: Install bindgen
+        # bindgen loads libclang, which local/ci-base carries.
         run: |
           eval "$(mise env -s bash)"
-          # shellcheck disable=SC2086 # APT_OPTS is a list of options
-          apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq --no-install-recommends libclang-dev >/dev/null
           cargo install bindgen-cli --version 0.72.1 --locked
       - name: Check the CUDA bindings are current
         working-directory: rust
