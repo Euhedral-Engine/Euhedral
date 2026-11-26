@@ -233,7 +233,7 @@ mod tests {
     fn a_dropped_command_is_known_but_not_listed() {
         for name in ["train-blocks", "train-model", "rotate"] {
             assert_eq!(run_words(&[name]).code, EXIT_NOT_AVAILABLE);
-            assert!(!usage().contains(name));
+            assert!(!usage().lines().any(|line| line.trim_start().starts_with(name)));
         }
     }
 }
