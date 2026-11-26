@@ -2191,8 +2191,8 @@ impl Owner {
             // A hidden request that offers no step soon (its sink is far behind, or its context is full) must not hold
             // the passes of the other sequences, which wait for each member of the last pass to offer or leave.
             // Only with nothing in flight: a step still pending would be withdrawn.
-            let stalled = run.hidden.as_ref().is_some_and(|hidden| hidden.behind() || ended);
-            if stalled && run.in_flight.is_empty() {
+            let sink_behind = run.hidden.as_ref().map(Hidden::behind);
+            if passes_choice(sink_behind, ended, run.in_flight.len()) == PassesChoice::Leave {
                 run.leave_passes();
             }
         }
@@ -2578,6 +2578,25 @@ pub(super) fn may_end(parked: usize, flight: &Flight) -> bool {
     parked == 0 && flight.settled()
 }
 
+/// What a request does about the shared passes when it has no step to offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassesChoice {
+    /// Keep offering to the passes.
+    Offer,
+    /// Leave the passes, so that the other sequences need not wait for this one.
+    Leave,
+}
+
+/// Whether a request leaves the shared passes: only a hidden request (`sink_behind` is its sink's state, `None` for
+/// any other request) whose sink is behind or that has no next step (`ended`), and only with nothing in flight, since
+/// a step still pending would be withdrawn.
+fn passes_choice(sink_behind: Option<bool>, ended: bool, in_flight: usize) -> PassesChoice {
+    match sink_behind {
+        Some(behind) if (behind || ended) && in_flight == 0 => PassesChoice::Leave,
+        _ => PassesChoice::Offer,
+    }
+}
+
 /// The prompt rows a prefill step takes: 0 for any other.
 fn next_rows(step: Step) -> usize {
     match step {
@@ -2641,6 +2660,43 @@ impl Turn for Owner {
 
     fn idle(&self) -> bool {
         self.run.is_none() && self.parked.is_empty() && self.copies == 0 && self.finished.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod passes_choice_tests {
+    use super::*;
+
+    #[test]
+    fn a_sink_behind_with_nothing_in_flight_leaves() {
+        assert_eq!(passes_choice(Some(true), false, 0), PassesChoice::Leave);
+    }
+
+    #[test]
+    fn a_sink_behind_with_a_step_in_flight_stays() {
+        assert_eq!(passes_choice(Some(true), false, 1), PassesChoice::Offer);
+    }
+
+    #[test]
+    fn no_next_step_with_nothing_in_flight_leaves() {
+        assert_eq!(passes_choice(Some(false), true, 0), PassesChoice::Leave);
+    }
+
+    #[test]
+    fn no_next_step_with_a_step_in_flight_stays() {
+        assert_eq!(passes_choice(Some(false), true, 2), PassesChoice::Offer);
+    }
+
+    #[test]
+    fn a_sink_that_keeps_up_with_a_next_step_offers() {
+        assert_eq!(passes_choice(Some(false), false, 0), PassesChoice::Offer);
+    }
+
+    #[test]
+    fn a_request_without_a_hidden_sink_never_leaves() {
+        for ended in [false, true] {
+            assert_eq!(passes_choice(None, ended, 0), PassesChoice::Offer);
+        }
     }
 }
 

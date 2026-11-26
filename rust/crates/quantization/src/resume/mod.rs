@@ -36,6 +36,7 @@ use std::os::windows::io::AsRawHandle;
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::{Lake, UnitGuard};
+use euhedral_inference_engine::Handoff;
 use euhedral_io::{AsyncIo, Continuation, Create, IoBuf, IoDone, OpenSpec, OwnedFile, RawFile};
 use thiserror::Error;
 
@@ -44,7 +45,7 @@ pub use header::Header;
 use slot::Slot;
 
 use crate::durable::{self, Done, LakeClosed, SharedFile};
-use crate::step::{Kind, step};
+use crate::step::{Kind, idle, step};
 
 /// Bytes of the header; the sections start after it.
 pub const HEADER: u64 = 4096;
@@ -216,6 +217,11 @@ impl ResumeFile {
     /// Replaces the header with `header`, making the sections written before it durable first and the header itself
     /// durable after. The header is checked first: one that does not fit returns the error and touches nothing.
     pub fn set_header(&self, header: &Header, then: Then<()>) -> Result<(), ResumeError> {
+        self.clone().set_header_owned(header, then)
+    }
+
+    /// [`set_header`](ResumeFile::set_header) that takes the caller's handle: the caller keeps none while the call runs.
+    fn set_header_owned(self, header: &Header, then: Then<()>) -> Result<(), ResumeError> {
         let bytes = header.encode()?;
         let slot = Slot::new(then);
         let keep = self.clone();
@@ -242,8 +248,31 @@ impl ResumeFile {
                 written.fail(started)
             }
         };
-        self.clone()
-            .on_host(durable::sync_and_close, &Slot::new(Box::new(barrier)))
+        self.on_host(durable::sync_and_close, &Slot::new(Box::new(barrier)))
+    }
+
+    /// Ends a file that is being written under a temporary name: writes `header` last, durably, then cuts the file to
+    /// `len` bytes, makes it durable, closes it and renames it to `to`, replacing a file of that name. A stop at any point
+    /// leaves `to` as it was or as the whole new file. The call takes the handle and the file must have no other: it ends
+    /// with [`ResumeError::Busy`] otherwise. Errors of a step that could not start reach `then`; the call itself returns
+    /// an error only when the header does not fit, and then `then` is dropped unrun.
+    pub fn finish(self, header: &Header, len: u64, to: &Path, then: Then<()>) -> Result<(), ResumeError> {
+        header.check()?;
+        let parked = Handoff::new();
+        parked.send(then);
+        let (waiting, to_held, again) = (Arc::clone(&parked), to.to_owned(), self.clone());
+        let sealed = Box::new(move |written: Result<(), ResumeError>| -> Box<dyn Frame> {
+            if let Err(error) = written {
+                return end_parked(&waiting, Err(error));
+            }
+            let ending = Arc::clone(&waiting);
+            let started = again.seal(len, &to_held, Box::new(move |result| end_parked(&ending, result)));
+            match started {
+                Ok(()) => idle(),
+                Err(error) => end_parked(&waiting, Err(error)),
+            }
+        });
+        self.set_header_owned(header, sealed)
     }
 
     /// Writes `bytes` at `offset`; `then` is told the offset after them.
@@ -268,6 +297,16 @@ impl ResumeFile {
             };
             Ok(io.write(file, offset, IoBuf { bytes, filled }, Box::new(written))?)
         })
+    }
+
+    /// [`write`](ResumeFile::write) that takes the handle and gives it back to the continuation with the offset after
+    /// the bytes: the caller holds none while the call runs, so the continuation can be the file's last holder.
+    pub fn write_through(self, offset: u64, bytes: Vec<u8>, then: Then<(ResumeFile, u64)>) -> Result<(), ResumeError> {
+        let me = self.clone();
+        let slot = Slot::new(Box::new(move |written: Result<u64, ResumeError>| {
+            then(written.map(|end| (me, end)))
+        }));
+        self.write_slot(offset, bytes, &slot)
     }
 
     /// Reads `len` bytes at `offset`. A file that ends first is an error naming where.
@@ -411,6 +450,14 @@ impl ResumeFile {
             });
             offered.offer(frame).map_err(|_| ResumeError::LakeClosed)
         })
+    }
+}
+
+/// Ends a call whose continuation waits in `cell`: runs it with `result` unless a step already has.
+fn end_parked(cell: &Handoff<Then<()>>, result: Result<(), ResumeError>) -> Box<dyn Frame> {
+    match cell.take() {
+        Some(then) => then(result),
+        None => idle(),
     }
 }
 

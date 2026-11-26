@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
-use euhedral_graph::{Completions, Lake};
+use euhedral_graph::Lake;
 use euhedral_inference_engine::lattice_config;
 use euhedral_inference_settings::Settings;
 use euhedral_io::AsyncIo;
@@ -35,11 +35,11 @@ impl Rig {
         Ok(Rig { lattice, io, host })
     }
 
-    /// Adds the completions of a device's lanes to the lattice: the frames that continue a run come from it.
-    pub fn attach(&self, completions: Arc<Completions>) -> Result<(), String> {
+    /// Has the lattice take frames from one more source, such as a device lane's completions.
+    pub fn attach(&self, source: Arc<dyn LatticeSource>) -> Result<(), String> {
         self.lattice
-            .add_upstream(completions as Arc<dyn LatticeSource>)
-            .map(|_| ())
+            .add_upstream(source)
+            .map(drop)
             .map_err(|error| format!("{error:?}"))
     }
 
