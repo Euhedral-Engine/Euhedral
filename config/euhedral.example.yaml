@@ -40,6 +40,9 @@ context:
   kv-cache-format: auto                       # optional, default auto: nvfp4 | bf16 | auto (the artifact's)
   kv-cache-on-gpu-tokens: 65536               # optional, default 65536: tokens of a sequence kept on the GPU before its cache spills to the host
 
+speculation:
+  mode: artifact                              # optional, default artifact, Rust engine only: artifact (draft as the artifact's draft layer allows) | none (never draft: no draft layer, head or state is loaded)
+
 prefix-cache:
   size: 4GiB                                  # optional, default 4GiB: host memory for shared prompt prefixes; 0 disables
   checkpoint-tokens: 2048                     # optional, default 2048: tokens between stored checkpoints; a positive multiple of 512

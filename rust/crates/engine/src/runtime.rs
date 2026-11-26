@@ -115,7 +115,7 @@ pub fn resolve_sequences(
     if requested >= 1 {
         return Ok(requested);
     }
-    let profile = ArtifactProfile::of(table, config)?;
+    let profile = ArtifactProfile::of(table, config)?.under(settings.speculation.mode);
     if profile.speculation == Speculation::Dflash2 {
         return Ok(1);
     }

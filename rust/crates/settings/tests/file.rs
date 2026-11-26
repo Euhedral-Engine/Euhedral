@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use euhedral_inference_settings::{
-    Auto, ByteSize, CpuList, HostLayerCompute, KvFormat, ModelSettings, Settings, SettingsErrors, load_file,
-    load_for_tool,
+    Auto, ByteSize, CpuList, HostLayerCompute, KvFormat, ModelSettings, Settings, SettingsErrors, SpeculationMode,
+    load_file, load_for_tool,
 };
 
 const MODEL: &str = "model:\n  artifact: /m/a.edrl\n  name: q\n";
@@ -358,4 +358,17 @@ fn a_tool_that_serves_no_model_loads_without_the_model_keys() {
     );
     let settings = load_for_tool(&[], &no_env).unwrap();
     assert_eq!(settings.host.copy_chunk_bytes, ByteSize::mib(16));
+}
+
+#[test]
+fn speculation_mode_reads_artifact_or_none_and_refuses_anything_else() {
+    assert_eq!(load(MODEL).unwrap().speculation.mode, SpeculationMode::Artifact);
+    assert_eq!(
+        load(&format!("{MODEL}speculation:\n  mode: none\n"))
+            .unwrap()
+            .speculation
+            .mode,
+        SpeculationMode::None
+    );
+    assert!(problems(&format!("{MODEL}speculation:\n  mode: mtp\n"))[0].contains("artifact or none"));
 }

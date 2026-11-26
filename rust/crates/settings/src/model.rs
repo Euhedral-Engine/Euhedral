@@ -62,6 +62,8 @@ pub struct Settings {
     pub context: ContextSettings,
     /// The prompt prefix cache.
     pub prefix_cache: PrefixCacheSettings,
+    /// Whether the load drafts.
+    pub speculation: SpeculationSettings,
     /// How sequences share passes.
     pub batching: BatchingSettings,
     /// Memory limits and where layers run.
@@ -81,6 +83,7 @@ impl Settings {
             server: ServerSettings::default(),
             context: ContextSettings::default(),
             prefix_cache: PrefixCacheSettings::default(),
+            speculation: SpeculationSettings::default(),
             batching: BatchingSettings::default(),
             memory: MemorySettings::default(),
             host: HostSettings::default(),
@@ -214,6 +217,23 @@ impl Default for PrefixCacheSettings {
             copy_piece_bytes: ByteSize::mib(16),
         }
     }
+}
+
+/// Whether the load drafts tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpeculationMode {
+    /// Drafts as the artifact's draft layer allows.
+    #[default]
+    Artifact,
+    /// Never drafts: the load takes no draft layer, draft head or draft state.
+    None,
+}
+
+/// Speculative decoding (`speculation`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeculationSettings {
+    /// Whether the engine drafts; a run that only scores given tokens sets `none` to keep the memory.
+    pub mode: SpeculationMode,
 }
 
 /// How sequences share passes (`batching`).
