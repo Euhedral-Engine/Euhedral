@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::ptr::copy_nonoverlapping;
 use std::slice::from_raw_parts;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -395,6 +395,43 @@ fn abandon_drops_the_failed_quantums_uses() {
     rig.reader.slot_freed(0, 2);
     assert_eq!(rig.port.started().len(), 2);
     assert_eq!(rig.reader.reads_in_flight(), 0);
+}
+
+#[test]
+fn a_kill_flag_set_abandons_the_quanta_watching_it_and_no_others() {
+    let rig = Rig::new(1);
+    let (flag, other) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0)]);
+    rig.reader.watch(1, Arc::clone(&flag));
+    rig.enqueue(2, vec![use_of("b", BLOCK, 100, 0)]);
+    rig.reader.watch(2, Arc::clone(&other));
+    // The read of quantum 1 is in flight; the flag is set and the reader told: quantum 2 reads once it arrives.
+    flag.store(true, Ordering::Release);
+    rig.reader.killed(&flag);
+    rig.port.finish(0);
+    assert_eq!(
+        rig.port.started().len(),
+        2,
+        "the slot went on to the quantum that is not killed"
+    );
+    assert_eq!(rig.port.started()[1].offset, BLOCK);
+    rig.port.finish(0);
+    assert!(rig.claim(0, 2));
+    // Telling again changes nothing.
+    rig.reader.killed(&flag);
+    assert_eq!(rig.port.started().len(), 2);
+}
+
+#[test]
+fn a_quantum_watched_with_its_flag_already_set_is_abandoned_at_once() {
+    let rig = Rig::new(1);
+    rig.enqueue(1, vec![use_of("a", 0, 100, 0), use_of("b", BLOCK, 100, 0)]);
+    rig.enqueue(2, vec![use_of("c", 2 * BLOCK, 100, 0)]);
+    rig.reader.watch(1, Arc::new(AtomicBool::new(true)));
+    // The read in flight is dropped when it arrives, and the quantum's second use is never read.
+    rig.port.finish(0);
+    assert_eq!(rig.port.started().len(), 2);
+    assert_eq!(rig.port.started()[1].offset, 2 * BLOCK);
 }
 
 #[test]

@@ -699,9 +699,10 @@ impl Run {
         if self.stopping.is_none() {
             self.stopping = Some(reason);
             for flying in &self.in_flight {
-                if !flying.kill.swap(true, Ordering::AcqRel) {
-                    self.shared.executor.killed(&flying.kill);
-                }
+                flying.kill.store(true, Ordering::Release);
+                // Also when a failed restore set the flag first: what waits on the flag is told once more, which is
+                // harmless, and never missed.
+                self.shared.executor.killed(&flying.kill);
             }
             if let Some(checkpoints) = self.checkpoints.as_mut() {
                 checkpoints.stop();
