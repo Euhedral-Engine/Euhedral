@@ -330,3 +330,79 @@ pub fn plan_cross_entropy(
         .device(label_log_probability);
     Ok(vec![step("draft_cross_entropy", rows, THREADS, args)?])
 }
+
+/// BF16 `out` `[rows, k]` from an artifact's NVFP4 rows (row-split-k128-v1): the packed codes `[rows, k_pad / 2]`, the
+/// scale codes `[rows, k_pad / 16]` and the FP32 global scale (one float).
+pub fn plan_nvfp4_decode_bf16(
+    packed: u64,
+    scales: u64,
+    global: u64,
+    rows: u32,
+    k_pad: u32,
+    k: u32,
+    out: u64,
+) -> Result<Vec<Step>, TrainError> {
+    let (packed, scales) = (address("packed", packed)?, address("scales", scales)?);
+    let (global, out) = (address("global", global)?, address("out", out)?);
+    let (k_pad, k_signed) = (dimension("k_pad", k_pad)?, dimension("k", k)?);
+    dimension("rows", rows)?;
+    if k_signed > k_pad || k_pad % 16 != 0 {
+        return Err(out_of_range("k_pad", u64::from(k_pad.unsigned_abs())));
+    }
+    let total = u64::from(rows) * u64::from(k);
+    let args = Args::new()
+        .device(packed)
+        .device(scales)
+        .device(global)
+        .arg(i64::from(rows))
+        .arg(k_pad)
+        .arg(k_signed)
+        .device(out);
+    Ok(vec![step(
+        "nvfp4_decode_bf16",
+        elementwise("count", total)?,
+        THREADS,
+        args,
+    )?])
+}
+
+/// BF16 `out` (round to nearest even) of `count` floats at `x`.
+pub fn plan_float_to_bf16(x: u64, count: u64, out: u64) -> Result<Vec<Step>, TrainError> {
+    let (x, out) = (address("x", x)?, address("out", out)?);
+    let signed = count64("count", count)?;
+    let args = Args::new().device(x).arg(signed).device(out);
+    Ok(vec![step(
+        "float_to_bf16",
+        elementwise("count", count)?,
+        THREADS,
+        args,
+    )?])
+}
+
+/// FP32 `out` `[rows, width]` of the embedding rows `ids` `[rows]` of a Q3G64 table whose FP16 scales start `scale_offset`
+/// bytes in. The table may be pinned host memory.
+pub fn plan_q3_embedding_rows(
+    table: u64,
+    ids: u64,
+    rows: u32,
+    width: u32,
+    scale_offset: u64,
+    out: u64,
+) -> Result<Vec<Step>, TrainError> {
+    let (table, ids, out) = (address("table", table)?, address("ids", ids)?, address("out", out)?);
+    let (rows_signed, width_signed) = (dimension("rows", rows)?, dimension("width", width)?);
+    let total = u64::from(rows) * u64::from(width);
+    let args = Args::new()
+        .device(table)
+        .device(ids)
+        .arg(rows_signed)
+        .arg(width_signed)
+        .arg(scale_offset)
+        .device(out);
+    Ok(vec![step(
+        "q3_embedding_rows",
+        elementwise("count", total)?,
+        THREADS,
+        args,
+    )?])
+}

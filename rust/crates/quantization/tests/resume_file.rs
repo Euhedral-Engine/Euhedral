@@ -463,3 +463,74 @@ fn the_length_follows_the_writes() {
     drop(file);
     world.finish();
 }
+
+/// A file written under a temporary name appears under its own only when whole, with the header last and the length
+/// cut, and a file of that name already there is replaced whole.
+#[test]
+fn finishing_renames_the_whole_file_over_the_old_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let (old, part) = (
+        directory.path().join("resume.bin"),
+        directory.path().join("resume.bin.part"),
+    );
+    let world = World::start();
+    let first = world.open(&old);
+    call(|then| first.set_header(&step_header(1), then)).unwrap();
+    call(|then| first.write(HEADER, longs(&[1, 2, 3, 4]), then)).unwrap();
+    drop(first);
+
+    let file = world.open(&part);
+    let (file, end) = call(|then| file.write_through(HEADER, longs(&[7, 8]), then)).unwrap();
+    assert_eq!(end, HEADER + 16);
+    assert_eq!(
+        fs::metadata(&old).unwrap().len(),
+        HEADER + 32,
+        "the old file is untouched until the rename"
+    );
+    call(|then| file.finish(&step_header(9), HEADER + 16, &old, then)).unwrap();
+
+    assert!(!part.exists());
+    assert_eq!(fs::metadata(&old).unwrap().len(), HEADER + 16);
+    let reopened = world.open(&old);
+    assert_eq!(call(|then| reopened.header(then)).unwrap().get("step"), Some("9"));
+    assert_eq!(call(|then| reopened.read(HEADER, 16, then)).unwrap(), longs(&[7, 8]));
+    drop(reopened);
+    world.finish();
+}
+
+/// A handle that is not the last cannot seal: the call ends with `Busy` and the target is left as it was.
+#[test]
+fn finishing_with_another_handle_open_is_busy_and_leaves_the_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let (old, part) = (
+        directory.path().join("best.bin"),
+        directory.path().join("best.bin.part"),
+    );
+    let world = World::start();
+    let first = world.open(&old);
+    call(|then| first.set_header(&step_header(1), then)).unwrap();
+    drop(first);
+    let file = world.open(&part);
+    let other = file.clone();
+    let result = call(|then| file.finish(&step_header(2), HEADER, &old, then));
+    assert!(matches!(result, Err(ResumeError::Busy)), "{result:?}");
+    let target = world.open(&old);
+    assert_eq!(call(|then| target.header(then)).unwrap().get("step"), Some("1"));
+    drop((other, target));
+    world.finish();
+}
+
+/// A header that does not fit is returned at once, and the file is not written.
+#[test]
+fn finishing_with_a_header_too_large_returns_the_error_and_writes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (to, part) = (directory.path().join("x.bin"), directory.path().join("x.bin.part"));
+    let world = World::start();
+    let file = world.open(&part);
+    let mut header = Header::new();
+    header.set("big", "x".repeat(HEADER as usize));
+    let started = file.finish(&header, HEADER, &to, Box::new(|_| Box::new(DummyFrame::INSTANCE)));
+    assert!(started.is_err());
+    assert!(!to.exists());
+    world.finish();
+}

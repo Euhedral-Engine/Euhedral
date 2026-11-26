@@ -18,20 +18,24 @@
 //! - the planners of the drafter module's kernels (`plan_*`), like those of [`training`](crate::training).
 
 mod drafter;
+mod head;
 mod kernels;
 mod layout;
 mod plan;
+pub mod train;
 
 use thiserror::Error;
 
 use crate::training::{Gemm, Step, TrainError};
 
 pub use drafter::{Drafter, Forward, Window};
+pub use head::{HeadProduct, plan_head_gradient, plan_head_logits};
 pub use kernels::DrafterKernels;
 pub use layout::{Config, Parameter, Shape};
 pub use plan::{
-    Lineage, Nvfp4Codes, Softmax, plan_absolute_maximum, plan_copy_columns, plan_cross_entropy, plan_lineage_dot,
-    plan_lineage_gather, plan_lineage_spread, plan_nvfp4_round, plan_softmax, plan_softmax_backward,
+    Lineage, Nvfp4Codes, Softmax, plan_absolute_maximum, plan_copy_columns, plan_cross_entropy, plan_float_to_bf16,
+    plan_lineage_dot, plan_lineage_gather, plan_lineage_spread, plan_nvfp4_decode_bf16, plan_nvfp4_round,
+    plan_q3_embedding_rows, plan_softmax, plan_softmax_backward,
 };
 
 /// One piece of work on a lane: kernel launches of one module, or one FP32 product, in the order planned.
@@ -41,6 +45,8 @@ pub enum Work {
     Steps(Vec<Step>),
     /// An FP32 product on the lane's cuBLAS handle.
     Product(Gemm),
+    /// A product of the draft head, BF16 operands into FP32, on the lane's cuBLAS handle.
+    Head(HeadProduct),
 }
 
 /// Why the drafter cannot be built, planned or run.
