@@ -30,6 +30,7 @@ pub mod gdn;
 pub mod hyper;
 pub mod kernels;
 pub mod ops;
+pub mod plan;
 pub mod ple;
 pub mod sequence;
 
