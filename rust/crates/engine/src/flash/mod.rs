@@ -44,6 +44,7 @@ pub mod ple;
 pub mod qsa;
 pub mod seq_state;
 pub mod sequence;
+pub mod serve;
 pub mod start;
 pub mod startup;
 pub mod step;

@@ -23,7 +23,7 @@ use euhedral_inference_settings::{ModelSettings, Settings};
 use super::FlashEngine;
 use crate::flash::startup::start;
 use crate::generation::{
-    CancelHandle, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
+    CancelHandle, FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
 use crate::handoff::Handoff;
 use crate::sampling::SamplingConfig;
@@ -34,8 +34,15 @@ const WAIT: Duration = Duration::from_secs(20 * 60);
 /// The longest it waits for one generation: a hang guard only, far above what a debug build needs.
 const GENERATION: Duration = Duration::from_secs(10 * 60);
 
-/// The prompt: a one-turn chat opening, as token ids.
-const PROMPT: [u32; 9] = [151_644, 872, 198, 9_707, 151_645, 198, 151_644, 77_091, 198];
+/// The prompt: a one-turn chat with an empty think block (`<|im_start|>user\nWhat is 17 times 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`),
+/// as the Flash-Next tokenizer encodes it (the `prompt_ids` of the greedy reference's last entry).
+const PROMPT: [u32; 22] = [
+    248_045, 846, 198, 3710, 369, 220, 16, 22, 2942, 220, 17, 18, 30, 248_046, 198, 248_045, 74_455, 198, 248_068, 271,
+    248_069, 271,
+];
+
+/// The model's generation end tokens: `<|endoftext|>` and `<|im_end|>`.
+const STOP: [u32; 2] = [248_044, 248_046];
 
 struct Recorder {
     tokens: Vec<u32>,
@@ -56,12 +63,12 @@ impl GenerationListener for Recorder {
     }
 }
 
-fn generate(engine: &FlashEngine, wanted: u32) -> (Vec<u32>, GenerationOutcome) {
+fn generate(engine: &FlashEngine, wanted: u32, stops: &[u32]) -> (Vec<u32>, GenerationOutcome) {
     let done = Handoff::new();
     let request = GenerationRequest {
         prompt: PROMPT.to_vec(),
         max_tokens: wanted,
-        stop_tokens: Vec::new(),
+        stop_tokens: stops.to_vec(),
         speculation: Speculation::Off,
         sampling: SamplingConfig::greedy(0),
         constraint: None,
@@ -95,13 +102,22 @@ fn a_short_prompt_generates_the_same_tokens_twice() {
         .expect("the model starts");
     println!("device plan: {:?}", model.plan.device);
     let engine = FlashEngine::new(&model).expect("the sequence is allocated");
-    let (first, outcome) = generate(&engine, 16);
+    let (first, outcome) = generate(&engine, 16, &STOP);
     println!("first: {first:?} {:?} in {:?}", outcome.reason, outcome.elapsed);
-    let (second, _) = generate(&engine, 16);
+    let (second, _) = generate(&engine, 16, &STOP);
     println!("second: {second:?}");
+    // A stop token ends the run at its first sighting, and is the last token reported.
+    let stop = first[first.len() / 2];
+    let at = first
+        .iter()
+        .position(|token| *token == stop)
+        .expect("the token is in the run");
+    let (stopped, outcome) = generate(&engine, 16, &[stop]);
+    assert_eq!(outcome.reason, FinishReason::Stop, "{stopped:?}");
+    assert_eq!(stopped, first[..=at], "the run did not end at the stop token");
     assert!(!first.is_empty(), "no token was generated");
     assert_eq!(first, second, "the same prompt generated different tokens");
     assert!(engine.stop(Duration::from_secs(60)), "the engine did not go idle");
     assert!(engine.close(), "the engine kept its sequence");
-    model.shutdown(owner);
+    model.shutdown(owner, true);
 }

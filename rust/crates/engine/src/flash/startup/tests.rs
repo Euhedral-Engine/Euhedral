@@ -129,9 +129,14 @@ fn experts() -> ExpertLayout {
 #[test]
 fn a_plan_that_holds_every_expert_record_in_memory_is_refused() {
     let held = plan_with(ExpertStoreMode::RamResident, NgramMode::MappedFile, 2, RECORD);
-    let error = refuse_unserved(&held).expect_err("the records are not preloaded");
+    let error = refuse_unserved(&held, &HostBudget::stated(24 << 30)).expect_err("the records are not preloaded");
     let message = error.to_string();
-    assert!(message.contains("every expert record"), "{message}");
+    assert!(message.contains("expert records"), "{message}");
+    assert!(
+        message.contains(&(24u64 << 30).to_string()),
+        "the stated budget is named: {message}"
+    );
+    assert!(message.contains("memory.host-limit"), "{message}");
     // The plan holds every record when the host budget is large: the advice shrinks it, never grows it.
     assert!(message.contains("lower memory.host-limit"), "{message}");
     assert!(message.contains("raise memory.host-margin"), "{message}");
@@ -141,14 +146,18 @@ fn a_plan_that_holds_every_expert_record_in_memory_is_refused() {
 #[test]
 fn a_plan_that_pins_the_ngram_tables_is_refused() {
     let pinned = plan_with(ExpertStoreMode::FileBacked, NgramMode::PinnedArena, 2, RECORD);
-    let error = refuse_unserved(&pinned).expect_err("the tables are read from the file");
+    let error = refuse_unserved(&pinned, &HostBudget::stated(24 << 30)).expect_err("the tables are read from the file");
     assert!(error.to_string().contains("n-gram"), "{error}");
 }
 
 #[test]
 fn a_plan_that_caches_or_reads_records_and_maps_the_tables_is_served() {
     for store in [ExpertStoreMode::RamCached, ExpertStoreMode::FileBacked] {
-        refuse_unserved(&plan_with(store, NgramMode::MappedFile, 2, RECORD)).expect("served");
+        refuse_unserved(
+            &plan_with(store, NgramMode::MappedFile, 2, RECORD),
+            &HostBudget::stated(24 << 30),
+        )
+        .expect("served");
     }
 }
 
@@ -268,4 +277,21 @@ fn the_scale_of_each_shard_is_read_from_its_trailer_in_the_order_of_the_tables()
     let at: Vec<_> = ranges.into_iter().map(|(range, _)| range).collect();
     assert_eq!(at, [1000 + trailer..1004 + trailer, 5000 + trailer..5004 + trailer]);
     assert!(scale_ranges(&config, |_| None).is_err());
+}
+
+#[test]
+fn a_model_whose_engine_did_not_end_is_never_freed_and_its_cache_is_left_alone() {
+    let mut asked = false;
+    let kept = Release::decide(false, || {
+        asked = true;
+        true
+    });
+    assert!(matches!(kept, Release::Keep(_)), "{kept:?}");
+    assert!(!asked, "the cache's loads were cut under a running graph");
+}
+
+#[test]
+fn a_model_is_freed_only_when_the_engine_and_the_cache_have_ended() {
+    assert_eq!(Release::decide(true, || true), Release::Free);
+    assert!(matches!(Release::decide(true, || false), Release::Keep(_)));
 }

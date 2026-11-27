@@ -43,6 +43,7 @@ use crate::frames::{Kind, step};
 use crate::handoff::Handoff;
 use crate::model::flash_config::FlashModelConfig;
 use crate::residency::accounting::{Consumer, PlanReservation};
+use crate::residency::budget::{BudgetSource, HostBudget};
 use crate::residency::disk::{ArtifactFile, DiskReadPiece};
 use crate::residency::expert_cache::{
     CacheConfig, CacheError, CopyLane, DeviceSlots, ExpertCache, Frames, RuntimeLanes,
@@ -146,22 +147,28 @@ impl FlashModel {
         self.held.expert_memory.ptr()
     }
 
-    /// Stops the engine: ends the cache's loads, closes the lakes and the lattice with `owner`, then frees the device
-    /// memory. Call it from the thread that started the engine, once no frame is running.
-    pub fn shutdown(self, owner: RuntimeOwner) {
+    /// Stops the engine: closes the lakes and the lattice with `owner`, then frees the device memory. Call it from the
+    /// thread that started the engine, once no frame is running. `engine_ended` is [`FlashEngine::close`]'s answer: when
+    /// it is `false` a graph may still read the weights, the expert cache and the pool, so nothing is freed and the
+    /// model is forgotten (its device memory stays allocated until the process exits, and the bytes are logged). Else
+    /// the cache's loads end first, and the memory is freed unless they do not end.
+    ///
+    /// [`FlashEngine::close`]: super::engine::FlashEngine::close
+    pub fn shutdown(self, owner: RuntimeOwner, engine_ended: bool) {
         let bound = self.core.teardown.cancel_bound;
-        let ended = self.held.cache.as_deref().is_none_or(|cache| wait_closed(cache, bound));
+        let release = Release::decide(engine_ended, || {
+            self.held.cache.as_deref().is_none_or(|cache| wait_closed(cache, bound))
+        });
         let allocated = self.core.teardown.device_bytes.load(Ordering::Acquire);
         let teardown = Arc::clone(&self.core.teardown);
-        owner.shutdown_with(move || {
-            if ended {
-                self.release();
-            } else {
-                log::error!("the expert cache did not end its loads: the device memory stays allocated until exit");
+        owner.shutdown_with(move || match release {
+            Release::Free => self.release(),
+            Release::Keep(why) => {
+                log::error!("{why}: {allocated} bytes of device memory stay allocated until the process exits");
                 mem::forget(self);
             }
         });
-        if !ended {
+        if release != Release::Free {
             // Nothing was freed: the bytes still count as allocated.
             teardown.device_bytes.store(allocated, Ordering::Release);
         }
@@ -187,6 +194,28 @@ impl FlashModel {
         } else {
             log::error!("memory account closed with claims still held: {report}");
         }
+    }
+}
+
+/// Whether a model's memory may be freed at shutdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Release {
+    Free,
+    /// Nothing is freed, for the reason.
+    Keep(&'static str),
+}
+
+impl Release {
+    /// Free only when the engine's sequence ended (`engine_ended`) and the cache's loads ended (`cache_ended`, asked
+    /// only then: a running graph may be waiting on a load, which the close would cut).
+    fn decide(engine_ended: bool, cache_ended: impl FnOnce() -> bool) -> Release {
+        if !engine_ended {
+            return Release::Keep("a generation is running at shutdown, and its graph reads the model");
+        }
+        if !cache_ended() {
+            return Release::Keep("the expert cache did not end its loads");
+        }
+        Release::Free
     }
 }
 
@@ -433,15 +462,26 @@ fn parse(
     FlashArtifact::parse(header, metadata, tables, tokenizer).map_err(failed)
 }
 
-/// The refusal of a plan the upload cannot serve, naming what asks for it.
-fn refuse_unserved(plan: &FlashPlan) -> Result<(), EngineError> {
+/// Where a host budget came from, as an operator reads it.
+fn source_name(source: BudgetSource) -> &'static str {
+    match source {
+        BudgetSource::Explicit => "memory.host-limit",
+        BudgetSource::Automatic => "the memory the machine can spare, less memory.host-margin",
+        BudgetSource::Unknown => "not reported by the machine",
+    }
+}
+
+/// The refusal of a plan the upload cannot serve, naming what asks for it and the budget it was made against.
+fn refuse_unserved(plan: &FlashPlan, host: &HostBudget) -> Result<(), EngineError> {
     if plan.expert_store == ExpertStoreMode::RamResident {
-        return Err(EngineError::Runtime(
-            "the plan holds every expert record in memory, which this start does not preload: lower \
-             memory.host-limit or raise memory.host-margin, so that less host memory counts as available and the plan \
-             caches the records"
-                .to_string(),
-        ));
+        return Err(EngineError::Runtime(format!(
+            "the host budget of {} bytes ({}) holds all {} bytes of expert records in memory, which this start does \
+             not preload: lower memory.host-limit or raise memory.host-margin, so that less host memory counts as \
+             available and the plan caches the records",
+            host.resident_bytes,
+            source_name(host.source),
+            plan.host.expert_ram,
+        )));
     }
     if plan.ngram == NgramMode::PinnedArena {
         return Err(EngineError::Runtime(
@@ -497,7 +537,7 @@ fn plan(mut boot: Boot, opened: Opened, device_free: u64) {
                 mode: FlashMode::TEXT,
             },
         )?;
-        refuse_unserved(&plan)?;
+        refuse_unserved(&plan, &core.host_budget)?;
         let layout = FixedLayout::of(&plan, tables.tensors()).map_err(flash_failed)?;
         let experts = Arc::new(ExpertLayout::new(tables.banks(), opened.length).map_err(expert_failed)?);
         let streaming = &core.settings.memory.weight_streaming;

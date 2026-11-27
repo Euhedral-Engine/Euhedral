@@ -24,13 +24,14 @@ use euhedral_graph::{Completions, DeviceQueue, Lake, LaneId, LanePool, UnitGuard
 use euhedral_hardware_utils::util::CpuSet;
 use euhedral_inference_cuda::launch::load::{KernelTable, load};
 use euhedral_inference_cuda::{CudaLibrary, PinnedPool};
+use euhedral_inference_edrl::ModelFamily;
 use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
 use crate::composite::Composite;
 use crate::error::{EngineError, PlanError};
-use crate::flash::start::host_budget;
+use crate::flash::start::{family_name, host_budget};
 use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, HiddenSink, LogitsSink};
 use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
 use crate::handoff::Handoff;
@@ -850,6 +851,7 @@ impl EngineRuntime {
         report: StartupReport,
     ) -> EngineRuntime {
         let cache = generations.prefix_cache_stats().map(|stats| stats.capacity_bytes);
+        log::info!("Model family: {}", family_name(ModelFamily::DenseV2));
         for line in summary::lines(&summary::Facts::of(&plan, &core.settings, cache)) {
             log::info!("{line}");
         }

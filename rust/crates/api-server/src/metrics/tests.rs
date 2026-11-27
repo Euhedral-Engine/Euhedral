@@ -306,7 +306,7 @@ fn every_series_reads_its_own_field() {
 fn an_engine_without_a_prefix_cache_or_artifact_exports_neither() {
     let text = Metrics::new(0, 0).render("m", 8, &EngineReport::default(), 0);
     assert!(text.contains(
-        "euhedral_engine_info{application=\"euhedral-inference\",artifact=\"unknown\",model=\"m\",speculation=\"none\",speculative_depth=\"0\"} 1\n"
+        "euhedral_engine_info{application=\"euhedral-inference\",artifact=\"unknown\",family=\"unknown\",model=\"m\",speculation=\"none\",speculative_depth=\"0\"} 1\n"
     ));
     assert!(!text.contains("euhedral_prefix_"));
     assert!(

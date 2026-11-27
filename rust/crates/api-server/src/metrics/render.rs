@@ -386,6 +386,7 @@ fn engine_state(page: &mut Page<'_>, model: &str, context_tokens: usize, engine:
     let depth = engine.speculative_depth.to_string();
     let labels = [
         ("artifact", engine.artifact.as_deref().unwrap_or("unknown")),
+        ("family", engine.family.as_str()),
         ("model", model),
         ("speculation", engine.speculation.as_str()),
         ("speculative_depth", depth.as_str()),

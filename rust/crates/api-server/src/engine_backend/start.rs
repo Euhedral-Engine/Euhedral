@@ -13,6 +13,9 @@ use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_inference_api_protocol::output_grammar::{end_ids, token_bytes};
 use euhedral_inference_api_protocol::template::{CONTROL_TOKENS, check_template_source};
 use euhedral_inference_engine::error::EngineError;
+use euhedral_inference_engine::flash::serve::FlashRuntime;
+use euhedral_inference_engine::flash::start::{ModelFamily, family_at as family_of_file, family_name};
+use euhedral_inference_engine::flash::startup::{FlashModel, FlashReady, start as start_flash};
 use euhedral_inference_engine::generation::{
     AdmissionError, CancelHandle, GenerationRequest as EngineRequest, MAX_VERIFIED, Speculation,
 };
@@ -123,6 +126,7 @@ impl Engine for RuntimeEngine {
         let pool = runtime.pinned_pool().gauges();
         EngineReport {
             artifact: self.artifact.clone(),
+            family: family_name(ModelFamily::DenseV2).to_owned(),
             speculation: if depth > 0 { "mtp" } else { "none" }.to_owned(),
             speculative_depth: depth,
             workers: runtime.lattice().active_workers(),
@@ -132,6 +136,60 @@ impl Engine for RuntimeEngine {
             pinned_pool_bytes: pool.held_bytes,
             pinned_pool_overflows: pool.overflows,
             prefix_cache: runtime.prefix_cache_stats().map(prefix_report),
+        }
+    }
+}
+
+/// The Flash-Next engine behind the traits: the runtime, held weakly so that [`EngineHost::shutdown`] holds the last
+/// handle. One sequence, no drafter.
+struct FlashServing {
+    runtime: Weak<FlashRuntime>,
+    artifact: Option<String>,
+    context_length: usize,
+    vocabulary_size: usize,
+}
+
+impl Engine for FlashServing {
+    fn generate(&self, request: EngineRequest, cancel: CancelHandle) -> Result<(), AdmissionError> {
+        match self.runtime.upgrade() {
+            Some(runtime) => runtime.generate(request, cancel),
+            None => Err(AdmissionError::Engine("the engine is closed".to_owned())),
+        }
+    }
+
+    fn context_length(&self) -> usize {
+        self.context_length
+    }
+
+    fn vocabulary_size(&self) -> usize {
+        self.vocabulary_size
+    }
+
+    fn sequences(&self) -> usize {
+        1
+    }
+
+    fn speculation(&self) -> Speculation {
+        Speculation::Off
+    }
+
+    fn report(&self) -> EngineReport {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return EngineReport::default();
+        };
+        let pool = runtime.pinned_pool().gauges();
+        EngineReport {
+            artifact: self.artifact.clone(),
+            family: family_name(ModelFamily::FlashNextV3).to_owned(),
+            speculation: "none".to_owned(),
+            speculative_depth: 0,
+            workers: runtime.lattice().active_workers(),
+            allocated_device_bytes: runtime.allocated_device_bytes(),
+            free_device_bytes: runtime.library().free_bytes().unwrap_or(0),
+            host_backed_weight_bytes: runtime.host_backed_weight_bytes(),
+            pinned_pool_bytes: pool.held_bytes,
+            pinned_pool_overflows: pool.overflows,
+            prefix_cache: None,
         }
     }
 }
@@ -189,6 +247,13 @@ fn artifact_problem(path: &Path) -> Option<String> {
     }
 }
 
+/// The family of the artifact at `path`, from its first bytes: the dispatch of the start. An artifact that is not a
+/// family this engine serves is refused here, naming what the file is, before the card is touched.
+fn family_at(path: &Path) -> Result<ModelFamily, StartError> {
+    family_of_file(path)
+        .map_err(|error| StartError::Setup(format!("{ARTIFACT_KEY} ({}): {error}", variable_name(ARTIFACT_KEY))))
+}
+
 /// An engine that is loading. It holds the engine's owner: finish it with [`wait`](EngineStarting::wait) or poll it
 /// with [`ready`](EngineStarting::ready), on the thread that started it.
 pub struct EngineStarting {
@@ -197,20 +262,64 @@ pub struct EngineStarting {
     settings: Settings,
 }
 
-/// The owner and the hand-off of a start that has not ended. Dropped with its start still pending, it abandons the
-/// start: a runtime that arrives later is freed by its arrival, and one that is already there is freed through the
+/// The start of one family that has not ended.
+enum Pending {
+    Dense(DensePending),
+    Flash(FlashPending),
+}
+
+/// What a start delivered.
+enum Arrival {
+    Dense(Result<Arc<EngineRuntime>, EngineError>),
+    Flash(Result<Box<FlashModel>, EngineError>),
+}
+
+impl Pending {
+    /// The delivery, if it is there.
+    fn take(&self) -> Option<Arrival> {
+        match self {
+            Pending::Dense(start) => start.ready.take().map(Arrival::Dense),
+            Pending::Flash(start) => start.ready.take().map(|loaded| Arrival::Flash(loaded.map(Box::new))),
+        }
+    }
+
+    /// The delivery within `limit`.
+    fn wait(&self, limit: Duration) -> Option<Arrival> {
+        match self {
+            Pending::Dense(start) => start.ready.wait(limit).ok().map(Arrival::Dense),
+            Pending::Flash(start) => start
+                .ready
+                .wait(limit)
+                .ok()
+                .map(|loaded| Arrival::Flash(loaded.map(Box::new))),
+        }
+    }
+
+    /// The owner, for a start that ended (or that this takes over).
+    fn owner(&mut self) -> Option<RuntimeOwner> {
+        match self {
+            Pending::Dense(start) => start.owner.take(),
+            Pending::Flash(start) => start.owner.take(),
+        }
+    }
+
+    fn abandon(&mut self) {
+        match self {
+            Pending::Dense(start) => start.abandon(),
+            Pending::Flash(start) => start.abandon(),
+        }
+    }
+}
+
+/// The owner and the hand-off of a dense start that has not ended. Dropped with its start still pending, it abandons
+/// the start: a runtime that arrives later is freed by its arrival, and one that is already there is freed through the
 /// owner.
-struct Pending {
+struct DensePending {
     owner: Option<RuntimeOwner>,
     ready: ReadyHandoff,
 }
 
-impl Pending {
-    /// The owner, for a start that ended (or that this takes over).
-    fn owner(&mut self) -> Option<RuntimeOwner> {
-        self.owner.take()
-    }
-
+impl DensePending {
     /// Ends the start without serving it. Nothing waits here beyond what the owner's drop does.
     fn abandon(&mut self) {
         let Some(owner) = self.owner.take() else { return };
@@ -225,16 +334,40 @@ impl Pending {
     }
 }
 
-impl Drop for Pending {
+impl Drop for DensePending {
     fn drop(&mut self) {
         self.abandon();
     }
 }
 
-/// Checks the artifact, reads its tokenizer and starts the engine of `settings` on the CUDA library at `library`.
-/// Returns at once; the engine loads on its own lattice. Call it from the thread that will shut the engine down, which
-/// is not a worker of any lattice. `close_timeout` is the longest the lattice's close waits for the workers (the server
-/// passes `server.shutdown-timeout`); `None` keeps the default.
+/// [`DensePending`] for a Flash-Next start: a model that is already there is freed through the owner, one that
+/// arrives later is dropped by its arrival (its device memory stays until exit, as the dense arrival's does when it
+/// cannot free).
+struct FlashPending {
+    owner: Option<RuntimeOwner>,
+    ready: FlashReady,
+}
+
+impl FlashPending {
+    fn abandon(&mut self) {
+        let Some(owner) = self.owner.take() else { return };
+        match self.ready.abandon() {
+            Some(Ok(model)) => model.shutdown(owner, true),
+            Some(Err(_)) | None => drop(owner),
+        }
+    }
+}
+
+impl Drop for FlashPending {
+    fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
+/// Checks the artifact, reads its tokenizer and starts the engine of `settings` on the CUDA library at `library`: the
+/// engine of the artifact's family. Returns at once; the engine loads on its own lattice. Call it from the thread that
+/// will shut the engine down, which is not a worker of any lattice. `close_timeout` is the longest the lattice's close
+/// waits for the workers (the server passes `server.shutdown-timeout`); `None` keeps the default.
 pub fn begin_start(
     settings: &Settings,
     library: &Path,
@@ -243,15 +376,28 @@ pub fn begin_start(
     if let Some(problem) = artifact_problem(&settings.model.artifact) {
         return Err(StartError::Setup(problem));
     }
+    let family = family_at(&settings.model.artifact)?;
     let section =
         read_artifact_section(&settings.model.artifact).map_err(|error| StartError::Tokenizer(error.to_string()))?;
     let tokenizer = checked_tokenizer(&section)?;
-    let (owner, ready) = EngineRuntime::start_with(settings, library, close_timeout);
+    let pending = match family {
+        ModelFamily::DenseV2 => {
+            let (owner, ready) = EngineRuntime::start_with(settings, library, close_timeout);
+            Pending::Dense(DensePending {
+                owner: Some(owner),
+                ready,
+            })
+        }
+        ModelFamily::FlashNextV3 => {
+            let (owner, ready) = start_flash(settings, library, close_timeout);
+            Pending::Flash(FlashPending {
+                owner: Some(owner),
+                ready,
+            })
+        }
+    };
     Ok(EngineStarting {
-        pending: Pending {
-            owner: Some(owner),
-            ready,
-        },
+        pending,
         tokenizer,
         settings: settings.clone(),
     })
@@ -294,8 +440,8 @@ impl Debug for EngineHost {
 impl EngineStarting {
     /// The loaded engine, or this still loading (`Err`), without waiting.
     pub fn ready(self) -> Result<Result<EngineHost, StartError>, Box<EngineStarting>> {
-        match self.pending.ready.take() {
-            Some(loaded) => Ok(self.host(loaded)),
+        match self.pending.take() {
+            Some(arrival) => Ok(self.host(arrival)),
             None => Err(Box::new(self)),
         }
     }
@@ -303,9 +449,9 @@ impl EngineStarting {
     /// Waits up to `limit` for the engine, on the caller's own thread: the one wait of a start. An engine that is not
     /// ready by then is stopped.
     pub fn wait(mut self, limit: Duration) -> Result<EngineHost, StartError> {
-        match self.pending.ready.wait(limit) {
-            Ok(loaded) => self.host(loaded),
-            Err(_) => {
+        match self.pending.wait(limit) {
+            Some(arrival) => self.host(arrival),
+            None => {
                 // It may have finished just now: what is loaded is freed through the owner. Otherwise the start is
                 // marked abandoned, so that a runtime arriving later is freed by its arrival, and the owner's drop
                 // closes the lattice.
@@ -318,7 +464,23 @@ impl EngineStarting {
         }
     }
 
-    fn host(mut self, loaded: Result<Arc<EngineRuntime>, EngineError>) -> Result<EngineHost, StartError> {
+    fn host(self, arrival: Arrival) -> Result<EngineHost, StartError> {
+        match arrival {
+            Arrival::Dense(loaded) => self.dense_host(loaded),
+            Arrival::Flash(loaded) => self.flash_host(loaded),
+        }
+    }
+
+    /// The artifact's file name, which the engine reports.
+    fn artifact_name(&self) -> Option<String> {
+        self.settings
+            .model
+            .artifact
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+
+    fn dense_host(mut self, loaded: Result<Arc<EngineRuntime>, EngineError>) -> Result<EngineHost, StartError> {
         let runtime = match loaded {
             Ok(runtime) => runtime,
             // Nothing was loaded; the owner's drop closes what started.
@@ -338,12 +500,7 @@ impl EngineStarting {
         }
         let engine = Arc::new(RuntimeEngine {
             runtime: Arc::downgrade(&runtime),
-            artifact: self
-                .settings
-                .model
-                .artifact
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned()),
+            artifact: self.artifact_name(),
             context_length,
             vocabulary_size: runtime.config().vocab_size,
         });
@@ -352,17 +509,62 @@ impl EngineStarting {
                 .map_err(StartError::Engine)?,
         );
         Ok(EngineHost {
-            owner,
-            runtime,
+            held: Held::Dense { owner, runtime },
             backend,
         })
     }
+
+    fn flash_host(mut self, loaded: Result<Box<FlashModel>, EngineError>) -> Result<EngineHost, StartError> {
+        let model = match loaded {
+            Ok(model) => model,
+            // Nothing was loaded; the owner's drop closes what started.
+            Err(error) => return Err(StartError::from(error)),
+        };
+        let Some(owner) = self.pending.owner() else {
+            return Err(StartError::Engine("the engine's owner is gone".to_owned()));
+        };
+        let runtime = Arc::new(FlashRuntime::over(*model, owner)?);
+        let sink = Arc::new(QueueIngestSink::new());
+        if let Err(error) = runtime.lattice().add_upstream(sink.delegate()) {
+            if let Err(stop) = runtime.shutdown(Duration::ZERO) {
+                log::error!("stopping the engine that did not start failed: {stop}");
+            }
+            return Err(StartError::Engine(format!("the lattice takes no backend: {error:?}")));
+        }
+        let engine = Arc::new(FlashServing {
+            runtime: Arc::downgrade(&runtime),
+            artifact: self.artifact_name(),
+            context_length: runtime.context_tokens(),
+            vocabulary_size: runtime.vocabulary_size(),
+        });
+        let backend = EngineBackend::new(engine, Arc::new(self.tokenizer), sink, self.settings.model.name.clone());
+        match backend {
+            Ok(backend) => Ok(EngineHost {
+                held: Held::Flash(runtime),
+                backend: Arc::new(backend),
+            }),
+            Err(error) => {
+                if let Err(stop) = runtime.shutdown(Duration::ZERO) {
+                    log::error!("stopping the engine that did not start failed: {stop}");
+                }
+                Err(StartError::Engine(error))
+            }
+        }
+    }
+}
+
+/// What a running engine is held by, per family.
+enum Held {
+    Dense {
+        owner: RuntimeOwner,
+        runtime: Arc<EngineRuntime>,
+    },
+    Flash(Arc<FlashRuntime>),
 }
 
 /// A running engine: its backend, its lattice (the server runs on it too) and the means to stop it.
 pub struct EngineHost {
-    owner: RuntimeOwner,
-    runtime: Arc<EngineRuntime>,
+    held: Held,
     backend: Arc<EngineBackend>,
 }
 
@@ -372,15 +574,21 @@ impl EngineHost {
         Arc::clone(&self.backend)
     }
 
-    /// The runtime itself, for what the backend does not offer (a direct generation, a snapshot). Do not keep the
-    /// handle: [`shutdown`](EngineHost::shutdown) needs the last one.
-    pub fn runtime(&self) -> &Arc<EngineRuntime> {
-        &self.runtime
+    /// The dense runtime itself, for what the backend does not offer (a direct generation, a snapshot); `None` for a
+    /// Flash-Next engine. Do not keep the handle: [`shutdown`](EngineHost::shutdown) needs the last one.
+    pub fn runtime(&self) -> Option<&Arc<EngineRuntime>> {
+        match &self.held {
+            Held::Dense { runtime, .. } => Some(runtime),
+            Held::Flash(_) => None,
+        }
     }
 
     /// The engine's lattice: the server's frames run here.
     pub fn lattice(&self) -> &Arc<ControlPlaneLattice> {
-        self.runtime.lattice()
+        match &self.held {
+            Held::Dense { runtime, .. } => runtime.lattice(),
+            Held::Flash(runtime) => runtime.lattice(),
+        }
     }
 
     /// Stops the engine within `window`: the backend admits nothing more, then the lattice closes and the device
@@ -388,9 +596,10 @@ impl EngineHost {
     /// stays. Call it on the thread that started the engine, after the server has stopped and no generation runs.
     pub fn shutdown(self, window: Duration) -> Result<(), StartError> {
         self.backend.close();
-        self.owner
-            .shutdown_within(self.runtime, window)
-            .map_err(StartError::from)
+        match self.held {
+            Held::Dense { owner, runtime } => owner.shutdown_within(runtime, window).map_err(StartError::from),
+            Held::Flash(runtime) => runtime.shutdown(window).map_err(StartError::from),
+        }
     }
 }
 
@@ -426,6 +635,7 @@ fn prefix_report(stats: PrefixCacheStats) -> PrefixCacheReport {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::io::Write;
     use std::path::PathBuf;
 
     use euhedral_inference_engine::runtime::Teardown;
@@ -434,6 +644,7 @@ mod tests {
 
     use euhedral_inference_edrl::{FOOTER_BYTES, TOKENIZER_ENTRIES, TokenizerFooter};
     use serde_json::{Value, json};
+    use tempfile::NamedTempFile;
 
     use super::*;
 
@@ -609,7 +820,7 @@ mod tests {
         let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
         let owner = RuntimeOwner::over(Teardown::new(lattice, Vec::new()));
         let ready = Handoff::new();
-        drop(Pending {
+        drop(DensePending {
             owner: Some(owner),
             ready: Arc::clone(&ready),
         });
@@ -626,5 +837,199 @@ mod tests {
         let text = StartError::Driver("no library".to_owned()).to_string();
         assert!(text.starts_with("the NVIDIA driver is required, with an NVIDIA Blackwell GPU: no library; install"));
         assert!(text.ends_with("(nvidia-smi lists the GPU when it works)"));
+    }
+
+    /// A temporary file holding `bytes`, removed when dropped.
+    fn artifact_with(bytes: &[u8]) -> NamedTempFile {
+        let mut file = NamedTempFile::new().expect("a temporary file");
+        file.write_all(bytes).expect("the file is written");
+        file
+    }
+
+    /// The first bytes of an artifact: the magic, the container version, the architecture.
+    fn head(version: u32, architecture: u32) -> Vec<u8> {
+        let mut bytes = 0x5157_454Eu32.to_be_bytes().to_vec();
+        bytes.extend(version.to_be_bytes());
+        bytes.extend(architecture.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn the_start_dispatches_on_the_family_the_artifact_names() {
+        let dense = artifact_with(&head(2, 0));
+        let flash = artifact_with(&head(3, 1));
+        assert_eq!(family_at(dense.path()).expect("dense"), ModelFamily::DenseV2);
+        assert_eq!(family_at(flash.path()).expect("flash"), ModelFamily::FlashNextV3);
+    }
+
+    #[test]
+    fn an_artifact_of_a_family_this_engine_does_not_serve_is_refused_naming_it() {
+        let unknown = artifact_with(&head(3, 9));
+        let refused = family_at(unknown.path())
+            .expect_err("an unknown architecture")
+            .to_string();
+        assert!(refused.contains("architecture 9"), "{refused}");
+        assert!(refused.contains(ARTIFACT_KEY), "{refused}");
+        let older = artifact_with(&head(1, 0));
+        let refused = family_at(older.path()).expect_err("an unknown version").to_string();
+        assert!(refused.contains("version 1"), "{refused}");
+    }
+
+    #[test]
+    fn an_artifact_too_short_to_name_its_family_is_refused() {
+        let short = artifact_with(&[0x51, 0x57]);
+        let refused = family_at(short.path()).expect_err("a short file").to_string();
+        assert!(refused.contains("cannot be read"), "{refused}");
+    }
+
+    #[test]
+    fn a_flash_engine_whose_runtime_is_gone_refuses_requests_and_reports_nothing() {
+        let engine = FlashServing {
+            runtime: Weak::new(),
+            artifact: None,
+            context_length: 8,
+            vocabulary_size: 4,
+        };
+        assert_eq!(engine.sequences(), 1);
+        assert_eq!(engine.speculation(), Speculation::Off);
+        assert_eq!(engine.report(), EngineReport::default());
+    }
+}
+
+/// Proof runs on the real Flash-Next artifact through the server's engine path: [`begin_start`] dispatches on the
+/// artifact's family, and the request is the one the backend builds (its stop tokens come from the tokenizer).
+#[cfg(test)]
+#[allow(clippy::print_stdout, reason = "a proof run reports what it generated")]
+mod flash_device {
+    use std::env::var_os;
+    use std::fs::read_to_string;
+    use std::mem;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use euhedral_inference_engine::Handoff;
+    use euhedral_inference_engine::generation::{GenerationListener, GenerationOutcome, QuantumEvent};
+    use euhedral_inference_engine::sampling::SamplingConfig;
+    use euhedral_inference_settings::{Auto, ByteSize, ModelSettings};
+
+    use super::*;
+
+    const WAIT: Duration = Duration::from_secs(40 * 60);
+    const GENERATION: Duration = Duration::from_secs(15 * 60);
+
+    /// `<|im_start|>user\nWhat is 17 times 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`, as the
+    /// artifact's tokenizer encodes it.
+    const PROMPT: [u32; 22] = [
+        248_045, 846, 198, 3710, 369, 220, 16, 22, 2942, 220, 17, 18, 30, 248_046, 198, 248_045, 74_455, 198, 248_068,
+        271, 248_069, 271,
+    ];
+
+    struct Recorder {
+        tokens: Vec<u32>,
+        done: Arc<Handoff<(Vec<u32>, GenerationOutcome)>>,
+    }
+
+    impl GenerationListener for Recorder {
+        fn prefill_done(&mut self, _at: Instant) {}
+
+        fn token(&mut self, id: u32, _at: Instant) {
+            self.tokens.push(id);
+        }
+
+        fn quantum(&mut self, _event: QuantumEvent) {}
+
+        fn finished(&mut self, outcome: GenerationOutcome) {
+            self.done.send((mem::take(&mut self.tokens), outcome));
+        }
+    }
+
+    fn run(engine: &dyn Engine, prompt: &[u32], wanted: u32, stops: &[u32]) -> (Vec<u32>, GenerationOutcome) {
+        let done = Handoff::new();
+        let request = EngineRequest {
+            prompt: prompt.to_vec(),
+            max_tokens: wanted,
+            stop_tokens: stops.to_vec(),
+            speculation: engine.speculation(),
+            sampling: SamplingConfig::greedy(0),
+            constraint: None,
+            listener: Box::new(Recorder {
+                tokens: Vec::new(),
+                done: Arc::clone(&done),
+            }),
+        };
+        engine
+            .generate(request, CancelHandle::default())
+            .expect("the engine takes the generation");
+        done.wait(GENERATION).expect("the generation never finished")
+    }
+
+    /// The tokens `golden` holds on its `prefix` line.
+    fn golden_line(golden: &str, prefix: &str) -> Vec<u32> {
+        let line = golden
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .expect("the golden has the line");
+        line.split_whitespace().map(|id| id.parse().expect("an id")).collect()
+    }
+
+    #[test]
+    #[ignore = "needs a GPU, the native library and the Flash-Next artifact"]
+    fn the_server_serves_the_flash_next_artifact_with_the_same_greedy_tokens_every_time() {
+        let Some(library) = test_support::require_property("euhedral.cuda.library") else {
+            return;
+        };
+        let Some(artifact) = test_support::require_property("euhedral.qwen4.artifact") else {
+            return;
+        };
+        let mut settings = Settings::with_model(ModelSettings {
+            artifact: PathBuf::from(artifact),
+            name: "flash".to_owned(),
+        });
+        settings.context.max_tokens = 4096;
+        settings.memory.host_limit = Auto::Value(ByteSize::mib(24_000));
+        let host = begin_start(&settings, Path::new(&library), None)
+            .expect("the start begins")
+            .wait(WAIT)
+            .expect("the engine starts");
+        assert!(
+            host.runtime().is_none(),
+            "the start did not dispatch to the Flash-Next engine"
+        );
+        let engine = Arc::clone(&host.backend.engine);
+        let stops = host.backend.codec.stop_tokens();
+        assert!(
+            stops.contains(&248_044) && stops.contains(&248_046),
+            "the model's end tokens: {stops:?}"
+        );
+        assert_eq!(engine.report().family, "flash-next");
+
+        let (first, outcome) = run(engine.as_ref(), &PROMPT, 32, &stops);
+        println!("first: {first:?} {:?}", outcome.reason);
+        let (second, _) = run(engine.as_ref(), &PROMPT, 32, &stops);
+        assert!(!first.is_empty(), "no token was generated");
+        assert_eq!(first, second, "the same prompt generated different tokens");
+
+        #[allow(clippy::disallowed_methods, reason = "a one-time device comparison reads its golden")]
+        let golden_path = var_os("EUHEDRAL_FLASH_GOLDEN");
+        if let Some(path) = golden_path {
+            #[allow(clippy::disallowed_methods, reason = "a one-time device comparison reads its golden")]
+            let golden = read_to_string(path).expect("the golden is readable");
+            let prompt = golden_line(&golden, "prompt ");
+            let want = golden_line(&golden, "generated ");
+            let (got, outcome) = run(engine.as_ref(), &prompt, 128, &stops);
+            println!("golden: {} tokens {:?}", got.len(), outcome.reason);
+            let at = got.iter().zip(&want).position(|(got, want)| got != want);
+            println!(
+                "first differing position: {at:?}; lengths {} vs {}",
+                got.len(),
+                want.len()
+            );
+            println!("rust: {got:?}\njava: {want:?}");
+            assert!(
+                at.is_none() && got.len() == want.len(),
+                "differs from the Java golden at {at:?}"
+            );
+        }
+        host.shutdown(Duration::from_secs(120)).expect("the engine stops");
     }
 }
