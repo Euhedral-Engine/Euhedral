@@ -46,6 +46,8 @@ pub struct Step {
     pub score: Score,
     /// The first quantum of a request: the sequence returns to position 0 before it.
     pub fresh: bool,
+    /// Prefill for the rows of the prompt, decode for the one row after.
+    pub kind: QuantumKind,
 }
 
 /// The device side of one sequence, as the owner uses it.
@@ -94,7 +96,11 @@ pub struct Rejected {
 }
 
 impl Rejected {
-    fn into_finished(self) -> Finished {
+    pub(crate) fn new(error: AdmissionError, listener: Box<dyn GenerationListener>) -> Self {
+        Self { error, listener }
+    }
+
+    pub(crate) fn into_finished(self) -> Finished {
         let reason = FinishReason::Failed(format!("the request was refused: {}", self.error));
         Finished::Outcome(self.listener, outcome(reason, 0, 0, Instant::now()))
     }
@@ -310,7 +316,17 @@ impl<S: Stepper> FlashOwner<S> {
             return self.fail(format!("the constraint could not prepare the next selection: {error}"));
         }
         let rows = tokens.len() as u32;
-        let step = Step { tokens, score, fresh };
+        let kind = if prefill {
+            QuantumKind::Prefill
+        } else {
+            QuantumKind::Decode
+        };
+        let step = Step {
+            tokens,
+            score,
+            fresh,
+            kind,
+        };
         run.flight = Some(Flight {
             rows,
             start,

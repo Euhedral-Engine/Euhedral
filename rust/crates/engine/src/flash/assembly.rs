@@ -196,8 +196,7 @@ impl Blueprint {
         let config = inputs.config;
         let hyper = hyper_shape(config)?;
         let streams = StreamShape::new(config.text.hidden_size, config.hyper_connection.count)?;
-        let capacity = u32::try_from(inputs.buckets.sizes().last().copied().unwrap_or(0))
-            .map_err(|_| FlashError::refused(OP, "the largest bucket does not fit 32 bits"))?;
+        let capacity = inputs.buckets.sizes().last().copied().unwrap_or(0);
         let layers = config.text.layer_types.len();
         if layers != config.text.num_layers as usize {
             return Err(FlashError::refused(
@@ -540,7 +539,7 @@ fn layer_moe(inputs: &Ingredients<'_>, layer: u32) -> Result<LayerMoe, FlashErro
         let sd4 = inputs
             .weights
             .nvfp4(&format!("{prefix}shared_expert/down_proj"))
-            .map_or(false, |down| down.sd4);
+            .is_ok_and(|down| down.sd4);
         Nvfp4Weight { weight, sd4 }
     });
     let weights = MoeWeights {

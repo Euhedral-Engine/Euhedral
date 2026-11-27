@@ -10,6 +10,7 @@
 //! time. [`SequenceState`] adds the device: it reserves the KV pages of a chunk and hands the chunk's placement (the
 //! `ChunkAt` of each cache layer) to the quantum.
 
+use std::fmt::Display;
 use std::sync::Arc;
 
 use euhedral_inference_cuda::{CudaError, DeviceBuffer, DevicePtr, KernelOps, LaneOps, PinnedPool};
@@ -141,7 +142,8 @@ impl SequenceLayout {
         self.ple_history
     }
 
-    fn attention(&self) -> impl Iterator<Item = QsaState> + '_ {
+    /// The indexer state of each sparse-attention layer, in layer order.
+    pub fn attention(&self) -> impl Iterator<Item = QsaState> + '_ {
         self.layers.iter().filter_map(|layer| match layer {
             LayerState::Attention(state) => Some(state.clone()),
             LayerState::Gdn(_) => None,
@@ -334,7 +336,7 @@ impl SequenceState {
     /// Returns the sequence to position 0: zeroes the device state on `kernels` (the caller waits for the lane) and
     /// forgets the cache's rows. Refuses a chunk in flight.
     pub fn reset(&mut self, kernels: &mut dyn KernelOps, context: &[i32]) -> Result<(), FlashError> {
-        let rejected = |error: &dyn std::fmt::Display| FlashError::refused(OP, format!("reset: {error}"));
+        let rejected = |error: &dyn Display| FlashError::refused(OP, format!("reset: {error}"));
         self.tracker.reset(context)?;
         self.kv.truncate(0).map_err(|error| rejected(&error))?;
         kernels

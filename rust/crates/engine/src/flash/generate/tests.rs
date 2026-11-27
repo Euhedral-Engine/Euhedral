@@ -1,3 +1,9 @@
+#![allow(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    reason = "the fakes share their record with the test through a mutex: the test reads it between turns"
+)]
+
 use std::sync::{Arc, Mutex};
 
 use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
@@ -236,7 +242,8 @@ fn prompt_runs_in_chunks_and_only_the_last_scores() {
         vec![Step {
             tokens: vec![1, 2],
             score: Score::None,
-            fresh: true
+            fresh: true,
+            kind: QuantumKind::Prefill,
         }]
     );
     rig.retire(&[10]);
@@ -249,7 +256,8 @@ fn prompt_runs_in_chunks_and_only_the_last_scores() {
         Step {
             tokens: vec![3, 4],
             score: Score::None,
-            fresh: false
+            fresh: false,
+            kind: QuantumKind::Prefill,
         }
     );
     assert_eq!(
@@ -257,7 +265,8 @@ fn prompt_runs_in_chunks_and_only_the_last_scores() {
         Step {
             tokens: vec![5],
             score: Score::Device,
-            fresh: false
+            fresh: false,
+            kind: QuantumKind::Prefill,
         }
     );
     assert_eq!(rig.device.lock().unwrap().committed, vec![vec![10], vec![11], vec![12]]);
@@ -290,7 +299,8 @@ fn decode_feeds_the_previous_token_and_the_budget_ends_it() {
         Step {
             tokens: vec![3],
             score: Score::Device,
-            fresh: false
+            fresh: false,
+            kind: QuantumKind::Decode,
         }
     );
     assert_eq!(
@@ -298,7 +308,8 @@ fn decode_feeds_the_previous_token_and_the_budget_ends_it() {
         Step {
             tokens: vec![4],
             score: Score::Device,
-            fresh: false
+            fresh: false,
+            kind: QuantumKind::Decode,
         }
     );
     assert_eq!(begun.len(), 3);
