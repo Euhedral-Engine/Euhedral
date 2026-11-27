@@ -75,16 +75,30 @@ planned launch the family files produce. Two files turn a plan into work on a Ru
 The device tests `kernels_gpu` (ignored by default) check that every catalog kernel resolves with parameters a
 plan can pass and print the module compile and load times.
 
+## Native library
+
+`cargo xtask native [--product linux-x64|windows-x64] [--force-download]` builds the CUDA library of each product in
+`native/native-products.json` (every product without `--product`) with the pinned Zig (`ZIG` names it, else `zig` on
+the path) into `build/native/<product>/`: `lib/` (the library, the CUDA runtime and NVRTC), `share/euhedral_cuda/` (the
+kernel sources), `cuda/include/` (the headers NVRTC compiles against) and `files.sha256`. The CUDA headers and
+libraries are the pinned 13.1 redistributables, downloaded with `curl` into `$XDG_CACHE_HOME/euhedral-cuda/` (else
+`xtask/cuda-cache/` under the Cargo target directory), checked against the SHA-256 values of the manifest and
+unpacked under `build/cuda-dev/<product>`; for the host's own product, `CUDA_HOME` or `CUDA_PATH` selects an installed
+toolkit instead (`--force-download` ignores it). Headers that disagree, or a toolkit without the libraries, are
+refused. `cargo xtask native-verify [--product <id>]` checks a built tree: the kernel sources equal `native/src`, the
+library imports the CUDA runtime of its platform, and `files.sha256` lists the files there. Rust links llguidance as a
+crate, so the tree carries no llguidance library (the Gradle build adds one for the Java engine).
+
 ## Server bundle
 
 `cargo xtask bundle --product linux-x64` (or `windows-x64`, on Windows) builds `euhedral-server` in release and
-assembles a runnable directory from it and the native product the Gradle build leaves in `build/native/<product>`
-(run `gradle nativeVerify` first; `--native <dir>` and `--out <dir>` override the product and output directories). The
-result is `build/bundle/euhedral-server-<product>/` and an archive of it (`.tar.gz` on Linux, `.zip` on Windows):
+assembles a runnable directory from it and the native product in `build/native/<product>` (build it with
+`cargo xtask native --product <product>` first; `--native <dir>` and `--out <dir>` override the product and output
+directories). The result is `build/bundle/euhedral-server-<product>/` and an archive of it (`.tar.gz` on Linux, `.zip` on Windows):
 
 ```text
 bin/euhedral-server
-lib/                  the CUDA library, CUDA runtime, NVRTC and llguidance
+lib/                  the CUDA library, CUDA runtime and NVRTC
 share/euhedral_cuda/  the kernel sources
 cuda/include/         the CUDA headers
 files.sha256          the manifest of the kernel sources

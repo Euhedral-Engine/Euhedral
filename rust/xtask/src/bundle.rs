@@ -1,9 +1,9 @@
 //! `cargo xtask bundle`: a runnable server bundle for one native product.
 //!
 //! The bundle directory holds `bin/euhedral-server` and, beside `bin/`, the native product's `lib/`,
-//! `share/euhedral_cuda/` and `cuda/include/` (the tree the Gradle native build leaves under `build/native/<product>`
-//! and the Java server unpacks into its native cache). The server finds its CUDA library there without
-//! `host.native-cache`. The directory is archived next to itself: `.tar.gz` for Linux, `.zip` for Windows.
+//! `share/euhedral_cuda/` and `cuda/include/` (the tree `cargo xtask native` leaves under `build/native/<product>`).
+//! The server finds its CUDA library there without `host.native-cache`. The directory is archived next to itself:
+//! `.tar.gz` for Linux, `.zip` for Windows.
 
 use std::env;
 use std::fs;
@@ -150,7 +150,7 @@ fn assemble(directory: &Path, executable: &Path, native: &Path, product: Product
     for file in [product.library(), MANIFEST] {
         if !native.join(file).is_file() {
             return Err(format!(
-                "{} is missing {file}: build the native product first (`gradle nativeVerify`)",
+                "{} is missing {file}: build the native product first (`cargo xtask native`)",
                 native.display()
             ));
         }
@@ -158,7 +158,7 @@ fn assemble(directory: &Path, executable: &Path, native: &Path, product: Product
     for tree in TREES {
         if !native.join(tree).is_dir() {
             return Err(format!(
-                "{} is missing {tree}: build the native product first (`gradle nativeVerify`)",
+                "{} is missing {tree}: build the native product first (`cargo xtask native`)",
                 native.display()
             ));
         }

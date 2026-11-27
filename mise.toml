@@ -35,7 +35,13 @@ run = "cargo test --workspace"
 
 [tasks."rust-native"]
 description = "Build the Linux host CUDA product the Rust crates load."
-depends = ["native-build"]
+dir = "rust"
+run = "cargo xtask native --product linux-x64"
+
+[tasks."rust-native-verify"]
+description = "Check the built Linux host CUDA product."
+dir = "rust"
+run = "cargo xtask native-verify --product linux-x64"
 
 [tasks.test]
 description = "Run all CPU Java tests."
