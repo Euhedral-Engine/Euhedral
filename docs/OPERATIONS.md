@@ -83,6 +83,22 @@ writes only that section and leaves every other byte of the artifact as it is:
 An interrupted run can leave the artifact unreadable (a Flash-Next artifact reports that its header declares fewer bytes
 than its content holds); running the command again repairs it.
 
+### The artifact while the engine runs
+
+The engine holds the artifact it serves (and the artifacts of a composite) from the start of its build until it stops,
+and trusts its bytes: it checks no checksum. The server reads the artifact's tokenizer section and checks the file's
+existence just before that build, so a change in that short interval is not caught. On Windows another program cannot
+write, rename or delete the file while the engine runs. On Linux the engine holds a shared file lock and Euhedral's own
+tools (`quantization assemble`, `export-drafter`, `package-tokenizer`) take the exclusive lock on their output and
+refuse, naming the path, when an engine holds it. A program that does not use Euhedral's tools is not stopped on Linux
+(there is no unprivileged mandatory lock): do not edit a served artifact in place. A delete or rename on Linux only moves
+the name, and the engine keeps the file it holds, but a later open by the old name would find nothing or another file.
+So the engine checks every open of the artifact it makes while starting (the index reads and the disk tier's handles)
+against the file it holds, and refuses a start in which the name has come to name another file, naming the path; it
+also refuses at the hold when the name changed between its open and its lock. The Flash-Next start holds the file
+but does not yet check its opens this way. A file system that takes no locks stops the engine at start, naming the path and the error. On NFS
+the tools open their output for writing to take the lock, as byte-range locks need.
+
 ## Starting
 
 Before anything loads, the server reads and validates the settings file and unpacks its native files into the native cache, then checks the files

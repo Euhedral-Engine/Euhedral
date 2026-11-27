@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::env::{current_exe, var_os};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::ptr::copy_nonoverlapping;
@@ -840,6 +840,14 @@ fn file_in_scratch(bytes: &[u8]) -> Option<(tempfile::TempDir, PathBuf)> {
     Some((dir, path))
 }
 
+/// A file in the default temporary directory: for the opens that do not need a file system that takes `O_DIRECT`.
+fn file_in_temp() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().join("artifact.bin");
+    fs::write(&path, contents()).expect("the artifact");
+    (dir, path)
+}
+
 fn read_through_the_ring(file: ArtifactFile) -> (Vec<u8>, Vec<u8>, bool) {
     let settings = Settings::with_model(ModelSettings::default());
     let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
@@ -902,14 +910,42 @@ fn a_direct_open_that_fails_leaves_every_read_buffered() {
     let Some((_dir, path)) = file_in_scratch(&contents()) else {
         return;
     };
-    let file = ArtifactFile::open_with(&path, |_| Err(io::Error::from_raw_os_error(ALIGNMENT_REFUSAL)))
-        .expect("the buffered open does not depend on it");
+    let file = ArtifactFile::open_checked(
+        &path,
+        |_| Err(io::Error::from_raw_os_error(ALIGNMENT_REFUSAL)),
+        |_| Ok(()),
+    )
+    .expect("the buffered open does not depend on it");
     assert!(!file.has_direct());
     assert_eq!(file.len(), FILE_BYTES as u64);
     let (middle, tail, direct) = read_through_the_ring(file);
     assert!(!direct);
     assert_eq!(middle, contents()[5000..14000]);
     assert_eq!(tail, contents()[FILE_BYTES - 100..]);
+}
+
+#[test]
+fn an_open_whose_buffered_handle_is_refused_by_the_check_fails() {
+    let (_dir, path) = file_in_temp();
+    let error = ArtifactFile::open_admitted(&path, |_| Err(io::Error::other("not the held file"))).unwrap_err();
+    assert_eq!(error.to_string(), "not the held file");
+}
+
+#[test]
+fn an_open_whose_direct_handle_is_refused_by_the_check_fails_and_is_not_read_buffered() {
+    let (_dir, path) = file_in_temp();
+    let shown = AtomicUsize::new(0);
+    let error = ArtifactFile::open_checked(
+        &path,
+        |named| File::open(named),
+        |_| match shown.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(()),
+            _ => Err(io::Error::other("not the held file")),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "not the held file");
+    assert_eq!(shown.load(Ordering::SeqCst), 2, "both handles are shown to the check");
 }
 
 #[test]

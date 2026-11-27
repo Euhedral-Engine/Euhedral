@@ -8,6 +8,8 @@ use euhedral_inference_cuda::CudaError;
 use euhedral_inference_edrl::EdrlError;
 use thiserror::Error;
 
+use crate::artifact_guard::GuardError;
+
 /// What a refusal says is too large: one context, or the contexts of several sequences.
 fn what_does_not_fit(sequences: usize) -> String {
     if sequences > 1 {
@@ -238,6 +240,11 @@ pub enum EngineError {
         source: io::Error,
     },
 
+    /// The artifact could not be held against change (another engine or writer has it, or its file system takes no
+    /// locks).
+    #[error(transparent)]
+    Guard(GuardError),
+
     /// The runtime could not start the lattice or one of its sources.
     #[error("{0}")]
     Runtime(String),
@@ -245,6 +252,17 @@ pub enum EngineError {
     /// The engine did not finish stopping within the window it was given; `left` says what was not done.
     #[error("the engine did not finish stopping within {} ms: {left}", .window.as_millis())]
     Unfinished { window: Duration, left: String },
+}
+
+/// A file the hold could not open is an I/O error naming the path, as the engine's own open of it would be; a refusal
+/// of the lock or of the file's identity stays a guard error.
+impl From<GuardError> for EngineError {
+    fn from(error: GuardError) -> Self {
+        match error {
+            GuardError::Open { path, source } => Self::io(format!("opening {}", path.display()), source),
+            other => Self::Guard(other),
+        }
+    }
 }
 
 impl EngineError {
@@ -299,5 +317,20 @@ mod tests {
         assert!(runtime.loads_nothing());
         assert!(!call.loads_nothing());
         assert!(!EngineError::Runtime("x".to_owned()).loads_nothing());
+    }
+
+    #[test]
+    fn a_file_the_hold_could_not_open_is_an_io_error_naming_it_and_a_lock_refusal_is_not() {
+        let open = GuardError::Open {
+            path: PathBuf::from("gone.edrl"),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        };
+        let error = EngineError::from(open);
+        assert!(matches!(&error, EngineError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound));
+        assert!(error.to_string().contains("gone.edrl"), "{error}");
+        let held = EngineError::from(GuardError::Held {
+            path: PathBuf::from("a.edrl"),
+        });
+        assert!(matches!(held, EngineError::Guard(GuardError::Held { .. })));
     }
 }

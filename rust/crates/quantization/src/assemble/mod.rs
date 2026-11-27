@@ -23,6 +23,7 @@ mod write;
 use std::sync::Arc;
 
 use euhedral_inference_edrl::EdrlError;
+use euhedral_inference_engine::GuardError;
 use thiserror::Error;
 
 use crate::checkpoint::CheckpointError;
@@ -57,6 +58,9 @@ pub enum AssembleError {
     /// The search's data refused something.
     #[error(transparent)]
     Mixed(#[from] MixedError),
+    /// A running engine holds the output.
+    #[error(transparent)]
+    Guard(#[from] GuardError),
 }
 
 impl AssembleError {
