@@ -147,7 +147,10 @@ fn everything_stays_on_the_device_and_the_cache_takes_the_rest_in_whole_slots() 
         assert_eq!(plan.storage_of(name), Some(StorageClass::DeviceResident));
     }
     assert_eq!(plan.storage_of("text/token_embedding"), Some(StorageClass::HostMapped));
-    assert_eq!(plan.storage_of("ngram/shard"), Some(StorageClass::HostStaged));
+    assert_eq!(
+        (plan.ngram, plan.storage_of("ngram/shard")),
+        (NgramMode::PinnedArena, Some(StorageClass::HostStaged))
+    );
     assert_eq!(plan.storage_of("mtp/proj"), Some(StorageClass::Deferred));
     assert_eq!(plan.storage_of("vision/proj"), Some(StorageClass::Deferred));
     assert_eq!(
@@ -474,6 +477,7 @@ fn the_expert_records_are_held_in_ram_cached_or_read_from_the_file_by_what_the_h
     let tight = with_resident(14 * MIB + 200 * MIB + 50 * MIB - 1);
     assert_eq!(tight.expert_store, ExpertStoreMode::RamResident);
     assert_eq!((tight.ngram, tight.host.ngram_file), (NgramMode::MappedFile, 50 * MIB));
+    assert_eq!(tight.storage_of("ngram/shard"), Some(StorageClass::FileMapped));
     let cached = with_resident(14 * MIB + 120 * MIB);
     assert_eq!(
         (cached.expert_store, cached.host.expert_ram_slots),

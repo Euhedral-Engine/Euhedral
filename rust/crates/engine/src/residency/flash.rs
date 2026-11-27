@@ -62,6 +62,9 @@ pub enum StorageClass {
     /// Held on the host; execution stages the object (a fixed projection) or the rows it needs (n-gram tables) to
     /// the device on use.
     HostStaged,
+    /// Read from the artifact file's own mapping, outside the pinned tier (the n-gram tables when the host cannot pin
+    /// them).
+    FileMapped,
     /// Brought into the bounded device cache on demand and evicted when its slot is needed (routed experts).
     DeviceCached,
     /// In the artifact and validated, but not loaded by the selected mode.
@@ -560,6 +563,12 @@ pub fn plan_flash(
     let (ngram, ngram_pinned) = if ngram_pinned_fits {
         (NgramMode::PinnedArena, ngram_bytes)
     } else {
+        for object in objects
+            .iter_mut()
+            .filter(|object| object.group == ComponentGroup::Ngram)
+        {
+            object.storage = StorageClass::FileMapped;
+        }
         (NgramMode::MappedFile, 0)
     };
 
