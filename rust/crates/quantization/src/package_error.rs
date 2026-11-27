@@ -45,7 +45,8 @@ pub enum PackageError {
     /// The artifact is too short or too large for its format.
     #[error("the artifact is not valid: {0}")]
     Format(&'static str),
-    /// A step of the run was dropped before it ran: the I/O refused it or the host lake closed.
+    /// A step of the run was accepted and then discarded before it ran: the I/O engine or the host lake is closing.
+    /// A lake that refuses a step of a run that is going ends it the same way.
     #[error("the run ended before it finished: a step was dropped")]
     Lost,
     /// An artifact written in place was cut back to its content and the section did not land: it has no tokenizer

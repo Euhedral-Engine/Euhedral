@@ -31,7 +31,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
-use euhedral_inference_cuda::{CudaLibrary, DevicePtr};
+use euhedral_inference_cuda::{CudaLibrary, DeviceBuffer, DevicePtr};
 use euhedral_inference_edrl::WeightFormat;
 use euhedral_inference_engine::error::{EngineError, PlanError};
 use euhedral_inference_engine::model::{LayerIndex, NormKind, Residence, Role};
@@ -408,11 +408,13 @@ fn startup_fails_before_device_alloc_on_corrupt_artifact() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_plan_that_does_not_fit_fails_before_device_alloc() {
     let Some(machine) = machine() else { return };
+    // The exclusive card, held to the end of the test: `live_bytes` counts the whole process, so no other test of this
+    // binary may allocate or free a device buffer between the two readings.
     let _card = common::card();
-    let library = CudaLibrary::load(&machine.library).unwrap();
-    let before = library.free_bytes().unwrap();
     let mut settings = settings(&machine.artifact, 4096);
     settings.memory.gpu_limit = euhedral_inference_settings::Auto::Value(ByteSize::gib(2));
+    // The bytes of this process's own device buffers: the card's free memory also moves with every other job on it.
+    let before = DeviceBuffer::live_bytes();
     let (outcome, _guard) = start(&settings, &machine.library);
     let error = outcome.expect_err("12 GiB of weights do not fit in 2 GiB");
     // The plan holds what cannot stay on the device in host memory or in the file: the host budget is too small for
@@ -448,10 +450,10 @@ fn a_plan_that_does_not_fit_fails_before_device_alloc() {
         }
         other => panic!("expected the device, host or offload refusal, got {other:?}"),
     }
-    let after = library.free_bytes().unwrap();
-    assert!(
-        before.abs_diff(after) < (256 << 20),
-        "free memory moved from {before} to {after}"
+    assert_eq!(
+        DeviceBuffer::live_bytes(),
+        before,
+        "the refused plan left device buffers allocated"
     );
 }
 
