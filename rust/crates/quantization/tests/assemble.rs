@@ -18,7 +18,7 @@ use std::time::Duration;
 use checkpoint_support::World;
 use euhedral_inference_edrl::tiny::{DRAFTER_PROJECTION, PROJECTIONS, TOKENIZER, TinyArtifact};
 use euhedral_inference_edrl::{MAX_DRAFT_DEPTH, TokenizerTexts};
-use euhedral_inference_engine::Handoff;
+use euhedral_inference_engine::{ArtifactGuard, Handoff};
 use euhedral_inference_quantization::assemble::{
     ArtifactFile, AssembleError, Done, Request, SourceSet, View, run, view, write,
 };
@@ -292,6 +292,23 @@ fn an_output_that_is_a_source_is_refused_and_the_source_and_the_temporary_file_a
 }
 
 #[test]
+fn an_output_that_a_running_engine_holds_is_refused_by_path_and_not_touched() {
+    let fixture = Fixture::new();
+    let sources = fixture.open(&fixture.two()).unwrap();
+    let composite = view(&sources, &allocation(&[]), None).unwrap();
+    let out = fixture.dir.path().join("served.edrl");
+    fs::write(&out, b"served").unwrap();
+    let guard = ArtifactGuard::hold(&out).unwrap();
+    let error = fixture.write(&composite, &out, 1 << 20).unwrap_err().to_string();
+    assert!(error.contains(&out.display().to_string()), "{error}");
+    assert_eq!(fs::read(&out).unwrap(), b"served");
+    assert!(!fixture.dir.path().join("served.edrl.part").exists());
+    drop(guard);
+    fixture.write(&composite, &out, 1 << 20).unwrap();
+    fixture.world.finish();
+}
+
+#[test]
 fn a_view_without_a_tokenizer_cannot_be_written() {
     let fixture = Fixture::new();
     let sources = fixture.open(&fixture.two()).unwrap();
@@ -494,7 +511,7 @@ fn a_stale_temporary_file_is_replaced() {
 
 #[cfg(unix)]
 #[test]
-fn an_output_name_that_cannot_be_compared_ends_the_run_and_leaves_the_temporary_file() {
+fn an_output_name_that_cannot_be_opened_is_refused_before_any_file_is_made() {
     use std::os::unix::fs::symlink;
     let fixture = Fixture::new();
     let sources = fixture.open(&fixture.two()).unwrap();
@@ -502,8 +519,8 @@ fn an_output_name_that_cannot_be_compared_ends_the_run_and_leaves_the_temporary_
     let out = fixture.dir.path().join("loop.edrl");
     symlink(&out, &out).unwrap();
     let error = fixture.write(&composite, &out, 1 << 20).unwrap_err().to_string();
-    assert!(error.contains("cannot compare"), "{error}");
-    assert!(fixture.dir.path().join("loop.edrl.part").exists());
+    assert!(error.contains("cannot lock") && error.contains("loop.edrl"), "{error}");
+    assert!(!fixture.dir.path().join("loop.edrl.part").exists());
     assert_eq!(fs::read_link(&out).unwrap(), out);
     fixture.world.finish();
 }

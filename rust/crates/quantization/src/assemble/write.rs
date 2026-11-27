@@ -16,7 +16,7 @@ use euhedral_inference_edrl::{
     ArtifactPlan, EdrlError, ObjectSpec, PAYLOAD_ALIGNMENT, TOKENIZER_ENTRIES, TokenizerTexts, encode_metadata,
     encode_tokenizer_section,
 };
-use euhedral_inference_engine::Handoff;
+use euhedral_inference_engine::{Handoff, WriteClaim};
 use euhedral_io::{AsyncIo, Create, IoBuf, IoDone, OpenSpec, OwnedFile};
 
 use super::chunks::read_chunk;
@@ -108,6 +108,8 @@ pub fn write(
         .collect();
     let largest = jobs.iter().map(|job| job.bytes).max().unwrap_or(0);
     let buffer = usize::try_from(largest).map_or(copy_buffer_bytes, |largest| largest.min(copy_buffer_bytes));
+    // Before the lake is admitted or a file is made: a running engine that holds the output refuses the run.
+    let claim = WriteClaim::take(out)?;
     let unit = host.admit().map_err(|_| CheckpointError::LakeClosed)?;
     let mut part: OsString = out.as_os_str().to_owned();
     part.push(".part");
@@ -124,6 +126,7 @@ pub fn write(
         io: Arc::clone(io),
         host: Arc::clone(host),
         unit,
+        claim,
         part: part.clone(),
         target: out.to_path_buf(),
         file: None,
@@ -158,6 +161,8 @@ struct Writing {
     host: Arc<Lake>,
     /// Keeps the host lake admitted until the chain has ended.
     unit: UnitGuard,
+    /// The exclusive lock on the output, until the chain has ended.
+    claim: WriteClaim,
     part: PathBuf,
     target: PathBuf,
     /// The `.part` file while it is open.
@@ -296,7 +301,9 @@ impl Writing {
 
     /// Hands the result over and lets the lake go.
     fn end(self, result: Result<(), AssembleError>) {
-        let Writing { done, unit, .. } = self;
+        let Writing { done, unit, claim, .. } = self;
+        // Released before the result is handed over: the caller may write the same output again at once.
+        drop(claim);
         done(result);
         drop(unit);
     }
@@ -305,8 +312,14 @@ impl Writing {
     fn fail(mut self, error: AssembleError) {
         drop(self.file.take());
         let Writing {
-            host, unit, part, done, ..
+            host,
+            unit,
+            part,
+            done,
+            claim,
+            ..
         } = self;
+        drop(claim);
         let pending = Handoff::new();
         pending.send(error);
         let (reported, held) = (Arc::clone(&pending), Arc::clone(&done));

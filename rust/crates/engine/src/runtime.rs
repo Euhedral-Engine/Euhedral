@@ -7,6 +7,7 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::iter;
 use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
@@ -28,6 +29,7 @@ use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
+use crate::artifact_guard::ArtifactGuard;
 use crate::composite::Composite;
 use crate::error::{EngineError, PlanError};
 use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, HiddenSink, LogitsSink};
@@ -215,6 +217,8 @@ pub(crate) struct Core {
     pub(crate) started: Instant,
     /// What stops the lattice and its lakes, shared with the owner.
     pub(crate) teardown: Arc<Teardown>,
+    /// The hold on each artifact file served (the base and the composite's sources), until the core is dropped.
+    _guards: Vec<ArtifactGuard>,
 }
 
 impl fmt::Debug for Core {
@@ -801,7 +805,7 @@ impl EngineRuntime {
             }
         };
         let ready = Handoff::new();
-        match build(settings, library, close_timeout) {
+        match build(settings, library, close_timeout, &composite) {
             Ok(core) => {
                 let owner = RuntimeOwner::over(Arc::clone(&core.teardown));
                 startup::run(core, Arc::clone(&ready), composite);
@@ -1279,8 +1283,18 @@ pub fn open_lane_set<G: Gpu>(
 
 /// Builds the lattice, the lakes, the device with its kernels and the pools of a startup, on the calling thread. The
 /// lanes are not opened here: their rings depend on the sequences the plan resolves ([`Core::open_lanes`]).
-fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duration>) -> Result<Arc<Core>, EngineError> {
+fn build(
+    settings: &Settings,
+    library_path: &Path,
+    close_timeout: Option<Duration>,
+    composite: &Composite,
+) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
+    // First, before any open of the artifact: the engine holds every file it serves against change for its life.
+    let guards = iter::once(&settings.model.artifact)
+        .chain(composite.replacements.iter().map(|replacement| &replacement.source))
+        .map(|path| ArtifactGuard::hold(path))
+        .collect::<Result<Vec<_>, _>>()?;
     // Before anything is opened: a stated count the passes cannot hold is refused.
     check_stated_sequences(&settings.batching)?;
     let library = CudaLibrary::load(library_path)?;
@@ -1343,6 +1357,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         pool_bytes,
         started,
         teardown,
+        _guards: guards,
     }))
 }
 

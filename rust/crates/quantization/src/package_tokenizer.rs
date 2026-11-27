@@ -30,7 +30,7 @@ use std::sync::Arc;
 use euhedral_core::generics::LatticeSource;
 use euhedral_graph::{Lake, UnitGuard};
 use euhedral_inference_edrl::{FOOTER_BYTES, HEADER_BYTES, Header, TensorTable};
-use euhedral_inference_engine::Handoff;
+use euhedral_inference_engine::{Handoff, WriteClaim};
 use euhedral_io::{AsyncIo, Create, IoBuf, OpenSpec, RawFile};
 
 use crate::durable::{self, SharedFile};
@@ -150,6 +150,8 @@ pub fn package_tokenizer(
             source: io::Error::other("the I/O engine is closed"),
         });
     }
+    // Before the lake is admitted or a file is touched: a running engine that holds the file this run writes refuses it.
+    let claim = WriteClaim::take(request.out.as_ref().unwrap_or(&request.artifact))?;
     let unit = host.admit().map_err(|error| PackageError::Lake(error.to_string()))?;
     let job = Job {
         io,
@@ -160,6 +162,7 @@ pub fn package_tokenizer(
             part: None,
             completion: Some(Completion { done: Some(done) }),
             cut: false,
+            claim: Some(claim),
         },
         _unit: unit,
     };
@@ -232,6 +235,9 @@ struct RunEnd {
     completion: Option<Completion>,
     /// An artifact written in place was cut back: until its section lands it has none.
     cut: bool,
+    /// The exclusive lock on the file the run writes. Released before the callback is called, which may write the
+    /// same file again at once.
+    claim: Option<WriteClaim>,
 }
 
 impl RunEnd {
@@ -246,6 +252,7 @@ impl RunEnd {
     /// Spends the run without reporting: the call that returns `Err` started nothing.
     fn abandon(&mut self) {
         self.part = None;
+        self.claim = None;
         if let Some(completion) = self.completion.take() {
             completion.disarm();
         }
@@ -254,6 +261,7 @@ impl RunEnd {
     /// Reports the end of the run; the output, if armed, was moved into place or is not this run's to remove.
     fn finish(&mut self, result: Result<Packaged, PackageError>) {
         self.part = None;
+        self.claim = None;
         if let Some(completion) = self.completion.take() {
             completion.finish(result);
         }
@@ -263,6 +271,7 @@ impl RunEnd {
     /// [`Failing`], which reports all the same.
     fn remove_then_fail(&mut self, error: PackageError) {
         let part = self.part.take();
+        self.claim = None;
         let Some(completion) = self.completion.take() else {
             return;
         };
@@ -1095,6 +1104,7 @@ mod tests {
             host: Arc::clone(&host),
             part: None,
             cut: false,
+            claim: None,
             completion: Some(Completion {
                 done: Some(Box::new(move |result| sender.send(result).unwrap())),
             }),
@@ -1127,6 +1137,7 @@ mod tests {
             host: Arc::clone(host),
             part: None,
             cut: false,
+            claim: None,
             completion: Some(Completion {
                 done: Some(Box::new(move |result| sender.send(result).unwrap())),
             }),
@@ -1287,6 +1298,7 @@ mod tests {
             host: Arc::clone(&host),
             part: None,
             cut: true,
+            claim: None,
             completion: Some(Completion {
                 done: Some(Box::new(move |result| sender.send(result).unwrap())),
             }),

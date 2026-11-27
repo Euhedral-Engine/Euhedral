@@ -83,6 +83,16 @@ writes only that section and leaves every other byte of the artifact as it is:
 An interrupted run can leave the artifact unreadable (a Flash-Next artifact reports that its header declares fewer bytes
 than its content holds); running the command again repairs it.
 
+### The artifact while the engine runs
+
+The engine holds the artifact it serves (and the artifacts of a composite) from before its first read until it stops,
+and trusts its bytes: it checks no checksum. On Windows another program cannot write, rename or delete the file while the
+engine runs. On Linux the engine holds a shared file lock and Euhedral's own tools (`quantization assemble`,
+`export-drafter`, `package-tokenizer`) take the exclusive lock on their output and refuse, naming the path, when an engine
+holds it; deleting the file only drops its name, and the engine keeps reading the file it has open. A program that does
+not use Euhedral's tools is not stopped on Linux (there is no unprivileged mandatory lock): do not edit a served artifact
+in place. A file system that takes no locks stops the engine at start, naming the path and the error.
+
 ## Starting
 
 Before anything loads, the server reads and validates the settings file and unpacks its native files into the native cache, then checks the files

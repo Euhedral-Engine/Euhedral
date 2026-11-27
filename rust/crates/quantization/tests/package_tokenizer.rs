@@ -29,7 +29,7 @@ use euhedral_core::generics::LatticeSource;
 use euhedral_graph::Lake;
 use euhedral_inference_edrl::tiny::TinyArtifact;
 use euhedral_inference_edrl::{FOOTER_BYTES, TokenizerFooter, TokenizerSection};
-use euhedral_inference_engine::lattice_config;
+use euhedral_inference_engine::{ArtifactGuard, lattice_config};
 use euhedral_inference_quantization::package_error::PackageError;
 use euhedral_inference_quantization::package_tokenizer::{PackageRequest, Packaged, package_tokenizer};
 use euhedral_inference_quantization::tokenizer_files::TokenizerFiles;
@@ -402,6 +402,38 @@ fn the_special_tokens_keep_the_ids_the_generation_config_sets_in_a_fixed_order()
     );
     assert_eq!(files(r#"{"top_k": 20}"#), "{}");
     assert_eq!(files("[]"), "{}");
+}
+
+#[test]
+fn an_artifact_a_running_engine_holds_is_refused_by_path_and_not_written_in_place() {
+    let run = Run::start();
+    let fixture = Fixture::new(&Checkpoint::standard());
+    let guard = ArtifactGuard::hold(&fixture.artifact()).unwrap();
+    let error = run.package(fixture.in_place()).unwrap_err().to_string();
+    assert!(error.contains(&fixture.artifact().display().to_string()), "{error}");
+    assert_eq!(
+        fs::read(fixture.artifact()).unwrap(),
+        fixture.content,
+        "the artifact is untouched"
+    );
+    drop(guard);
+    run.package(fixture.in_place()).unwrap();
+}
+
+#[test]
+fn an_output_a_running_engine_holds_is_refused_by_path_and_not_replaced() {
+    let run = Run::start();
+    let fixture = Fixture::new(&Checkpoint::standard());
+    fs::write(fixture.path("out.edrl"), b"served").unwrap();
+    let guard = ArtifactGuard::hold(&fixture.path("out.edrl")).unwrap();
+    let error = run.package(fixture.to_output()).unwrap_err().to_string();
+    assert!(
+        error.contains(&fixture.path("out.edrl").display().to_string()),
+        "{error}"
+    );
+    assert_eq!(fs::read(fixture.path("out.edrl")).unwrap(), b"served");
+    drop(guard);
+    run.package(fixture.to_output()).unwrap();
 }
 
 #[test]
