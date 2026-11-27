@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 use euhedral_io::IoMemory;
@@ -61,6 +61,31 @@ impl DevicePtr {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AllocationId(pub u64);
 
+/// The bytes of the live [`DeviceBuffer`]s of this process: raised by an allocation that succeeded, lowered when its
+/// buffer is freed. A failed allocation leaves it where it was.
+#[derive(Debug, Default)]
+struct LiveBytes(AtomicU64);
+
+impl LiveBytes {
+    const fn new() -> LiveBytes {
+        LiveBytes(AtomicU64::new(0))
+    }
+
+    fn allocated(&self, bytes: usize) {
+        self.0.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn freed(&self, bytes: usize) {
+        self.0.fetch_sub(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+static LIVE_DEVICE_BYTES: LiveBytes = LiveBytes::new();
+
 /// A device allocation, freed on drop.
 ///
 /// A plain drop frees the buffer at once with `cudaFree`, which waits for the whole device under the driver's lock (and
@@ -101,6 +126,7 @@ impl DeviceBuffer {
         let status = unsafe { self.library.api().euhedral_cuda_free_async(self.ptr().as_mut()) };
         // The allocation is gone either way: a failed stream-ordered free must not become a second free on drop.
         self.addr = 0;
+        LIVE_DEVICE_BYTES.freed(self.bytes);
         check("euhedral_cuda_free_async", status)
     }
 
@@ -117,6 +143,7 @@ impl DeviceBuffer {
                 bytes: bytes as u64,
             });
         }
+        LIVE_DEVICE_BYTES.allocated(bytes);
         Ok(DeviceBuffer {
             library: Arc::clone(library),
             addr: address.expose_provenance() as u64,
@@ -124,6 +151,12 @@ impl DeviceBuffer {
             generation: library.next_allocation(),
             stream_ordered,
         })
+    }
+
+    /// The bytes of every live device buffer of this process, whichever library allocated them: what the process
+    /// itself holds on the device through this crate, unmoved by other processes on a shared card.
+    pub fn live_bytes() -> u64 {
+        LIVE_DEVICE_BYTES.get()
     }
 
     /// The device address.
@@ -217,6 +250,7 @@ impl Drop for DeviceBuffer {
         }
         // SAFETY: the address is this buffer's live allocation, freed once. A failure leaves nothing to recover.
         let _ = unsafe { self.library.api().euhedral_cuda_free(self.ptr().as_mut()) };
+        LIVE_DEVICE_BYTES.freed(self.bytes);
     }
 }
 
@@ -564,4 +598,21 @@ fn device_address(library: &CudaLibrary, host: *const c_void) -> Result<DevicePt
     };
     check("euhedral_cuda_host_weights_device_pointer", status)?;
     Ok(DevicePtr(device))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LiveBytes;
+
+    #[test]
+    fn an_allocation_raises_the_count_by_its_size_and_its_free_lowers_it() {
+        let live = LiveBytes::new();
+        live.allocated(4096);
+        live.allocated(1 << 20);
+        assert_eq!(live.get(), 4096 + (1 << 20));
+        live.freed(4096);
+        assert_eq!(live.get(), 1 << 20);
+        live.freed(1 << 20);
+        assert_eq!(live.get(), 0);
+    }
 }
