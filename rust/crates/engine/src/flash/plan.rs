@@ -1,10 +1,14 @@
 //! The nodes and edges of the dense part of a Flash-Next quantum (`ExecutionPlan`'s stage list for the non-diagnostic
 //! shape): the embedding, the n-gram embedding's host roots and its device stage at the layer that holds it, and for
-//! each layer the block and the end injection, then the final mix.
+//! each layer the block, the layer's mixture of experts and the end injection, then the final mix.
 //!
-//! The nodes are what a session builds a stage for; [`DensePlan::spec`] is the RustEE graph over them. The MoE
-//! layer's nodes go between a layer's block and its end injection: the end injection waits for the block now, and
-//! waits for the last MoE node once there is one.
+//! The nodes are what a session builds a stage for; [`DensePlan::spec`] is the RustEE graph over them. A plan made
+//! with [`DensePlan::with_moe`] puts a layer's MoE nodes between its block and its end injection (the shape of
+//! `docs/flash-next/FLASH_NEXT_LATTICE.md`): the route and the shared expert follow the block; the plan follows the
+//! route by a device-completion edge, because it reads what the route copied to the host; a fetch and an expert node
+//! for each expert the block can name follow the plan, an expert after its fetch; and the finish follows the shared
+//! expert and every expert, and the end injection follows the finish. A plan made with [`DensePlan::from_config`] has
+//! none of them: the end injection follows the block.
 
 use euhedral_graph::{EdgeKind, GraphError, LaneId, StageGraphSpec, StageId, StageSpec};
 use euhedral_inference_edrl::FlashConfig;
@@ -29,12 +33,24 @@ pub enum NodeKind {
     End(usize),
     /// The final mixer over the last row.
     FinalMix,
+    /// The router of layer `n`'s MoE block, and the copy of its choice to the host.
+    MoeRoute(usize),
+    /// The shared expert of layer `n`.
+    MoeShared(usize),
+    /// The grouping of layer `n`'s pairs by expert and the copy of the description to the device (host work, then a copy).
+    MoePlan(usize),
+    /// The `i`-th expert layer `n`'s block names, held in the device cache (host).
+    MoeFetch(usize, u32),
+    /// The kernels of the `i`-th expert of layer `n`'s block.
+    MoeExpert(usize, u32),
+    /// The sum of layer `n`'s experts, with the shared expert's gated output.
+    MoeFinish(usize),
 }
 
 impl NodeKind {
     /// Whether the node runs on the host, with no lane.
     pub fn host(self) -> bool {
-        matches!(self, NodeKind::PleIds | NodeKind::PleGather(_))
+        matches!(self, NodeKind::PleIds | NodeKind::PleGather(_) | NodeKind::MoeFetch(..))
     }
 
     /// The node's name in the graph.
@@ -47,6 +63,12 @@ impl NodeKind {
             NodeKind::Block(_) => "flash block",
             NodeKind::End(_) => "flash end inject",
             NodeKind::FinalMix => "flash final mix",
+            NodeKind::MoeRoute(_) => "flash moe route",
+            NodeKind::MoeShared(_) => "flash moe shared",
+            NodeKind::MoePlan(_) => "flash moe plan",
+            NodeKind::MoeFetch(..) => "flash moe fetch",
+            NodeKind::MoeExpert(..) => "flash moe expert",
+            NodeKind::MoeFinish(_) => "flash moe finish",
         }
     }
 }
@@ -55,7 +77,20 @@ impl NodeKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
     pub kind: NodeKind,
+    /// The nodes whose submission the node waits for.
     pub after: Vec<usize>,
+    /// The nodes whose device work must have completed (not only been submitted) before the node runs.
+    pub completed: Vec<usize>,
+}
+
+impl Node {
+    fn new(kind: NodeKind, after: Vec<usize>) -> Self {
+        Self {
+            kind,
+            after,
+            completed: vec![],
+        }
+    }
 }
 
 /// The nodes of a model's dense part, in an order where every node follows the nodes before it.
@@ -68,6 +103,18 @@ impl DensePlan {
     /// The plan of `config`'s layers. The embedding of n-grams runs at the one layer `config.ple.layers` names, as it
     /// does in Java; a configuration that names more is refused with the layers.
     pub fn from_config(config: &FlashConfig) -> Result<Self, FlashError> {
+        Self::build(config, None)
+    }
+
+    /// The plan of `config`'s layers with the MoE nodes of each layer, whose blocks name at most `width` experts.
+    pub fn with_moe(config: &FlashConfig, width: u32) -> Result<Self, FlashError> {
+        if width == 0 {
+            return Err(FlashError::refused("dense plan", "a MoE block of 0 experts".to_owned()));
+        }
+        Self::build(config, Some(width))
+    }
+
+    fn build(config: &FlashConfig, moe_width: Option<u32>) -> Result<Self, FlashError> {
         let layers = config.text.num_layers as usize;
         if layers == 0 {
             return Err(FlashError::refused("dense plan", "a model of 0 layers".to_owned()));
@@ -89,50 +136,55 @@ impl DensePlan {
                 ));
             }
         };
-        let mut nodes = vec![Node {
-            kind: NodeKind::Embed,
-            after: vec![],
-        }];
+        let mut nodes = vec![Node::new(NodeKind::Embed, vec![])];
         let mut last = 0;
         for layer in 0..layers {
             if ple_layer == Some(layer) {
                 let ids = nodes.len();
-                nodes.push(Node {
-                    kind: NodeKind::PleIds,
-                    after: vec![],
-                });
+                nodes.push(Node::new(NodeKind::PleIds, vec![]));
                 let gathers: Vec<usize> = (0..PARTS)
                     .map(|part| {
-                        nodes.push(Node {
-                            kind: NodeKind::PleGather(part),
-                            after: vec![ids],
-                        });
+                        nodes.push(Node::new(NodeKind::PleGather(part), vec![ids]));
                         nodes.len() - 1
                     })
                     .collect();
                 let mut after = gathers;
                 after.push(last);
-                nodes.push(Node {
-                    kind: NodeKind::Ple,
-                    after,
-                });
+                nodes.push(Node::new(NodeKind::Ple, after));
                 last = nodes.len() - 1;
             }
-            nodes.push(Node {
-                kind: NodeKind::Block(layer),
-                after: vec![last],
-            });
-            nodes.push(Node {
-                kind: NodeKind::End(layer),
-                after: vec![nodes.len() - 1],
-            });
+            nodes.push(Node::new(NodeKind::Block(layer), vec![last]));
+            last = nodes.len() - 1;
+            if let Some(width) = moe_width {
+                last = Self::push_moe(&mut nodes, layer, last, width);
+            }
+            nodes.push(Node::new(NodeKind::End(layer), vec![last]));
             last = nodes.len() - 1;
         }
-        nodes.push(Node {
-            kind: NodeKind::FinalMix,
-            after: vec![last],
-        });
+        nodes.push(Node::new(NodeKind::FinalMix, vec![last]));
         Ok(Self { nodes })
+    }
+
+    /// Adds layer `layer`'s MoE nodes after node `block`, and returns the index of the finish.
+    fn push_moe(nodes: &mut Vec<Node>, layer: usize, block: usize, width: u32) -> usize {
+        let mut add = |node: Node| {
+            nodes.push(node);
+            nodes.len() - 1
+        };
+        let route = add(Node::new(NodeKind::MoeRoute(layer), vec![block]));
+        let shared = add(Node::new(NodeKind::MoeShared(layer), vec![block]));
+        let plan = add(Node {
+            kind: NodeKind::MoePlan(layer),
+            after: vec![],
+            completed: vec![route],
+        });
+        let mut finish_after = vec![shared];
+        for index in 0..width {
+            let fetch = add(Node::new(NodeKind::MoeFetch(layer, index), vec![plan]));
+            // The expert's lane may differ from the plan's, so it waits for the plan's copy of the description itself.
+            finish_after.push(add(Node::new(NodeKind::MoeExpert(layer, index), vec![fetch, plan])));
+        }
+        add(Node::new(NodeKind::MoeFinish(layer), finish_after))
     }
 
     /// The nodes, each after the nodes it lists.
@@ -145,8 +197,15 @@ impl DensePlan {
         self.nodes.iter().position(|node| node.kind == kind)
     }
 
-    /// The graph of the nodes: the device nodes on lane `home`, the host nodes on none, every edge a submission edge.
+    /// The graph of the nodes: the device nodes on lane `home`, the host nodes on none; an edge is a submission edge
+    /// unless the node lists its predecessor as completed.
     pub fn spec(&self, home: LaneId) -> Result<StageGraphSpec, GraphError> {
+        self.spec_on(home, &[])
+    }
+
+    /// As [`DensePlan::spec`], with the expert nodes free to run on any of `expert_lanes` (when there are some), so that
+    /// experts of a block run beside one another; the nodes ordered after them wait for their markers.
+    pub fn spec_on(&self, home: LaneId, expert_lanes: &[LaneId]) -> Result<StageGraphSpec, GraphError> {
         let mut spec = StageGraphSpec::new();
         let ids: Vec<StageId> = self
             .nodes
@@ -155,13 +214,20 @@ impl DensePlan {
                 spec.stage(StageSpec {
                     name: node.kind.name(),
                     ordered: None,
-                    lanes: if node.kind.host() { vec![] } else { vec![home] },
+                    lanes: match node.kind {
+                        kind if kind.host() => vec![],
+                        NodeKind::MoeExpert(..) if !expert_lanes.is_empty() => expert_lanes.to_vec(),
+                        _ => vec![home],
+                    },
                 })
             })
             .collect();
         for (index, node) in self.nodes.iter().enumerate() {
             for &before in &node.after {
                 spec.edge(ids[before], ids[index], EdgeKind::Submission);
+            }
+            for &before in &node.completed {
+                spec.edge(ids[before], ids[index], EdgeKind::Completion);
             }
         }
         spec.validate()?;
