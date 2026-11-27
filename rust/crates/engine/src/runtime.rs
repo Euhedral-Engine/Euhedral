@@ -30,6 +30,7 @@ use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
 use crate::composite::Composite;
 use crate::error::{EngineError, PlanError};
+use crate::flash::start::host_budget;
 use crate::generation::{AdmissionError, CancelHandle, GenerationRequest, Generations, HiddenSink, LogitsSink};
 use crate::generation::{GREEDY_DEPTH, OPERATION_BOUND};
 use crate::handoff::Handoff;
@@ -41,6 +42,7 @@ use crate::prefix::PrefixCacheStats;
 #[cfg(feature = "test-oracles")]
 use crate::quantum::body_fault::{BodyFault, Defect, HoldEvent, RunSnapshot, Sighting};
 use crate::residency::accounting::{Consumer, MemoryAccount, PlanReservation};
+use crate::residency::budget::HostBudget;
 use crate::residency::disk::DiskReader;
 use crate::residency::planner::{
     LocationBytes, PlanInputs, ResidencyPlan, TierSummary, forced_rows_of, pass_rows_limit, sequences_for,
@@ -207,6 +209,8 @@ pub(crate) struct Core {
     pub(crate) released: Arc<ReleasedBuffers>,
     /// Pinned host bytes the load may use.
     pub(crate) host_pinned_bytes: Option<u64>,
+    /// The host memory a Flash-Next plan is made against ([`crate::flash::start::host_budget`]), read with the machine's.
+    pub(crate) host_budget: HostBudget,
     /// The memory planner's account: the plan is admitted against it and every allocation of the startup holds a claim
     /// from it. Closed by the runtime's release, which reports what is still held.
     pub(crate) account: MemoryAccount,
@@ -430,7 +434,7 @@ pub struct Teardown {
     /// Device bytes the runtime allocated and `shutdown` has not freed.
     pub(crate) device_bytes: AtomicU64,
     /// The bytes the leak check at shutdown found still claimed; [`NOT_CHECKED`] until it ran.
-    leaked_bytes: AtomicU64,
+    pub(crate) leaked_bytes: AtomicU64,
     /// How long `shutdown` waits for a running request to end after its cancel: the lattice's close timeout.
     pub(crate) cancel_bound: Duration,
     /// The disk reader, until the close takes it: reads are stopped first, while the lattice still runs the frames that
@@ -529,6 +533,26 @@ impl RuntimeOwner {
         RuntimeOwner {
             teardown: Some(teardown),
         }
+    }
+
+    /// The owner of a start that failed before it had a lattice: it closes nothing.
+    pub(crate) fn idle() -> RuntimeOwner {
+        RuntimeOwner { teardown: None }
+    }
+
+    /// Stops an engine that is not an [`EngineRuntime`]: closes the lakes and the lattice, waiting for the workers,
+    /// then runs `free`, which frees the device memory the engine holds (it may wait for the device). Call it from the
+    /// thread that started the engine, once no frame is running.
+    pub(crate) fn shutdown_with<R>(mut self, free: impl FnOnce() -> R) -> R {
+        let teardown = self.teardown.take();
+        if let Some(teardown) = &teardown {
+            teardown.close();
+        }
+        let freed = free();
+        if let Some(teardown) = &teardown {
+            teardown.device_bytes.store(0, Ordering::Release);
+        }
+        freed
     }
 
     /// Stops the engine: closes the lakes and the lattice, waiting for the workers, then frees the device memory of
@@ -1279,7 +1303,11 @@ pub fn open_lane_set<G: Gpu>(
 
 /// Builds the lattice, the lakes, the device with its kernels and the pools of a startup, on the calling thread. The
 /// lanes are not opened here: their rings depend on the sequences the plan resolves ([`Core::open_lanes`]).
-fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duration>) -> Result<Arc<Core>, EngineError> {
+pub(crate) fn build(
+    settings: &Settings,
+    library_path: &Path,
+    close_timeout: Option<Duration>,
+) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
     // Before anything is opened: a stated count the passes cannot hold is refused.
     check_stated_sequences(&settings.batching)?;
@@ -1324,6 +1352,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         cancel_bound,
     );
     let host_pinned_bytes = startup::host_pinned_bytes(settings, &machine);
+    let host_budget = host_budget(&settings.memory, machine.available);
     let account = MemoryAccount::open(library.free_bytes().unwrap_or(0));
     Ok(Arc::new(Core {
         settings: settings.clone(),
@@ -1339,6 +1368,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         pool,
         released: Arc::new(ReleasedBuffers::new()),
         host_pinned_bytes,
+        host_budget,
         account,
         pool_bytes,
         started,
