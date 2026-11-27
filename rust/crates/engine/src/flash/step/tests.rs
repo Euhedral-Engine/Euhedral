@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::mem::replace;
 
 use euhedral_graph::{StageCx, StageError, Submitted};
 use euhedral_inference_edrl::tiny_flash::tiny_config;
@@ -148,4 +149,62 @@ fn a_new_quantum_waits_for_the_sink_of_the_one_before_it_at_its_embedding_and_no
         }]
     );
     assert!(dependencies(&[]).is_empty(), "a retired predecessor orders nothing");
+}
+
+#[test]
+fn the_sink_is_the_last_node_and_a_plan_too_large_for_the_stage_ids_is_refused() {
+    let plan = DensePlan::with_moe(&tiny_config(), 2).unwrap();
+    assert_eq!(sink_of(&plan).unwrap(), StageId((plan.nodes().len() - 1) as u16));
+    let huge = DensePlan::with_moe(&tiny_config(), 40_000).unwrap();
+    let message = sink_of(&huge).unwrap_err().to_string();
+    assert!(message.contains(&huge.nodes().len().to_string()), "{message}");
+}
+
+/// Whether `from` reaches `to` over the submission and completion edges of `plan`.
+fn reaches(plan: &DensePlan, from: usize, to: usize) -> bool {
+    let mut seen = vec![false; plan.nodes().len()];
+    let mut open = vec![to];
+    while let Some(node) = open.pop() {
+        if node == from {
+            return true;
+        }
+        if replace(&mut seen[node], true) {
+            continue;
+        }
+        let node = &plan.nodes()[node];
+        open.extend(node.after.iter().chain(&node.completed));
+    }
+    false
+}
+
+#[test]
+fn the_edges_of_a_bucket_order_each_layer_through_its_experts_and_every_node_ends_at_the_head() {
+    let buckets = Buckets::new(32, 3, 2).unwrap();
+    let plan = buckets.plan(&tiny_config(), 16).unwrap();
+    let at = |kind| plan.index_of(kind).unwrap();
+    for layer in 0..2 {
+        for slot in 0..3 {
+            let expert = at(NodeKind::MoeExpert(layer, slot));
+            assert!(reaches(&plan, at(NodeKind::Block(layer)), expert));
+            assert!(reaches(&plan, expert, at(NodeKind::End(layer))));
+        }
+        assert!(reaches(
+            &plan,
+            at(NodeKind::MoeRoute(layer)),
+            at(NodeKind::MoePlan(layer))
+        ));
+        assert!(reaches(&plan, at(NodeKind::MoeShared(layer)), at(NodeKind::End(layer))));
+    }
+    assert!(reaches(&plan, at(NodeKind::End(0)), at(NodeKind::Block(1))));
+    let head = at(NodeKind::Head);
+    assert!(
+        (0..plan.nodes().len()).all(|node| reaches(&plan, node, head)),
+        "a node does not lead to the head, so no marker covers its work"
+    );
+    assert!(
+        (1..plan.nodes().len())
+            .filter(|&node| plan.nodes()[node].after.is_empty() && plan.nodes()[node].completed.is_empty())
+            .all(|node| plan.nodes()[node].kind.host()),
+        "a device node has no predecessor, so it would run beside the quantum before it"
+    );
 }

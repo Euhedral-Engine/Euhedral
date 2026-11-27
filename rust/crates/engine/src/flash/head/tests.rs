@@ -89,7 +89,23 @@ fn a_head_the_weights_or_the_logits_cannot_honour_is_refused() {
     assert!(new(weight(right), 0x200008, HIDDEN, VOCABULARY).is_err());
     assert!(new(weight(0), 0x200000, HIDDEN, 0).is_err());
     assert!(new(weight(0), 0x200000, 0, VOCABULARY).is_err());
-    // A hidden width the BF16 kernels cannot take is refused when the launch is built.
-    let odd = new(weight(u64::from(VOCABULARY) * 12 * 2), 0x200000, 12, VOCABULARY).unwrap();
-    assert!(odd.ops(false, Select::Row).is_err());
+    // A hidden width the BF16 kernels cannot take, or another than the regions hold, is refused at construction.
+    assert!(new(weight(u64::from(VOCABULARY) * 12 * 2), 0x200000, 12, VOCABULARY).is_err());
+    assert!(new(weight(u64::from(VOCABULARY) * 128 * 2), 0x200000, 128, VOCABULARY).is_err());
+}
+
+#[test]
+fn the_host_reads_the_row_when_the_quantum_has_a_row_readback_else_the_key_and_refuses_neither() {
+    let stage = head();
+    let keys = at(0x300000);
+    let row = VOCABULARY as usize * 2;
+    assert_eq!(stage.select(Some(row), None).unwrap(), Select::Row);
+    assert_eq!(stage.select(Some(row), Some(keys)).unwrap(), Select::Row);
+    assert_eq!(stage.select(None, Some(keys)).unwrap(), Select::Key(keys));
+    assert!(stage.select(None, None).is_err());
+    let message = stage.select(Some(row + 2), Some(keys)).unwrap_err().to_string();
+    assert!(
+        message.contains(&(row + 2).to_string()) && message.contains(&row.to_string()),
+        "{message}"
+    );
 }

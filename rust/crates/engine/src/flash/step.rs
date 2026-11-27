@@ -125,6 +125,22 @@ pub fn dependencies(after: &[Predecessor<'_>]) -> SmallVec<[Dependency; 16]> {
     external_edges(&[], after)
 }
 
+/// The stage whose marker covers a quantum's device work: the last node of `plan`. A plan with more nodes than the
+/// graph's stage ids hold is refused with the count.
+pub fn sink_of(plan: &DensePlan) -> Result<StageId, FlashError> {
+    let last = plan.nodes().len() - 1;
+    u16::try_from(last).map(StageId).map_err(|_| {
+        FlashError::refused(
+            OP,
+            format!(
+                "a plan of {} nodes exceeds the {} a graph holds",
+                last + 1,
+                u32::from(u16::MAX) + 1
+            ),
+        )
+    })
+}
+
 /// What builds the RustEE stage of a node.
 pub trait NodeStages {
     /// The stage of the node `kind` in the plan of `bucket` rows.
@@ -200,7 +216,7 @@ impl FlashStep {
             graphs.push(BucketGraph {
                 bucket,
                 graph,
-                sink: StageId((plan.nodes().len() - 1) as u16),
+                sink: sink_of(&plan)?,
             });
         }
         Ok(Self { buckets, graphs })

@@ -48,10 +48,21 @@ impl HeadStage {
         hidden: u32,
         vocabulary: u32,
     ) -> Result<Self, FlashError> {
-        if hidden == 0 || vocabulary == 0 {
+        if hidden == 0 || vocabulary == 0 || !hidden.is_multiple_of(8) {
             return Err(FlashError::refused(
                 OP,
-                format!("a head of {vocabulary} entries over {hidden} hidden values"),
+                format!(
+                    "a head of {vocabulary} entries over {hidden} hidden values: both are positive and the width is a multiple of 8"
+                ),
+            ));
+        }
+        if hidden != regions.shape().hidden {
+            return Err(FlashError::refused(
+                OP,
+                format!(
+                    "a head over {hidden} hidden values, the regions hold {}",
+                    regions.shape().hidden
+                ),
             ));
         }
         let expected = u64::from(vocabulary) * u64::from(hidden) * BF16;
@@ -114,12 +125,11 @@ impl HeadStage {
         }
     }
 
-    /// What the quantum's host reads: the row when its segment has a row readback, else the key of its selection.
-    fn select_of(&self, quantum: &Quantum) -> Result<Select, FlashError> {
-        let segment = quantum.segment();
-        if let Some(rows) = &segment.row_readback {
-            let bytes = rows.row(0).map_or(0, <[u8]>::len) as u64;
-            if bytes != self.row_bytes() {
+    /// What the host reads, from what the quantum offers: the row when it has a row readback (whose rows are
+    /// `row_bytes` bytes), else the key of its selection at `keys`.
+    pub fn select(&self, row_bytes: Option<usize>, keys: Option<DevicePtr>) -> Result<Select, FlashError> {
+        if let Some(bytes) = row_bytes {
+            if bytes as u64 != self.row_bytes() {
                 return Err(FlashError::refused(
                     OP,
                     format!(
@@ -130,13 +140,12 @@ impl HeadStage {
             }
             return Ok(Select::Row);
         }
-        match &segment.selection {
-            Some(selection) => Ok(Select::Key(selection.device_keys())),
-            None => Err(FlashError::refused(
+        keys.map(Select::Key).ok_or_else(|| {
+            FlashError::refused(
                 OP,
                 "a quantum that scores a row has neither a selection nor a row readback".to_owned(),
-            )),
-        }
+            )
+        })
     }
 }
 
@@ -149,16 +158,36 @@ impl Launch for HeadStage {
         if self.idle(quantum) {
             return Ok(());
         }
-        let select = self.select_of(quantum).map_err(fatal)?;
-        let mut list = self.ops(kernels.exact_numerics(), select).map_err(fatal)?;
-        let (source, bytes) = self.readback(select);
-        let segment = quantum.segment();
+        // The head writes one row: the last of one sequence's rows.
+        let [segment] = quantum.segments() else {
+            return Err(fatal(format!(
+                "the head serves one sequence, the quantum has {} segments",
+                quantum.segments().len()
+            )));
+        };
+        if quantum.logits_rows != 1 {
+            return Err(fatal(format!(
+                "the head writes one logits row, the quantum scores {}",
+                quantum.logits_rows
+            )));
+        }
+        let select = self
+            .select(
+                segment
+                    .row_readback
+                    .as_ref()
+                    .map(|rows| rows.row(0).map_or(0, <[u8]>::len)),
+                segment.selection.as_ref().map(|selection| selection.device_keys()),
+            )
+            .map_err(fatal)?;
         // The pinned buffer belongs to the quantum, which retires only after the marker that follows this launch.
         let destination = match (&segment.row_readback, &segment.selection) {
             (Some(rows), _) => rows.pinned(),
             (None, Some(selection)) => selection.readback(),
             (None, None) => return Err(fatal("a quantum that scores a row has nowhere to copy it")),
         };
+        let mut list = self.ops(kernels.exact_numerics(), select).map_err(fatal)?;
+        let (source, bytes) = self.readback(select);
         list.push(Op::Readback {
             destination,
             offset: 0,
