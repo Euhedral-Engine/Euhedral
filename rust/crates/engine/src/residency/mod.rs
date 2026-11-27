@@ -3,6 +3,8 @@
 pub mod accounting;
 pub mod budget;
 pub mod disk;
+pub mod experts;
+pub mod flash;
 pub mod footprint;
 pub mod loader;
 pub mod offload;

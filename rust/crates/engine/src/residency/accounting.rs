@@ -45,6 +45,10 @@ pub enum Consumer {
     DiskWindow,
     /// The prefix cache's pinned arena, the one consumer the plan may drop.
     PrefixCache,
+    /// The device slots the routed experts of a Flash-Next model are cached in.
+    ExpertCache,
+    /// The pinned host slots every Flash-Next expert record passes through on its way to the device.
+    ExpertStaging,
 }
 
 impl Consumer {
@@ -61,6 +65,8 @@ impl Consumer {
             Consumer::HostWeights => "weights on the host",
             Consumer::DiskWindow => "disk window",
             Consumer::PrefixCache => "prefix cache",
+            Consumer::ExpertCache => "expert cache",
+            Consumer::ExpertStaging => "expert staging",
         }
     }
 }

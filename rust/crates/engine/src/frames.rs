@@ -40,6 +40,10 @@ pub(crate) enum Kind {
     DiskRead,
     /// The completions of the copies out of the disk window, one chain per slot.
     DiskCopy,
+    /// The completions of the parts of one routed-expert record's read, one chain per part.
+    ExpertRead,
+    /// The copy of a routed-expert record out of the host tier into a staging buffer.
+    ExpertCopy,
     /// The delivery of a hidden-rows request's rows to its sink.
     Hidden,
 }
