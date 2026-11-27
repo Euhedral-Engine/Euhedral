@@ -129,6 +129,12 @@ impl Buckets {
         }
         DensePlan::with_moe(config, self.expert_width(bucket))
     }
+
+    /// The stage whose marker covers the device work of a step of `bucket` rows: what a [`Started`] names as its sink,
+    /// so that the quantum after it waits for the right stage of the graph of its own bucket.
+    pub fn sink(&self, config: &FlashConfig, bucket: u32) -> Result<StageId, FlashError> {
+        sink_of(&self.plan(config, bucket)?)
+    }
 }
 
 /// The edges a quantum starts with behind the quantum before it on the workspace (`after` is that quantum, or empty
@@ -221,7 +227,7 @@ impl FlashStep {
             graphs.push(BucketGraph {
                 bucket,
                 graph,
-                sink: sink_of(&plan)?,
+                sink: buckets.sink(config, bucket)?,
             });
         }
         Ok(Self { buckets, graphs })

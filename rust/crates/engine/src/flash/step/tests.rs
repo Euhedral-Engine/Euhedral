@@ -175,6 +175,26 @@ fn a_new_quantum_waits_for_the_sink_of_the_one_before_it_at_its_embedding_and_no
 }
 
 #[test]
+fn each_bucket_names_the_last_stage_of_its_own_graph_as_the_sink_a_started_quantum_carries() {
+    let buckets = Buckets::new(32, 3, 2).unwrap();
+    let config = tiny_config();
+    let sinks: Vec<StageId> = buckets
+        .sizes()
+        .iter()
+        .map(|bucket| buckets.sink(&config, *bucket).unwrap())
+        .collect();
+    for (bucket, sink) in buckets.sizes().iter().zip(&sinks) {
+        let nodes = buckets.plan(&config, *bucket).unwrap().nodes().len();
+        assert_eq!(*sink, StageId((nodes - 1) as u16), "bucket {bucket}");
+    }
+    assert_ne!(
+        sinks[0], sinks[1],
+        "the buckets' graphs differ in size, and so in their sinks"
+    );
+    assert!(buckets.sink(&config, 8).is_err(), "8 rows is no bucket of this model");
+}
+
+#[test]
 fn the_sink_is_the_last_node() {
     let plan = DensePlan::with_moe(&tiny_config(), 2).unwrap();
     assert_eq!(sink_of(&plan).unwrap(), StageId((plan.nodes().len() - 1) as u16));

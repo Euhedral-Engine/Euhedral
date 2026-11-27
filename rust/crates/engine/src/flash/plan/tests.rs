@@ -179,3 +179,16 @@ fn a_plan_with_more_nodes_than_a_graph_holds_is_refused_naming_its_count_before_
     );
     assert!(DensePlan::with_moe(&config, u32::MAX).is_err());
 }
+
+#[test]
+fn a_plan_is_admitted_up_to_the_stages_a_graph_holds_and_refused_one_node_pair_past_them() {
+    // Without the n-gram layer a plan has 2 * layers + 3 nodes, always odd, so a plan of exactly `MAX_NODES` cannot
+    // exist: these are the last count below the limit and the first above it.
+    let mut config = tiny_config();
+    config.ple.layers.clear();
+    config.text.num_layers = (MAX_NODES as u32 - 3) / 2;
+    assert_eq!(DensePlan::from_config(&config).unwrap().nodes().len(), MAX_NODES - 1);
+    config.text.num_layers += 1;
+    let message = DensePlan::from_config(&config).unwrap_err().to_string();
+    assert!(message.contains(&(MAX_NODES + 1).to_string()), "{message}");
+}

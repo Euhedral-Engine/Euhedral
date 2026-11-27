@@ -163,6 +163,17 @@ impl HeadStage {
     }
 }
 
+/// The one segment the head serves: a quantum of any other count is refused, naming it.
+fn single_segment<T>(segments: &[T]) -> Result<&T, FlashError> {
+    match segments {
+        [segment] => Ok(segment),
+        other => Err(FlashError::refused(
+            OP,
+            format!("the head serves one sequence, the quantum has {} segments", other.len()),
+        )),
+    }
+}
+
 impl Launch for HeadStage {
     fn idle(&self, quantum: &Quantum) -> bool {
         quantum.logits_rows == 0
@@ -172,12 +183,7 @@ impl Launch for HeadStage {
         if self.idle(quantum) {
             return Ok(());
         }
-        let [segment] = quantum.segments() else {
-            return Err(fatal(format!(
-                "the head serves one sequence, the quantum has {} segments",
-                quantum.segments().len()
-            )));
-        };
+        let segment = single_segment(quantum.segments()).map_err(fatal)?;
         let row = segment
             .row_readback
             .as_ref()

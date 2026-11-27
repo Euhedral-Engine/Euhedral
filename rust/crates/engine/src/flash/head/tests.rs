@@ -130,3 +130,12 @@ fn a_head_refuses_a_quantum_that_scores_any_other_count_of_rows_than_one() {
         assert!(message.contains(&format!("scores {rows}")), "{message}");
     }
 }
+
+#[test]
+fn the_head_serves_a_quantum_of_one_segment_and_refuses_any_other_count_naming_it() {
+    assert_eq!(single_segment(&[7]).unwrap(), &7);
+    for count in [0usize, 2, 3] {
+        let message = single_segment(&vec![0; count]).unwrap_err().to_string();
+        assert!(message.contains(&format!("has {count} segments")), "{message}");
+    }
+}
