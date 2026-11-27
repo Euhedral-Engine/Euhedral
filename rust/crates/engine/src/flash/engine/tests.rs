@@ -31,19 +31,11 @@ use crate::sampling::SamplingConfig;
 /// The longest the proof run waits for the load.
 const WAIT: Duration = Duration::from_secs(20 * 60);
 
-/// The longest it waits for one generation.
-const GENERATION: Duration = Duration::from_secs(90);
+/// The longest it waits for one generation: a hang guard only, far above what a debug build needs.
+const GENERATION: Duration = Duration::from_secs(10 * 60);
 
 /// The prompt: a one-turn chat opening, as token ids.
 const PROMPT: [u32; 9] = [151_644, 872, 198, 9_707, 151_645, 198, 151_644, 77_091, 198];
-
-struct Stderr;
-impl log::Log for Stderr {
-    fn enabled(&self, _m: &log::Metadata<'_>) -> bool { true }
-    fn log(&self, r: &log::Record<'_>) { eprintln!("LOG {} {}: {}", r.level(), r.target(), r.args()); }
-    fn flush(&self) {}
-}
-static STDERR: Stderr = Stderr;
 
 struct Recorder {
     tokens: Vec<u32>,
@@ -51,18 +43,13 @@ struct Recorder {
 }
 
 impl GenerationListener for Recorder {
-    fn prefill_done(&mut self, _at: Instant) {
-        println!("prefill done");
-    }
+    fn prefill_done(&mut self, _at: Instant) {}
 
     fn token(&mut self, id: u32, _at: Instant) {
-        println!("token {id}");
         self.tokens.push(id);
     }
 
-    fn quantum(&mut self, event: QuantumEvent) {
-        println!("quantum {event:?}");
-    }
+    fn quantum(&mut self, _event: QuantumEvent) {}
 
     fn finished(&mut self, outcome: GenerationOutcome) {
         self.done.send((mem::take(&mut self.tokens), outcome));
@@ -96,8 +83,6 @@ fn a_short_prompt_generates_the_same_tokens_twice() {
     let Some(artifact) = test_support::require_property("euhedral.qwen4.artifact") else {
         return;
     };
-    let _ = log::set_logger(&STDERR);
-    log::set_max_level(log::LevelFilter::Debug);
     let mut settings = Settings::with_model(ModelSettings {
         artifact: PathBuf::from(artifact),
         name: "test".to_string(),
@@ -109,9 +94,7 @@ fn a_short_prompt_generates_the_same_tokens_twice() {
         .expect("the start never reported")
         .expect("the model starts");
     println!("device plan: {:?}", model.plan.device);
-    println!("model started");
     let engine = FlashEngine::new(&model).expect("the sequence is allocated");
-    println!("engine built");
     let (first, outcome) = generate(&engine, 16);
     println!("first: {first:?} {:?} in {:?}", outcome.reason, outcome.elapsed);
     let (second, _) = generate(&engine, 16);

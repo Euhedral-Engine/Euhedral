@@ -345,7 +345,6 @@ impl<S: Stepper> FlashOwner<S> {
 
     /// A quantum retired.
     fn retired(&mut self, retired: Retired) {
-        eprintln!("DBG owner retired ok={}", retired.result.is_ok());
         let Some(run) = self.run.as_mut() else { return };
         let Some(flight) = run.flight.take() else { return };
         let next_context = match retired.result {

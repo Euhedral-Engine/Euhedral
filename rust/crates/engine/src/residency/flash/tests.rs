@@ -271,6 +271,21 @@ fn the_smallest_cache_fits_exactly_and_one_byte_less_is_refused_with_the_bytes_n
 }
 
 #[test]
+fn each_fixed_object_is_counted_at_the_size_the_arena_places_it() {
+    let mut tensors = immovable();
+    tensors[1].bytes = MIB + 1;
+    // The arena starts every object at a multiple of ARENA_ALIGNMENT, so the one-byte excess takes a whole step.
+    let resident = 2 * MIB + ARENA_ALIGNMENT;
+    let exact = reserved(&config(), 700, 256) + resident + 4 * MIB;
+    let fits = plan(&tensors, &memory(700), inputs(exact, 256)).unwrap();
+    assert_eq!((fits.device.fixed_resident, fits.device.slack), (resident, 0));
+    assert!(matches!(
+        plan(&tensors, &memory(700), inputs(exact - 1, 256)),
+        Err(PlanError::FlashDeviceTooSmall { .. })
+    ));
+}
+
+#[test]
 fn the_refusal_message_names_the_needed_and_the_free_bytes() {
     let exact = reserved(&config(), 700, 256) + 2 * MIB + 4 * MIB;
     let message = plan(&immovable(), &memory(700), inputs(exact - 1, 256))

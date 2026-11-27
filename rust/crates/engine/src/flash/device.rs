@@ -39,7 +39,6 @@ use super::startup::FlashModel;
 use super::step::{Buckets, FlashStep};
 use crate::generation::Address;
 use crate::model::ModelConfig;
-use crate::quantum::Started;
 use crate::runtime::{Core, Units};
 use crate::stages::sampling::{RowReadback, Selection};
 use crate::stages::{InputRecordRef, Outcome, Quantum, SequenceRefs, conclude};
@@ -90,8 +89,6 @@ fn carrier_config(vocabulary: usize) -> ModelConfig {
 
 /// The quantum in flight, and what it holds until it retires.
 struct InFlight {
-    /// Keeps the graph's run referenced until the next quantum starts.
-    _started: Started,
     /// The pinned staging of the cache reservation the quantum's stages read.
     _retained: KvRetained,
 }
@@ -220,7 +217,6 @@ impl DeviceStepper {
             LaneId(0),
             &stages,
             move |quantum, outcome| {
-                eprintln!("DBG retire callback");
                 retiring.post(Message::Retired(retired(&quantum, &outcome)));
             },
         )
@@ -275,7 +271,6 @@ impl DeviceStepper {
         let (state, fresh_context) = (&mut self.state, &self.fresh_context);
         let (workspace, config, device) = (&self.workspace, &self.config, &self.device);
         let (selection, readback) = (&self.selection, &self.readback);
-        eprintln!("DBG launch submit rows={rows} fresh={}", step.fresh);
         let (quantum, marker) = core
             .lane_table()
             .submit_ops(core.owner_lane(), false, |lane| {
@@ -321,16 +316,14 @@ impl DeviceStepper {
                 freed.map(|()| quantum)
             })
             .map_err(|error| format!("preparing the quantum: {error}"))?;
-        eprintln!("DBG submitted");
         let mut quantum = quantum;
         quantum.prepared_after(marker);
-        let started = self
+        // Nothing depends on this quantum, and a held reference keeps it from retiring: let it go at once.
+        let _ = self
             .step
             .start(quantum, Arc::new(AtomicBool::new(false)), &[])
             .map_err(|error| error.to_string())?;
-        eprintln!("DBG started");
         self.flight = Some(InFlight {
-            _started: started,
             _retained: retained,
         });
         Ok(())
