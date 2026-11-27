@@ -11,6 +11,7 @@
 //! What the host stages share with the device stage travels in the quantum ([`PleRows`]), which they reach through
 //! [`Quantum::ple`]; no stage holds a lock or waits for another: the graph's edges order them.
 
+mod file_shard;
 mod ngram;
 
 use std::ops::Range;
@@ -19,6 +20,7 @@ use std::sync::{Arc, OnceLock};
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{DevicePtr, KernelOps, PinnedPool, PooledPinned};
 
+pub use self::file_shard::FileShard;
 pub use self::ngram::{NgramIds, NgramRows, PARTS, PartSlots, PublishError, ShardBytes, part_count, part_range};
 use super::buffers::{Carver, FlashRegions, ScratchSizes, StreamShape, bf16_bytes};
 use super::linear::{Nvfp4Device, Nvfp4Weight};

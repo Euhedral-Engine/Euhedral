@@ -175,13 +175,36 @@ impl NgramIds {
     }
 }
 
-/// The bytes of one shard of the table: a mapped file, or memory.
-pub trait ShardBytes: AsRef<[u8]> + Send + Sync + fmt::Debug {}
+/// The bytes of one shard of the table, read by position: memory, or a file read in place ([`FileShard`]).
+pub trait ShardBytes: Send + Sync + fmt::Debug {
+    /// The shard's length in bytes.
+    fn size(&self) -> u64;
 
-impl<T: AsRef<[u8]> + Send + Sync + fmt::Debug> ShardBytes for T {}
+    /// Fills `out` with the bytes at `offset`. Refuses a range outside the shard and a failed read, naming the cause.
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), String>;
+}
+
+impl<T: AsRef<[u8]> + Send + Sync + fmt::Debug> ShardBytes for T {
+    fn size(&self) -> u64 {
+        self.as_ref().len() as u64
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
+        let bytes = self.as_ref();
+        let end = offset
+            .checked_add(out.len() as u64)
+            .filter(|end| *end <= bytes.len() as u64);
+        let Some(end) = end else {
+            return Err(format!("{} bytes at {offset} of a shard of {}", out.len(), bytes.len()));
+        };
+        out.copy_from_slice(&bytes[offset as usize..end as usize]);
+        Ok(())
+    }
+}
 
 /// The n-gram table: shards of `shard_rows` rows each (the last may hold fewer), every shard laid out as
-/// [`NgramLayout`] describes and carrying its own global scale. Reads are shared and never block.
+/// [`NgramLayout`] describes and carrying its own global scale. Reads are shared; a read of a file shard waits for the
+/// page cache as a read of a mapped page does.
 #[derive(Debug)]
 pub struct NgramRows {
     shards: Box<[Arc<dyn ShardBytes>]>,
@@ -219,20 +242,20 @@ impl NgramRows {
             let rows = shard_rows.min(total_rows - index as u64 * shard_rows);
             let layout = NgramLayout::new(rows, u64::from(row_width))
                 .map_err(|why| FlashError::refused(OP, format!("shard {index}: {why}")))?;
-            let bytes = shard.as_ref().as_ref();
-            if (bytes.len() as u64) < layout.byte_size() {
+            if shard.size() < layout.byte_size() {
                 return Err(FlashError::refused(
                     OP,
                     format!(
                         "shard {index} holds {} bytes, {rows} rows of {row_width} values take {}",
-                        bytes.len(),
+                        shard.size(),
                         layout.byte_size()
                     ),
                 ));
             }
-            let at = layout.trailer_offset() as usize;
             let mut scale = [0u8; 4];
-            scale.copy_from_slice(&bytes[at..at + 4]);
+            shard
+                .read_at(layout.trailer_offset(), &mut scale)
+                .map_err(|why| FlashError::refused(OP, format!("shard {index}'s scale: {why}")))?;
             scales.push(f32::from_le_bytes(scale));
             layouts.push(layout);
         }
@@ -293,10 +316,10 @@ impl NgramRows {
             // The layout of the shard knows every row of it: the shard of this row was checked at construction.
             let at = self.layouts[shard]
                 .row_offset(local)
-                .ok_or_else(|| FlashError::refused(OP, format!("row {row} is not in shard {shard}")))?
-                as usize;
-            let bytes: &[u8] = self.shards[shard].as_ref().as_ref();
-            slot[..row_bytes].copy_from_slice(&bytes[at..at + row_bytes]);
+                .ok_or_else(|| FlashError::refused(OP, format!("row {row} is not in shard {shard}")))?;
+            self.shards[shard]
+                .read_at(at, &mut slot[..row_bytes])
+                .map_err(|why| FlashError::refused(OP, format!("row {row}: {why}")))?;
             slot[row_bytes..record - 4].fill(0);
             slot[record - 4..].copy_from_slice(&self.scales[shard].to_le_bytes());
         }

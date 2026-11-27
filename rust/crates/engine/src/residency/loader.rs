@@ -103,8 +103,13 @@ struct Copy {
 
 /// The pieces of a plan, at most `piece_bytes` long, in file order.
 pub fn pieces(plan: &ResidencyPlan, piece_bytes: u64) -> Vec<Piece> {
+    pieces_of(&plan.device, piece_bytes)
+}
+
+/// The pieces of `placements`, at most `piece_bytes` long, in file order; a piece's `placement` indexes the slice.
+pub fn pieces_of(placements: &[Placement], piece_bytes: u64) -> Vec<Piece> {
     let mut out = Vec::new();
-    for (index, placement) in plan.device.iter().enumerate() {
+    for (index, placement) in placements.iter().enumerate() {
         // An object left in the artifact file is read when it is used, not loaded.
         let base = match placement.tier {
             Tier::Device => placement.offset,
