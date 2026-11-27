@@ -209,32 +209,53 @@ impl Launch for BlockStage {
 }
 
 impl BlockStage {
-    /// Where the quantum's rows lie: the segment's start and, for a layer that reads the cache, its page tables from
+    /// Where the quantum's rows lie: for a layer that reads the cache, the segment's start and its page tables from
     /// the view the quantum took at admission. A launch knows no tail slot: the cache layer's stage runs only the
     /// first chunk of a sequence (slot 0), and refuses a later one, because a stale tail would write wrong block keys.
     /// A sequence with later chunks supplies its slot through [`BlockStage::ops_at`].
     fn chunk_of(&self, quantum: &Quantum) -> Result<ChunkAt, StageError> {
-        let segment = quantum.segment();
-        let start = u32::try_from(segment.start_position)
-            .map_err(|_| fatal(format!("position {} exceeds 32 bits", segment.start_position)))?;
         let Some(layer) = self.kv_layer else {
-            return Ok(ChunkAt {
-                start,
-                ..ChunkAt::default()
-            });
+            return Ok(ChunkAt::default());
         };
-        let view = segment
-            .refs
-            .kv(KvSource::Base)
-            .ok_or_else(|| fatal("the quantum has no view of the cache".to_owned()))?;
-        let table = |tables: Option<DevicePtr>, name: &str| {
-            tables.ok_or_else(|| fatal(format!("the cache has no {name} page table for layer {layer}")))
+        let segments = quantum.segments();
+        let tables = match segments {
+            [segment] => segment
+                .refs
+                .kv(KvSource::Base)
+                .map(|view| (view.key_table(layer), view.value_table(layer))),
+            _ => None,
+        };
+        let start = segments.first().map_or(0, |segment| segment.start_position);
+        self.place(segments.len(), start, tables).map_err(fatal)
+    }
+
+    /// The chunk of a launch of a cache layer's stage over `segments` segments, the first at `start_position`, whose
+    /// view of the cache gives `tables` (K and V) for the layer. Refuses a batch, a missing view or table, a position
+    /// of 32 bits or more, and a position past the first chunk.
+    fn place(
+        &self,
+        segments: usize,
+        start_position: u64,
+        tables: Option<(Option<DevicePtr>, Option<DevicePtr>)>,
+    ) -> Result<ChunkAt, String> {
+        let Some(layer) = self.kv_layer else {
+            return Ok(ChunkAt::default());
+        };
+        if segments != 1 {
+            return Err(format!(
+                "the block of a cache layer runs one sequence's chunk, the quantum has {segments} segments"
+            ));
+        }
+        let start = u32::try_from(start_position).map_err(|_| format!("position {start_position} exceeds 32 bits"))?;
+        let (keys, values) = tables.ok_or_else(|| "the quantum has no view of the cache".to_owned())?;
+        let table = |table: Option<DevicePtr>, name: &str| {
+            table.ok_or_else(|| format!("the cache has no {name} page table for layer {layer}"))
         };
         Ok(ChunkAt {
             start,
-            key_table: table(view.key_table(layer), "K")?,
-            value_table: table(view.value_table(layer), "V")?,
-            tail_slot: unsupplied_tail_slot(start).map_err(fatal)?,
+            key_table: table(keys, "K")?,
+            value_table: table(values, "V")?,
+            tail_slot: unsupplied_tail_slot(start)?,
         })
     }
 }

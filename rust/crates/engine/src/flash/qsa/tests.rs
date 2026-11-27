@@ -61,11 +61,8 @@ fn body_of(shape: QsaShape) -> QsaBody {
         index_query_norm: weight(0x170000),
         index_key_norm: weight(0x180000),
     };
-    let buffers = QsaBuffers {
-        block_keys: at(0x1000000),
-        tails: at(0x2000000),
-    };
-    QsaBody::new(shape, weights, buffers, Nvfp4Device::with_native_route(true, 8))
+    let state = QsaState::over(at(0x1000000), shape.max_tokens()).unwrap();
+    QsaBody::new(shape, weights, &state, Nvfp4Device::with_native_route(true, 8)).unwrap()
 }
 
 fn body() -> QsaBody {
@@ -418,4 +415,79 @@ fn the_split_partials_are_sized_for_the_largest_row_count_that_splits() {
     assert_eq!(shape.splits_for(1, 100), 3);
     assert_eq!(shape.splits_for(1, 31), 1);
     assert_eq!(shape.splits_for(1, 100_000), 64);
+}
+
+#[test]
+fn a_decode_row_launches_every_op_with_the_scratch_each_stage_reads_and_writes() {
+    // Key and value come out of their projections, the key is normed and rotated into its own buffer and that buffer
+    // is what the cache appends; the output linear reads the gated attention.
+    let body = body();
+    let ops = body.ops(&call(&body, 1, chunk(3003, 0))).unwrap();
+    assert_eq!(
+        lines(&ops),
+        [
+            "nvfp4_linear p200000,p100000,p4000000,i1,i256,i4096,i4096",
+            "nvfp4_linear p200000,p110000,p4002000,i1,i256,i512,i4096",
+            "nvfp4_linear p200000,p120000,p4002800,i1,i256,i512,i4096",
+            "euhedral_q4_linear_bf16 grid=80,1,1 block=256,1,1 smem=0 args=p200000,p160000,p4002c00,i1,i256,i640",
+            "euhedral_q4_head_norm_rope_bf16 grid=2,1,1 block=128,1,1 smem=0 args=p4000000,p140000,p4000000,i1,i8,i256,i4096,i512,i4096,i512,i64,i3003,i1,i897988541,i1259902592",
+            "euhedral_q4_head_norm_rope_bf16 grid=1,1,1 block=128,1,1 smem=0 args=p4002000,p150000,p4002400,i1,i2,i256,i512,i256,i512,i256,i64,i3003,i1,i897988541,i1259902592",
+            "euhedral_q4_head_norm_rope_bf16 grid=1,1,1 block=128,1,1 smem=0 args=p4002c00,p170000,p4002c00,i1,i4,i128,i640,i128,i640,i128,i64,i3003,i1,i897988541,i1259902592",
+            "euhedral_q4_qsa_kv_append grid=1,1,1 block=128,1,1 smem=0 args=p4002400,p4002800,p3000000,p3100000,i1,i2,i512,i512,i3003",
+            "euhedral_q4_qsa_pool_keys_bf16 grid=1,1,1 block=128,1,1 smem=0 args=p4003000,p1040000,p1000000,i1,i3003,i640",
+            "euhedral_q4_head_norm_rope_bf16 grid=1,1,1 block=128,1,1 smem=0 args=p102ee00,p180000,p102ee00,i1,i1,i128,i128,i128,i128,i128,i64,i3000,i4,i897988541,i1259902592",
+            "euhedral_q4_qsa_tail_bf16 grid=1,1,1 block=128,1,1 smem=0 args=p4003000,p1040000,p1040300,i1,i3003,i640",
+            "euhedral_q4_qsa_scores grid=12,1,1 block=256,1,1 smem=0 args=p4002c00,p1000000,p4003100,i0,i1,i3003,i640,i768,i751",
+            "euhedral_q4_qsa_select grid=1,1,1 block=1024,1,1 smem=0 args=p4003100,p5003100,p5003900,i0,i3003,i768,i512",
+            "euhedral_q4_qsa_attention grid=128,1,1 block=96,1,1 smem=28224 args=p4000000,p4000200,p3000000,p3100000,p5003100,p5003900,p5003a00,p0,p5084a00,i1,i8,i2,i3003,i64,i512,i4096,i512,i4096,i512",
+            "euhedral_q4_qsa_merge grid=2,1,1 block=128,1,1 smem=0 args=p5003a00,p4000200,p0,p5084a00,i1,i8,i64,i4096,i512",
+            "nvfp4_linear p5084a00,p130000,p210000,i1,i2048,i256,i4096",
+        ]
+    );
+}
+
+#[test]
+fn a_prefill_chunk_launches_every_op_with_the_scratch_each_stage_reads_and_writes() {
+    // The chunk is the second of its sequence: it reads tail slot 1 and writes slot 0.
+    let body = body();
+    let ops = body.ops(&call(&body, 2000, chunk(1500, 1))).unwrap();
+    assert_eq!(
+        lines(&ops),
+        [
+            "nvfp4_linear p200000,p100000,p4000000,i2000,i256,i4096,i4096,native p8000000",
+            "nvfp4_linear p200000,p110000,p4fa0000,i2000,i256,i512,i4096,native p8000000",
+            "nvfp4_linear p200000,p120000,p5388000,i2000,i256,i512,i4096,native p8000000",
+            "euhedral_q4_linear_tc_rows_split_bf16 grid=80,32,1 block=128,1,1 smem=0 args=p200000,p160000,p557c000,i2000,i256,i640",
+            "euhedral_q4_head_norm_rope_bf16 grid=4000,1,1 block=128,1,1 smem=0 args=p4000000,p140000,p4000000,i2000,i8,i256,i4096,i512,i4096,i512,i64,i1500,i1,i897988541,i1259902592",
+            "euhedral_q4_head_norm_rope_bf16 grid=1000,1,1 block=128,1,1 smem=0 args=p4fa0000,p150000,p5194000,i2000,i2,i256,i512,i256,i512,i256,i64,i1500,i1,i897988541,i1259902592",
+            "euhedral_q4_head_norm_rope_bf16 grid=2000,1,1 block=128,1,1 smem=0 args=p557c000,p170000,p557c000,i2000,i4,i128,i640,i128,i640,i128,i64,i1500,i1,i897988541,i1259902592",
+            "euhedral_q4_qsa_kv_append grid=1000,1,1 block=128,1,1 smem=0 args=p5194000,p5388000,p3000000,p3100000,i2000,i2,i512,i512,i1500",
+            "euhedral_q4_qsa_pool_keys_bf16 grid=125,1,1 block=128,1,1 smem=0 args=p557c400,p1040300,p1000000,i500,i1500,i640",
+            "euhedral_q4_head_norm_rope_bf16 grid=125,1,1 block=128,1,1 smem=0 args=p1017700,p180000,p1017700,i500,i1,i128,i128,i128,i128,i128,i64,i1500,i4,i897988541,i1259902592",
+            "euhedral_q4_qsa_tail_bf16 grid=1,1,1 block=128,1,1 smem=0 args=p557c400,p1040300,p1040000,i2000,i1500,i640",
+            "euhedral_q4_qsa_select grid=551,1,1 block=1024,1,1 smem=0 args=p57ed000,p67ed000,p6bd5000,i0,i1500,i0,i512",
+            "euhedral_q4_qsa_scores grid=14,46,1 block=256,1,1 smem=0 args=p557c000,p1000000,p57ed000,i551,i1449,i1500,i640,i896,i875",
+            "euhedral_q4_qsa_select grid=1449,1,1 block=1024,1,1 smem=0 args=p57ed000,p67ed000,p6bd5000,i551,i1500,i896,i512",
+            "euhedral_q4_qsa_attention grid=4000,1,1 block=96,1,1 smem=28224 args=p4000000,p4000200,p3000000,p3100000,p67ed000,p6bd5000,p0,p0,p6ddb000,i2000,i8,i2,i1500,i1,i512,i4096,i512,i4096,i512",
+            "nvfp4_linear p6ddb000,p130000,p210000,i2000,i2048,i256,i4096,native p8000000",
+        ]
+    );
+}
+
+#[test]
+fn a_sequence_selects_from_the_token_after_the_budget_blocks_and_their_tail() {
+    // 512 blocks of 4 and the three tokens of the open block: 2051 tokens list everything.
+    let names = |rows, start| names(&body(), rows, chunk(start, 0));
+    assert_eq!(count(&names(1, 2050), SELECT), 0);
+    assert_eq!(count(&names(2, 2049), SELECT), 0);
+    assert_eq!(count(&names(1, 2051), SELECT), 1);
+    assert_eq!(count(&names(2, 2050), SELECT), 2);
+}
+
+#[test]
+fn a_body_over_a_state_laid_out_for_fewer_tokens_is_refused_with_both_sizes() {
+    let shape = shape_with(4096, DEFAULT_SCORE_BYTES);
+    let small = QsaState::over(at(0x1000000), 2048).unwrap();
+    let err = QsaBody::new(shape, body().weights, &small, Nvfp4Device::with_native_route(true, 8)).unwrap_err();
+    assert!(err.to_string().contains("2048 tokens, the layer's shape 4096"));
 }

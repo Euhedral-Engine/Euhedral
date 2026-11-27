@@ -237,8 +237,44 @@ fn regions_output(stage: &BlockStage) -> DevicePtr {
     stage.regions.block_output
 }
 
+fn cache_stage(layer: Option<usize>) -> BlockStage {
+    let (hyper, regions) = regions();
+    let stage = BlockStage::new(hyper, site(true), site(true), Arc::new(Marked), regions).unwrap();
+    match layer {
+        Some(layer) => stage.with_kv_layer(layer),
+        None => stage,
+    }
+}
+
 #[test]
-fn a_launch_knows_the_tail_slot_of_a_first_chunk_only() {
-    assert_eq!(unsupplied_tail_slot(0), Ok(0));
-    assert!(unsupplied_tail_slot(4).unwrap_err().contains("position 4"));
+fn a_stage_without_a_cache_layer_takes_any_quantum_as_the_default_chunk() {
+    let stage = cache_stage(None);
+    // A GDN layer's quantum may be a batch, with no view of the cache.
+    assert_eq!(stage.place(3, 70_000_000_000, None), Ok(ChunkAt::default()));
+}
+
+#[test]
+fn a_cache_layers_stage_gets_the_tables_of_its_layer_for_a_first_chunk() {
+    let stage = cache_stage(Some(3));
+    let tables = Some((Some(at(0xa000)), Some(at(0xb000))));
+    let expected = ChunkAt {
+        start: 0,
+        key_table: at(0xa000),
+        value_table: at(0xb000),
+        tail_slot: 0,
+    };
+    assert_eq!(stage.place(1, 0, tables), Ok(expected));
+}
+
+#[test]
+fn a_cache_layers_stage_refuses_what_it_cannot_place_naming_the_cause() {
+    let stage = cache_stage(Some(3));
+    let tables = Some((Some(at(0xa000)), Some(at(0xb000))));
+    let refused = |segments, start, tables| stage.place(segments, start, tables).unwrap_err();
+    assert!(refused(2, 0, tables).contains("2 segments"));
+    assert!(refused(1, 0, None).contains("no view of the cache"));
+    assert!(refused(1, 0, Some((None, Some(at(0xb000))))).contains("no K page table for layer 3"));
+    assert!(refused(1, 0, Some((Some(at(0xa000)), None))).contains("no V page table for layer 3"));
+    assert!(refused(1, 8, tables).contains("position 8"));
+    assert!(refused(1, 1 << 32, tables).contains("exceeds 32 bits"));
 }

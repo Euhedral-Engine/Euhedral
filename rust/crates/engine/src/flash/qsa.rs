@@ -22,7 +22,7 @@ use self::ops::{
     Attention, BLOCK_TOKENS, HeadNormRope, INDEX_HEADS, INDEX_WIDTH, PARTIAL_FLOATS, POSITION_LIMIT, Scores,
     completed_blocks,
 };
-use self::state::{QsaBuffers, max_blocks};
+use self::state::{QsaBuffers, QsaState, max_blocks};
 use super::block::{BlockBody, BlockCall, ChunkAt};
 use super::buffers::{ALIGNMENT, Carver, bf16_bytes};
 use super::linear::{Nvfp4Device, Nvfp4Weight};
@@ -287,13 +287,30 @@ pub struct QsaBody {
 }
 
 impl QsaBody {
-    pub fn new(shape: QsaShape, weights: QsaWeights, buffers: QsaBuffers, device: Nvfp4Device) -> Self {
-        Self {
+    /// The body of a layer over `state`, which must hold at least the tokens the shape names: the block keys and the
+    /// norm of a pooled block are written within the state's buffers.
+    pub fn new(
+        shape: QsaShape,
+        weights: QsaWeights,
+        state: &QsaState,
+        device: Nvfp4Device,
+    ) -> Result<Self, FlashError> {
+        if state.max_tokens() < shape.max_tokens {
+            return Err(FlashError::refused(
+                OP,
+                format!(
+                    "the state holds {} tokens, the layer's shape {}",
+                    state.max_tokens(),
+                    shape.max_tokens
+                ),
+            ));
+        }
+        Ok(Self {
             shape,
             weights,
-            buffers,
+            buffers: state.buffers(),
             device,
-        }
+        })
     }
 
     /// Refuses a chunk the layer's state cannot hold or has no cache for.
