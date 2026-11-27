@@ -12,15 +12,23 @@
 //! with the token at `position` (the node's `paired` token). A prompt with that same token at `position` restores the
 //! row whole; any other recomputes it from the stored hidden row. Its pages run from the page of row `start - 1`
 //! (which a restore overwrites from the later node, as that row is the parent's last) to `ceil(position / 256)`.
+//!
+//! The DFlash2 state is the drafter's rings: for every drafter layer its ring of keys then its ring of values, each
+//! the window's rows. A ring holds all the drafter keeps of a sequence (the keys and values of the last window of
+//! positions before the checkpoint), so each node stores its own whole and a restore copies the leaf's alone; nothing
+//! is recomputed.
 
 use std::slice;
 
 use euhedral_inference_settings::KvFormat;
 use euhedral_memory::SlotLease;
+use thiserror::Error;
 
+use crate::model::dflash2::{Dflash2Config, MAX_WINDOW};
 use crate::model::{LayerKind, ModelConfig};
 use crate::prefix::tree::{POSITION_GRANULE, PrefixNode, Speculation};
 use crate::residency::footprint::page_bytes;
+use crate::state::attention::DrafterBuffers;
 
 const PAGE: u32 = POSITION_GRANULE;
 
@@ -37,6 +45,27 @@ pub enum Buffer {
     MtpPage { page: usize },
     /// The sequence's draft seed row: the base hidden row of the checkpoint's position.
     SeedRow,
+    /// The ring of keys of the DFlash2 drafter's layer `layer`.
+    DrafterKeys { layer: usize },
+    /// The ring of values of the DFlash2 drafter's layer `layer`.
+    DrafterValues { layer: usize },
+}
+
+/// Why a layout cannot be made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum LayoutError {
+    #[error("the drafter has {layers} layers, and a checkpoint holds the rings of at least 1")]
+    DrafterLayers { layers: usize },
+    #[error("the drafter's window is {window} rows, and a ring holds 1 to {max}")]
+    DrafterWindow { window: usize, max: usize },
+}
+
+/// The DFlash2 drafter's rings in a checkpoint.
+#[derive(Clone, Copy, Debug)]
+struct Rings {
+    layers: usize,
+    /// Bytes of one layer's ring of keys (or of values).
+    ring_bytes: u64,
 }
 
 /// One copy between a slot of the host arena (at `host`) and `bytes` of `buffer` from `offset`.
@@ -54,6 +83,7 @@ pub struct CheckpointLayout {
     gdn_layers: Vec<usize>,
     kv_layers: Vec<usize>,
     mtp_pages: bool,
+    rings: Option<Rings>,
     convolution_bytes: u64,
     recurrent_bytes: u64,
     page_bytes: u64,
@@ -93,6 +123,7 @@ impl CheckpointLayout {
             slot_bytes: kv_layers.len() as u64 * page,
             kv_layers,
             mtp_pages: config.mtp_layer_count > 0,
+            rings: None,
             convolution_bytes: convolution,
             recurrent_bytes: recurrent,
             page_bytes: page,
@@ -100,15 +131,35 @@ impl CheckpointLayout {
         })
     }
 
+    /// The layout that also holds the rings of `drafter`, which the sequences it is for allocate. Refused when the
+    /// drafter's layers or window are outside what a checkpoint holds.
+    pub fn with_drafter(mut self, drafter: &Dflash2Config) -> Result<Self, LayoutError> {
+        if drafter.layers == 0 {
+            return Err(LayoutError::DrafterLayers { layers: drafter.layers });
+        }
+        if drafter.sliding_window == 0 || drafter.sliding_window > MAX_WINDOW {
+            return Err(LayoutError::DrafterWindow {
+                window: drafter.sliding_window,
+                max: MAX_WINDOW,
+            });
+        }
+        self.rings = Some(Rings {
+            layers: drafter.layers,
+            ring_bytes: DrafterBuffers::ring_bytes(drafter),
+        });
+        Ok(self)
+    }
+
     /// Bytes of one slot: one KV page of every full-attention layer.
     pub fn slot_bytes(&self) -> u64 {
         self.slot_bytes
     }
 
-    /// Whether the model has an MTP layer whose state a checkpoint can hold.
+    /// Whether a checkpoint can hold the state of `kind`: the model has an MTP layer, or the layout was given a drafter.
     pub fn has_speculation(&self, kind: Speculation) -> bool {
         match kind {
             Speculation::Mtp => self.mtp_pages,
+            Speculation::Dflash2 => self.rings.is_some(),
         }
     }
 
@@ -140,6 +191,7 @@ impl CheckpointLayout {
                 let count = Self::mtp_end_page(position).saturating_sub(Self::mtp_first_page(start));
                 self.hidden_row_bytes + count as u64 * self.page_bytes
             }
+            Speculation::Dflash2 => self.rings.map_or(0, |rings| 2 * rings.layers as u64 * rings.ring_bytes),
         }
     }
 
@@ -181,16 +233,21 @@ impl CheckpointLayout {
         for node in chain {
             self.page_copies(node, &mut copies);
         }
-        if let Some(kind) = speculation {
-            for node in chain {
-                self.speculative_copies(
-                    kind,
-                    node,
-                    |buffer| matches!(buffer, Buffer::MtpPage { .. }),
-                    &mut copies,
-                );
+        match speculation {
+            Some(kind @ Speculation::Mtp) => {
+                for node in chain {
+                    self.speculative_copies(
+                        kind,
+                        node,
+                        |buffer| matches!(buffer, Buffer::MtpPage { .. }),
+                        &mut copies,
+                    );
+                }
+                self.speculative_copies(kind, leaf, |buffer| buffer == Buffer::SeedRow, &mut copies);
             }
-            self.speculative_copies(kind, leaf, |buffer| buffer == Buffer::SeedRow, &mut copies);
+            // The leaf's rings are the sequence's whole drafter state.
+            Some(kind @ Speculation::Dflash2) => self.speculative_copies(kind, leaf, |_| true, &mut copies),
+            None => {}
         }
         copies
     }
@@ -247,10 +304,21 @@ impl CheckpointLayout {
         let from = self.gdn_slots() + self.page_slots(node.start(), node.position());
         let count = self.speculative_slots(kind, node.start(), node.position());
         let slots = self.section(node, from, count);
-        let Speculation::Mtp = kind;
-        let mut pieces = vec![(Buffer::SeedRow, self.hidden_row_bytes)];
-        for page in Self::mtp_first_page(node.start())..Self::mtp_end_page(node.position()) {
-            pieces.push((Buffer::MtpPage { page }, self.page_bytes));
+        let mut pieces = Vec::new();
+        match kind {
+            Speculation::Mtp => {
+                pieces.push((Buffer::SeedRow, self.hidden_row_bytes));
+                for page in Self::mtp_first_page(node.start())..Self::mtp_end_page(node.position()) {
+                    pieces.push((Buffer::MtpPage { page }, self.page_bytes));
+                }
+            }
+            Speculation::Dflash2 => {
+                for layer in 0..self.rings.map_or(0, |rings| rings.layers) {
+                    let ring = self.rings.map_or(0, |rings| rings.ring_bytes);
+                    pieces.push((Buffer::DrafterKeys { layer }, ring));
+                    pieces.push((Buffer::DrafterValues { layer }, ring));
+                }
+            }
         }
         lay(&pieces, slots, self.slot_bytes, keep, copies);
     }

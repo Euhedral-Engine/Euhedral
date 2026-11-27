@@ -12,7 +12,7 @@ use euhedral_graph::Marker;
 use euhedral_inference_cuda::PinnedBuffer;
 use euhedral_inference_settings::KvFormat;
 
-use super::fixtures::{arena, compact, tokens};
+use super::fixtures::{arena, compact, drafter, tokens};
 use super::{
     Buffer, CacheParts, CheckpointLayout, CopyJob, Direction, Ended, Hit, HostArena, NodeId, OpenError,
     PrefixCacheHandle, PrefixCacheStats, Resolve, RestoreError, Speculation, Submit,
@@ -52,6 +52,8 @@ impl Device {
             Buffer::KvPage { layer, page } => 1000 + 64 * layer as u64 + page as u64,
             Buffer::MtpPage { page } => 5000 + page as u64,
             Buffer::SeedRow => 6000,
+            Buffer::DrafterKeys { layer } => 7000 + 2 * layer as u64,
+            Buffer::DrafterValues { layer } => 7001 + 2 * layer as u64,
         }
     }
 
@@ -739,6 +741,44 @@ fn a_cache_over_the_wrong_slot_size_or_an_off_grid_interval_does_not_open() {
     let off = PrefixCacheHandle::open(parts(layout.slot_bytes(), 700), inline());
     assert_eq!(off.err(), Some(OpenError::Interval));
     assert!(PrefixCacheHandle::open(parts(layout.slot_bytes(), 0), inline()).is_err());
+}
+
+#[test]
+fn a_cache_whose_arena_cannot_hold_one_drafting_checkpoint_does_not_open() {
+    let layout = CheckpointLayout::new(&compact(), FORMAT)
+        .expect("layout")
+        .with_drafter(&drafter(3, 2000))
+        .expect("a drafter");
+    let host: Arc<dyn HostArena> = Arc::new(Host {
+        memory: Mutex::new(Vec::new()),
+    });
+    let needed = layout.slots(0, CHUNK, Some(Speculation::Dflash2));
+    let parts = |slots: u32| CacheParts {
+        layout: layout.clone(),
+        arena: arena(slots, layout.slot_bytes()),
+        host: Arc::clone(&host),
+        format: FORMAT,
+        interval: INTERVAL,
+        chunk: CHUNK,
+        piece_bytes: 1 << 20,
+        first_serial: 0,
+    };
+    let short = needed as u32 - 1;
+    let refused = PrefixCacheHandle::open(parts(short), inline()).err();
+    assert_eq!(
+        refused,
+        Some(OpenError::Capacity {
+            kind: Speculation::Dflash2,
+            needed,
+            slots: short
+        })
+    );
+    let message = refused.unwrap().to_string();
+    assert!(
+        message.contains(&needed.to_string()) && message.contains(&short.to_string()),
+        "{message}"
+    );
+    assert!(PrefixCacheHandle::open(parts(needed as u32), inline()).is_ok());
 }
 
 #[test]

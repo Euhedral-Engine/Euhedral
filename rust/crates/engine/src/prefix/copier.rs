@@ -156,6 +156,14 @@ impl Resolve for SequenceAddresses {
                 let view = self.refs.kv(KvSource::Mtp)?;
                 within(view.page(0, page), 2 * view.plane_page_bytes(), offset, bytes)
             }
+            Buffer::DrafterKeys { layer } => {
+                let rings = device.scratch.drafter().filter(|rings| layer < rings.layers())?;
+                within(Some(rings.ring_keys(layer)), rings.ring_size(), offset, bytes)
+            }
+            Buffer::DrafterValues { layer } => {
+                let rings = device.scratch.drafter().filter(|rings| layer < rings.layers())?;
+                within(Some(rings.ring_values(layer)), rings.ring_size(), offset, bytes)
+            }
             Buffer::SeedRow => {
                 let rows = &device.scratch.draft()?.seed_rows;
                 let offset = seed_offset(self.seed_row, self.hidden_row_bytes, offset);

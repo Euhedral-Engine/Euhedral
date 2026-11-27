@@ -35,6 +35,7 @@ mod hidden;
 mod loader;
 mod mtp;
 mod prefix_copy;
+mod prefix_dflash2;
 mod prefix_mtp;
 mod prefix_restore;
 mod reserve;
