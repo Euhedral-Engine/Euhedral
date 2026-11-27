@@ -150,7 +150,8 @@ pub enum PlanError {
     /// `memory.gpu-reserve` and the runtime's own reserve leave no device memory for the model.
     #[error(
         "memory.gpu-reserve of {gpu_reserve} bytes and the runtime reserve of {runtime_reserve} bytes are not less \
-         than the {free} bytes of device memory free: nothing is left for the model; lower memory.gpu-reserve"
+         than the {free} bytes of device memory free: nothing is left for the model; {}",
+        reserve_advice(*gpu_reserve)
     )]
     FlashReserveTooLarge {
         gpu_reserve: u64,
@@ -265,6 +266,15 @@ impl EngineError {
             path: path.display().to_string(),
             source,
         }
+    }
+}
+
+/// What to change when the reserves take the whole device budget: only a gpu-reserve above 0 can be lowered.
+fn reserve_advice(gpu_reserve: u64) -> &'static str {
+    if gpu_reserve > 0 {
+        "lower memory.gpu-reserve or memory.runtime-reserve"
+    } else {
+        "memory.gpu-reserve is already 0, so lower memory.runtime-reserve, raise memory.gpu-limit or free device memory"
     }
 }
 

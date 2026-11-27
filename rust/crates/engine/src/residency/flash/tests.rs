@@ -3,7 +3,7 @@
 use euhedral_inference_edrl::{
     ComponentGroup, ExpertBank, ExpertProjection, ExpertRecord, FlashTensor, TensorDataType, WeightFormat, WeightLayout,
 };
-use euhedral_inference_settings::{ByteSize, MemorySettings, WeightStreamingSettings};
+use euhedral_inference_settings::{Auto, ByteSize, MemorySettings, WeightStreamingSettings};
 
 use super::*;
 use crate::model::flash_config::fixtures::flash_config;
@@ -114,7 +114,7 @@ fn inputs(device_free: u64, context: usize) -> FlashPlanInputs {
 /// The device bytes the plan keeps beside the model and the cache for `context` tokens at the 512-token chunk.
 fn reserved(config: &FlashModelConfig, gpu_reserve_mib: u64, context: usize) -> u64 {
     let sizes = SequenceState::new(config);
-    KERNEL_RESERVE_BYTES
+    DEFAULT_RUNTIME_RESERVE_BYTES
         + gpu_reserve_mib * MIB
         + sizes.context_bytes(context).unwrap()
         + sizes.workspace_bytes(512).unwrap()
@@ -174,8 +174,8 @@ fn gpu_reserve_is_kept_free_beside_the_runtime_reserve() {
     let free = reserved(&config(), 0, 256) + 2 * MIB + 90 * MIB;
     let small = plan(&immovable(), &memory(0), inputs(free, 256)).unwrap();
     let large = plan(&immovable(), &memory(64), inputs(free, 256)).unwrap();
-    assert_eq!(small.device.runtime_reserve, KERNEL_RESERVE_BYTES);
-    assert_eq!(large.device.runtime_reserve, KERNEL_RESERVE_BYTES + 64 * MIB);
+    assert_eq!(small.device.runtime_reserve, DEFAULT_RUNTIME_RESERVE_BYTES);
+    assert_eq!(large.device.runtime_reserve, DEFAULT_RUNTIME_RESERVE_BYTES + 64 * MIB);
     assert_eq!(small.expert_cache.slot_count, 90);
     assert_eq!(large.expert_cache.slot_count, 26);
 }
@@ -209,19 +209,13 @@ fn the_lane_count_is_the_gpu_streams_setting() {
 }
 
 #[test]
-fn zero_reads_zero_streams_and_a_bad_context_are_refused_naming_the_setting() {
+fn a_zero_or_too_long_context_is_refused_naming_the_setting() {
     let free = reserved(&config(), 700, 256) + GIB;
     let refusal = |settings: MemorySettings, context: usize| match plan(&immovable(), &settings, inputs(free, context))
     {
         Err(PlanError::Setting(why)) => why,
         other => panic!("expected a refused setting, got {other:?}"),
     };
-    let mut reads = memory(700);
-    reads.weight_streaming.concurrent_reads = 0;
-    assert!(refusal(reads, 256).contains("memory.weight-streaming.concurrent-reads is 0"));
-    let mut streams = memory(700);
-    streams.weight_streaming.gpu_streams = 0;
-    assert!(refusal(streams, 256).contains("memory.weight-streaming.gpu-streams is 0"));
     assert!(refusal(memory(700), 0).contains("context.max-tokens is 0"));
     let why = refusal(memory(700), 4097);
     assert!(why.contains("4097") && why.contains("4096"), "{why}");
@@ -229,7 +223,7 @@ fn zero_reads_zero_streams_and_a_bad_context_are_refused_naming_the_setting() {
 
 #[test]
 fn a_reserve_that_takes_the_whole_budget_is_refused_with_both_figures() {
-    let free = KERNEL_RESERVE_BYTES + 700 * MIB;
+    let free = DEFAULT_RUNTIME_RESERVE_BYTES + 700 * MIB;
     let Err(PlanError::FlashReserveTooLarge {
         gpu_reserve,
         runtime_reserve,
@@ -240,7 +234,7 @@ fn a_reserve_that_takes_the_whole_budget_is_refused_with_both_figures() {
     };
     assert_eq!(
         (gpu_reserve, runtime_reserve, reported),
-        (700 * MIB, KERNEL_RESERVE_BYTES, free)
+        (700 * MIB, DEFAULT_RUNTIME_RESERVE_BYTES, free)
     );
     assert!(
         plan(&immovable(), &memory(700), inputs(free + 1, 256)).is_err(),
@@ -272,7 +266,7 @@ fn the_smallest_cache_fits_exactly_and_one_byte_less_is_refused_with_the_bytes_n
     assert_eq!((context_tokens, free), (256, exact - 1));
     assert_eq!((minimum_slots, minimum_cache_bytes), (4, 4 * MIB));
     assert_eq!((fixed_after_move_bytes, ring_bytes), (2 * MIB, 0));
-    assert_eq!(runtime_reserve, KERNEL_RESERVE_BYTES + 700 * MIB);
+    assert_eq!(runtime_reserve, DEFAULT_RUNTIME_RESERVE_BYTES + 700 * MIB);
     assert_eq!(needed_bytes, exact);
 }
 
@@ -515,4 +509,147 @@ fn an_artifact_with_fewer_experts_than_the_smallest_cache_is_refused() {
     );
     let none = plan_flash(&config(), &immovable(), &[], &memory(700), inputs(8 * GIB, 256)).unwrap_err();
     assert!(matches!(none, PlanError::Unsupported(why) if why.contains("0 routed experts")));
+}
+
+#[test]
+fn an_explicit_runtime_reserve_replaces_the_default_and_the_cache_gives_up_the_difference() {
+    let free = reserved(&config(), 700, 256) + 2 * MIB + 150 * MIB;
+    let default = plan(&immovable(), &memory(700), inputs(free, 256)).unwrap();
+    let mut settings = memory(700);
+    settings.runtime_reserve = Auto::Value(ByteSize::mib(1124));
+    let raised = plan(&immovable(), &settings, inputs(free, 256)).unwrap();
+    assert_eq!(default.device.runtime_reserve, (1024 + 700) * MIB);
+    assert_eq!(raised.device.runtime_reserve, (1124 + 700) * MIB);
+    assert_eq!(
+        (default.expert_cache.slot_count, raised.expert_cache.slot_count),
+        (150, 50)
+    );
+}
+
+#[test]
+fn a_runtime_reserve_that_takes_the_whole_budget_is_refused_naming_it_and_the_free_bytes() {
+    let mut settings = memory(0);
+    settings.runtime_reserve = Auto::Value(ByteSize::mib(2048));
+    let Err(error) = plan(&immovable(), &settings, inputs(2048 * MIB, 256)) else {
+        panic!("a reserve as large as the free memory leaves nothing");
+    };
+    assert!(matches!(
+        error,
+        PlanError::FlashReserveTooLarge { gpu_reserve: 0, runtime_reserve, free }
+            if runtime_reserve == 2048 * MIB && free == 2048 * MIB
+    ));
+    let message = error.to_string();
+    assert!(
+        message.contains(&(2048 * MIB).to_string()) && message.contains("memory.runtime-reserve"),
+        "{message}"
+    );
+    assert!(message.contains("already 0"), "{message}");
+}
+
+#[test]
+fn the_advice_to_lower_the_gpu_reserve_is_given_only_while_it_is_above_zero() {
+    let free = DEFAULT_RUNTIME_RESERVE_BYTES + 700 * MIB;
+    let message = plan(&immovable(), &memory(700), inputs(free, 256))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("lower memory.gpu-reserve") && !message.contains("already 0"),
+        "{message}"
+    );
+}
+
+#[test]
+fn the_gpu_limit_caps_the_free_memory_the_plan_may_use() {
+    let free = reserved(&config(), 700, 256) + 2 * MIB + 50 * MIB;
+    let mut settings = memory(700);
+    settings.gpu_limit = Auto::Value(ByteSize(free - 20 * MIB));
+    let plan = plan(&immovable(), &settings, inputs(free + GIB, 256)).unwrap();
+    assert_eq!((plan.device.free, plan.expert_cache.slot_count), (free - 20 * MIB, 30));
+    // A limit above what is free changes nothing.
+    settings.gpu_limit = Auto::Value(ByteSize(free + 4 * GIB));
+    assert_eq!(
+        self::plan(&immovable(), &settings, inputs(free, 256))
+            .unwrap()
+            .device
+            .free,
+        free
+    );
+    // A limit that leaves less than the smallest cache is refused with the limit as the free figure.
+    settings.gpu_limit = Auto::Value(ByteSize(free - 49 * MIB));
+    let Err(PlanError::FlashDeviceTooSmall { free: reported, .. }) =
+        self::plan(&immovable(), &settings, inputs(free, 256))
+    else {
+        panic!("a limit below the smallest cache is refused");
+    };
+    assert_eq!(reported, free - 49 * MIB);
+}
+
+#[test]
+fn the_staging_slots_setting_sets_the_slots_of_the_ring_staged_objects_pass_through() {
+    let mut tensors = immovable();
+    for layer in 0..16 {
+        tensors.push(tensor(
+            &format!("text/layers/{layer}/gdn/proj"),
+            ComponentGroup::Gdn,
+            40,
+        ));
+    }
+    let free = reserved(&config(), 700, 256) + 500 * MIB;
+    let ring = |slots: Auto<u32>| {
+        let settings = MemorySettings {
+            staging_slots: slots,
+            ..memory(700)
+        };
+        plan(&tensors, &settings, inputs(free, 256)).unwrap().staging
+    };
+    assert_eq!(
+        ring(Auto::Auto),
+        Some(StagingGeometry {
+            slots: 4,
+            slot_bytes: 40 * MIB
+        })
+    );
+    assert_eq!(
+        ring(Auto::Value(2)),
+        Some(StagingGeometry {
+            slots: 2,
+            slot_bytes: 40 * MIB
+        })
+    );
+}
+
+#[test]
+fn the_ngram_tables_are_staged_only_when_every_expert_is_resident_in_ram_and_the_host_can_pin_them() {
+    let free = reserved(&config(), 700, 256) + 50 * MIB + 2 * MIB;
+    let small_ngram = |bytes: u64| {
+        let mut tensors = immovable();
+        tensors.retain(|tensor| tensor.group != ComponentGroup::Ngram);
+        let mut ngram = tensor("ngram/shard", ComponentGroup::Ngram, 0);
+        ngram.bytes = bytes;
+        tensors.push(ngram);
+        tensors
+    };
+    let with = |resident: u64| {
+        let mut inputs = inputs(free, 256);
+        inputs.host = HostBudget {
+            pinnable_bytes: GIB,
+            resident_bytes: resident,
+            source: BudgetSource::Explicit,
+        };
+        plan(&small_ngram(MIB / 2), &memory(700), inputs).unwrap()
+    };
+    // 14 MiB pinned; 200 MiB of records leave room for the tables.
+    let resident = with(14 * MIB + 200 * MIB + MIB);
+    assert_eq!(
+        (resident.expert_store, resident.ngram),
+        (ExpertStoreMode::RamResident, NgramMode::PinnedArena)
+    );
+    assert_eq!(resident.storage_of("ngram/shard"), Some(StorageClass::HostStaged));
+    // Records cached in RAM leave 0.75 MiB over, enough for the tables, but they are not all resident.
+    let cached = with(14 * MIB + 120 * MIB + MIB * 3 / 4);
+    assert_eq!(
+        (cached.expert_store, cached.ngram),
+        (ExpertStoreMode::RamCached, NgramMode::MappedFile)
+    );
+    assert_eq!(cached.storage_of("ngram/shard"), Some(StorageClass::FileMapped));
 }
