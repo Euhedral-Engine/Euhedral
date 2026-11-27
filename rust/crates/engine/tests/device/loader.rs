@@ -408,6 +408,8 @@ fn startup_fails_before_device_alloc_on_corrupt_artifact() {
 #[ignore = "needs a GPU, the native library and the RCO artifact"]
 fn a_plan_that_does_not_fit_fails_before_device_alloc() {
     let Some(machine) = machine() else { return };
+    // The exclusive card, held to the end of the test: `live_bytes` counts the whole process, so no other test of this
+    // binary may allocate or free a device buffer between the two readings.
     let _card = common::card();
     let mut settings = settings(&machine.artifact, 4096);
     settings.memory.gpu_limit = euhedral_inference_settings::Auto::Value(ByteSize::gib(2));
