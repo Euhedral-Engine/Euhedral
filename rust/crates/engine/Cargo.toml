@@ -12,6 +12,7 @@ publish.workspace = true
 test-oracles = ["euhedral-inference-cuda/test-oracles"]
 
 [dependencies]
+crc32fast.workspace = true
 euhedral-core.workspace = true
 euhedral-data-structures.workspace = true
 euhedral-gpu = { workspace = true, features = ["cuda"] }

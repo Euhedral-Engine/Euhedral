@@ -143,6 +143,61 @@ pub enum PlanError {
     )]
     HostBudgetUnknown { needed: u64 },
 
+    /// The Flash-Next artifact's configuration is malformed, as its reader names.
+    #[error("the Flash-Next configuration is malformed: {0}")]
+    Config(String),
+
+    /// `memory.gpu-reserve` and the runtime's own reserve leave no device memory for the model.
+    #[error(
+        "memory.gpu-reserve of {gpu_reserve} bytes and the runtime reserve of {runtime_reserve} bytes are not less \
+         than the {free} bytes of device memory free: nothing is left for the model; {}",
+        reserve_advice(*gpu_reserve)
+    )]
+    FlashReserveTooLarge {
+        gpu_reserve: u64,
+        /// The runtime's own reserve (the CUDA context, kernel modules and graph pools).
+        runtime_reserve: u64,
+        free: u64,
+    },
+
+    /// A Flash-Next model of this context does not fit the device even with every object that may leave it on the
+    /// host: the smallest expert cache of `minimum_slots` slots is more than what is left.
+    #[error(
+        "a context of {context_tokens} tokens does not fit in the {free} bytes of device memory free: it needs \
+         {state_bytes} bytes of sequence state and workspace and {runtime_reserve} bytes of runtime reserve \
+         (memory.gpu-reserve included), {fixed_stay_bytes} bytes of objects that must stay on the device \
+         ({fixed_after_move_bytes} bytes after moving every movable object to the host, with a {ring_bytes} byte \
+         staging ring) and the smallest expert cache of {minimum_slots} slots takes {minimum_cache_bytes} bytes: \
+         {needed_bytes} bytes in all; set a smaller context.max-tokens"
+    )]
+    FlashDeviceTooSmall {
+        context_tokens: u64,
+        free: u64,
+        /// The KV cache, indexer keys, GDN state and workspace.
+        state_bytes: u64,
+        runtime_reserve: u64,
+        /// The fixed objects that never leave the device.
+        fixed_stay_bytes: u64,
+        /// What the fixed objects take on the device with everything movable moved, the ring included.
+        fixed_after_move_bytes: u64,
+        ring_bytes: u64,
+        minimum_slots: u64,
+        minimum_cache_bytes: u64,
+        needed_bytes: u64,
+    },
+
+    /// The host cannot pin what the plan holds there.
+    #[error(
+        "the plan pins {needed_bytes} bytes of host memory (the mapped embedding and output head, staged weights and \
+         the {expert_staging_bytes} byte staging slots every expert record passes through), more than the \
+         {pinnable_bytes} bytes the host can pin; set memory.host-limit higher or a smaller context.max-tokens"
+    )]
+    FlashHostTooSmall {
+        needed_bytes: u64,
+        expert_staging_bytes: u64,
+        pinnable_bytes: u64,
+    },
+
     /// A setting the plan reads is out of range.
     #[error("{0}")]
     Setting(String),
@@ -211,6 +266,15 @@ impl EngineError {
             path: path.display().to_string(),
             source,
         }
+    }
+}
+
+/// What to change when the reserves take the whole device budget: only a gpu-reserve above 0 can be lowered.
+fn reserve_advice(gpu_reserve: u64) -> &'static str {
+    if gpu_reserve > 0 {
+        "lower memory.gpu-reserve or memory.runtime-reserve"
+    } else {
+        "memory.gpu-reserve is already 0, so lower memory.runtime-reserve, raise memory.gpu-limit or free device memory"
     }
 }
 
