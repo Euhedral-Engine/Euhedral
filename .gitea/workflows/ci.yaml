@@ -25,14 +25,6 @@ on:
     paths:
       - "rust/**"
       - "native/**"
-      - "api/**"
-      - "core/**"
-      - "benchmark/**"
-      - "gradle/**"
-      - "settings.gradle.kts"
-      - "gradle.properties"
-      - "native.gradle.kts"
-      - "build.gradle.kts"
       - "mise.toml"
       - ".gitea/workflows/**"
       - "scripts/lint-workflows.py"
@@ -102,9 +94,7 @@ jobs:
             ':(glob)rust/**' ':(glob)native/include/**' ':(glob)mise.toml' ':(glob).gitea/workflows/ci.yaml'
           )
           native_paths=(
-            ':(glob)api/**' ':(glob)core/**' ':(glob)benchmark/**' ':(glob)gradle/**' ':(glob)settings.gradle.kts'
-            ':(glob)gradle.properties' ':(glob)native/**' ':(glob)native.gradle.kts' ':(glob)build.gradle.kts'
-            ':(glob)mise.toml' ':(glob)rust/**' ':(glob).gitea/workflows/ci.yaml'
+            ':(glob)native/**' ':(glob)mise.toml' ':(glob)rust/**' ':(glob).gitea/workflows/ci.yaml'
           )
 
           # The Bazel gate: the workspace, the Bazel files, and the GitHub workflow the Windows leg runs.
@@ -589,8 +579,13 @@ jobs:
           apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq llvm xz-utils python3-pip gcc libc6-dev >/dev/null
       - name: Install the toolchains
         run: mise install >/dev/null
-      - name: Build both CUDA products and package Spring Boot
-        run: mise exec -- gradle nativeVerify :api:bootJar build
+      # Both CUDA products (linux-x64 and windows-x64), then the check of each built tree: the kernel sources, the binary
+      # format and imports, the bundled runtime and headers, and files.sha256.
+      - name: Build and verify both CUDA products
+        working-directory: rust
+        run: |
+          mise exec -- cargo xtask native
+          mise exec -- cargo xtask native-verify
       # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources and the registry.
       - name: Native host tests
         working-directory: native/tests
@@ -607,13 +602,6 @@ jobs:
         run: |
           mise exec -- cargo xtask native-verify --product windows-x64
           mise exec -- cargo xtask bundle --product windows-x64
-      - name: Upload the test reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit
-          path: api/build/test-results/test/*.xml
-          retention-days: 2
       - name: Upload the server bundle
         uses: actions/upload-artifact@v4
         with:
