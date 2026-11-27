@@ -2,6 +2,8 @@
 //! widened-weight lookup, the admission of a plan and the pool of the expert cache, and the owner of a start that never
 //! got a lattice.
 
+use euhedral_inference_edrl::tiny_flash::tiny_config;
+
 use super::*;
 
 fn job(layer: u32, offset: u64) -> PadJob {
@@ -128,7 +130,12 @@ fn experts() -> ExpertLayout {
 fn a_plan_that_holds_every_expert_record_in_memory_is_refused() {
     let held = plan_with(ExpertStoreMode::RamResident, NgramMode::MappedFile, 2, RECORD);
     let error = refuse_unserved(&held).expect_err("the records are not preloaded");
-    assert!(error.to_string().contains("every expert record"), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("every expert record"), "{message}");
+    // The plan holds every record when the host budget is large: the advice shrinks it, never grows it.
+    assert!(message.contains("lower memory.host-limit"), "{message}");
+    assert!(message.contains("raise memory.host-margin"), "{message}");
+    assert!(!message.contains("raise memory.host-limit"), "{message}");
 }
 
 #[test]
@@ -203,4 +210,62 @@ fn a_pool_whose_size_overflows_is_refused() {
         .expert_pool(&mut reservation, 0, u64::MAX, 2)
         .expect_err("the size overflows");
     assert!(error.to_string().contains("overflow"), "{error}");
+}
+
+/// The homes the tiny configuration's two n-gram shards (layer 1: 16 rows of 64 values each) have when they are in the
+/// file at 1000 and 5000 and hold `bytes`; any other name has none.
+fn shard_homes(bytes: u64) -> impl Fn(&str) -> Option<Home> {
+    move |name| {
+        let offset = match name {
+            "text/layers/1/ple/ngram/shard_000" => 1000,
+            "text/layers/1/ple/ngram/shard_001" => 5000,
+            _ => return None,
+        };
+        Some(Home::File { offset, bytes })
+    }
+}
+
+fn shard_bytes() -> u64 {
+    NgramRows::shard_extent(0, 16, 32, 64).expect("a shard").0
+}
+
+#[test]
+fn n_gram_shards_that_are_all_placed_in_the_file_and_hold_their_rows_are_served() {
+    let config = tiny_config();
+    check_ngram(&config, shard_homes(shard_bytes())).expect("every shard holds its rows");
+    check_ngram(&config, shard_homes(shard_bytes() + 4096)).expect("a longer shard holds them too");
+}
+
+#[test]
+fn an_n_gram_shard_that_is_missing_or_short_is_refused_naming_it_before_anything_is_allocated() {
+    let config = tiny_config();
+    let missing = check_ngram(&config, |name| {
+        shard_homes(shard_bytes())(name).filter(|_| !name.ends_with("001"))
+    })
+    .expect_err("a shard is missing")
+    .to_string();
+    assert!(missing.contains("shard_001"), "{missing}");
+    let on_device = check_ngram(&config, |name| {
+        shard_homes(shard_bytes())(name).map(|_| Home::Device { offset: 0 })
+    })
+    .expect_err("a shard that is not in the file")
+    .to_string();
+    assert!(on_device.contains("shard_000"), "{on_device}");
+    let short = check_ngram(&config, shard_homes(shard_bytes() - 1))
+        .expect_err("a shard shorter than its rows")
+        .to_string();
+    assert!(
+        short.contains("shard_000") && short.contains(&shard_bytes().to_string()),
+        "{short}"
+    );
+}
+
+#[test]
+fn the_scale_of_each_shard_is_read_from_its_trailer_in_the_order_of_the_tables() {
+    let config = tiny_config();
+    let trailer = NgramRows::shard_extent(0, 16, 32, 64).expect("a shard").1;
+    let ranges = scale_ranges(&config, shard_homes(shard_bytes())).expect("placed");
+    let at: Vec<_> = ranges.into_iter().map(|(range, _)| range).collect();
+    assert_eq!(at, [1000 + trailer..1004 + trailer, 5000 + trailer..5004 + trailer]);
+    assert!(scale_ranges(&config, |_| None).is_err());
 }

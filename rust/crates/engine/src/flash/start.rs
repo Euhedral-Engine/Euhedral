@@ -3,7 +3,7 @@
 //! refusal is a returned value that names the setting and its value.
 
 use euhedral_inference_edrl::{DETECT_BYTES, EdrlError, ModelFamily};
-use euhedral_inference_settings::{BatchingSettings, MemorySettings};
+use euhedral_inference_settings::{BatchingSettings, MemorySettings, Settings};
 
 use crate::error::EngineError;
 use crate::residency::budget::HostBudget;
@@ -18,6 +18,24 @@ pub fn one_sequence(batching: &BatchingSettings) -> Result<usize, EngineError> {
              (or leave it automatic)"
         ))),
     }
+}
+
+/// The compute streams a Flash-Next engine opens: `memory.weight-streaming.gpu-streams`, at least 1. Zero is refused,
+/// not raised.
+pub fn compute_streams(memory: &MemorySettings) -> Result<usize, EngineError> {
+    match memory.weight_streaming.gpu_streams {
+        0 => Err(EngineError::Runtime(
+            "memory.weight-streaming.gpu-streams is 0: a step needs at least 1 stream".to_string(),
+        )),
+        streams => Ok(streams as usize),
+    }
+}
+
+/// Refuses the settings a Flash-Next engine cannot serve, before anything is opened or allocated: the sequences
+/// ([`one_sequence`]) and the streams ([`compute_streams`], returned).
+pub fn check_settings(settings: &Settings) -> Result<usize, EngineError> {
+    one_sequence(&settings.batching)?;
+    compute_streams(&settings.memory)
 }
 
 /// The family of the artifact whose first bytes are `head`, or the refusal that names what the file is: a magic, a
@@ -49,7 +67,7 @@ pub fn host_budget(memory: &MemorySettings, available: Option<u64>) -> HostBudge
 
 #[cfg(test)]
 mod tests {
-    use euhedral_inference_settings::{Auto, ByteSize, ModelSettings, Settings};
+    use euhedral_inference_settings::{Auto, ByteSize, ModelSettings};
 
     use crate::residency::budget::BudgetSource;
 
@@ -97,6 +115,20 @@ mod tests {
         settings.batching.max_sequences = 4;
         let refused = one_sequence(&settings.batching).expect_err("refused").to_string();
         assert!(refused.contains("batching.max-sequences is 4"), "{refused}");
+    }
+
+    #[test]
+    fn settings_a_flash_engine_cannot_serve_are_refused_naming_the_setting_and_the_streams_are_returned() {
+        let mut settings = Settings::with_model(ModelSettings::default());
+        settings.memory.weight_streaming.gpu_streams = 3;
+        assert_eq!(check_settings(&settings).expect("served"), 3);
+        settings.memory.weight_streaming.gpu_streams = 0;
+        let streams = check_settings(&settings).expect_err("no streams").to_string();
+        assert!(streams.contains("gpu-streams is 0"), "{streams}");
+        settings.memory.weight_streaming.gpu_streams = 3;
+        settings.batching.max_sequences = 2;
+        let sequences = check_settings(&settings).expect_err("two sequences").to_string();
+        assert!(sequences.contains("max-sequences is 2"), "{sequences}");
     }
 
     #[test]

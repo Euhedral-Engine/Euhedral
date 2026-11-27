@@ -26,17 +26,17 @@ use euhedral_core::frames::Frame;
 use euhedral_graph::Lake;
 use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer, PooledPinned};
 use euhedral_inference_edrl::{
-    DETECT_BYTES, FLASH_HEADER_BYTES, FOOTER_BYTES, FlashArtifact, FlashConfig, FlashHeader, ReadPlan, TokenizerFooter,
-    TokenizerSection, content_end, shard_name,
+    DETECT_BYTES, FLASH_HEADER_BYTES, FOOTER_BYTES, FlashArtifact, FlashConfig, FlashHeader, ModelFamily, ReadPlan,
+    TokenizerFooter, TokenizerSection, content_end, shard_name,
 };
 use euhedral_inference_settings::Settings;
-use euhedral_io::{OpenSpec, OwnedFile};
+use euhedral_io::{AsyncIo, OpenSpec, OwnedFile};
 use euhedral_memory::{Claim, SlotArena, TierPool};
 
-use super::load::{FixedLayout, FixedWeights, PadJob, layer_prefix, pad_launches, padding};
+use super::load::{FixedLayout, FixedWeights, Home, PadJob, layer_prefix, pad_launches, padding};
 use super::ple::{FileShard, NgramRows, ShardBytes};
 use super::sequence::Op;
-use super::start::{family_of, one_sequence};
+use super::start::{check_settings, family_of};
 use super::{FlashError, Weight};
 use crate::error::EngineError;
 use crate::frames::{Kind, step};
@@ -185,6 +185,11 @@ fn wait_closed(cache: &ExpertCache, bound: Duration) -> bool {
 /// [`FlashModel::shutdown`] takes it.
 pub fn start(settings: &Settings, library: &Path, close_timeout: Option<Duration>) -> (RuntimeOwner, FlashReady) {
     let ready: FlashReady = Handoff::new();
+    // The settings are refused before the runtime is built: nothing is opened or allocated for a start that cannot serve them.
+    if let Err(error) = check_settings(settings) {
+        ready.send(Err(error));
+        return (RuntimeOwner::idle(), ready);
+    }
     match build(settings, library, close_timeout) {
         Ok(core) => {
             let owner = RuntimeOwner::over(Arc::clone(&core.teardown));
@@ -338,7 +343,11 @@ fn locate(boot: Boot, path: PathBuf, file: Arc<OwnedFile>, length: u64, read: Ve
             .get(..DETECT_BYTES)
             .and_then(|head| head.try_into().ok())
             .ok_or_else(|| EngineError::Runtime("the header read returned too few bytes".to_string()))?;
-        family_of(&head)?;
+        if family_of(&head)? != ModelFamily::FlashNextV3 {
+            return Err(EngineError::Runtime(
+                "the artifact is a dense model, not a Flash-Next one".to_string(),
+            ));
+        }
         let header_bytes: [u8; FLASH_HEADER_BYTES] = header_bytes
             .as_slice()
             .try_into()
@@ -408,8 +417,9 @@ fn parse(
 fn refuse_unserved(plan: &FlashPlan) -> Result<(), EngineError> {
     if plan.expert_store == ExpertStoreMode::RamResident {
         return Err(EngineError::Runtime(
-            "the plan holds every expert record in memory, which this start does not preload: raise \
-             memory.host-limit or lower memory.host-margin so the plan caches the records"
+            "the plan holds every expert record in memory, which this start does not preload: lower \
+             memory.host-limit or raise memory.host-margin, so that less host memory counts as available and the plan \
+             caches the records"
                 .to_string(),
         ));
     }
@@ -438,14 +448,8 @@ struct Planned {
 fn lanes(boot: Boot, opened: Opened) {
     let core = Arc::clone(&boot.core);
     let free = (|| {
-        one_sequence(&core.settings.batching)?;
-        let compute = core.settings.memory.weight_streaming.gpu_streams;
-        if compute == 0 {
-            return Err(EngineError::Runtime(
-                "memory.weight-streaming.gpu-streams is 0: a step needs at least 1 stream".to_string(),
-            ));
-        }
-        core.open_lanes(1, compute as usize)?;
+        // `start` checked the settings before the runtime was built.
+        core.open_lanes(1, core.settings.memory.weight_streaming.gpu_streams as usize)?;
         Ok(startup::device_inputs(&core)?.device_free)
     })();
     match free {
@@ -479,7 +483,7 @@ fn plan(mut boot: Boot, opened: Opened, device_free: u64) {
         let streaming = &core.settings.memory.weight_streaming;
         let piece = DiskReadPiece::from_setting(core.settings.memory.disk_read_piece).map_err(EngineError::Runtime)?;
         check_cache(&plan, &experts, streaming.read_split, streaming.concurrent_reads)?;
-        check_ngram(opened.artifact.config(), &layout)?;
+        check_ngram(opened.artifact.config(), |name| layout.home(name))?;
         let reservation = core.account.admit_flash(&plan)?;
         let admitted = reservation.admitted();
         log::info!(
@@ -540,20 +544,87 @@ fn check_cache(
     Ok(())
 }
 
-/// Refuses an artifact whose n-gram shards are not all placed: the tables are built over them after the upload.
-fn check_ngram(config: &FlashConfig, layout: &FixedLayout) -> Result<(), EngineError> {
-    for layer in 0..config.text.num_layers {
-        if !config.has_ngram(layer as usize) {
-            continue;
-        }
-        for shard in 0..config.ngram.split_parts {
+/// The n-gram tables' sizes, from the artifact's configuration.
+#[derive(Clone, Copy, Debug)]
+struct NgramGeometry {
+    shard_rows: u64,
+    total_rows: u64,
+    row_width: u32,
+    parts: u32,
+}
+
+impl NgramGeometry {
+    /// The sizes `config` gives. Refuses a row width that does not fit 32 bits and a table of more rows than 64 bits.
+    fn of(config: &FlashConfig) -> Result<NgramGeometry, EngineError> {
+        let (heads, parts) = (config.ngram.heads(), config.ngram.split_parts);
+        let shard_rows = config.ngram.shard_rows.unsigned_abs();
+        let row_width = u32::try_from(u64::from(config.text.hidden_size) / heads.max(1))
+            .map_err(|_| EngineError::Runtime("the n-gram row width does not fit 32 bits".to_string()))?;
+        let total_rows = shard_rows.checked_mul(u64::from(parts)).ok_or_else(|| {
+            EngineError::Runtime(format!("{parts} n-gram shards of {shard_rows} rows overflow 64 bits"))
+        })?;
+        Ok(NgramGeometry {
+            shard_rows,
+            total_rows,
+            row_width,
+            parts,
+        })
+    }
+
+    /// The bytes shard `shard` takes and where its scale is in it.
+    fn extent(&self, shard: u32) -> Result<(u64, u64), EngineError> {
+        NgramRows::shard_extent(u64::from(shard), self.shard_rows, self.total_rows, self.row_width)
+            .map_err(flash_failed)
+    }
+}
+
+/// The layers that have an n-gram table, in order.
+fn ngram_layers(config: &FlashConfig) -> impl Iterator<Item = u32> + '_ {
+    (0..config.text.num_layers).filter(|layer| config.has_ngram(*layer as usize))
+}
+
+/// Refuses an artifact whose n-gram shards are not all placed in the file, or are shorter than their rows: the tables
+/// are built over them after the upload, and a refusal there would come after the memory was taken.
+fn check_ngram(config: &FlashConfig, home: impl Fn(&str) -> Option<Home>) -> Result<(), EngineError> {
+    let geometry = NgramGeometry::of(config)?;
+    for layer in ngram_layers(config) {
+        for shard in 0..geometry.parts {
             let name = ngram_shard(layer, shard);
-            if layout.home(&name).is_none() {
+            let Some(Home::File { bytes, .. }) = home(&name) else {
                 return Err(EngineError::Runtime(format!("the artifact has no n-gram shard {name}")));
+            };
+            let (needed, _) = geometry.extent(shard)?;
+            if bytes < needed {
+                return Err(EngineError::Runtime(format!(
+                    "the n-gram shard {name} holds {bytes} bytes, its rows take {needed}"
+                )));
             }
         }
     }
     Ok(())
+}
+
+/// Where each shard's scale is in the file, in the order of [`ngram_layers`] and the shards.
+fn scale_ranges(
+    config: &FlashConfig,
+    home: impl Fn(&str) -> Option<Home>,
+) -> Result<Vec<(Range<u64>, &'static str)>, EngineError> {
+    let geometry = NgramGeometry::of(config)?;
+    let mut ranges = Vec::new();
+    for layer in ngram_layers(config) {
+        for shard in 0..geometry.parts {
+            let name = ngram_shard(layer, shard);
+            let Some(Home::File { offset, .. }) = home(&name) else {
+                return Err(EngineError::Runtime(format!("the artifact has no n-gram shard {name}")));
+            };
+            let (_, trailer) = geometry.extent(shard)?;
+            let at = offset
+                .checked_add(trailer)
+                .ok_or_else(|| EngineError::Runtime(format!("the scale of {name} is past 64 bits")))?;
+            ranges.push((at..at + 4, "an n-gram scale"));
+        }
+    }
+    Ok(ranges)
 }
 
 /// The name of shard `shard` of layer `layer`'s n-gram table.
@@ -788,17 +859,52 @@ fn pad(mut boot: Boot, planned: Planned, weights: FixedWeights, mut held: Held, 
     }
 }
 
-/// Step 8: builds the experts' cache and the n-gram tables over the artifact file, and delivers the model.
-fn build_cache(
+/// Step 8a: reads the n-gram shards' scales (a few bytes each), then builds the tables and the cache.
+fn build_cache(boot: Boot, planned: Planned, weights: FixedWeights, padded_down: PaddedDown, held: Held, rest: Rest) {
+    let core = Arc::clone(&boot.core);
+    let ranges = match scale_ranges(planned.opened.artifact.config(), |name| planned.layout.home(name)) {
+        Ok(ranges) => ranges,
+        Err(error) => {
+            drop(held);
+            return boot.fail(error);
+        }
+    };
+    let (file, path) = (Arc::clone(&planned.opened.file), core.settings.model.artifact.clone());
+    // A failed read ends the start with what was taken let go; the scales then go on in the device lake's frame.
+    let scales: Reads = Box::new(move |read| {
+        let scales = read.and_then(|read| {
+            read.iter()
+                .map(|bytes| bytes.as_slice().try_into().map(f32::from_le_bytes))
+                .collect::<Result<Vec<f32>, _>>()
+                .map_err(|_| EngineError::Runtime("an n-gram scale read came back short".to_string()))
+        });
+        match scales {
+            Ok(scales) => boot.then(device, move |boot| {
+                build_tables(boot, planned, weights, padded_down, held, rest, scales)
+            }),
+            Err(error) => {
+                drop(held);
+                boot.fail(error);
+            }
+        }
+    });
+    read_all(&core, file, path, ranges, Vec::new(), scales);
+}
+
+/// Step 8b: builds the n-gram tables over the artifact file, then the experts' cache, and delivers the model. The
+/// tables come first: they can refuse, and the cache's workers are on the lattice from the moment it is built.
+fn build_tables(
     mut boot: Boot,
     planned: Planned,
     weights: FixedWeights,
     padded_down: PaddedDown,
     mut held: Held,
     rest: Rest,
+    scales: Vec<f32>,
 ) {
     let core = Arc::clone(&boot.core);
     let built = (|| {
+        let tables = ngram_tables(&planned, &core.io, &scales)?;
         let plan = &planned.plan;
         let path = &core.settings.model.artifact;
         let layout = Arc::clone(&planned.experts);
@@ -837,7 +943,6 @@ fn build_cache(
             copier: lanes as Arc<dyn CopyLane>,
         };
         let cache = ExpertCache::on_lattice(config, &core.lattice).map_err(cache_failed)?;
-        let tables = ngram_tables(&planned, &weights)?;
         Ok::<_, EngineError>((cache, tables))
     })();
     match built {
@@ -890,28 +995,39 @@ fn cache_failed(error: CacheError) -> EngineError {
     EngineError::Runtime(format!("the expert cache: {error}"))
 }
 
-/// The n-gram table of each layer that has one, over the artifact file read in place.
-fn ngram_tables(planned: &Planned, weights: &FixedWeights) -> Result<Vec<(u32, Arc<NgramRows>)>, EngineError> {
+/// The n-gram table of each layer that has one, over the artifact file read in place; `scales` are the shards' scales
+/// as [`scale_ranges`] placed them. Reads nothing: a table's rows are read as they are gathered.
+fn ngram_tables(
+    planned: &Planned,
+    io: &Arc<AsyncIo>,
+    scales: &[f32],
+) -> Result<Vec<(u32, Arc<NgramRows>)>, EngineError> {
     let config = planned.opened.artifact.config();
-    let (heads, parts) = (config.ngram.heads(), config.ngram.split_parts);
-    let shard_rows = config.ngram.shard_rows.unsigned_abs();
-    let row_width = u32::try_from(u64::from(config.text.hidden_size) / heads.max(1))
-        .map_err(|_| EngineError::Runtime("the n-gram row width does not fit 32 bits".to_string()))?;
+    let geometry = NgramGeometry::of(config)?;
+    let mut scales = scales.chunks_exact(geometry.parts as usize);
     let mut out = Vec::new();
-    for layer in 0..config.text.num_layers {
-        if !config.has_ngram(layer as usize) {
-            continue;
-        }
-        let mut shards: Vec<Arc<dyn ShardBytes>> = Vec::with_capacity(parts as usize);
-        for shard in 0..parts {
+    for layer in ngram_layers(config) {
+        let mut shards: Vec<Arc<dyn ShardBytes>> = Vec::with_capacity(geometry.parts as usize);
+        for shard in 0..geometry.parts {
             let name = ngram_shard(layer, shard);
-            let (offset, bytes) = weights.file_range(&name).map_err(flash_failed)?;
-            let part = FileShard::over(&planned.opened.file, offset, bytes)
-                .map_err(|error| EngineError::io(format!("sharing the artifact for {name}"), error))?;
+            let Some(Home::File { offset, bytes }) = planned.layout.home(&name) else {
+                return Err(EngineError::Runtime(format!("the artifact has no n-gram shard {name}")));
+            };
+            let part = FileShard::over(Arc::clone(io), Arc::clone(&planned.opened.file), offset, bytes)
+                .map_err(|why| EngineError::Runtime(format!("sharing the artifact for {name}: {why}")))?;
             shards.push(Arc::new(part));
         }
-        let total = shard_rows * u64::from(parts);
-        let rows = NgramRows::new(shards, shard_rows, total, row_width).map_err(flash_failed)?;
+        let own = scales
+            .next()
+            .ok_or_else(|| EngineError::Runtime(format!("no scales were read for layer {layer}'s n-gram table")))?;
+        let rows = NgramRows::new(
+            shards,
+            geometry.shard_rows,
+            geometry.total_rows,
+            geometry.row_width,
+            own.to_vec(),
+        )
+        .map_err(flash_failed)?;
         out.push((layer, Arc::new(rows)));
     }
     Ok(out)
