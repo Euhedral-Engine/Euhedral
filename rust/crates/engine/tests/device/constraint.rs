@@ -262,7 +262,8 @@ fn run_opening(
             }),
         })
         .expect("the request is admitted");
-    done.wait(GENERATION_WAIT).expect("the generation never reported its outcome within the hang guard")
+    done.wait(GENERATION_WAIT)
+        .expect("the generation never reported its outcome within the hang guard")
 }
 
 /// Quanta in flight, selections and row readbacks leased after a generation: all free.
