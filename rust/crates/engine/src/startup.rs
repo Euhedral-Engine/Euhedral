@@ -45,6 +45,7 @@ use crate::model::{
     LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Residence, Role, Speculation, TrellisParts, WeightRef, Weights,
     companion_name, trellis_logical, validate_base_inventory, validate_inventory,
 };
+use crate::plan::Plan;
 use crate::residency::accounting::{Consumer, PlanReservation};
 use crate::residency::budget::{self, HostBudget};
 use crate::residency::disk::{ArtifactFile, DiskReadPiece, DiskReader, DiskWindow, FilePort};
@@ -738,7 +739,8 @@ fn device_inputs(core: &Core) -> Result<PlanInputs, EngineError> {
 /// again ([`lane_sizing`]).
 fn open_lanes(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>, first: usize) {
     let core = Arc::clone(&startup.core);
-    let sized = core.open_lanes(first).and_then(|()| {
+    let compute = Plan::lane_width(artifact.config.dflash2.is_some());
+    let sized = core.open_lanes(first, compute).and_then(|()| {
         let inputs = device_inputs(&core)?;
         let sizing = lane_sizing(core.settings.batching.max_sequences, first, || {
             resolve_sequences(&artifact.config, &artifact.table, &core.settings, inputs)

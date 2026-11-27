@@ -46,6 +46,12 @@ pub(crate) enum Kind {
     ExpertCopy,
     /// The delivery of a hidden-rows request's rows to its sink.
     Hidden,
+    /// The submission of a routed expert's copy to the device on the copy lane.
+    ExpertSubmit,
+    /// The retirement of a routed expert's copy: its staging buffer is free and its load ends.
+    ExpertRetire,
+    /// The turn of the routed-expert cache's owner: it applies the records posted to it.
+    ExpertOwner,
 }
 
 /// The id hash of a frame of `kind` on chain `chain`: distinct per kind and chain, mixed so that the chains spread

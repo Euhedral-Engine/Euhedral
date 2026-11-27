@@ -8,7 +8,7 @@
 
 mod bf16;
 mod embedding;
-mod nvfp4;
+pub(crate) mod nvfp4;
 mod q3;
 mod row_exact;
 pub mod shapes;

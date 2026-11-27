@@ -3,6 +3,7 @@
 pub mod accounting;
 pub mod budget;
 pub mod disk;
+pub mod expert_cache;
 pub mod experts;
 pub mod flash;
 pub mod footprint;

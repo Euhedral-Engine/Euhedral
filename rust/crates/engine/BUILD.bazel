@@ -58,6 +58,7 @@ rust_test(
     deps = [
         "//rust/crates/bench:euhedral_inference_bench",
         "//rust/crates/cuda:euhedral_inference_cuda",
+        "//rust/crates/edrl:euhedral_inference_edrl",
         "//rust/crates/test-support:test_support",
         "//rust/crates/tokenizer:euhedral_inference_tokenizer",
         "@euhedral_crates//:sha2",
@@ -76,6 +77,7 @@ rust_doc_test(
     deps = [
         "//rust/crates/bench:euhedral_inference_bench",
         "//rust/crates/cuda:euhedral_inference_cuda",
+        "//rust/crates/edrl:euhedral_inference_edrl",
         "//rust/crates/test-support:test_support",
         "//rust/crates/tokenizer:euhedral_inference_tokenizer",
         "@euhedral_crates//:sha2",

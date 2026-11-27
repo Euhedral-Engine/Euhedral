@@ -153,7 +153,8 @@ impl Dflash2Config {
     }
 
     /// Refuses a drafter the target or the kernels cannot run: the taps must be increasing layers of the target, the
-    /// hidden and vocabulary widths the target's, and the sizes within what the kernels hold.
+    /// hidden and vocabulary widths the target's, the mask token inside the vocabulary, the epsilon and the rotary base
+    /// finite and positive, and the sizes within what the kernels hold.
     pub fn check_against(&self, target: &ModelConfig) -> Result<(), PlanError> {
         let unsupported = |why: String| Err(PlanError::Unsupported(why));
         if let Some(tap) = self.taps.iter().find(|tap| **tap >= target.num_hidden_layers) {
@@ -172,6 +173,24 @@ impl Dflash2Config {
             return unsupported(format!(
                 "the drafter's hidden {} and vocabulary {} must be the target's ({} and {})",
                 self.hidden, self.vocab, target.hidden_size, target.vocab_size
+            ));
+        }
+        if self.mask_token as usize >= target.vocab_size {
+            return unsupported(format!(
+                "the drafter's mask token {} is outside the target's vocabulary of {}",
+                self.mask_token, target.vocab_size
+            ));
+        }
+        if !self.eps.is_finite() || self.eps <= 0.0 {
+            return unsupported(format!(
+                "the drafter's norm epsilon is {}, it must be finite and above 0",
+                self.eps
+            ));
+        }
+        if !self.theta.is_finite() || self.theta <= 0.0 {
+            return unsupported(format!(
+                "the drafter's rotary base is {}, it must be finite and above 0",
+                self.theta
             ));
         }
         if self.head_dim != HEAD_DIM {

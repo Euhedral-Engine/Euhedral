@@ -34,6 +34,7 @@ euhedral-gpu = { workspace = true, features = ["cuda", "fake"] }
 euhedral-graph = { workspace = true, features = ["testing"] }
 euhedral-inference-bench = { path = "../bench" }
 euhedral-inference-cuda = { path = "../cuda", features = ["test-oracles"] }
+euhedral-inference-edrl = { path = "../edrl", features = ["test-util"] }
 euhedral-inference-tokenizer = { path = "../tokenizer" }
 sha2.workspace = true
 tempfile.workspace = true

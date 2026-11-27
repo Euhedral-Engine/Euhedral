@@ -543,7 +543,7 @@ struct Rig {
 
 fn rig(view: View) -> Rig {
     let fixture = fixture();
-    let compute = Plan::lane_width();
+    let compute = Plan::lane_width(false);
     // Two transfer lanes: the last is the staging lane.
     let gpu = FakeGpu::new();
     gpu.define("combine", |memory, _launch, args| {
