@@ -323,7 +323,7 @@ impl Plan {
             vocab: 1,
             eps: 1.0,
             theta: 1.0,
-            taps: vec![0],
+            taps: (0..config.layer_kinds.len()).collect(),
         };
         let drafting = ModelConfig {
             dflash2: Some(drafter),
@@ -343,13 +343,18 @@ impl Plan {
     }
 
     /// The lanes the graphs of any model of this family need, from the topology of its views alone: the width of the
-    /// widest view of a model with one layer of each kind and an MTP layer. The width comes from the fan-out inside a
+    /// widest view of a model with both kinds of layer, each tapped by the DFlash2 drafter beside the next layer's projections, and an MTP layer. The width comes from the fan-out inside a
     /// layer, so more layers do not change it; [`Plan::build`] measures the real one, and a runtime that made fewer
     /// lanes refuses the plan. The lanes of a runtime are made before the model's metadata is read, which is why the
     /// width is asked for here and not from a plan.
     pub fn lane_width() -> usize {
         let mut width = 1;
-        for nodes in Self::probe_nodes(vec![LayerKind::GatedDeltaNet, LayerKind::FullAttention]) {
+        for nodes in Self::probe_nodes(vec![
+            LayerKind::GatedDeltaNet,
+            LayerKind::GatedDeltaNet,
+            LayerKind::FullAttention,
+            LayerKind::GatedDeltaNet,
+        ]) {
             for variant in Variant::ALL {
                 let regions: Vec<Option<usize>> = nodes.iter().map(|node| node.make.scratch_region(variant)).collect();
                 let region_count = regions.iter().flatten().max().map_or(1, |region| region + 1);

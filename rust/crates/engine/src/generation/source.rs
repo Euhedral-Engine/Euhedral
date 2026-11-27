@@ -2160,6 +2160,8 @@ impl Owner {
         let start = run.position;
         let speculative = matches!(run.mode, Mode::Speculative { .. });
         let drafting = matches!(&run.mode, Mode::Speculative { state, .. } if state.drafting());
+        // The DFlash2 drafter reads the tap rows every base quantum writes, not the MTP draft's seed rows.
+        let seeds = self.shared.dflash2.is_none() && drafting;
         let hidden = run.hidden.is_some();
         // A chunk that ends at a checkpoint has nothing chained behind it: it retires, and the state it leaves is captured
         // before the next chunk starts (see `PromptCheckpoints`).
@@ -2236,7 +2238,7 @@ impl Owner {
                     Some(previous) => quantum.token_from(previous)?,
                     None => quantum.with_tokens(tokens)?,
                 };
-                if hidden || (drafting && matches!(next, Step::Prefill { .. })) {
+                if hidden || (seeds && matches!(next, Step::Prefill { .. })) {
                     quantum.seeding_draft()
                 } else {
                     Ok(quantum)

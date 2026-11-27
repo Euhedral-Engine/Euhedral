@@ -238,7 +238,8 @@ fn dflash2_output_equals_greedy() {
         );
         assert_eq!(
             drafted.tokens, reference,
-            "{name}: the drafted tokens are greedy decode's"
+            "{name}: the drafted tokens are greedy decode's (the generation ended with {:?})",
+            drafted.outcome.reason
         );
         assert_eq!(drafted.outcome.generated, GENERATED as usize);
         assert!(

@@ -42,8 +42,8 @@ use crate::generation::{Generation, Generations};
 use crate::handoff::Handoff;
 use crate::model::dflash2::{CONFIG_OBJECT, Dflash2Config};
 use crate::model::{
-    LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Residence, Role, TrellisParts, WeightRef, Weights, companion_name,
-    trellis_logical, validate_base_inventory, validate_inventory,
+    LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Residence, Role, Speculation, TrellisParts, WeightRef, Weights,
+    companion_name, trellis_logical, validate_base_inventory, validate_inventory,
 };
 use crate::residency::accounting::{Consumer, PlanReservation};
 use crate::residency::budget::{self, HostBudget};
@@ -1316,7 +1316,8 @@ impl DraftIds {
 /// The pinned buffer for the draft head's token ids, when the plan drafts. A plan that drafts and cannot have them is
 /// an error: speculation is not silently left off.
 fn draft_ids_loan(core: &Core, plan: &ResidencyPlan, weights: &Weights) -> Result<Option<DraftIds>, EngineError> {
-    if plan.draft_depth == 0 {
+    // The DFlash2 drafter selects whole-vocabulary ids on the device: it has no draft head and no id table.
+    if plan.draft_depth == 0 || plan.profile.speculation == Speculation::Dflash2 {
         return Ok(None);
     }
     let ids = weights

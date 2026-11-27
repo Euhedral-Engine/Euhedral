@@ -325,10 +325,12 @@ fn fan_out_width_is_plan_width() {
         "the joint projection, query/key and value/z run at once"
     );
     assert_eq!(plan.fan_out_width(), 3);
+    // The lanes are made before the model is known, for the widest plan of the family: a DFlash2 drafter's tap copy
+    // runs beside the next layer's three projections, one wider than any plan without a drafter.
     assert_eq!(
         Plan::lane_width(),
-        plan.fan_out_width(),
-        "the lanes a runtime makes before it knows the model are the width of the model's plan"
+        plan.fan_out_width() + 1,
+        "the lanes a runtime makes before it knows the model cover the model's plan and its drafter's taps"
     );
     // Every graph names lanes within the pool the width sizes: the root the home lane, each other stage the one lane of its chain.
     for view in [View::Decode, View::PrefillChunk, View::Draft { rows: 2 }] {
