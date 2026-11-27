@@ -67,6 +67,8 @@ fn settings(artifact: &Path, cache: ByteSize) -> Settings {
     // One sequence: the rings read back are the only sequence's.
     settings.batching.max_sequences = 1;
     settings.prefix_cache.size = cache;
+    // The drafter's context and block quanta run as recorded graphs.
+    settings.kernels.graphs.captures_per_view = 8;
     settings
 }
 
