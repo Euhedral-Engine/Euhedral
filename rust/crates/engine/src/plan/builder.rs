@@ -715,7 +715,7 @@ impl<W: WeightLookup + ?Sized> Nodes<'_, W> {
 /// copy of a sampled quantum's row to the host).
 fn head<W: WeightLookup + ?Sized>(
     nodes: &mut Nodes<'_, W>,
-    after: usize,
+    after: &[usize],
     final_norm: WeightRef,
     head: WeightRef,
     vocabulary: usize,
@@ -728,7 +728,7 @@ fn head<W: WeightLookup + ?Sized>(
             weight: final_norm,
             rows: NormRows::Final,
         },
-        &[after],
+        after,
     );
     let logits = nodes.push(
         Make::Linear {
@@ -785,6 +785,7 @@ pub(crate) fn base_nodes<W: WeightLookup + ?Sized>(
     );
     let mut previous = embedding;
     let mut attention_index = 0;
+    let mut tap_nodes = Vec::with_capacity(taps.len());
     for (index, kind) in config.layer_kinds.iter().enumerate() {
         let layer =
             LayerIndex(u16::try_from(index).map_err(|_| PlanBuildError::Geometry("more than 65535 layers".into()))?);
@@ -878,12 +879,17 @@ pub(crate) fn base_nodes<W: WeightLookup + ?Sized>(
             );
         }
         if let Some(tap) = taps.iter().position(|layer| *layer == index) {
-            nodes.push(Make::DrafterTap { tap }, &[previous]);
+            tap_nodes.push(nodes.push(Make::DrafterTap { tap }, &[previous]));
         }
     }
     let final_norm = nodes.norm_weight(global, NormKind::Final)?;
     let lm_head = nodes.weight(global, Role::LmHead)?;
-    head(&mut nodes, previous, final_norm, lm_head, config.vocab_size, true);
+    // A tap is a leaf of its own: the final norm waits for every one, so the selection's marker covers the copies and
+    // the next quantum cannot overwrite a tap buffer before it is read (a tap of the last layer has no later writer
+    // of the hidden state to order it).
+    let mut after = vec![previous];
+    after.extend(tap_nodes);
+    head(&mut nodes, &after, final_norm, lm_head, config.vocab_size, true);
     Ok(nodes.list)
 }
 
@@ -984,7 +990,7 @@ pub(crate) fn mtp_nodes<W: WeightLookup + ?Sized>(
     let draft_head = nodes.weight(global, Role::DraftHead)?;
     let vocabulary = usize::try_from(draft_head.shape.first().copied().unwrap_or(0))
         .map_err(|_| PlanBuildError::Geometry("the draft head has too many rows".into()))?;
-    let selected = head(&mut nodes, finish, final_norm, draft_head, vocabulary, false);
+    let selected = head(&mut nodes, &[finish], final_norm, draft_head, vocabulary, false);
     nodes.push(Make::SelectedToken, &[selected]);
     Ok(nodes.list)
 }

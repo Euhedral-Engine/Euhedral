@@ -145,6 +145,8 @@ pub(crate) struct DeviceLanes {
     /// owner's lane (reservations and input records), then the transfer lanes, one per upload chain, the first of
     /// which also zeroes the sequence state.
     lane_table: LaneTable,
+    /// The compute lanes among them: the plan's width, which the model's drafter decides ([`Plan::lane_width`]).
+    compute: usize,
     /// The events in the ring of each stage lane ([`stage_ring`]).
     stage_ring: usize,
     /// Turns the lanes' progress into frames.
@@ -199,8 +201,6 @@ pub(crate) struct Core {
     kernels: Arc<KernelTable>,
     /// What the lanes own, once they are opened: after the plan, which decides how many sequences their rings carry.
     device_lanes: OnceLock<DeviceLanes>,
-    /// The plan's compute lanes.
-    pub(crate) compute: usize,
     pub(crate) pool: Arc<PinnedPool>,
     /// Buffers waiting to be freed in stream order: the pages and page tables of the caches, once their last quantum
     /// is gone. The generation's owner frees them on its lane.
@@ -282,13 +282,14 @@ impl Core {
     /// Opens the lanes with rings for `sequences` sequences, and attaches the completions to the lattice. Run in a frame
     /// of the device lake, after the first resolve of the sequence count and before the plan is made, so that a ring is
     /// never smaller than the quanta the plan's count keeps in flight. The device memory the events take is the free
-    /// memory falling across the open: the plan is made from the free memory read after it.
-    pub(crate) fn open_lanes(&self, sequences: usize) -> Result<(), EngineError> {
+    /// memory falling across the open: the plan is made from the free memory read after it. `compute` stage lanes are
+    /// made for the graphs: [`Plan::lane_width`] of the model's artifact.
+    pub(crate) fn open_lanes(&self, sequences: usize, compute: usize) -> Result<(), EngineError> {
         let runtime = |what: &str, error: &dyn fmt::Display| EngineError::Runtime(format!("{what}: {error}"));
-        let chains = startup::transfer_lanes(&self.settings, self.library.max_lanes(), self.compute);
+        let chains = startup::transfer_lanes(&self.settings, self.library.max_lanes(), compute);
         let ring = stage_ring(quanta_for(sequences));
         let before = self.library.free_bytes().map_err(EngineError::from)?;
-        let set = open_lane_set(&self.gpu, self.compute, ring, chains)
+        let set = open_lane_set(&self.gpu, compute, ring, chains)
             .map_err(|error| runtime("the lanes would not open", &error))?;
         let after = self.library.free_bytes().map_err(EngineError::from)?;
         let bytes = before.saturating_sub(after);
@@ -304,6 +305,7 @@ impl Core {
         let opened = DeviceLanes {
             lanes,
             lane_table,
+            compute,
             stage_ring: ring,
             completions,
             bytes,
@@ -315,17 +317,17 @@ impl Core {
 
     /// The owner's lane: the sequence's reservations and its quanta's input records.
     pub(crate) fn owner_lane(&self) -> &Arc<CudaQueue> {
-        self.lane(LaneId(self.compute as u16))
+        self.lane(LaneId(self.compute_lanes() as u16))
     }
 
     /// The transfer lane of upload chain `chain`.
     pub(crate) fn transfer_lane(&self, chain: usize) -> &Arc<CudaQueue> {
-        self.lane(LaneId((self.compute + 1 + chain) as u16))
+        self.lane(LaneId((self.compute_lanes() + 1 + chain) as u16))
     }
 
     /// The id of the transfer lane of chain `chain`.
     pub(crate) fn transfer_lane_id(&self, chain: usize) -> LaneId {
-        LaneId((self.compute + 1 + chain) as u16)
+        LaneId((self.compute_lanes() + 1 + chain) as u16)
     }
 
     /// The lane the weight transfers of a staging ring run on: the last transfer lane. The upload is over when
@@ -345,7 +347,7 @@ impl Core {
 
     /// The number of transfer lanes.
     pub(crate) fn transfer_lanes(&self) -> usize {
-        self.lane_table().len() - self.compute - 1
+        self.lane_table().len() - self.compute_lanes() - 1
     }
 
     fn lane(&self, id: LaneId) -> &Arc<CudaQueue> {
@@ -357,7 +359,7 @@ impl Core {
 
     /// The lanes the plan's graphs run on.
     pub(crate) fn compute_lanes(&self) -> usize {
-        self.compute
+        self.device_lanes().compute
     }
 
     /// Admits a unit on every lake.
@@ -1310,8 +1312,7 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
     );
 
     let machine = startup::read_machine();
-    let compute = Plan::lane_width();
-    // The lanes open at the plan: their rings are sized by the sequences it resolves ([`Core::open_lanes`]).
+    // The lanes open at the plan: their width and rings follow the model and the sequences it resolves ([`Core::open_lanes`]).
     lattice
         .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
         .map_err(|error| runtime("the lattice would not take the file I/O", &format!("{error:?}")))?;
@@ -1335,7 +1336,6 @@ fn build(settings: &Settings, library_path: &Path, close_timeout: Option<Duratio
         gpu,
         kernels,
         device_lanes: OnceLock::new(),
-        compute,
         pool,
         released: Arc::new(ReleasedBuffers::new()),
         host_pinned_bytes,

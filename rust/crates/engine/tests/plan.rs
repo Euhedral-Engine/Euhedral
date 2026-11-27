@@ -334,12 +334,10 @@ fn fan_out_width_is_plan_width() {
         "the joint projection, query/key and value/z run at once"
     );
     assert_eq!(plan.fan_out_width(), 3);
-    // The lanes are made before the model is known, for the widest plan of the family: a DFlash2 drafter's tap copy
-    // runs beside the next layer's three projections, one wider than any plan without a drafter.
     assert_eq!(
-        Plan::lane_width(),
-        plan.fan_out_width() + 1,
-        "the lanes a runtime makes before it knows the model cover the model's plan and its drafter's taps"
+        Plan::lane_width(false),
+        plan.fan_out_width(),
+        "a model without a drafter asks for the lanes of its own plan, no more"
     );
     // Every graph names lanes within the pool the width sizes: the root the home lane, each other stage the one lane of its chain.
     for view in [View::Decode, View::PrefillChunk, View::Draft { rows: 2 }] {
@@ -417,6 +415,32 @@ fn every_stage_is_an_ancestor_of_the_sink_in_every_view() {
     }
 }
 
+/// The drafter's taps are ordered behind the sink in every view, also a tap of the last layer, which no later layer
+/// writes after.
+#[test]
+fn every_stage_is_an_ancestor_of_the_sink_with_a_tap_of_the_last_layer() {
+    let mut config = dflash2_config();
+    config.dflash2.as_mut().unwrap().taps = vec![5, 19, 33, 47, 63];
+    let plan = build(config, &dflash2_table_without(true, |_| false), 40 << 30).plan;
+    for view in [
+        View::Decode,
+        View::Verify { rows: 5 },
+        View::PrefillChunk,
+        View::Context { rows: 7 },
+        View::Block,
+    ] {
+        let edges = plan.edges(view).unwrap();
+        let sink = plan.sink(view).unwrap();
+        assert_eq!(sink, edges.len() - 1, "{view:?}");
+        let reaches = ancestors_of_last(edges);
+        let loose: Vec<usize> = (0..edges.len()).filter(|stage| !reaches[*stage]).collect();
+        assert!(
+            loose.is_empty(),
+            "{view:?}: stages {loose:?} are not ancestors of the sink, so its marker would not cover them"
+        );
+    }
+}
+
 /// The views of a plan with the DFlash2 drafter: the base views with the tap copies, and the drafter's own.
 #[test]
 fn a_plan_with_the_dflash2_drafter_has_its_views_each_ordered_behind_one_sink_and_fits_the_lanes() {
@@ -445,9 +469,13 @@ fn a_plan_with_the_dflash2_drafter_has_its_views_each_ordered_behind_one_sink_an
         );
         assert_eq!(plan.roots(view).unwrap(), vec![0], "{view:?}");
         let width = plan.width(view).unwrap();
-        assert!(width <= Plan::lane_width(), "{view:?} fans out {width} wide");
+        assert!(width <= Plan::lane_width(true), "{view:?} fans out {width} wide");
     }
-    assert!(plan.fan_out_width() <= Plan::lane_width());
+    assert_eq!(
+        Plan::lane_width(true),
+        plan.fan_out_width(),
+        "a model with the drafter asks for the lanes of its own plan: a tap copy runs beside the next layer's three projections"
+    );
     // The tap copies are in the base views, and the drafter's views are not the MTP's.
     let taps = plan
         .kinds(View::Decode)

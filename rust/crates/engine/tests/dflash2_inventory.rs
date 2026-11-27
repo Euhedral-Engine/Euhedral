@@ -112,6 +112,37 @@ fn a_drafter_the_target_cannot_take_is_refused() {
     assert!(refusal(&table, &config).contains("layer 64"));
 }
 
+#[test]
+fn a_mask_token_outside_the_vocabulary_is_refused() {
+    let mut config = dflash2_config();
+    let vocabulary = config.vocab_size;
+    config.dflash2.as_mut().unwrap().mask_token = u32::try_from(vocabulary).unwrap();
+    let table = dflash2_table_without(true, |_| false);
+    let message = refusal(&table, &config);
+    assert!(message.contains(&format!("mask token {vocabulary}")), "{message}");
+    assert!(message.contains(&format!("vocabulary of {vocabulary}")), "{message}");
+}
+
+#[test]
+fn a_norm_epsilon_that_is_not_finite_and_positive_is_refused() {
+    let table = dflash2_table_without(true, |_| false);
+    for eps in [f32::NAN, 0.0, -1e-6, f32::INFINITY] {
+        let mut config = dflash2_config();
+        config.dflash2.as_mut().unwrap().eps = eps;
+        assert!(refusal(&table, &config).contains("norm epsilon"), "{eps}");
+    }
+}
+
+#[test]
+fn a_rotary_base_that_is_not_finite_and_positive_is_refused() {
+    let table = dflash2_table_without(true, |_| false);
+    for theta in [f32::NAN, 0.0, -1e7, f32::NEG_INFINITY] {
+        let mut config = dflash2_config();
+        config.dflash2.as_mut().unwrap().theta = theta;
+        assert!(refusal(&table, &config).contains("rotary base"), "{theta}");
+    }
+}
+
 fn base_rows() -> String {
     common::fixture()
         .lines()

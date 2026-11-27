@@ -267,9 +267,9 @@ impl Plan {
         })
     }
 
-    /// The node lists (base views, then MTP views) of a model of the family whose layers are `kinds`, over described
-    /// weights: the plan's topology without a model.
-    fn probe_nodes(kinds: Vec<LayerKind>) -> Vec<Vec<Node>> {
+    /// The node lists (base views, then MTP views, then with `dflash2` the tapped base views and the drafter's) of a
+    /// model of the family whose layers are `kinds`, over described weights: the plan's topology without a model.
+    fn probe_nodes(kinds: Vec<LayerKind>, dflash2: bool) -> Vec<Vec<Node>> {
         let weight = WeightRef {
             name: String::new(),
             shape: vec![1, 1],
@@ -330,31 +330,32 @@ impl Plan {
             ..config.clone()
         };
         let stub = Described(weight);
-        [
-            base_nodes(&config, &stub, false),
-            mtp_nodes(&config, &stub),
-            base_nodes(&drafting, &stub, true),
-            context_nodes(&drafting, &stub),
-            block_nodes(&drafting, &stub),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
+        let mut views = vec![base_nodes(&config, &stub, false), mtp_nodes(&config, &stub)];
+        if dflash2 {
+            views.push(base_nodes(&drafting, &stub, true));
+            views.push(context_nodes(&drafting, &stub));
+            views.push(block_nodes(&drafting, &stub));
+        }
+        views.into_iter().flatten().collect()
     }
 
-    /// The lanes the graphs of any model of this family need, from the topology of its views alone: the width of the
-    /// widest view of a model with both kinds of layer, each tapped by the DFlash2 drafter beside the next layer's projections, and an MTP layer. The width comes from the fan-out inside a
-    /// layer, so more layers do not change it; [`Plan::build`] measures the real one, and a runtime that made fewer
-    /// lanes refuses the plan. The lanes of a runtime are made before the model's metadata is read, which is why the
-    /// width is asked for here and not from a plan.
-    pub fn lane_width() -> usize {
+    /// The lanes the graphs of a model of this family need, from the topology of its views alone: the width of the
+    /// widest view of a model with both kinds of layer and an MTP layer, and with `dflash2` (the artifact holds the
+    /// DFlash2 drafter) each layer tapped beside the next layer's projections and the drafter's views. The width
+    /// comes from the fan-out inside a layer, so more layers do not change it; [`Plan::build`] measures the real one,
+    /// and a runtime that made fewer lanes refuses the plan. The lanes are made once the artifact is parsed and
+    /// before the plan is built, which is why the width is asked for here and not from a plan.
+    pub fn lane_width(dflash2: bool) -> usize {
         let mut width = 1;
-        for nodes in Self::probe_nodes(vec![
-            LayerKind::GatedDeltaNet,
-            LayerKind::GatedDeltaNet,
-            LayerKind::FullAttention,
-            LayerKind::GatedDeltaNet,
-        ]) {
+        for nodes in Self::probe_nodes(
+            vec![
+                LayerKind::GatedDeltaNet,
+                LayerKind::GatedDeltaNet,
+                LayerKind::FullAttention,
+                LayerKind::GatedDeltaNet,
+            ],
+            dflash2,
+        ) {
             for variant in Variant::ALL {
                 let regions: Vec<Option<usize>> = nodes.iter().map(|node| node.make.scratch_region(variant)).collect();
                 let region_count = regions.iter().flatten().max().map_or(1, |region| region + 1);
@@ -381,7 +382,7 @@ impl Plan {
     pub fn stage_bound() -> usize {
         [LayerKind::GatedDeltaNet, LayerKind::FullAttention]
             .into_iter()
-            .flat_map(|kind| Self::probe_nodes(vec![kind; ModelConfig::SUPPORTED_LAYERS]))
+            .flat_map(|kind| Self::probe_nodes(vec![kind; ModelConfig::SUPPORTED_LAYERS], true))
             .map(|nodes| nodes.len())
             .max()
             .unwrap_or(0)
