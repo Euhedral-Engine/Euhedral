@@ -282,6 +282,7 @@ impl Plan {
             attention_output_gate: true,
             mtp_layer_count: 1,
             draft_depth: None,
+            dflash2: None,
         };
         let stub = Described(weight);
         [base_nodes(&config, &stub), mtp_nodes(&config, &stub)]

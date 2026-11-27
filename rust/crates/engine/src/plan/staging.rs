@@ -360,6 +360,7 @@ mod tests {
             attention_output_gate: true,
             mtp_layer_count: 1,
             draft_depth: None,
+            dflash2: None,
         }
     }
 

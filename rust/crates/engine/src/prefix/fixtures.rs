@@ -46,6 +46,7 @@ pub fn config(kinds: Vec<LayerKind>, key_heads: usize, value_heads: usize, key_d
         attention_output_gate: true,
         mtp_layer_count: 1,
         draft_depth: None,
+        dflash2: None,
     }
 }
 

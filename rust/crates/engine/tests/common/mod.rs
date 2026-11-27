@@ -35,6 +35,7 @@ use euhedral_inference_edrl::{
 };
 use euhedral_inference_engine::error::EngineError;
 use euhedral_inference_engine::model::ModelConfig;
+use euhedral_inference_engine::model::dflash2::Dflash2Config;
 use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
 use euhedral_inference_settings::{ModelSettings, Settings};
 
@@ -113,6 +114,113 @@ pub fn table_of(fixture: &str, skip: impl Fn(&str) -> bool) -> TensorTable {
     put_u64(&mut header, data_offset);
     let header = Header::parse(header.as_slice().try_into().unwrap()).unwrap();
     TensorTable::parse(&table, &header, offset).unwrap()
+}
+
+/// The drafter configuration words of the DFlash2 artifact.
+pub fn drafter_words() -> Vec<i32> {
+    vec![
+        1,
+        5,
+        5120,
+        17_408,
+        32,
+        8,
+        128,
+        8,
+        248_070,
+        2,
+        16,
+        16,
+        256,
+        2048,
+        248_320,
+        1e-6f32.to_bits() as i32,
+        1e7f32.to_bits() as i32,
+        5,
+        5,
+        19,
+        33,
+        47,
+        61,
+    ]
+}
+
+/// The model's configuration with the drafter's, as the engine holds them once the artifact's file is open.
+pub fn dflash2_config() -> ModelConfig {
+    let bytes: Vec<u8> = drafter_words().iter().flat_map(|word| word.to_le_bytes()).collect();
+    ModelConfig {
+        dflash2: Some(Dflash2Config::parse(&bytes).unwrap()),
+        ..config()
+    }
+}
+
+/// The rows of the drafter's objects (`name`, shape, dtype, format and layout ordinals, bytes), as the fixture lists
+/// them; the projections are NVFP4 when `nvfp4`, else BF16.
+pub fn drafter_rows(nvfp4: bool) -> String {
+    let drafter = dflash2_config().dflash2.unwrap();
+    let mut rows = String::new();
+    let mut put = |name: &str, shape: &[usize], dtype: u32, format: u32, layout: u32| {
+        let elements: usize = shape.iter().product();
+        let bytes = match format {
+            3 => 4 * elements,
+            7 => {
+                // NVFP4 in the K128 row split: codes, then one scale per 16 columns, each plane aligned, then a trailer.
+                let (rows, k) = (shape[0], shape[1].div_ceil(128) * 128);
+                let scales = (rows * k / 2).div_ceil(256) * 256;
+                (scales + rows * (k / 16)).div_ceil(256) * 256 + 4
+            }
+            _ => 2 * elements,
+        };
+        let shape: Vec<String> = shape.iter().map(ToString::to_string).collect();
+        rows.push_str(&format!(
+            "{name}\t{}\t{dtype}\t{format}\t{layout}\t{bytes}\n",
+            shape.join("x")
+        ));
+    };
+    let words = drafter_words();
+    put("dflash2/config", &[words.len()], 6, 3, 0);
+    let (hidden, rank) = (drafter.hidden, drafter.selector_rank);
+    let projection = |put: &mut dyn FnMut(&str, &[usize], u32, u32, u32), name: &str, shape: &[usize]| {
+        if nvfp4 {
+            put(name, shape, 0, 7, 1);
+        } else {
+            put(name, shape, 0, 0, 0);
+        }
+    };
+    projection(&mut put, "dflash2/fc", &[hidden, drafter.tap_width()]);
+    put("dflash2/hidden_norm", &[hidden], 0, 0, 0);
+    put("dflash2/final_norm", &[hidden], 0, 0, 0);
+    put("dflash2/selector/hidden_projection", &[rank, hidden], 0, 0, 0);
+    put("dflash2/selector/predecessor", &[drafter.vocab, rank], 0, 0, 0);
+    put("dflash2/selector/successor", &[drafter.vocab, rank], 0, 0, 0);
+    for layer in 0..drafter.layers {
+        let at = |tail: &str| format!("dflash2/layers/{layer}/{tail}");
+        put(&at("input_norm"), &[hidden], 0, 0, 0);
+        put(&at("post_attention_norm"), &[hidden], 0, 0, 0);
+        projection(&mut put, &at("attention/query"), &[drafter.query_width(), hidden]);
+        projection(&mut put, &at("attention/key_value"), &[2 * drafter.kv_width(), hidden]);
+        projection(&mut put, &at("attention/output"), &[hidden, drafter.query_width()]);
+        put(&at("attention/query_norm"), &[drafter.head_dim], 0, 0, 0);
+        put(&at("attention/key_norm"), &[drafter.head_dim], 0, 0, 0);
+        projection(&mut put, &at("mlp/gate_up"), &[2 * drafter.intermediate, hidden]);
+        projection(&mut put, &at("mlp/down"), &[hidden, drafter.intermediate]);
+        for conv in ["attention_conv", "mlp_conv"] {
+            put(&at(&format!("{conv}/base")), &[2, drafter.conv_kernel, hidden], 0, 0, 0);
+            projection(
+                &mut put,
+                &at(&format!("{conv}/projection")),
+                &[drafter.conv_projection_width(), hidden],
+            );
+        }
+    }
+    rows
+}
+
+/// The RCO artifact's table with the drafter's objects added (the DFlash2 artifact keeps the MTP layer), less the
+/// objects `skip` names.
+pub fn dflash2_table_without(nvfp4: bool, skip: impl Fn(&str) -> bool) -> TensorTable {
+    let base = fixture().to_string();
+    table_of(&(base + &drafter_rows(nvfp4)), skip)
 }
 
 pub fn rco_table() -> TensorTable {
