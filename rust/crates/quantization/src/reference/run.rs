@@ -372,38 +372,39 @@ impl Run {
         }
     }
 
-    /// Reads the state `settled` decides on. The order is the contract; every load is SeqCst.
+    /// Reads the guard of `settled`. The order is the contract; every load is SeqCst.
     /// - `concluded` before `next`: both only grow and `concluded <= next`, so their equality is one instant with
     ///   no chunk in flight.
     /// - `broken` before `marking`: a count write sets `broken` and calls `fail` while `marking` is held, and
     ///   releases it after, so a `marking` read of false after `broken` was seen true follows that `fail`.
-    /// - `failed` after all of them: every chunk `fail` precedes its `concluded` increment, so a guard that passed
-    ///   on equal counters and a released `marking` has the `failed` read after it see every `fail`. A `failed`
-    ///   read before the guard can miss one that lands while the guard is still closed.
-    fn read_state(&self) -> State {
+    fn read_guard(&self) -> Guard {
         let concluded = self.concluded.load(Ordering::SeqCst);
         let next = self.next.load(Ordering::SeqCst);
         let recorded = self.recorded.load(Ordering::SeqCst);
         let prefix = self.prefix.load(Ordering::SeqCst);
         let broken = self.broken.load(Ordering::SeqCst);
         let marking = self.marking.load(Ordering::SeqCst);
-        State {
+        Guard {
             next,
             concluded,
             marking,
             recorded,
             prefix,
             broken,
-            failed: self.failed.load(Ordering::SeqCst),
-            limit: self.limit.load(Ordering::SeqCst),
         }
+    }
+
+    /// Reads `(failed, limit)`, only once the guard has passed: every chunk `fail` precedes its `concluded`
+    /// increment, so a passed guard (equal counters, `marking` released) makes this read see every `fail`. A
+    /// `failed` read before the guard can miss one that lands while the guard is still closed.
+    fn read_late(&self) -> (bool, usize) {
+        (self.failed.load(Ordering::SeqCst), self.limit.load(Ordering::SeqCst))
     }
 
     /// Ends the run when everything is settled: every chunk that started has been concluded, nothing more starts, and
     /// the count is recorded as far as it can be.
     fn settle(self: &Arc<Self>) {
-        let state = self.read_state();
-        let completed = match settled(state) {
+        let completed = match settled(self.read_guard(), || self.read_late()) {
             Settled::Pending => return,
             Settled::Failed => None,
             Settled::Done { completed } => Some(completed),
@@ -443,17 +444,15 @@ impl Run {
     }
 }
 
-/// What `settle` reads, in the order `Run::read_state` reads it.
+/// What `settle` reads first, to know whether the run is quiet (see `Run::read_guard` for the order).
 #[derive(Clone, Copy, Debug)]
-struct State {
+struct Guard {
     next: usize,
     concluded: usize,
     marking: bool,
     recorded: usize,
     prefix: usize,
     broken: bool,
-    failed: bool,
-    limit: usize,
 }
 
 /// What a settle decides.
@@ -467,23 +466,22 @@ enum Settled {
     Done { completed: usize },
 }
 
-/// Decides from one reading. The guard is: every started chunk concluded, no count write in flight, and the count
-/// caught up with the prefix (or given up on). Only past the guard do `failed` and `limit` decide, so the reading
-/// must have taken them after the rest (see `Run::read_state`).
-fn settled(state: State) -> Settled {
-    let State {
+/// Decides from the guard, and past it from `late`, which returns `(failed, limit)`. `late` is called only once the
+/// guard has passed, so what it reads is later than everything the guard saw. The guard is: every started chunk
+/// concluded, no count write in flight, and the count caught up with the prefix (or given up on).
+fn settled(guard: Guard, late: impl FnOnce() -> (bool, usize)) -> Settled {
+    let Guard {
         next,
         concluded,
         marking,
         recorded,
         prefix,
         broken,
-        failed,
-        limit,
-    } = state;
+    } = guard;
     if concluded != next || marking || (recorded != prefix && !broken) {
         return Settled::Pending;
     }
+    let (failed, limit) = late();
     if failed {
         return Settled::Failed;
     }
@@ -606,78 +604,92 @@ impl LogitsSink for ReferenceSink {
 
 #[cfg(test)]
 mod tests {
-    use super::{Settled, State, settled};
+    use std::cell::Cell;
+
+    use super::{Guard, Settled, settled};
 
     /// Three chunks all started and concluded, the count recorded over the prefix of `prefix` chunks.
-    fn quiet(failed: bool, prefix: usize) -> State {
-        State {
+    fn quiet(prefix: usize) -> Guard {
+        Guard {
             next: 3,
             concluded: 3,
             marking: false,
             recorded: prefix,
             prefix,
             broken: false,
-            failed,
-            limit: 3,
+        }
+    }
+
+    /// The decision, with `late` returning `(failed, limit)`, and whether `late` was called.
+    fn decide(guard: Guard, failed: bool, limit: usize) -> (Settled, bool) {
+        let called = Cell::new(false);
+        let outcome = settled(guard, || {
+            called.set(true);
+            (failed, limit)
+        });
+        (outcome, called.get())
+    }
+
+    #[test]
+    fn a_run_that_is_not_quiet_is_pending_and_reads_nothing_late() {
+        let open = Guard {
+            concluded: 2,
+            ..quiet(1)
+        };
+        let writing = Guard {
+            marking: true,
+            ..quiet(1)
+        };
+        let lagging = Guard {
+            recorded: 0,
+            ..quiet(1)
+        };
+        for guard in [open, writing, lagging] {
+            assert_eq!(decide(guard, true, 3), (Settled::Pending, false));
         }
     }
 
     #[test]
-    fn a_failure_seen_after_the_guard_passes_ends_the_run_with_the_error() {
-        // The count-write continuation settles while chunk 1 is still open; chunks 1 and 2 then conclude and the
-        // failure lands. The reading after the guard carries it, whatever the continuation read earlier.
-        assert_eq!(settled(quiet(true, 1)), Settled::Failed);
-        assert_eq!(settled(quiet(true, 0)), Settled::Failed);
+    fn a_failure_read_late_ends_the_run_with_the_error() {
+        assert_eq!(decide(quiet(1), true, 3), (Settled::Failed, true));
+        assert_eq!(decide(quiet(0), true, 3), (Settled::Failed, true));
     }
 
     #[test]
     fn a_run_without_failure_is_done_with_the_recorded_count() {
-        assert_eq!(settled(quiet(false, 3)), Settled::Done { completed: 3 });
-        let capped = State {
-            limit: 2,
+        assert_eq!(decide(quiet(3), false, 3), (Settled::Done { completed: 3 }, true));
+        let capped = Guard {
             next: 2,
             concluded: 2,
-            ..quiet(false, 2)
+            ..quiet(2)
         };
-        assert_eq!(settled(capped), Settled::Done { completed: 2 });
+        assert_eq!(decide(capped, false, 2), (Settled::Done { completed: 2 }, true));
+    }
+
+    #[test]
+    fn a_resume_past_the_limit_is_done() {
+        // `stop_after` below the completed count: the first chunk to start is already past the limit.
+        let resumed = Guard {
+            next: 5,
+            concluded: 5,
+            ..quiet(5)
+        };
+        assert_eq!(decide(resumed, false, 2), (Settled::Done { completed: 5 }, true));
     }
 
     #[test]
     fn a_failed_count_write_ends_the_run_with_its_error_though_the_count_lags() {
-        let broken = State {
+        let broken = Guard {
             broken: true,
             recorded: 1,
             prefix: 2,
-            ..quiet(true, 2)
+            ..quiet(2)
         };
-        assert_eq!(settled(broken), Settled::Failed);
+        assert_eq!(decide(broken, true, 3), (Settled::Failed, true));
     }
 
     #[test]
-    fn a_run_waits_while_a_chunk_is_open_a_write_is_in_flight_or_the_count_lags() {
-        let open = State {
-            concluded: 2,
-            ..quiet(true, 1)
-        };
-        let writing = State {
-            marking: true,
-            ..quiet(true, 1)
-        };
-        let lagging = State {
-            recorded: 0,
-            ..quiet(true, 1)
-        };
-        for state in [open, writing, lagging] {
-            assert_eq!(settled(state), Settled::Pending);
-        }
-    }
-
-    #[test]
-    fn a_run_without_failure_waits_while_more_chunks_are_to_start() {
-        let more = State {
-            limit: 4,
-            ..quiet(false, 3)
-        };
-        assert_eq!(settled(more), Settled::Pending);
+    fn a_run_without_failure_is_pending_while_more_chunks_are_to_start() {
+        assert_eq!(decide(quiet(3), false, 4), (Settled::Pending, true));
     }
 }
