@@ -165,3 +165,17 @@ fn the_moe_graph_validates_with_experts_on_one_lane_and_on_several_and_the_fetch
 fn a_moe_plan_of_no_experts_is_refused() {
     assert!(DensePlan::with_moe(&tiny_config(), 0).is_err());
 }
+
+#[test]
+fn a_plan_with_more_nodes_than_a_graph_holds_is_refused_naming_its_count_before_any_node_is_built() {
+    let config = tiny_config();
+    let ok = DensePlan::with_moe(&config, 15_000).unwrap();
+    assert!(ok.nodes().len() <= MAX_NODES);
+    // Two layers of 2 * 40000 + 6 nodes, and the rest: the count the refusal names.
+    let message = DensePlan::with_moe(&config, 40_000).unwrap_err().to_string();
+    assert!(
+        message.contains("160") && message.contains(&MAX_NODES.to_string()),
+        "{message}"
+    );
+    assert!(DensePlan::with_moe(&config, u32::MAX).is_err());
+}

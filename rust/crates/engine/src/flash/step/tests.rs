@@ -152,12 +152,9 @@ fn a_new_quantum_waits_for_the_sink_of_the_one_before_it_at_its_embedding_and_no
 }
 
 #[test]
-fn the_sink_is_the_last_node_and_a_plan_too_large_for_the_stage_ids_is_refused() {
+fn the_sink_is_the_last_node() {
     let plan = DensePlan::with_moe(&tiny_config(), 2).unwrap();
     assert_eq!(sink_of(&plan).unwrap(), StageId((plan.nodes().len() - 1) as u16));
-    let huge = DensePlan::with_moe(&tiny_config(), 40_000).unwrap();
-    let message = sink_of(&huge).unwrap_err().to_string();
-    assert!(message.contains(&huge.nodes().len().to_string()), "{message}");
 }
 
 /// Whether `from` reaches `to` over the submission and completion edges of `plan`.
