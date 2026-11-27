@@ -44,22 +44,32 @@ impl FlashHeader {
         file_size: u64,
     ) -> Result<FlashHeader, EdrlError> {
         if metadata_size > MAX_METADATA_BYTES {
-            return Err(EdrlError::invalid("metadata size is out of range"));
+            return Err(EdrlError::invalid(format!(
+                "metadata size {metadata_size} is over the limit {MAX_METADATA_BYTES}"
+            )));
         }
         if tables_size > MAX_TABLES_BYTES {
-            return Err(EdrlError::invalid("table size is out of range"));
+            return Err(EdrlError::invalid(format!(
+                "tables size {tables_size} is over the limit {MAX_TABLES_BYTES}"
+            )));
         }
         let tables_end = FLASH_HEADER_BYTES as u64 + metadata_size + tables_size;
         if tables_end > file_size {
-            return Err(EdrlError::invalid("tables extend beyond the file"));
+            return Err(EdrlError::invalid(format!(
+                "tables end at {tables_end}, beyond the file size {file_size}"
+            )));
         }
         if data_offset < tables_end || data_offset > file_size || !data_offset.is_multiple_of(DATA_ALIGNMENT) {
             return Err(EdrlError::invalid(format!(
-                "data section offset is invalid: {data_offset}"
+                "data section offset {data_offset} must be a multiple of {DATA_ALIGNMENT} from the tables end \
+                 {tables_end} to the file size {file_size}"
             )));
         }
         if i64::try_from(file_size).is_err() {
-            return Err(EdrlError::invalid("file size is out of range"));
+            return Err(EdrlError::invalid(format!(
+                "file size {file_size} is over the limit {}",
+                i64::MAX
+            )));
         }
         Ok(FlashHeader {
             metadata_size,
@@ -101,23 +111,29 @@ impl FlashHeader {
         if architecture != ARCHITECTURE_QWEN4_EXP {
             return Err(EdrlError::UnsupportedArchitecture { found: architecture });
         }
-        if reader.i32("header reserved field")? != 0 {
-            return Err(EdrlError::invalid("header reserved field must be zero"));
+        let reserved = reader.i32("header reserved field")?;
+        if reserved != 0 {
+            return Err(EdrlError::invalid(format!(
+                "header reserved field is {reserved}, it must be zero"
+            )));
         }
-        let metadata_offset = non_negative(reader.i64("metadata offset")?, "metadata")?;
-        let metadata_size = non_negative(reader.i64("metadata size")?, "metadata")?;
-        let tables_offset = non_negative(reader.i64("tables offset")?, "tables")?;
-        let tables_size = non_negative(reader.i64("tables size")?, "tables")?;
-        let data_offset = non_negative(reader.i64("data offset")?, "data")?;
+        let metadata_offset = non_negative(reader.i64("metadata offset")?, "metadata offset")?;
+        let metadata_size = non_negative(reader.i64("metadata size")?, "metadata size")?;
+        let tables_offset = non_negative(reader.i64("tables offset")?, "tables offset")?;
+        let tables_size = non_negative(reader.i64("tables size")?, "tables size")?;
+        let data_offset = non_negative(reader.i64("data offset")?, "data offset")?;
         let file_size = non_negative(reader.i64("file size")?, "file size")?;
         if metadata_offset != FLASH_HEADER_BYTES as u64 {
-            return Err(EdrlError::invalid("metadata must immediately follow the header"));
+            return Err(EdrlError::invalid(format!(
+                "metadata offset is {metadata_offset}, it must be {FLASH_HEADER_BYTES} (right after the header)"
+            )));
         }
-        if metadata_size > MAX_METADATA_BYTES {
-            return Err(EdrlError::invalid("metadata size is out of range"));
-        }
+        // A metadata size over the limit is refused by `new`, after this offset check.
         if tables_offset != metadata_offset + metadata_size {
-            return Err(EdrlError::invalid("tables must immediately follow the metadata"));
+            return Err(EdrlError::invalid(format!(
+                "tables offset is {tables_offset}, it must be {} (right after the metadata)",
+                metadata_offset + metadata_size
+            )));
         }
         FlashHeader::new(metadata_size, tables_size, data_offset, file_size)
     }
@@ -198,7 +214,7 @@ impl ReadPlan {
         })
     }
 
-    /// The reads that remain for a Flash-Next artifact once [`ReadPlan::probe`]'s header and footer are fetched and
+    /// The reads that remain for a Flash-Next artifact once [`ReadPlan::probe_flash`]'s header and footer are fetched and
     /// parsed: the metadata and the tables, then the tokenizer body when `footer` is present. The header must
     /// declare the content end the file's length and footer give.
     pub fn for_flash(

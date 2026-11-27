@@ -90,7 +90,11 @@ impl FlashMetadata {
         let count = u32::try_from(count)
             .ok()
             .filter(|count| *count <= MAX_ENTRIES)
-            .ok_or_else(|| EdrlError::invalid(format!("metadata entry count is out of range: {count}")))?;
+            .ok_or_else(|| {
+                EdrlError::invalid(format!(
+                    "metadata entry count is out of range: {count} (0 to {MAX_ENTRIES})"
+                ))
+            })?;
         let mut entries = BTreeMap::new();
         let mut previous: Option<String> = None;
         for _ in 0..count {
@@ -108,7 +112,10 @@ impl FlashMetadata {
             entries.insert(key, value);
         }
         if cursor.remaining() != 0 {
-            return Err(EdrlError::invalid("metadata contains trailing bytes"));
+            return Err(EdrlError::invalid(format!(
+                "metadata contains {} trailing bytes after its {count} entries",
+                cursor.remaining()
+            )));
         }
         Ok(FlashMetadata { entries })
     }
@@ -119,7 +126,12 @@ impl FlashMetadata {
         let count = u32::try_from(self.entries.len())
             .ok()
             .filter(|count| *count <= MAX_ENTRIES)
-            .ok_or_else(|| EdrlError::invalid(format!("metadata has too many entries: {}", self.entries.len())))?;
+            .ok_or_else(|| {
+                EdrlError::invalid(format!(
+                    "metadata has {} entries, over the limit {MAX_ENTRIES}",
+                    self.entries.len()
+                ))
+            })?;
         let mut out = Vec::new();
         out.extend_from_slice(&count.to_be_bytes());
         for (key, value) in &self.entries {
@@ -161,7 +173,10 @@ impl FlashMetadata {
             }
         }
         if out.len() as u64 > MAX_METADATA_BYTES {
-            return Err(EdrlError::invalid("metadata is too large"));
+            return Err(EdrlError::invalid(format!(
+                "metadata of {} bytes is over the limit {MAX_METADATA_BYTES}",
+                out.len()
+            )));
         }
         Ok(out)
     }
@@ -170,7 +185,7 @@ impl FlashMetadata {
 fn put_count(out: &mut Vec<u8>, key: &str, count: usize) -> Result<(), EdrlError> {
     if count > MAX_ARRAY {
         return Err(EdrlError::invalid(format!(
-            "metadata '{key}' array is too long: {count}"
+            "metadata '{key}' array has {count} elements, over the limit {MAX_ARRAY}"
         )));
     }
     out.extend_from_slice(&(count as u32).to_be_bytes());
@@ -179,7 +194,10 @@ fn put_count(out: &mut Vec<u8>, key: &str, count: usize) -> Result<(), EdrlError
 
 fn put_string(out: &mut Vec<u8>, key: &str, text: &str) -> Result<(), EdrlError> {
     if text.len() > MAX_STRING_BYTES {
-        return Err(EdrlError::invalid(format!("metadata '{key}' string is too long")));
+        return Err(EdrlError::invalid(format!(
+            "metadata '{key}' string has {} bytes, over the limit {MAX_STRING_BYTES}",
+            text.len()
+        )));
     }
     out.extend_from_slice(&(text.len() as u32).to_be_bytes());
     out.extend_from_slice(text.as_bytes());
@@ -227,7 +245,11 @@ impl Cursor<'_> {
         usize::try_from(length)
             .ok()
             .filter(|length| *length <= max)
-            .ok_or_else(|| EdrlError::invalid(format!("metadata '{field}' {what} is out of range: {length}")))
+            .ok_or_else(|| {
+                EdrlError::invalid(format!(
+                    "metadata '{field}' {what} is out of range: {length} (0 to {max})"
+                ))
+            })
     }
 
     fn string(&mut self, field: &str) -> Result<String, EdrlError> {
@@ -252,7 +274,11 @@ impl Cursor<'_> {
             TYPE_BOOL => match self.array::<1>(key)? {
                 [0] => MetadataValue::Bool(false),
                 [1] => MetadataValue::Bool(true),
-                _ => return Err(EdrlError::invalid(format!("metadata {key} is not a boolean"))),
+                [other] => {
+                    return Err(EdrlError::invalid(format!(
+                        "metadata {key} boolean byte is {other}, expected 0 or 1"
+                    )));
+                }
             },
             TYPE_TEXT => MetadataValue::Text(self.string(key)?),
             TYPE_INTS => {

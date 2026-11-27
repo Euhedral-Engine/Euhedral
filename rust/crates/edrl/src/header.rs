@@ -8,7 +8,7 @@ use crate::tokenizer_section::{FOOTER_BYTES, TokenizerFooter, content_end};
 pub const HEADER_BYTES: usize = 48;
 
 pub(crate) const MAGIC: u32 = 0x5157_454E;
-const COMPACT_VERSION: u32 = 2;
+pub(crate) const COMPACT_VERSION: u32 = 2;
 /// The most tensors, layers and so on the format counts.
 pub(crate) const MAX_COUNT: u32 = 1_000_000;
 pub(crate) const MAX_METADATA_BYTES: u64 = 8 << 20;

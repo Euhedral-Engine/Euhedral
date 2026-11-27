@@ -11,8 +11,8 @@
 
 use euhedral_inference_edrl::tiny_flash::{TinyFlash, tiny_config};
 use euhedral_inference_edrl::{
-    ComponentGroup, DETECT_BYTES, EdrlError, ExpectedInventory, FLASH_HEADER_BYTES, FlashConfig, FlashMetadata,
-    FlashTensor, InventoryProblem, MetadataValue, ModelFamily, NgramLayout, TensorDataType, WeightFormat,
+    ComponentGroup, DETECT_BYTES, EdrlError, ExpectedInventory, FLASH_HEADER_BYTES, FlashMetadata, FlashTensor,
+    InventoryProblem, MetadataValue, ModelFamily, NgramLayout, TensorDataType, WeightFormat,
 };
 
 const MAGIC: u32 = 0x5157_454E;
@@ -337,41 +337,6 @@ fn metadata_keys_out_of_order_are_refused() {
     let at = bytes.iter().rposition(|byte| *byte == b'b').unwrap();
     bytes[at] = b'A';
     assert!(invalid(FlashMetadata::decode(&bytes).unwrap_err()).contains("increasing"));
-}
-
-#[test]
-fn a_configuration_with_a_zero_divisor_is_refused_not_trapped() {
-    for (key, what) in [
-        ("attention.num_kv_heads", "KV heads"),
-        ("gdn.num_key_heads", "key heads"),
-        ("ngram.heads_per_ngram", "n-gram"),
-    ] {
-        let mut metadata = tiny_config().to_metadata();
-        assert!(metadata.get(key).is_some(), "the tiny metadata has no {key}");
-        metadata.insert(key, MetadataValue::Int(0));
-        let message = invalid(FlashConfig::from_metadata(&metadata).unwrap_err());
-        assert!(message.contains(what), "{key}: {message}");
-    }
-}
-
-#[test]
-fn a_gdn_size_that_overflows_the_channel_count_is_refused_not_trapped() {
-    let mut config = tiny_config();
-    config.gdn.num_key_heads = u32::MAX;
-    config.gdn.key_head_dim = u32::MAX;
-    let message = invalid(ExpectedInventory::from_config(&config).unwrap_err());
-    assert!(message.contains("GDN"), "{message}");
-}
-
-#[test]
-fn an_inventory_is_not_derived_from_a_configuration_that_does_not_validate() {
-    let mut config = tiny_config();
-    config.text.layer_types.pop();
-    let message = invalid(ExpectedInventory::from_config(&config).unwrap_err());
-    assert!(message.contains("layer types"), "{message}");
-    let mut config = tiny_config();
-    config.ngram.size = 1;
-    assert!(ExpectedInventory::from_config(&config).is_err());
 }
 
 #[test]

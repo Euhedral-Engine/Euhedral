@@ -1,13 +1,10 @@
 use crate::error::EdrlError;
-use crate::header::MAGIC;
+use crate::flash::header::{ARCHITECTURE_QWEN4_EXP, FLASH_VERSION};
+use crate::header::{COMPACT_VERSION, MAGIC};
 use crate::reader::Reader;
 
 /// How many leading bytes [`ModelFamily::detect`] reads: magic, version and architecture.
 pub const DETECT_BYTES: usize = 12;
-
-const DENSE_VERSION: u32 = 2;
-const FLASH_NEXT_VERSION: u32 = 3;
-const FLASH_NEXT_ARCHITECTURE: u32 = 1;
 
 /// The model family an artifact holds, which decides the reader a caller dispatches to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,9 +28,9 @@ impl ModelFamily {
         let version = reader.u32("artifact version")?;
         let architecture = reader.u32("artifact architecture")?;
         match version {
-            DENSE_VERSION => Ok(ModelFamily::DenseV2),
-            FLASH_NEXT_VERSION if architecture == FLASH_NEXT_ARCHITECTURE => Ok(ModelFamily::FlashNextV3),
-            FLASH_NEXT_VERSION => Err(EdrlError::UnsupportedArchitecture { found: architecture }),
+            COMPACT_VERSION => Ok(ModelFamily::DenseV2),
+            FLASH_VERSION if architecture == ARCHITECTURE_QWEN4_EXP => Ok(ModelFamily::FlashNextV3),
+            FLASH_VERSION => Err(EdrlError::UnsupportedArchitecture { found: architecture }),
             _ => Err(EdrlError::UnsupportedVersion { found: version }),
         }
     }

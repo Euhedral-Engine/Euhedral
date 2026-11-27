@@ -2,13 +2,13 @@ use std::collections::HashSet;
 use std::str;
 
 use crate::error::EdrlError;
+use crate::flash::config::MAX_EXPERTS;
 use crate::flash::header::{FlashHeader, OBJECT_ALIGNMENT};
 use crate::flash::ngram::NgramLayout;
 use crate::format::{TensorDataType, WeightFormat, WeightLayout, accepts_byte_size};
 use crate::reader::{Reader, checked_end};
 
 const MAX_OBJECTS: u32 = 1 << 20;
-const MAX_EXPERTS: u32 = 65536;
 const MAX_PROJECTIONS: u32 = 64;
 pub(crate) const MAX_NAME_BYTES: usize = 4096;
 pub(crate) const MAX_RANK: usize = 16;
@@ -135,7 +135,11 @@ impl ExpertBank {
     ) -> Result<ExpertBank, EdrlError> {
         let name = name.into();
         if projections.is_empty() || records.is_empty() {
-            return Err(EdrlError::invalid(format!("expert bank {name} is empty")));
+            return Err(EdrlError::invalid(format!(
+                "expert bank {name} is empty: {} experts, {} projections",
+                records.len(),
+                projections.len()
+            )));
         }
         let mut record_end: u64 = 0;
         for projection in &projections {
@@ -145,7 +149,8 @@ impl ExpertBank {
         for (expert, record) in records.iter().enumerate() {
             if record.bytes < record_end {
                 return Err(EdrlError::invalid(format!(
-                    "expert {expert} of {name} has a record smaller than its projections"
+                    "expert {expert} of {name} has a record of {} bytes, smaller than its projections' {record_end}",
+                    record.bytes
                 )));
             }
         }
@@ -235,7 +240,10 @@ impl FlashTables {
             banks.push(bank);
         }
         if reader.remaining() != 0 {
-            return Err(EdrlError::invalid("tables contain trailing bytes"));
+            return Err(EdrlError::invalid(format!(
+                "tables contain {} trailing bytes",
+                reader.remaining()
+            )));
         }
         let tables = FlashTables { tensors, banks };
         tables.check_ranges(header)?;
@@ -333,7 +341,7 @@ fn count(reader: &mut Reader<'_>, what: &'static str, max: u32) -> Result<u32, E
     u32::try_from(value)
         .ok()
         .filter(|value| *value <= max)
-        .ok_or_else(|| EdrlError::invalid(format!("{what} is out of range: {value}")))
+        .ok_or_else(|| EdrlError::invalid(format!("{what} is out of range: {value} (0 to {max})")))
 }
 
 fn name(reader: &mut Reader<'_>, what: &'static str) -> Result<String, EdrlError> {
@@ -341,7 +349,11 @@ fn name(reader: &mut Reader<'_>, what: &'static str) -> Result<String, EdrlError
     let length = usize::try_from(length)
         .ok()
         .filter(|length| (1..=MAX_NAME_BYTES).contains(length))
-        .ok_or_else(|| EdrlError::invalid(format!("{what} length is out of range: {length}")))?;
+        .ok_or_else(|| {
+            EdrlError::invalid(format!(
+                "{what} length is out of range: {length} (1 to {MAX_NAME_BYTES})"
+            ))
+        })?;
     str::from_utf8(reader.take(length, what)?)
         .map(str::to_owned)
         .map_err(|_| EdrlError::invalid(format!("{what} is not valid UTF-8")))
@@ -352,7 +364,7 @@ fn shape(reader: &mut Reader<'_>, owner: &str) -> Result<Vec<u64>, EdrlError> {
     let rank = usize::try_from(rank)
         .ok()
         .filter(|rank| *rank <= MAX_RANK)
-        .ok_or_else(|| EdrlError::invalid(format!("rank of {owner} is out of range: {rank}")))?;
+        .ok_or_else(|| EdrlError::invalid(format!("rank of {owner} is out of range: {rank} (0 to {MAX_RANK})")))?;
     let mut shape = Vec::with_capacity(rank);
     for _ in 0..rank {
         let dimension = reader.i64("tensor shape")?;
@@ -471,7 +483,9 @@ fn read_bank(reader: &mut Reader<'_>) -> Result<ExpertBank, EdrlError> {
     let experts = count(reader, "expert count", MAX_EXPERTS)?;
     let projection_count = count(reader, "projection count", MAX_PROJECTIONS)?;
     if experts == 0 || projection_count == 0 {
-        return Err(EdrlError::invalid(format!("expert bank {bank} is empty")));
+        return Err(EdrlError::invalid(format!(
+            "expert bank {bank} is empty: {experts} experts, {projection_count} projections"
+        )));
     }
     let mut projections = Vec::with_capacity(projection_count as usize);
     let mut projection_names = HashSet::new();
@@ -516,7 +530,7 @@ fn read_bank(reader: &mut Reader<'_>) -> Result<ExpertBank, EdrlError> {
             (Ok(offset), Ok(bytes)) => records.push(ExpertRecord { offset, bytes, crc32 }),
             _ => {
                 return Err(EdrlError::invalid(format!(
-                    "expert record of {bank} has a negative offset or size"
+                    "expert record of {bank} has a negative offset {offset} or size {bytes}"
                 )));
             }
         }

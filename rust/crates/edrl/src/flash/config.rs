@@ -82,10 +82,12 @@ pub struct GdnConfig {
 }
 
 impl GdnConfig {
-    /// The channels the input convolution runs over: query, key and value.
+    /// The channels the input convolution runs over: query, key and value. Saturates at `u64::MAX`, which no
+    /// validated configuration reaches (the sizes are bounded by [`MAX_GDN_DIMENSION`]).
     pub fn conv_channels(&self) -> u64 {
-        2 * u64::from(self.num_key_heads) * u64::from(self.key_head_dim)
-            + u64::from(self.num_value_heads) * u64::from(self.value_head_dim)
+        let keys = u64::from(self.num_key_heads).saturating_mul(u64::from(self.key_head_dim));
+        let values = u64::from(self.num_value_heads).saturating_mul(u64::from(self.value_head_dim));
+        keys.saturating_mul(2).saturating_add(values)
     }
 }
 
@@ -131,9 +133,9 @@ pub struct NgramConfig {
 }
 
 impl NgramConfig {
-    /// The hash heads: `(size - 1) * heads_per_ngram`.
+    /// The hash heads: `(size - 1) * heads_per_ngram`, 0 for a size below 2.
     pub fn heads(&self) -> u64 {
-        u64::from(self.size - 1) * u64::from(self.heads_per_ngram)
+        u64::from(self.size.saturating_sub(1)) * u64::from(self.heads_per_ngram)
     }
 }
 
@@ -192,8 +194,9 @@ pub struct FlashConfig {
 }
 
 impl FlashConfig {
-    pub fn layer_type(&self, layer: usize) -> FlashLayerType {
-        self.text.layer_types[layer]
+    /// The token mixer of text layer `layer`, or `None` past the last layer.
+    pub fn layer_type(&self, layer: usize) -> Option<FlashLayerType> {
+        self.text.layer_types.get(layer).copied()
     }
 
     /// Whether `layer` holds the n-gram tables.
@@ -207,9 +210,10 @@ impl FlashConfig {
     /// Reads the configuration from the decoded metadata: exactly the keys it knows, each of its type.
     pub fn from_metadata(metadata: &FlashMetadata) -> Result<FlashConfig, EdrlError> {
         let mut input = MetadataReader::new(metadata);
-        if input.string("architecture")? != ARCHITECTURE {
+        let architecture = input.string("architecture")?;
+        if architecture != ARCHITECTURE {
             return Err(EdrlError::invalid(format!(
-                "metadata architecture is not {ARCHITECTURE}"
+                "metadata architecture is '{architecture}', not {ARCHITECTURE}"
             )));
         }
         input.string("source.model_type")?;
@@ -468,53 +472,102 @@ impl FlashConfig {
             },
         )?;
         require(t.hidden_size > 0 && t.hidden_size.is_multiple_of(128), || {
-            "hidden size must be a positive multiple of 128".into()
+            format!("hidden size {} must be a positive multiple of 128", t.hidden_size)
         })?;
-        require(t.vocab_size > 0, || "vocabulary size must be positive".into())?;
-        require(a.num_kv_heads > 0 && a.num_heads.is_multiple_of(a.num_kv_heads), || {
-            "attention heads are not a positive multiple of the KV heads".into()
+        require(t.vocab_size > 0, || {
+            format!("vocabulary size {} must be positive", t.vocab_size)
+        })?;
+        require(t.max_position_embeddings > 0, || {
+            format!(
+                "maximum position embeddings {} must be positive",
+                t.max_position_embeddings
+            )
+        })?;
+        require(a.num_kv_heads > 0, || {
+            format!("attention KV heads {} must be positive", a.num_kv_heads)
+        })?;
+        require(a.num_heads.is_multiple_of(a.num_kv_heads), || {
+            format!(
+                "attention heads {} are not a multiple of the KV heads {}",
+                a.num_heads, a.num_kv_heads
+            )
         })?;
         require(a.output_gate == "sigmoid", || {
-            format!("unsupported attention output gate {}", a.output_gate)
+            format!("unsupported attention output gate {} (sigmoid)", a.output_gate)
         })?;
-        require(
-            g.num_key_heads > 0 && g.num_value_heads.is_multiple_of(g.num_key_heads),
-            || "GDN value heads are not a positive multiple of the key heads".into(),
-        )?;
-        require(
-            [g.num_key_heads, g.num_value_heads, g.key_head_dim, g.value_head_dim]
-                .iter()
-                .all(|dimension| *dimension <= MAX_GDN_DIMENSION),
-            || format!("GDN heads and head dimensions are at most {MAX_GDN_DIMENSION}"),
-        )?;
+        require(g.num_key_heads > 0, || {
+            format!("GDN key heads {} must be positive", g.num_key_heads)
+        })?;
+        require(g.num_value_heads.is_multiple_of(g.num_key_heads), || {
+            format!(
+                "GDN value heads {} are not a multiple of the key heads {}",
+                g.num_value_heads, g.num_key_heads
+            )
+        })?;
+        for (what, dimension) in [
+            ("key heads", g.num_key_heads),
+            ("value heads", g.num_value_heads),
+            ("key head dimension", g.key_head_dim),
+            ("value head dimension", g.value_head_dim),
+        ] {
+            require(dimension <= MAX_GDN_DIMENSION, || {
+                format!("GDN {what} {dimension} are over the limit {MAX_GDN_DIMENSION}")
+            })?;
+        }
         require(g.ssm_dtype == "float32", || {
-            format!("unsupported GDN state type {}", g.ssm_dtype)
+            format!("unsupported GDN state type {} (float32)", g.ssm_dtype)
+        })?;
+        require(e.num_experts <= MAX_EXPERTS, || {
+            format!("expert count {} is over the limit {MAX_EXPERTS}", e.num_experts)
         })?;
         require(e.experts_per_token > 0 && e.experts_per_token <= e.num_experts, || {
-            "experts per token is out of range".into()
+            format!(
+                "experts per token {} must be from 1 to the expert count {}",
+                e.experts_per_token, e.num_experts
+            )
         })?;
-        require(e.num_experts <= MAX_EXPERTS, || "expert count is out of range".into())?;
-        require(h.count > 0 && h.lowrank > 0, || {
-            "hyper-connection sizes must be positive".into()
+        require(h.count > 0, || {
+            format!("hyper-connection count {} must be positive", h.count)
         })?;
-        require(
-            n.size >= 2
-                && n.heads_per_ngram > 0
-                && n.split_parts > 0
-                && n.split_parts <= MAX_SPLIT_PARTS
-                && n.shard_rows > 0,
-            || "n-gram configuration is invalid".into(),
-        )?;
+        require(h.lowrank > 0, || {
+            format!("hyper-connection low rank {} must be positive", h.lowrank)
+        })?;
+        require(n.size >= 2, || format!("n-gram size {} must be at least 2", n.size))?;
+        require(n.heads_per_ngram > 0, || {
+            format!("n-gram heads per n-gram {} must be positive", n.heads_per_ngram)
+        })?;
+        require(n.split_parts > 0 && n.split_parts <= MAX_SPLIT_PARTS, || {
+            format!(
+                "n-gram split parts {} must be from 1 to {MAX_SPLIT_PARTS}",
+                n.split_parts
+            )
+        })?;
+        require(n.shard_rows > 0, || {
+            format!("n-gram shard rows {} must be positive", n.shard_rows)
+        })?;
         let heads = n.heads();
         require(
             n.heads_offsets.len() as u64 == heads && n.heads_vocab_sizes.len() as u64 == heads,
-            || format!("n-gram head tables do not have {heads} entries"),
+            || {
+                format!(
+                    "n-gram head tables hold {} offsets and {} vocabulary sizes, expected {heads} each",
+                    n.heads_offsets.len(),
+                    n.heads_vocab_sizes.len()
+                )
+            },
         )?;
         require(n.layer_multipliers.len() == n.size as usize, || {
-            "n-gram multipliers do not have one entry per n-gram size".into()
+            format!(
+                "n-gram multipliers hold {} entries, expected one per n-gram size {}",
+                n.layer_multipliers.len(),
+                n.size
+            )
         })?;
         require(u64::from(t.hidden_size).is_multiple_of(heads), || {
-            "hidden size is not a multiple of the n-gram heads".into()
+            format!(
+                "hidden size {} is not a multiple of the {heads} n-gram heads",
+                t.hidden_size
+            )
         })?;
         require(!p.layers.is_empty() && p.layers.len() <= MAX_NGRAM_LAYERS, || {
             format!(
@@ -524,32 +577,43 @@ impl FlashConfig {
         })?;
         for layer in &p.layers {
             require(u32::try_from(*layer).is_ok_and(|layer| layer < t.num_layers), || {
-                format!("n-gram layer {layer} is out of range")
+                format!("n-gram layer {layer} is outside the {} text layers", t.num_layers)
             })?;
         }
-        let total_rows = (n.shard_rows as u64).saturating_mul(u64::from(n.split_parts));
+        let total_rows = n.shard_rows.unsigned_abs().saturating_mul(u64::from(n.split_parts));
         let mut end: i64 = 0;
         for (head, (offset, size)) in n.heads_offsets.iter().zip(&n.heads_vocab_sizes).enumerate() {
             require(*offset == end, || {
-                format!("n-gram head offsets are not cumulative at head {head}")
+                format!("n-gram head {head} starts at {offset}, expected the end of the previous head {end}")
             })?;
-            require(*size > 0, || format!("n-gram head {head} has an empty vocabulary"))?;
-            end = end
-                .checked_add(*size)
-                .ok_or_else(|| EdrlError::invalid(format!("invalid configuration: n-gram head {head} overflows")))?;
+            require(*size > 0, || {
+                format!("n-gram head {head} vocabulary size {size} must be positive")
+            })?;
+            let Some(next) = end.checked_add(*size) else {
+                return Err(EdrlError::invalid(format!(
+                    "invalid configuration: n-gram head {head} vocabulary size {size} overflows the running total {end}"
+                )));
+            };
+            end = next;
         }
-        require(end as u64 <= total_rows, || {
-            format!("n-gram heads address {end} rows but the shards hold {total_rows}")
+        require(end.unsigned_abs() <= total_rows, || {
+            format!(
+                "n-gram heads address {end} rows but the {} shards hold {total_rows}",
+                n.split_parts
+            )
         })?;
-        require(
-            x.num_layers <= MAX_MTP_LAYERS && x.layer_types.len() == x.num_layers as usize,
-            || "MTP layer types do not match the MTP layer count".into(),
-        )?;
+        require(x.num_layers <= MAX_MTP_LAYERS, || {
+            format!("MTP layer count {} is over the limit {MAX_MTP_LAYERS}", x.num_layers)
+        })?;
+        require(x.layer_types.len() == x.num_layers as usize, || {
+            format!(
+                "{} MTP layer types for {} MTP layers",
+                x.layer_types.len(),
+                x.num_layers
+            )
+        })?;
         require(self.vision.depth <= MAX_LAYERS, || {
-            "vision depth is out of range".into()
-        })?;
-        require(t.max_position_embeddings > 0, || {
-            "maximum position embeddings must be positive".into()
+            format!("vision depth {} is over the limit {MAX_LAYERS}", self.vision.depth)
         })
     }
 }

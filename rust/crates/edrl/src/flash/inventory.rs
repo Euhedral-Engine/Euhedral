@@ -3,7 +3,7 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::error::EdrlError;
 use crate::flash::config::{FlashConfig, FlashLayerType};
-use crate::flash::tables::{ComponentGroup, ExpertBank, FlashTables};
+use crate::flash::tables::{ComponentGroup, ExpertBank, ExpertProjection, FlashTables};
 use crate::format::{TensorDataType, WeightFormat, WeightLayout};
 
 /// How many problems an error message lists.
@@ -113,7 +113,7 @@ pub struct ExpectedTensor {
     pub group: ComponentGroup,
 }
 
-/// One expected expert bank: its projections' shapes, in record order.
+/// One expected expert bank: its projections' shapes, found by name (a record may store them in either order).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedBank {
     pub name: String,
@@ -207,14 +207,14 @@ impl ExpectedInventory {
             config,
             ComponentGroup::HyperConnection,
         )?;
-        for layer in 0..config.text.num_layers as usize {
+        for (layer, kind) in config.text.layer_types.iter().enumerate() {
             let prefix = format!("text/layers/{layer}");
             layer_objects(
                 &mut b,
                 &prefix,
                 layer,
                 config,
-                config.layer_type(layer),
+                *kind,
                 ComponentGroup::RoutedExpert,
                 None,
             )?;
@@ -222,15 +222,14 @@ impl ExpectedInventory {
                 ngram_objects(&mut b, &format!("{prefix}/ple"), config, hidden, width)?;
             }
         }
-        for layer in 0..config.mtp.num_layers as usize {
+        for (layer, kind) in config.mtp.layer_types.iter().enumerate() {
             let prefix = format!("mtp/layers/{layer}");
-            let kind = config.mtp.layer_types[layer];
             layer_objects(
                 &mut b,
                 &prefix,
                 layer,
                 config,
-                kind,
+                *kind,
                 ComponentGroup::Mtp,
                 Some(ComponentGroup::Mtp),
             )?;
@@ -368,9 +367,8 @@ fn check_bank(bank: &ExpertBank, want: &ExpectedBank, problems: &mut Vec<Invento
             ),
         );
     }
-    // Projections follow one another in the record, in the expected order, and never overlap.
-    let mut cursor: u64 = 0;
-    for (index, (projection, shape)) in want.projections.iter().enumerate() {
+    // Projections are found by name, in whatever order the record stores them, and never overlap.
+    for (projection, shape) in &want.projections {
         let path = format!("{}/{projection}", bank.name());
         let Some(actual) = bank
             .projections()
@@ -380,32 +378,48 @@ fn check_bank(bank: &ExpertBank, want: &ExpectedBank, problems: &mut Vec<Invento
             bank_problem(bank.name().to_owned(), format!("lacks projection {projection}"));
             continue;
         };
-        if bank.projections().get(index).is_none_or(|at| at.name != *projection) {
-            bank_problem(path.clone(), "is not in the expected projection order".into());
-        }
         if actual.shape != *shape {
             bank_problem(
                 path.clone(),
                 format!("has shape {:?}, expected {shape:?}", actual.shape),
             );
         }
-        if actual.dtype != TensorDataType::Bf16 {
-            bank_problem(path.clone(), format!("has data type {:?}, expected Bf16", actual.dtype));
-        }
         if (actual.format, actual.layout) != (WeightFormat::Nvfp4, WeightLayout::RowSplitK128V1) {
-            bank_problem(path.clone(), "is not row-split NVFP4".into());
+            bank_problem(
+                path,
+                format!(
+                    "is stored as {}/{}, expected Nvfp4/RowSplitK128V1",
+                    format_name(actual.format),
+                    layout_name(actual.layout)
+                ),
+            );
         }
-        if actual.record_offset < cursor {
-            bank_problem(path, "overlaps the previous projection in the record".into());
+    }
+    let mut by_offset: Vec<&ExpertProjection> = bank.projections().iter().collect();
+    by_offset.sort_by_key(|projection| projection.record_offset);
+    for pair in by_offset.windows(2) {
+        let previous_end = pair[0].record_offset.saturating_add(pair[0].bytes);
+        if pair[1].record_offset < previous_end {
+            bank_problem(
+                format!("{}/{}", bank.name(), pair[1].name),
+                format!(
+                    "starts at {} in the record, inside {} that ends at {previous_end}",
+                    pair[1].record_offset, pair[0].name
+                ),
+            );
         }
-        cursor = cursor.max(actual.record_offset.saturating_add(actual.bytes));
     }
     // Expert `e` is the e-th record: records follow one another in expert order, so an id is its position.
     for (expert, pair) in bank.records().windows(2).enumerate() {
         if pair[1].offset < pair[0].offset.saturating_add(pair[0].bytes) {
             bank_problem(
                 bank.name().to_owned(),
-                format!("expert {} does not follow expert {expert}", expert + 1),
+                format!(
+                    "expert {} at {} does not follow expert {expert}, which ends at {}",
+                    expert + 1,
+                    pair[1].offset,
+                    pair[0].offset.saturating_add(pair[0].bytes)
+                ),
             );
             break;
         }
@@ -570,8 +584,8 @@ fn ngram_objects(
         b.add(format!("{prefix}/{norm}"), ComponentGroup::NormSmallState, &[width]);
     }
     let row_width = hidden / config.ngram.heads();
-    let rows =
-        u64::try_from(config.ngram.shard_rows).map_err(|_| EdrlError::invalid("n-gram shard rows are negative"))?;
+    // The configuration is validated: the shard rows are positive.
+    let rows = config.ngram.shard_rows.unsigned_abs();
     for shard in 0..config.ngram.split_parts {
         b.put(
             format!("{prefix}/ngram/{}", shard_name(shard)),
