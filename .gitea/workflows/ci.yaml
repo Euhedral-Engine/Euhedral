@@ -46,11 +46,12 @@ permissions:
   actions: write
 
 # The event is part of the group, so a manual run on the integration branch never cancels the push run that
-# `rollover promote` requires for that commit, and a push run is per commit. A pull request's land run and another label's run
-# are in different groups.
+# `rollover promote` requires for that commit, and a push run is per commit. A pull request's land run (true at the end) and
+# another label's run (false) are in different groups. Gitea stores this whole block in a varchar(255): a longer one fails the
+# insert of the run, and no run starts (scripts/lint-ci-triggers.py keeps it under 200).
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}-${{ contains(github.event.changes.added_labels.*.name, 'land') && 'land' || 'other' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}-${{ contains(github.event.changes.added_labels.*.name, 'land') }}
+  cancel-in-progress: true
 
 defaults:
   run:
