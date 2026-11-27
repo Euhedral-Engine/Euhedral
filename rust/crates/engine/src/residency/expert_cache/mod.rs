@@ -6,6 +6,7 @@
 
 mod cache;
 mod host;
+mod lanes;
 mod lease;
 mod owner;
 mod shard;

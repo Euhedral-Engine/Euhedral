@@ -719,7 +719,7 @@ fn copy(shared: Arc<Shared>, chain: usize, index: usize, loan: PooledPinned) {
 }
 
 /// A lane the loader may wait on: its queue, and its id in the pool.
-trait RetryLane: DeviceQueue {
+pub(crate) trait RetryLane: DeviceQueue {
     fn lane_id(&self) -> LaneId;
 }
 
@@ -733,7 +733,7 @@ impl RetryLane for CudaQueue {
 /// which frees a slot of its ring. Nothing waits and nothing is offered meanwhile. When the lane has no marker in
 /// flight there is no completion to wait for (something else holds the slot) and `retry` goes to `offer` at once, one
 /// offer per call.
-fn retry_or_offer(
+pub(crate) fn retry_or_offer(
     lane: &dyn RetryLane,
     completions: &Completions,
     retry: Box<dyn Frame>,
