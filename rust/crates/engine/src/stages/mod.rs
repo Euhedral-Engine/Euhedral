@@ -45,6 +45,7 @@ use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 
 use crate::error::EngineError;
+use crate::flash::ple::PleRows;
 use crate::model::ModelConfig;
 use crate::quantum::Capture;
 use crate::state::attention::DRAFT_TOKEN_SLOTS;
@@ -795,7 +796,7 @@ pub struct Quantum {
     /// from disk.
     pub(crate) disk: Option<Arc<transfer::DiskLedger>>,
     /// What the Flash-Next n-gram embedding's stages hand to one another for this quantum ([`Quantum::with_ple_rows`]).
-    pub(crate) ple: Option<Arc<crate::flash::ple::PleRows>>,
+    pub(crate) ple: Option<Arc<PleRows>>,
 }
 
 /// The next quantum's id.
@@ -1361,13 +1362,13 @@ impl Quantum {
 
     /// The hand-over of the Flash-Next n-gram embedding's stages for this quantum, built over the context the sequence
     /// carried into it.
-    pub fn with_ple_rows(mut self, rows: Arc<crate::flash::ple::PleRows>) -> Self {
+    pub fn with_ple_rows(mut self, rows: Arc<PleRows>) -> Self {
         self.ple = Some(rows);
         self
     }
 
     /// The hand-over of the n-gram embedding, if the quantum carries one.
-    pub fn ple_rows(&self) -> Option<&Arc<crate::flash::ple::PleRows>> {
+    pub fn ple_rows(&self) -> Option<&Arc<PleRows>> {
         self.ple.as_ref()
     }
 

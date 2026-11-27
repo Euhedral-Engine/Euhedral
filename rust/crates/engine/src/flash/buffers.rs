@@ -122,7 +122,7 @@ impl FlashRegions {
         hyper_scratch_bytes: u64,
         layer_scratch_bytes: u64,
     ) -> Result<Self, FlashError> {
-        if capacity_rows == 0 || base.is_null() || base.get() % ALIGNMENT != 0 {
+        if capacity_rows == 0 || base.is_null() || !base.get().is_multiple_of(ALIGNMENT) {
             return Err(FlashError::refused(
                 "regions",
                 format!(

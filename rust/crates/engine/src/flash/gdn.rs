@@ -45,7 +45,7 @@ impl GdnShape {
                 ),
             ));
         }
-        if config.num_key_heads == 0 || config.num_value_heads % config.num_key_heads != 0 {
+        if config.num_key_heads == 0 || !config.num_value_heads.is_multiple_of(config.num_key_heads) {
             return Err(FlashError::refused(
                 OP,
                 format!(
@@ -75,7 +75,7 @@ impl GdnShape {
         };
         let channels = 2 * u64::from(config.num_key_heads) * u64::from(HEAD_DIM)
             + u64::from(config.num_value_heads) * u64::from(HEAD_DIM);
-        if hidden == 0 || hidden % 8 != 0 || channels > u64::from(u32::MAX) / 2 || !epsilon.is_finite() {
+        if hidden == 0 || !hidden.is_multiple_of(8) || channels > u64::from(u32::MAX) / 2 || !epsilon.is_finite() {
             return Err(FlashError::refused(
                 OP,
                 format!("hidden {hidden} (a positive multiple of 8), {channels} channels, epsilon {epsilon}"),

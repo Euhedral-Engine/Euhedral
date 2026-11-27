@@ -65,7 +65,7 @@ pub fn linear_bf16(
 ) -> Result<Launch, FlashError> {
     const OP: &str = "linear_bf16";
     positive(OP, &[("rows", rows), ("k", k), ("n", n)])?;
-    if k % 8 != 0 {
+    if !k.is_multiple_of(8) {
         return Err(FlashError::refused(
             OP,
             format!("a BF16 linear needs K divisible by 8, got {k}"),
@@ -79,8 +79,8 @@ pub fn linear_bf16(
         .int32(rows)
         .int32(k)
         .int32(n);
-    if rows >= TC_MIN_ROWS && !exact && k % 32 == 0 && n % 8 == 0 && output.get() & 3 == 0 {
-        let split = n <= 1536 || n % 32 != 0;
+    if rows >= TC_MIN_ROWS && !exact && k.is_multiple_of(32) && n.is_multiple_of(8) && output.get() & 3 == 0 {
+        let split = n <= 1536 || !n.is_multiple_of(32);
         let tiles = rows > 16;
         let kernel = match (split, tiles) {
             (true, true) => Qwen4Kernel::LinearTcRowsSplit,
@@ -232,7 +232,7 @@ pub fn ngram_expand(
         OP,
         &[("count", count), ("width", width), ("record_bytes", record_bytes)],
     )?;
-    if record_bytes % 4 != 0 {
+    if !record_bytes.is_multiple_of(4) {
         return Err(FlashError::refused(
             OP,
             format!("records are multiples of four bytes, got {record_bytes}"),
@@ -449,7 +449,7 @@ pub fn embedding(
 ) -> Result<Launch, FlashError> {
     const OP: &str = "embedding";
     positive(OP, &[("rows", rows), ("width", width), ("vocabulary", vocabulary)])?;
-    if width % 8 != 0 {
+    if !width.is_multiple_of(8) {
         return Err(FlashError::refused(
             OP,
             format!("embedding rows are multiples of 8 values, got {width}"),

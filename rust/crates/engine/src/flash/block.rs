@@ -5,6 +5,7 @@
 //! [`super::gdn::GdnBody`]; sparse attention supplies its own. [`EndInject`] injects what the MoE block wrote, and
 //! [`FinalMix`] mixes the last row for the output head.
 
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use euhedral_graph::StageError;
@@ -30,7 +31,7 @@ pub struct BlockCall {
 }
 
 /// The token mixer of a layer between its two hyper-connection sites.
-pub trait BlockBody: Send + Sync + std::fmt::Debug {
+pub trait BlockBody: Send + Sync + Debug {
     /// The operations of the block for `call`, in the order they are queued.
     fn ops(&self, call: &BlockCall) -> Result<OpList<'static>, FlashError>;
 }

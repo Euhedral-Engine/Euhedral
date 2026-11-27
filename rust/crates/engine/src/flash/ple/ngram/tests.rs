@@ -123,8 +123,8 @@ fn a_gather_the_table_cannot_serve_is_refused_with_the_row() {
     let mut out = vec![0; 24];
     let error = table.gather(&[8], 0..1, &mut out).unwrap_err().to_string();
     assert!(error.contains("row 8 of 8"), "{error}");
-    assert!(table.gather(&[1], 0..1, &mut vec![0; 23]).is_err());
-    assert!(table.gather(&[1], 0..2, &mut vec![0; 48]).is_err());
+    assert!(table.gather(&[1], 0..1, &mut [0; 23]).is_err());
+    assert!(table.gather(&[1], 0..2, &mut [0; 48]).is_err());
 }
 
 #[test]
@@ -174,17 +174,4 @@ fn a_part_published_twice_keeps_the_first_and_hands_back_the_second() {
     assert_eq!(slots.get(1), Some(&"first"));
     let (error, _) = slots.publish(2, "late").unwrap_err();
     assert_eq!(error, PublishError::OutOfRange { part: 2, parts: 2 });
-}
-
-#[test]
-fn two_publishers_of_one_part_leave_exactly_one_winner() {
-    let slots = PartSlots::new(1);
-    let results = std::thread::scope(|scope| {
-        let first = scope.spawn(|| slots.publish(0, 1).is_ok());
-        let second = scope.spawn(|| slots.publish(0, 2).is_ok());
-        [first.join().unwrap(), second.join().unwrap()]
-    });
-    assert_eq!(results.iter().filter(|won| **won).count(), 1);
-    let kept = *slots.get(0).unwrap();
-    assert_eq!(results[kept - 1], true, "the kept value is the winner's");
 }

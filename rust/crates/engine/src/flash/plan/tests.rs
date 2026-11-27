@@ -24,9 +24,15 @@ fn the_n_gram_embedding_waits_for_every_part_and_the_layer_before_it() {
     expected.push(at(NodeKind::End(0)));
     assert_eq!(ple.after, expected);
     for part in 0..PARTS {
-        assert_eq!(plan.nodes()[at(NodeKind::PleGather(part))].after, [at(NodeKind::PleIds)]);
+        assert_eq!(
+            plan.nodes()[at(NodeKind::PleGather(part))].after,
+            [at(NodeKind::PleIds)]
+        );
     }
-    assert!(plan.nodes()[at(NodeKind::PleIds)].after.is_empty(), "the ids root has no predecessor");
+    assert!(
+        plan.nodes()[at(NodeKind::PleIds)].after.is_empty(),
+        "the ids root has no predecessor"
+    );
     assert_eq!(plan.nodes()[at(NodeKind::Block(1))].after, [at(NodeKind::Ple)]);
 }
 
@@ -61,9 +67,19 @@ fn a_model_without_the_n_gram_layer_has_no_host_roots() {
 fn a_model_with_two_n_gram_layers_or_one_past_the_last_is_refused_with_them() {
     let mut config = tiny_config();
     config.ple.layers = vec![0, 1];
-    assert!(DensePlan::from_config(&config).unwrap_err().to_string().contains("[0, 1]"));
+    assert!(
+        DensePlan::from_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("[0, 1]")
+    );
     config.ple.layers = vec![2];
-    assert!(DensePlan::from_config(&config).unwrap_err().to_string().contains("layer 2"));
+    assert!(
+        DensePlan::from_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("layer 2")
+    );
     config.ple.layers = vec![-1];
     assert!(DensePlan::from_config(&config).is_err());
 }

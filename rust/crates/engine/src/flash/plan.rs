@@ -74,9 +74,14 @@ impl DensePlan {
         }
         let ple_layer = match config.ple.layers.as_slice() {
             [] => None,
-            [layer] => Some(usize::try_from(*layer).ok().filter(|layer| *layer < layers).ok_or_else(|| {
-                FlashError::refused("dense plan", format!("n-gram layer {layer} of {layers} layers"))
-            })?),
+            [layer] => Some(
+                usize::try_from(*layer)
+                    .ok()
+                    .filter(|layer| *layer < layers)
+                    .ok_or_else(|| {
+                        FlashError::refused("dense plan", format!("n-gram layer {layer} of {layers} layers"))
+                    })?,
+            ),
             several => {
                 return Err(FlashError::refused(
                     "dense plan",

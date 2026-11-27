@@ -10,6 +10,10 @@ use smallvec::SmallVec;
 use crate::formats::shapes::Launch;
 
 /// One device operation.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "an operation list is built per quantum into inline storage; boxing the launch would allocate for each"
+)]
 #[derive(Debug)]
 pub enum Op<'a> {
     /// A kernel of the Flash-Next table.
@@ -107,14 +111,16 @@ impl Op<'_> {
                 rows,
                 width,
             } => kernels.residual_add_bf16(residual, delta, output, rows, width),
-            // SAFETY: the stage that built the operation keeps the pinned buffer in the quantum, which is dropped after
-            // the quantum's work retired, and does not write it again.
             Op::Upload {
                 destination,
                 source,
                 offset,
                 bytes,
-            } => unsafe { kernels.copy_upload_to_device(destination, source, offset, bytes) },
+            } => {
+                // SAFETY: the stage that built the operation keeps the pinned buffer in the quantum, which is dropped
+                // after the quantum's work retired, and does not write it again.
+                unsafe { kernels.copy_upload_to_device(destination, source, offset, bytes) }
+            }
         }
     }
 
