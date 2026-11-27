@@ -93,7 +93,8 @@ fn the_graph_validates_and_holds_the_host_nodes_without_lanes() {
 }
 
 #[test]
-fn a_moe_layer_has_a_route_a_shared_expert_a_plan_a_fetch_and_an_expert_per_slot_and_a_finish_between_its_block_and_its_end() {
+fn a_moe_layer_has_a_route_a_shared_expert_a_plan_a_fetch_and_an_expert_per_slot_and_a_finish_between_its_block_and_its_end()
+ {
     let plan = DensePlan::with_moe(&tiny_config(), 2).unwrap();
     let at = |kind| plan.index_of(kind).unwrap();
     let after = |kind| plan.nodes()[at(kind)].after.clone();
@@ -137,9 +138,18 @@ fn the_moe_graph_validates_with_experts_on_one_lane_and_on_several_and_the_fetch
     let plan = DensePlan::with_moe(&tiny_config(), 3).unwrap();
     plan.spec(LaneId(0)).unwrap();
     plan.spec_on(LaneId(0), &[LaneId(1), LaneId(2)]).unwrap();
-    let fetches = plan.nodes().iter().filter(|node| matches!(node.kind, NodeKind::MoeFetch(..))).count();
+    let fetches = plan
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.kind, NodeKind::MoeFetch(..)))
+        .count();
     assert_eq!(fetches, 2 * 3);
-    assert!(plan.nodes().iter().filter(|node| matches!(node.kind, NodeKind::MoeFetch(..))).all(|node| node.kind.host()));
+    assert!(
+        plan.nodes()
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::MoeFetch(..)))
+            .all(|node| node.kind.host())
+    );
 }
 
 #[test]
