@@ -605,6 +605,14 @@ jobs:
       - name: Bundle the Rust server (linux-x64)
         working-directory: rust
         run: mise exec -- cargo xtask bundle --product linux-x64
+      # The Windows server bundle, cross-built here with zig as the linker (the Windows host the pull-request dispatch reaches
+      # runs only the Bazel test). The check refuses a native product that lacks its runtime DLLs or imports the wrong
+      # library, and the bundle refuses a missing or empty input, so a bad package fails the job.
+      - name: Bundle the Rust server (windows-x64)
+        working-directory: rust
+        run: |
+          mise exec -- cargo xtask native-verify --product windows-x64
+          mise exec -- cargo xtask bundle --product windows-x64
       - name: Upload the test reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -617,6 +625,13 @@ jobs:
         with:
           name: rust-server-linux-x64
           path: build/bundle/euhedral-server-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 2
+      - name: Upload the Windows server bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-server-windows-x64
+          path: build/bundle/euhedral-server-windows-x64.zip
           if-no-files-found: error
           retention-days: 2
       # Last step: the first failed job cancels the run (see the action).

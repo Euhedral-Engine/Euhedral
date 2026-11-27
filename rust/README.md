@@ -91,10 +91,11 @@ crate, so the tree carries no llguidance library (the Gradle build adds one for 
 
 ## Server bundle
 
-`cargo xtask bundle --product linux-x64` (or `windows-x64`, on Windows) builds `euhedral-server` in release and
+`cargo xtask bundle --product linux-x64` (or `windows-x64`, on Windows or cross-built on Linux x86-64 with `cargo zigbuild` for
+`x86_64-pc-windows-gnu`) builds `euhedral-server` in release and
 assembles a runnable directory from it and the native product in `build/native/<product>` (build it with
 `cargo xtask native --product <product>` first; `--native <dir>` and `--out <dir>` override the product and output
-directories). The result is `build/bundle/euhedral-server-<product>/` and an archive of it (`.tar.gz` on Linux, `.zip` on Windows):
+directories). The result is `build/bundle/euhedral-server-<product>/` and an archive of it (`.tar.gz` for linux-x64, `.zip` for windows-x64, where the server is `bin/euhedral-server.exe` and `lib/` holds the DLLs):
 
 ```text
 bin/euhedral-server
@@ -105,7 +106,8 @@ files.sha256          the manifest of the kernel sources
 ```
 
 Unpack it anywhere and run `bin/euhedral-server --config <file>`: with no `host.native-cache` set, the server finds
-`lib/` beside `bin/`. CI builds and uploads the linux-x64 archive next to the server jar.
+`lib/` beside `bin/`. CI builds both products' archives in the `native-package` job, cross-building the Windows server on Linux, and uploads them as
+`rust-server-linux-x64` and `rust-server-windows-x64` next to the server jar; a missing or empty input fails the job.
 
 `docker build -f rust/Dockerfile .` (from the repository root) puts the linux-x64 bundle and `euhedral-health-probe`, the
 image's health check, into the distroless image; see `docs/OPERATIONS.md`.
