@@ -23,6 +23,12 @@ use crate::launch::attention::{
     AppendShape, CacheFormat, CausalShape, RopeShape, plan_causal_with, plan_kv_append, plan_qk_norm_rope,
 };
 use crate::launch::catalog::{Launch, linear_table, lookup};
+use crate::launch::dflash::{
+    AttentionShape, BlockQkShape, ContextKvShape, ConvShape, LinearShape, RmsNormShape as DflashRmsNormShape,
+    SelectShape, SwigluShape as DflashSwigluShape, TopkShape, plan_attention, plan_block_qk, plan_context_kv,
+    plan_conv, plan_linear as plan_dflash_linear, plan_rms_norm as plan_dflash_rms_norm, plan_select,
+    plan_swiglu as plan_dflash_swiglu, plan_topk,
+};
 use crate::launch::elementwise::{
     ArgmaxShape, ResidualAddShape, ResidualRmsNormShape, RmsNormShape, SelectedTokenShape, SwigluShape,
     check_zero_device_memory, plan_argmax, plan_argmax_logprob, plan_residual_add, plan_residual_rms_norm,
@@ -1008,6 +1014,257 @@ where
         let shape = SelectedTokenShape { key, ids, token };
         self.planned("euhedral_cuda_selected_token", |sink| {
             plan_selected_token(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    fn dflash_linear_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+    ) -> Result<(), CudaError> {
+        let shape = LinearShape {
+            input,
+            weights,
+            output,
+            rows,
+            in_features,
+            out_features,
+        };
+        self.planned("euhedral_cuda_dflash_linear_bf16", |sink| {
+            plan_dflash_linear(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    fn dflash_rms_norm_bf16(
+        &mut self,
+        input: DevicePtr,
+        weight: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), CudaError> {
+        let shape = DflashRmsNormShape {
+            input,
+            weight,
+            output,
+            rows,
+            width,
+            epsilon,
+        };
+        self.planned("euhedral_cuda_dflash_rms_norm_bf16", |sink| {
+            plan_dflash_rms_norm(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_conv_bf16(
+        &mut self,
+        input: DevicePtr,
+        dynamic: DevicePtr,
+        base: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        width: u32,
+        group: u32,
+        taps: u32,
+        part: u32,
+    ) -> Result<(), CudaError> {
+        let shape = ConvShape {
+            input,
+            dynamic,
+            base,
+            output,
+            rows,
+            width,
+            group,
+            taps,
+            part,
+        };
+        self.planned("euhedral_cuda_dflash_conv_bf16", |sink| {
+            plan_conv(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_context_kv_bf16(
+        &mut self,
+        kv: DevicePtr,
+        key_norm: DevicePtr,
+        ring_keys: DevicePtr,
+        ring_values: DevicePtr,
+        rows: u32,
+        position: DevicePtr,
+        window: u32,
+        key_value_heads: u32,
+        head_dim: u32,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), CudaError> {
+        let shape = ContextKvShape {
+            kv,
+            key_norm,
+            ring_keys,
+            ring_values,
+            rows,
+            position,
+            window,
+            key_value_heads,
+            head_dim,
+            epsilon,
+            theta,
+        };
+        self.planned("euhedral_cuda_dflash_context_kv_bf16", |sink| {
+            plan_context_kv(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_block_qk_bf16(
+        &mut self,
+        query: DevicePtr,
+        kv: DevicePtr,
+        query_norm: DevicePtr,
+        key_norm: DevicePtr,
+        query_out: DevicePtr,
+        key_out: DevicePtr,
+        rows: u32,
+        position: DevicePtr,
+        heads: u32,
+        key_value_heads: u32,
+        head_dim: u32,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), CudaError> {
+        let shape = BlockQkShape {
+            query,
+            kv,
+            query_norm,
+            key_norm,
+            query_out,
+            key_out,
+            rows,
+            position,
+            heads,
+            key_value_heads,
+            head_dim,
+            epsilon,
+            theta,
+        };
+        self.planned("euhedral_cuda_dflash_block_qk_bf16", |sink| {
+            plan_block_qk(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_attention_bf16(
+        &mut self,
+        query: DevicePtr,
+        block_keys: DevicePtr,
+        kv: DevicePtr,
+        ring_keys: DevicePtr,
+        ring_values: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        position: DevicePtr,
+        window: u32,
+        heads: u32,
+        key_value_heads: u32,
+        head_dim: u32,
+    ) -> Result<(), CudaError> {
+        let shape = AttentionShape {
+            query,
+            block_keys,
+            kv,
+            ring_keys,
+            ring_values,
+            output,
+            scratch,
+            rows,
+            position,
+            window,
+            heads,
+            key_value_heads,
+            head_dim,
+        };
+        self.planned("euhedral_cuda_dflash_attention_bf16", |sink| {
+            plan_attention(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    fn dflash_swiglu_bf16(
+        &mut self,
+        gate_up: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        intermediate: u32,
+    ) -> Result<(), CudaError> {
+        let shape = DflashSwigluShape {
+            gate_up,
+            output,
+            rows,
+            intermediate,
+        };
+        self.planned("euhedral_cuda_dflash_swiglu_bf16", |sink| {
+            plan_dflash_swiglu(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    fn dflash_topk_bf16(
+        &mut self,
+        logits: DevicePtr,
+        rows: u32,
+        vocabulary: u32,
+        values: DevicePtr,
+        indices: DevicePtr,
+        scratch: DevicePtr,
+    ) -> Result<(), CudaError> {
+        let shape = TopkShape {
+            logits,
+            rows,
+            vocabulary,
+            values,
+            indices,
+            scratch,
+        };
+        self.planned("euhedral_cuda_dflash_topk_bf16", |sink| {
+            plan_topk(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_select_bf16(
+        &mut self,
+        hidden: DevicePtr,
+        values: DevicePtr,
+        indices: DevicePtr,
+        predecessor: DevicePtr,
+        successor: DevicePtr,
+        anchor: DevicePtr,
+        positions: u32,
+        rank: u32,
+        tokens: DevicePtr,
+        scores: DevicePtr,
+    ) -> Result<(), CudaError> {
+        let shape = SelectShape {
+            hidden,
+            values,
+            indices,
+            predecessor,
+            successor,
+            anchor,
+            positions,
+            rank,
+            tokens,
+            scores,
+        };
+        self.planned("euhedral_cuda_dflash_select_bf16", |sink| {
+            plan_select(&shape, &mut |launch| sink(launch))
         })
     }
 

@@ -8,7 +8,7 @@
 //! dependent launch (`euhedral_cuda_pdl_register`).
 //!
 //! The families are the ones the Rust engine calls (`ops.rs`). The native library has more kernels (the Q3 gate-up
-//! SwiGLU, the multi-expert GEMMs, the drafter's, `euhedral_linear_bf16_to_float`, `euhedral_gdn_control_fp32`,
+//! SwiGLU, the multi-expert GEMMs, `euhedral_linear_bf16_to_float`, `euhedral_gdn_control_fp32`,
 //! `euhedral_bf16_embedding`, the native gate-up SwiGLU); they stay out until the engine calls them.
 
 use crate::DevicePtr;
@@ -38,6 +38,8 @@ pub enum Module {
     Q45,
     /// Block-scaled FP8 tensor cores for the Q3, Q4 and Q5 prefill; compiled for the architecture-specific target.
     Q3Mx,
+    /// The DFlash2 drafter's operators.
+    Dflash,
     Reference,
 }
 
@@ -59,6 +61,7 @@ impl Module {
             Module::Q3 => "q3/kernels.cu",
             Module::Q45 => "q45/kernels.cu",
             Module::Q3Mx => "q3_mx/kernels.cu",
+            Module::Dflash => "dflash/kernels.cu",
             Module::Reference => "reference/kernels.cu",
         }
     }
@@ -87,6 +90,8 @@ pub enum Family {
     Embedding,
     /// The Q3, Q4 and Q5 grouped linears: decode, reference, FP8 prefill and the P2E2 expansion.
     Q3,
+    /// The DFlash2 drafter's operators.
+    Dflash,
 }
 
 /// One kernel, as the native library has it.
@@ -226,7 +231,7 @@ const LINEAR_TABLE_LEN: usize = 11;
 /// `native/src/host/qwen4_ops.c:12-50`.
 const QWEN4_TABLE_LEN: usize = 36;
 
-const SPECS: [KernelSpec; 188] = [
+const SPECS: [KernelSpec; 202] = [
     spec(
         Family::LinearTable,
         "euhedral_trellis_prepass",
@@ -1075,6 +1080,68 @@ const SPECS: [KernelSpec; 188] = [
     spec(Family::Q3, "euhedral_q3mx_reduce", Module::Q3Mx, 0, false),
     spec(Family::Q3, "euhedral_q3_reference", Module::Reference, 0, false),
     spec(Family::Q3, "euhedral_q45_reference", Module::Reference, 0, false),
+    spec(Family::Dflash, "euhedral_dflash_linear_bf16", Module::Dflash, 0, true),
+    spec(
+        Family::Dflash,
+        "euhedral_dflash_linear_rows_bf16",
+        Module::Dflash,
+        0,
+        true,
+    ),
+    spec(
+        Family::Dflash,
+        "euhedral_dflash_linear_split_bf16",
+        Module::Dflash,
+        0,
+        true,
+    ),
+    spec(
+        Family::Dflash,
+        "euhedral_dflash_linear_rows_split_bf16",
+        Module::Dflash,
+        0,
+        true,
+    ),
+    spec(Family::Dflash, "euhedral_dflash_rms_norm_bf16", Module::Dflash, 0, true),
+    spec(Family::Dflash, "euhedral_dflash_conv_bf16", Module::Dflash, 0, true),
+    spec(
+        Family::Dflash,
+        "euhedral_dflash_context_kv_bf16",
+        Module::Dflash,
+        0,
+        true,
+    ),
+    spec(Family::Dflash, "euhedral_dflash_block_qk_bf16", Module::Dflash, 0, true),
+    spec(
+        Family::Dflash,
+        "euhedral_dflash_attention_tc_bf16",
+        Module::Dflash,
+        32 * 276 * 4 + 2 * 32 * 280 * 2 + 16 * 136 * 2 + 64 * 4,
+        true,
+    ),
+    spec(
+        Family::Dflash,
+        "euhedral_dflash_attention_merge_bf16",
+        Module::Dflash,
+        0,
+        true,
+    ),
+    spec(Family::Dflash, "euhedral_dflash_swiglu_bf16", Module::Dflash, 0, true),
+    spec(
+        Family::Dflash,
+        "euhedral_dflash_topk_partial_bf16",
+        Module::Dflash,
+        0,
+        true,
+    ),
+    spec(
+        Family::Dflash,
+        "euhedral_dflash_topk_merge_bf16",
+        Module::Dflash,
+        0,
+        true,
+    ),
+    spec(Family::Dflash, "euhedral_dflash_select_bf16", Module::Dflash, 0, true),
 ];
 
 /// The parameters of one tensor map, as the C code passes them to `cuTensorMapEncodeTiled` (`byte_map`,
@@ -1380,6 +1447,25 @@ mod tests {
                 registered.insert(format!("euhedral_q{bits}_decode_contiguous_rows{rows}"));
             }
         }
+        // dflash.c:`initialize`: every drafter kernel.
+        for name in [
+            "linear",
+            "linear_rows",
+            "linear_split",
+            "linear_rows_split",
+            "rms_norm",
+            "conv",
+            "context_kv",
+            "block_qk",
+            "attention_tc",
+            "attention_merge",
+            "swiglu",
+            "topk_partial",
+            "topk_merge",
+            "select",
+        ] {
+            registered.insert(format!("euhedral_dflash_{name}_bf16"));
+        }
         // Registered natively and not launched by the Rust engine, so not in the catalog: qwen_layer_ops.c:170
         // (`euhedral_linear_bf16_to_float`) and :171 (`euhedral_gdn_control_fp32`).
         for name in ["euhedral_linear_bf16_to_float", "euhedral_gdn_control_fp32"] {
@@ -1528,6 +1614,11 @@ mod tests {
             85040
         );
         assert_eq!(kernel!("euhedral_nvfp4n_skinny_16").spec().shared_opt_in_bytes, 61440);
+        // dflash.c `ATTENTION_SHARED_BYTES`.
+        assert_eq!(
+            kernel!("euhedral_dflash_attention_tc_bf16").spec().shared_opt_in_bytes,
+            75776
+        );
         assert_eq!(
             kernel!("euhedral_nvfp4n_skinny_32_sd4").spec().shared_opt_in_bytes,
             81920
@@ -1554,7 +1645,7 @@ mod tests {
                 .shared_opt_in_bytes,
             75264
         );
-        assert_eq!(with, 1 + 1 + 2 + 5 + 2 + 6 + 3 + 1);
+        assert_eq!(with, 1 + 1 + 2 + 5 + 2 + 6 + 3 + 1 + 1);
     }
 
     #[test]
