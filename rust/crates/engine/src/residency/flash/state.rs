@@ -3,14 +3,15 @@
 //!
 //! - Attention keys and values live in NVFP4 pages of [`PAGE_TOKENS`] tokens: a row of 256 values takes 144 bytes, and a
 //!   token stores one key row and one value row per 256 values of each KV head, in every sparse-attention layer.
-//! - The indexer keeps one BF16 key of `qsa.head_dim` per `qsa.kv_heads` for every `qsa.compress_ratio` tokens of each
-//!   sparse-attention layer.
+//! - The indexer keeps one BF16 key of `qsa.head_dim` per `qsa.kv_heads` for every complete block of
+//!   `qsa.compress_ratio` tokens of each sparse-attention layer, and two raw tails of the incomplete block's keys.
 //! - Gated DeltaNet keeps an FP32 `key_head_dim x value_head_dim` state per value head and the last `conv_kernel_dim - 1`
 //!   inputs of its convolution in BF16, for each GDN layer, whatever the length.
 //!
 //! Every size is `None` when it overflows 64 bits; [`FlashModelConfig::check_supported`] proves the sizes a plan asks
 //! for do not.
 
+use crate::flash::qsa::state::indexer_layer_bytes;
 use crate::model::{FlashModelConfig, KV_ROW_VALUES};
 
 /// Tokens per KV page.
@@ -51,16 +52,13 @@ impl<'a> SequenceState<'a> {
             .checked_mul(rows_per_token)
     }
 
-    /// Indexer key bytes of one sequence.
+    /// Indexer bytes of one sequence: per sparse-attention layer, one key per complete block and the two raw tails of
+    /// the incomplete block (`QsaState.indexerBytes`).
     pub fn indexer_bytes(&self, tokens: usize) -> Option<u64> {
         let config = self.config;
-        let keys = (tokens as u64).div_ceil(config.qsa_compress_ratio);
-        config
-            .sparse_attention_layers
-            .checked_mul(keys)?
-            .checked_mul(config.qsa_kv_heads)?
-            .checked_mul(config.qsa_head_dim)?
-            .checked_mul(2)
+        let key_bytes = config.qsa_kv_heads.checked_mul(config.qsa_head_dim)?.checked_mul(2)?;
+        let layer = indexer_layer_bytes(tokens as u64, config.qsa_compress_ratio, key_bytes)?;
+        config.sparse_attention_layers.checked_mul(layer)
     }
 
     /// Recurrent state and convolution history of one sequence.
@@ -180,11 +178,13 @@ mod tests {
     }
 
     #[test]
-    fn the_indexer_keeps_one_bf16_key_per_compressed_block_rounded_up() {
+    fn the_indexer_keeps_one_bf16_key_per_complete_block_and_two_raw_tails() {
         let config = config();
         let state = SequenceState::new(&config);
-        // ceil(10 / 4) = 3 keys of 1 head x 16 values x 2 bytes.
-        assert_eq!(state.indexer_bytes(10), Some(3 * 16 * 2));
+        // 10 / 4 = 2 keys and two tails of 3 keys, of 1 head x 16 values x 2 bytes.
+        assert_eq!(state.indexer_bytes(10), Some((2 + 6) * 16 * 2));
+        // Fewer tokens than a block still keep one key.
+        assert_eq!(state.indexer_bytes(1), Some((1 + 6) * 16 * 2));
     }
 
     #[test]

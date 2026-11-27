@@ -176,3 +176,63 @@ fn stages_over_regions_of_another_shape_or_with_too_little_scratch_are_refused()
     let no_layer = ScratchSizes { layer: 0, ..full };
     assert_eq!(stages(regions_of(4, no_layer)), [false, true, true]);
 }
+
+/// A body that queues a residual add whose row count is the chunk's start, and whose width is the tail slot, so the
+/// tests read what reached the body.
+#[derive(Debug)]
+struct ChunkReader;
+
+impl BlockBody for ChunkReader {
+    fn scratch_bytes(&self, _rows: u32) -> u64 {
+        0
+    }
+
+    fn expansion_bytes(&self, _rows: u32) -> u64 {
+        0
+    }
+
+    fn ops(&self, call: &BlockCall) -> Result<OpList<'static>, FlashError> {
+        let mut list = OpList::new();
+        list.push(Op::ResidualAdd {
+            residual: call.chunk.key_table,
+            delta: call.chunk.value_table,
+            output: call.output,
+            rows: call.chunk.start,
+            width: call.chunk.tail_slot,
+        });
+        Ok(list)
+    }
+}
+
+#[test]
+fn the_chunk_a_caller_names_reaches_the_body_and_the_default_is_a_first_chunk_with_no_tables() {
+    let (hyper, regions) = regions();
+    let stage = BlockStage::new(hyper, site(true), site(true), Arc::new(ChunkReader), regions).unwrap();
+    let chunk = ChunkAt {
+        start: 40,
+        key_table: at(0xa000),
+        value_table: at(0xb000),
+        tail_slot: 1,
+    };
+    let reached = |ops: &OpList<'static>| lines(ops)[6].clone();
+    let named = Op::ResidualAdd {
+        residual: at(0xa000),
+        delta: at(0xb000),
+        output: regions_output(&stage),
+        rows: 40,
+        width: 1,
+    };
+    assert_eq!(reached(&stage.ops_at(2, false, chunk).unwrap()), named.line());
+    let first = Op::ResidualAdd {
+        residual: DevicePtr::NULL,
+        delta: DevicePtr::NULL,
+        output: regions_output(&stage),
+        rows: 0,
+        width: 0,
+    };
+    assert_eq!(reached(&stage.ops(2, false).unwrap()), first.line());
+}
+
+fn regions_output(stage: &BlockStage) -> DevicePtr {
+    stage.regions.block_output
+}

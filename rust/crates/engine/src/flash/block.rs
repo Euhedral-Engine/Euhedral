@@ -16,7 +16,34 @@ use super::buffers::{FlashRegions, ScratchSizes, StreamShape};
 use super::hyper::{HyperScratch, HyperShape, HyperWeights};
 use super::linear::Expansion;
 use super::sequence::{Op, OpList, queue_all};
+use crate::stages::attention::KvSource;
 use crate::stages::{Launch, Quantum, fatal};
+
+/// Where a call's rows lie in their sequence, and the per-chunk device state of that sequence a token mixer reads. The
+/// sequence's owner makes it (for sparse attention from [`QsaState::begin_chunk`](super::qsa::state::QsaState) and the
+/// cache's page tables); a mixer with no state per position (GDN) ignores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkAt {
+    /// The position of the call's first row in its sequence.
+    pub start: u32,
+    /// The device tables of the K and V page addresses of the layer's cache.
+    pub key_table: DevicePtr,
+    pub value_table: DevicePtr,
+    /// The slot (0 or 1) of the raw indexer tail the chunk reads; it writes the other.
+    pub tail_slot: u32,
+}
+
+impl Default for ChunkAt {
+    /// The first chunk of a sequence that has no cache: no page tables, which the mixers that need them refuse.
+    fn default() -> Self {
+        Self {
+            start: 0,
+            key_table: DevicePtr::NULL,
+            value_table: DevicePtr::NULL,
+            tail_slot: 0,
+        }
+    }
+}
 
 /// What a block is called with.
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +58,8 @@ pub struct BlockCall {
     pub scratch: DevicePtr,
     /// The expansion scratch of the NVFP4 linears' native route.
     pub expansion: Expansion,
+    /// Where the rows lie in their sequence.
+    pub chunk: ChunkAt,
 }
 
 /// The token mixer of a layer between its two hyper-connection sites.
@@ -82,6 +111,8 @@ pub struct BlockStage {
     moe_site: HyperWeights,
     body: Arc<dyn BlockBody>,
     regions: FlashRegions,
+    /// The layer's place among the layers of the sequence's cache, when its body reads one.
+    kv_layer: Option<usize>,
 }
 
 impl BlockStage {
@@ -115,11 +146,24 @@ impl BlockStage {
             moe_site,
             body,
             regions,
+            kv_layer: None,
         })
     }
 
-    /// The operations for `rows` rows, in order: the mix for the block, the block, the injection, the mix for MoE.
+    /// The stage of a layer whose block reads the page tables of layer `layer` of the quantum's cache.
+    pub fn with_kv_layer(mut self, layer: usize) -> Self {
+        self.kv_layer = Some(layer);
+        self
+    }
+
+    /// The operations for `rows` rows of a sequence's first chunk, in order: the mix for the block, the block, the
+    /// injection, the mix for MoE.
     pub fn ops(&self, rows: u32, exact: bool) -> Result<OpList<'static>, FlashError> {
+        self.ops_at(rows, exact, ChunkAt::default())
+    }
+
+    /// The operations for `rows` rows at `chunk`.
+    pub fn ops_at(&self, rows: u32, exact: bool, chunk: ChunkAt) -> Result<OpList<'static>, FlashError> {
         let regions = &self.regions;
         let scratch = self.hyper.scratch(regions.hyper_scratch, rows);
         let mut list = self.hyper.mix(
@@ -137,6 +181,7 @@ impl BlockStage {
             exact,
             scratch: regions.layer_scratch,
             expansion: regions.expansion_scratch(),
+            chunk,
         })?);
         list.push(
             self.hyper
@@ -157,8 +202,36 @@ impl Launch for BlockStage {
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let rows = rows_of(quantum, &self.regions)?;
-        let ops = self.ops(rows, kernels.exact_numerics()).map_err(fatal)?;
+        let chunk = self.chunk_of(quantum)?;
+        let ops = self.ops_at(rows, kernels.exact_numerics(), chunk).map_err(fatal)?;
         queue_all(&ops, kernels).map_err(fatal)
+    }
+}
+
+impl BlockStage {
+    /// Where the quantum's rows lie: the segment's start and, for a layer that reads the cache, its page tables from
+    /// the view the quantum took at admission. The tail slot is the committed one (0): a sequence with chunks of
+    /// several quanta in flight supplies its own through [`BlockStage::ops_at`].
+    fn chunk_of(&self, quantum: &Quantum) -> Result<ChunkAt, StageError> {
+        let segment = quantum.segment();
+        let start = u32::try_from(segment.start_position)
+            .map_err(|_| fatal(format!("position {} exceeds 32 bits", segment.start_position)))?;
+        let Some(layer) = self.kv_layer else {
+            return Ok(ChunkAt { start, ..ChunkAt::default() });
+        };
+        let view = segment
+            .refs
+            .kv(KvSource::Base)
+            .ok_or_else(|| fatal("the quantum has no view of the cache".to_owned()))?;
+        let table = |tables: Option<DevicePtr>, name: &str| {
+            tables.ok_or_else(|| fatal(format!("the cache has no {name} page table for layer {layer}")))
+        };
+        Ok(ChunkAt {
+            start,
+            key_table: table(view.key_table(layer), "K")?,
+            value_table: table(view.value_table(layer), "V")?,
+            tail_slot: 0,
+        })
     }
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::flash::block::ChunkAt;
 use crate::flash::linear::Expansion;
 use crate::flash::sequence::lines;
 
@@ -67,6 +68,7 @@ fn call(rows: u32) -> BlockCall {
             address: at(0x800000),
             bytes: body().expansion_bytes(rows.max(64)),
         },
+        chunk: ChunkAt::default(),
     }
 }
 

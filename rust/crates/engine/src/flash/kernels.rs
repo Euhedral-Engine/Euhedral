@@ -1,6 +1,8 @@
-//! The kernels of the Flash-Next table (`euhedral_cuda_qwen4_launch`, native/src/host/qwen4_ops.c) the dense part
-//! launches. The discriminant is the kernel's index in the table, which is its ABI; a test compares every name with the
-//! catalog's.
+//! The kernels of the Flash-Next table (`euhedral_cuda_qwen4_launch`, native/src/host/qwen4_ops.c) the dense part and
+//! the sparse attention launch. The discriminant is the kernel's index in the table, which is its ABI; a test compares
+//! every name with the catalog's.
+
+use euhedral_inference_cuda::launch::catalog::qwen4_table;
 
 use crate::formats::shapes::{KernelArguments, Launch, Table};
 
@@ -21,6 +23,14 @@ pub enum Qwen4Kernel {
     GdnConv = 10,
     GdnControl = 11,
     GdnGatedNorm = 12,
+    HeadNormRope = 13,
+    QsaPoolKeys = 14,
+    QsaTail = 15,
+    QsaScores = 16,
+    QsaSelect = 17,
+    QsaAttention = 18,
+    QsaMerge = 19,
+    QsaKvAppend = 20,
     Embedding = 24,
     LinearTc = 30,
     LinearTcSplit = 31,
@@ -32,7 +42,7 @@ pub enum Qwen4Kernel {
 
 impl Qwen4Kernel {
     /// Every kernel the dense part launches.
-    pub const ALL: [Qwen4Kernel; 20] = [
+    pub const ALL: [Qwen4Kernel; 28] = [
         Qwen4Kernel::LinearBf16,
         Qwen4Kernel::GroupedRmsNorm,
         Qwen4Kernel::ScaledSilu,
@@ -46,6 +56,14 @@ impl Qwen4Kernel {
         Qwen4Kernel::GdnConv,
         Qwen4Kernel::GdnControl,
         Qwen4Kernel::GdnGatedNorm,
+        Qwen4Kernel::HeadNormRope,
+        Qwen4Kernel::QsaPoolKeys,
+        Qwen4Kernel::QsaTail,
+        Qwen4Kernel::QsaScores,
+        Qwen4Kernel::QsaSelect,
+        Qwen4Kernel::QsaAttention,
+        Qwen4Kernel::QsaMerge,
+        Qwen4Kernel::QsaKvAppend,
         Qwen4Kernel::Embedding,
         Qwen4Kernel::LinearTc,
         Qwen4Kernel::LinearTcSplit,
@@ -76,6 +94,14 @@ impl Qwen4Kernel {
             Qwen4Kernel::GdnConv => "euhedral_q4_gdn_conv_bf16",
             Qwen4Kernel::GdnControl => "euhedral_q4_gdn_control_bf16",
             Qwen4Kernel::GdnGatedNorm => "euhedral_q4_gdn_gated_norm_bf16",
+            Qwen4Kernel::HeadNormRope => "euhedral_q4_head_norm_rope_bf16",
+            Qwen4Kernel::QsaPoolKeys => "euhedral_q4_qsa_pool_keys_bf16",
+            Qwen4Kernel::QsaTail => "euhedral_q4_qsa_tail_bf16",
+            Qwen4Kernel::QsaScores => "euhedral_q4_qsa_scores",
+            Qwen4Kernel::QsaSelect => "euhedral_q4_qsa_select",
+            Qwen4Kernel::QsaAttention => "euhedral_q4_qsa_attention",
+            Qwen4Kernel::QsaMerge => "euhedral_q4_qsa_merge",
+            Qwen4Kernel::QsaKvAppend => "euhedral_q4_qsa_kv_append",
             Qwen4Kernel::Embedding => "euhedral_q4_embedding_bf16",
             Qwen4Kernel::LinearTc => "euhedral_q4_linear_tc_bf16",
             Qwen4Kernel::LinearTcSplit => "euhedral_q4_linear_tc_split_bf16",
@@ -86,15 +112,26 @@ impl Qwen4Kernel {
         }
     }
 
+    /// The dynamic shared bytes the catalog opts the kernel in to: what its launches ask for (0 for a kernel that
+    /// uses none).
+    pub fn shared_bytes(self) -> u32 {
+        qwen4_table()[self.index() as usize].shared_opt_in_bytes
+    }
+
     /// A launch of this kernel with no dynamic shared memory (Java launches none).
     pub fn launch(self, grid: [u32; 3], block: [u32; 3], args: KernelArguments) -> Launch {
+        self.launch_shared(grid, block, 0, args)
+    }
+
+    /// A launch of this kernel with `shared_bytes` of dynamic shared memory.
+    pub fn launch_shared(self, grid: [u32; 3], block: [u32; 3], shared_bytes: u32, args: KernelArguments) -> Launch {
         Launch {
             table: Table::Qwen4,
             kernel: self.index(),
             symbol: self.symbol(),
             grid,
             block,
-            shared_bytes: 0,
+            shared_bytes,
             args,
         }
     }
@@ -102,8 +139,6 @@ impl Qwen4Kernel {
 
 #[cfg(test)]
 mod tests {
-    use euhedral_inference_cuda::launch::catalog::qwen4_table;
-
     use super::*;
 
     #[test]

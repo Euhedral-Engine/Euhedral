@@ -33,6 +33,7 @@ pub mod linear;
 pub mod ops;
 pub mod plan;
 pub mod ple;
+pub mod qsa;
 pub mod sequence;
 
 use euhedral_inference_cuda::DevicePtr;

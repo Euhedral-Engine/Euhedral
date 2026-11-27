@@ -14,14 +14,14 @@ const WARP_BLOCK: u32 = 256;
 const TC_BLOCK: u32 = 128;
 const TC_MIN_ROWS: u32 = 9;
 
-fn positive(op: &'static str, extents: &[(&str, u32)]) -> Result<(), FlashError> {
+pub(crate) fn positive(op: &'static str, extents: &[(&str, u32)]) -> Result<(), FlashError> {
     match extents.iter().find(|(_, value)| *value == 0) {
         Some((name, _)) => Err(FlashError::refused(op, format!("{name} must be positive, got 0"))),
         None => Ok(()),
     }
 }
 
-fn aligned(op: &'static str, alignment: u64, addresses: &[(&str, DevicePtr)]) -> Result<(), FlashError> {
+pub(crate) fn aligned(op: &'static str, alignment: u64, addresses: &[(&str, DevicePtr)]) -> Result<(), FlashError> {
     match addresses
         .iter()
         .find(|(_, address)| address.is_null() || address.get() % alignment != 0)
@@ -35,7 +35,7 @@ fn aligned(op: &'static str, alignment: u64, addresses: &[(&str, DevicePtr)]) ->
 }
 
 /// `value / divisor` rounded up, as a launch dimension.
-fn blocks(op: &'static str, value: u64, divisor: u64) -> Result<u32, FlashError> {
+pub(crate) fn blocks(op: &'static str, value: u64, divisor: u64) -> Result<u32, FlashError> {
     u32::try_from(value.div_ceil(divisor))
         .map_err(|_| FlashError::refused(op, format!("{value} items in blocks of {divisor} exceed a grid")))
 }
