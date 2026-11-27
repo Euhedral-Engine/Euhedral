@@ -44,7 +44,7 @@ use crate::handoff::Handoff;
 use crate::model::flash_config::FlashModelConfig;
 use crate::residency::accounting::{Consumer, PlanReservation};
 use crate::residency::budget::{BudgetSource, HostBudget};
-use crate::residency::disk::{ArtifactFile, DiskReadPiece};
+use crate::residency::disk::DiskReadPiece;
 use crate::residency::expert_cache::{
     CacheConfig, CacheError, CopyLane, DeviceSlots, ExpertCache, Frames, RuntimeLanes,
 };
@@ -355,6 +355,11 @@ fn open(boot: Boot) {
 
 /// Reads the header and the footer, then the metadata, tables and tokenizer they locate, and parses them.
 fn index(boot: Boot, path: PathBuf, file: OwnedFile) {
+    // The open went by the name: it must have found the file the engine holds.
+    let (admitted, file) = startup::admitted(&boot.core.guards, &path, file);
+    if let Err(error) = admitted {
+        return boot.fail(error.into());
+    }
     let (length, file) = startup::file_len(file);
     let length = match length {
         Ok(length) => length,
@@ -968,8 +973,7 @@ fn build_tables(
         let plan = &planned.plan;
         let path = &core.settings.model.artifact;
         let layout = Arc::clone(&planned.experts);
-        let file =
-            ArtifactFile::open(path).map_err(|error| EngineError::io(format!("opening {}", path.display()), error))?;
+        let file = startup::open_artifact(&core.guards, path)?;
         let piece = planned.piece;
         let port: Arc<dyn PartPort> = Arc::new(FilePartPort::new(Arc::clone(&core.io), Arc::new(file), piece));
         let split = core.settings.memory.weight_streaming.read_split as usize;
