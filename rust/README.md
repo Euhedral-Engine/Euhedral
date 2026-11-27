@@ -87,7 +87,7 @@ unpacked under `build/cuda-dev/<product>`; for the host's own product, `CUDA_HOM
 toolkit instead (`--force-download` ignores it). Headers that disagree, or a toolkit without the libraries, are
 refused. `cargo xtask native-verify [--product <id>]` checks a built tree: the kernel sources equal `native/src`, the
 library imports the CUDA runtime of its platform, and `files.sha256` lists the files there. Rust links llguidance as a
-crate, so the tree carries no llguidance library (the Gradle build adds one for the Java engine).
+crate, so the tree carries no llguidance library.
 
 ## Server bundle
 
@@ -107,7 +107,7 @@ files.sha256          the manifest of the kernel sources
 
 Unpack it anywhere and run `bin/euhedral-server --config <file>`: with no `host.native-cache` set, the server finds
 `lib/` beside `bin/`. CI builds both products' archives in the `native-package` job, cross-building the Windows server on Linux, and uploads them as
-`rust-server-linux-x64` and `rust-server-windows-x64` next to the server jar; a missing or empty input fails the job.
+`rust-server-linux-x64` and `rust-server-windows-x64`; a missing or empty input fails the job.
 
 `docker build -f rust/Dockerfile .` (from the repository root) puts the linux-x64 bundle and `euhedral-health-probe`, the
 image's health check, into the distroless image; see `docs/OPERATIONS.md`.
@@ -117,7 +117,7 @@ image's health check, into the distroless image; see `docs/OPERATIONS.md`.
 `euhedral-inference-quantization` (`crates/quantization`) is the library behind the quantization tools: seeded `Random` and
 `SplittableRandom` generators in the style of Java's (`java_random`), and the `.npy` and `.npz` formats (`npy`,
 `npz`). `euhedral-inference-quantize` (`crates/quantize`) is the command line, a binary called `quantization` that
-dispatches the commands of the Java tool. A command whose work is not wired yet exits with code 3; `train-blocks`,
+dispatches the quantization commands. A command whose work is not wired yet exits with code 3; `train-blocks`,
 `train-model` and `rotate` are not part of this tool.
 
 ## cuBLAS and cuSOLVER
@@ -132,7 +132,7 @@ Test settings are looked up in this order: `EUHEDRAL_TEST_<KEY>` in the environm
 
 ## Benchmark
 
-`euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with the Java benchmark's configuration
+`euhedral-bench` (crate `euhedral-inference-bench`) measures the Rust engine with its configuration
 files (`rust/resources/bench/configs`) and writes rows in its result schema (`euhedral-inference.benchmark-result` version 1,
 `implementation` `rust`):
 
@@ -159,8 +159,8 @@ euhedral-bench drift --artifact FILE --prefix N --steps N --candidate host-tier|
 `score` forces each chunk of a llama.cpp reference (`.kld`) on a fresh sequence: a prefill of N / 2 + 1 tokens, then the
 rest teacher-forced one row at a time (the rows a verification of up to 8 tokens gives). Each logits row is copied,
 its reference record is read with `AsyncIo`, and the row is scored in a frame of the `host` lake: NLL, reference NLL, KL over the reference entries above the -16 floor, top-1 agreement and the
-probability difference. The summary lines are the Java scorer's, appended to `--results`; `--values DIR` writes
-`DIR/NAME.values` in the format `tools/t5/run.py` reads (`--engine rust --rust-bench PATH`).
+probability difference. The summary lines are appended to `--results`; `--values DIR` writes
+`DIR/NAME.values` in the format `tools/t5/run.py` reads (`--rust-bench PATH`).
 
 `drift` decodes `PREFIX + STEPS` forced tokens of the corpus document twice and compares the second run's final hidden
 state and logits row with the first's at every step: the first on the default settings (all layers on the GPU), the

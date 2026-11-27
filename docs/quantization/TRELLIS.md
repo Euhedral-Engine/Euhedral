@@ -64,8 +64,8 @@ The prepass outputs fit FP16 with a wide margin: over two calibration sequences,
 ## Building an artifact
 
 ```bash
-./gradlew :quantization:run --args="calibrate --model CHECKPOINT_DIR --format trellis --bits 3.5 \
-    --tokens TOKENS.npy --draft-ids-from Q3_ARTIFACT.edrl --out EXL3_DIR"
+cargo run --release -p euhedral-inference-quantize -- calibrate --model CHECKPOINT_DIR --format trellis --bits 3.5 \
+    --tokens TOKENS.npy --draft-ids-from Q3_ARTIFACT.edrl --out EXL3_DIR
 python3 tools/convert_checkpoint.py --model CHECKPOINT_DIR --quantization trellis --trellis-from EXL3_DIR \
     --codes-from EXL3_DIR/heads --draft-ids-from Q3_ARTIFACT.edrl --out qwen3_8_27b_trellis_3_5.edrl
 ```

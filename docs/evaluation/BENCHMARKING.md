@@ -1,8 +1,7 @@
 # Benchmarking
 
-The `benchmark` Gradle module is an end-to-end harness. It loads `InferenceEngine`, creates a fresh
-session for every iteration (`createGenerationSession`), for either model, and runs the real tokenizer -> Euhedral lattice -> CUDA
-path. It is not part of `core` or `api` and is not packaged in the API JAR. The `run` command writes
+`euhedral-bench` (crate `euhedral-inference-bench`, in `rust/`) is an end-to-end harness. It loads the engine, creates a fresh
+session for every iteration, and runs the real tokenizer -> lattice -> CUDA path. The `run` command writes
 end-to-end engine measurements. The engine derives its execution policy (kernels, speculative
 depth, host-backed weight residency) from the artifact, and prefill runs in 512-token chunks, so
 the harness measures what a user of the engine gets.
@@ -14,16 +13,16 @@ Change one variable at a time and keep the JSON for every run you compare.
 1. **Build.**
 
    ```bash
-   ./gradlew build
+   cd rust
+   cargo xtask native --product linux-x64
+   cargo build --release -p euhedral-inference-bench
    ```
 
-2. **Correctness and integration tests.** Unit tests need no GPU. The CUDA suites need the
-   artifacts and a GPU with room for the model.
+2. **Correctness and integration tests.** Unit tests need no GPU. The device tests need the
+   artifacts and a GPU with room for the model ([testing](TESTING.md)).
 
    ```bash
-   ./gradlew test
-   ./gradlew :core:tokenizerReferenceTest -Peuhedral.qwen.tokenizer-dir=CHECKPOINT_DIR
-   ./gradlew cudaIntegrationTest -Peuhedral.qwen.artifact=ARTIFACT.edrl
+   mise run rust-test
    ```
 
 3. **Check the GPU is free.** The engine refuses to load, and the run exits with code 3 without
@@ -42,32 +41,28 @@ Change one variable at a time and keep the JSON for every run you compare.
    treating any timing as a baseline.
 
    ```bash
-   ./gradlew :benchmark:run --args="run rust/resources/bench/configs/baseline.json --validate-only"
+   cargo run --release -p euhedral-inference-bench -- run resources/bench/configs/baseline.json --validate-only
    ```
 
 5. **Baseline benchmark.** The default suite on all available processors with the default
    context capacity.
 
    ```bash
-   ./gradlew :benchmark:run --args="run rust/resources/bench/configs/baseline.json"
+   cargo run --release -p euhedral-inference-bench -- run resources/bench/configs/baseline.json
    ```
 
 6. **Retain the JSON.** Rows are appended to the configured `output` as they complete (JSONL), and a
    summary is printed at the end. `benchmark-results/` is git-ignored; archive it deliberately
    together with the commit you measured (`git rev-parse HEAD`).
 
-7. **External NVIDIA profiling.** Profile outside Gradle so the profiler sees one JVM. Install the
-   start script and build the native product; the library finds the CUDA runtime, NVRTC and the CUDA
+7. **External NVIDIA profiling.** Profile the built binary, not `cargo run`, so the profiler sees one process. Build the native product; the library finds the CUDA runtime, NVRTC and the CUDA
    headers in its own layout (`build/native/linux-x64/`).
 
    ```bash
-   ./gradlew :benchmark:installDist nativeBuild
    nsys profile --trace=cuda,nvtx,osrt -o benchmark-results/smoke \
-     benchmark/build/install/euhedral-inference-benchmark/bin/euhedral-inference-benchmark \
-     run rust/resources/bench/configs/smoke.json
+     rust/target/release/euhedral-bench run rust/resources/bench/configs/smoke.json
    ncu --target-processes all -o benchmark-results/smoke-kernels \
-     benchmark/build/install/euhedral-inference-benchmark/bin/euhedral-inference-benchmark \
-     run rust/resources/bench/configs/smoke.json
+     rust/target/release/euhedral-bench run rust/resources/bench/configs/smoke.json
    ```
 
    Profiled runs are slower; give each command a fresh result path and keep their JSON separate
@@ -77,11 +72,11 @@ Change one variable at a time and keep the JSON for every run you compare.
 8. **Change one variable**, for example the CPU selection:
 
    ```bash
-   ./gradlew :benchmark:run --args="run rust/resources/bench/configs/custom-cpus.json"
+   cargo run --release -p euhedral-inference-bench -- run resources/bench/configs/custom-cpus.json
    ```
 
 9. **Rerun and compare** against the retained baseline. Use the same scenarios, prompt seed,
-   warmup, and iteration counts. Repeat each configuration in several JVMs (forks, below) before
+   warmup, and iteration counts. Repeat each configuration in several processes (forks, below) before
    drawing a conclusion.
 
 10. **Retain or revert.** Keep the change only if it improves the metric you targeted without
@@ -92,7 +87,7 @@ Change one variable at a time and keep the JSON for every run you compare.
 
 `run CONFIG.json [--fork-id ID] [--validate-only]`. The config is JSON. Only `artifact` and
 `cudaLibrary` are required, and unknown fields are rejected. Relative paths resolve
-against the working directory, which is the repository root under `./gradlew :benchmark:run`.
+against the working directory.
 
 | Field | Default | Meaning |
 | ----- | ------- | ------- |
@@ -113,7 +108,7 @@ against the working directory, which is the repository root under `./gradlew :be
 | `promptCorpus` | `words` | `words` draws seeded random words; `chat` uses chat-templated prompts (thinking disabled) built from a fixed corpus; iteration i runs prompt i mod corpus size. |
 | `shutdownTimeoutSeconds` | `10` | Engine shutdown timeout. |
 
-CPU selection uses the core `ProcessorTopology`. Unavailable IDs are rejected, not dropped. On hosts
+CPU selection uses the lattice's processor topology. Unavailable IDs are rejected, not dropped. On hosts
 where Euhedral cannot classify performance and efficiency cores, `performance` selects every
 available processor.
 
@@ -137,25 +132,25 @@ keeps the cache off.
 
 ### Forks
 
-A fork is a separately launched JVM. Only an externally supplied `--fork-id` names one. Iterations
-inside one JVM share `runId` and `fork.pid` and are never independent forks. To collect forks, run
+A fork is a separately launched process. Only an externally supplied `--fork-id` names one. Iterations
+inside one process share `runId` and `fork.pid` and are never independent forks. To collect forks, run
 the same config several times with an appending output:
 
 ```bash
 for fork in 1 2 3; do
-  ./gradlew :benchmark:run --args="run rust/resources/bench/configs/forks.json --fork-id $fork"
+  cargo run --release -p euhedral-inference-bench -- run resources/bench/configs/forks.json --fork-id $fork
 done
 ```
 
 The checked-in `forks.json` sets `"append": true` and writes to `benchmark-results/forks.jsonl`.
 Record the exact artifact and native library alongside these fork results; iterations inside one
-JVM are not independent replicates.
+process are not independent replicates.
 
 ## Prompts
 
 Prompts are raw text, not chat-templated. Words are drawn from a fixed list
-(`PromptMaterial.WORDS`) by `SplittableRandom(promptSeed)`. The longest word prefix whose
-`encodeWithModelSpecialTokens` count, the count the session itself encodes, fits the target is kept,
+by a `SplittableRandom` seeded with `promptSeed`. The longest word prefix whose
+encoded token count, the count the session itself encodes, fits the target is kept,
 then punctuation suffixes are tried to reach the target exactly. Each row records the target, the
 actual encoded count (`work.promptTokens`), the generator, the seed, and the prompt's SHA-256.
 `--validate-only` prints the actual counts. The session's own count is checked against the
@@ -163,13 +158,13 @@ prepared count; a mismatch fails the row.
 
 ## Metrics
 
-All timestamps are `System.nanoTime()` on the generating thread. Each duration comes from its own
+All timestamps are monotonic clock readings on the generating thread. Each duration comes from its own
 boundary pair; none is derived by subtracting one phase from an aggregate.
 
-Boundaries come from an opt-in `GenerationTimingListener` on `Session.generate`. Without
-a listener the session records nothing and calls nothing extra.
+Boundaries come from an opt-in timing callback on the session's generate call. Without
+a callback the session records nothing and calls nothing extra.
 
-- **generate entry / return:** taken immediately around `session.generate`. Session creation and
+- **generate entry / return:** taken immediately around the session's generate call. Session creation and
   close are excluded.
 - **prompt encoded:** after tokenization.
 - **prefill quantum:** from before the quantum's context is built to successful runtime execution,
@@ -229,11 +224,11 @@ below is illustrative; its values are not a measurement.
 ```json
 {
   "schema": "euhedral-inference.benchmark-result", "schemaVersion": 1,
-  "implementation": "euhedral-inference",
-  "provenance": {"kind": "measured", "tool": "euhedral-inference-benchmark", "commandLine": "run rust/resources/bench/configs/baseline.json",
+  "implementation": "rust",
+  "provenance": {"kind": "measured", "tool": "euhedral-bench", "commandLine": "run resources/bench/configs/baseline.json",
                  "source": null, "sourceSha256": null, "note": null},
-  "runId": "<uuid per JVM>",
-  "fork": {"id": null, "source": "unspecified", "pid": 1234, "jvmStartedAt": "<instant>"},
+  "runId": "<uuid per process>",
+  "fork": {"id": null, "source": "unspecified", "pid": 1234, "jvmStartedAt": "<process start instant>"},
   "recordedAt": "<instant>",
   "scenario": {"name": "decode-32-256", "kind": "decode", "targetPromptTokens": 32, "requestedNewTokens": 256,
                "promptGenerator": "euhedral-words-v1", "promptSeed": 20260925, "promptSha256": "<hex>"},
@@ -252,28 +247,8 @@ below is illustrative; its values are not a measurement.
 }
 ```
 
-`engine` is the engine's `InferenceRunSnapshot`: configuration (worker processors, context
+`engine` is the engine's run snapshot: configuration (worker processors, context
 capacity, artifact name, and the speculative depth the engine selected), worker cores, model
-identity and dimensions, generation settings, and Java/Euhedral/native identity. Values the runtime
+identity and dimensions, generation settings, and the engine, operating system and native library identity. Values the runtime
 does not expose, such as the CUDA runtime version, are `"unavailable"`. `gpuMemory` is null unless
 `gpuMemory` is enabled; it is device-wide, so it includes other processes.
-
-## Importing external results
-
-External results, for example from NInfer, can be stored beside these rows if they already use this
-schema and name themselves in `implementation`. This does not launch NInfer.
-
-```bash
-./gradlew :benchmark:run --args="import --input /path/to/ninfer.jsonl --implementation ninfer \
-  --output benchmark-results/baseline.jsonl --append --note 'NInfer abc123, same host'"
-```
-
-Import validates every row:
-
-- schema and version must match, and unknown fields are rejected;
-- a row whose `implementation` differs from `--implementation` is rejected;
-- failed rows may carry no rates;
-- every reported rate must equal this document's definition over the row's own work and timings.
-
-Imported rows get `provenance.kind = "imported"`, the absolute source path, the source file's
-SHA-256, and the note. The original tool and command line are kept.

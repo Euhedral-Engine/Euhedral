@@ -1,8 +1,8 @@
 # Euhedral CUDA native ABI
 
-This directory contains the plain C ABI used by the Java Foreign Function & Memory binding.
+This directory contains the plain C ABI used by the Rust binding (`rust/crates/cuda`).
 
-The engine requires an NVIDIA Blackwell GPU (compute capability 12.x); `CudaGpuMemory` fails to construct on any other device.
+The engine requires an NVIDIA Blackwell GPU (compute capability 12.x); the engine refuses any other device.
 
 The minimum CUDA header/runtime ABI is 13.1.x. An installed newer CUDA 13.x toolkit is accepted
 when its headers and target libraries are complete. The host must also provide the CUDA driver library and NVRTC runtime; the driver must
@@ -84,7 +84,7 @@ The exported C API (`include/euhedral_cuda.h`) falls into these groups:
 ## Tests
 
 `tests/` holds the native Python/CUDA tests. They compile a source with the pinned NVRTC runtime and launch its kernels on the device,
-and skip when the runtime or a GPU is unavailable; the pinned runtime is built by the Gradle native tasks. Several tests (attention, MXFP8, native FP4) need
+and skip when the runtime or a GPU is unavailable; the pinned runtime is built by `cargo xtask native`. Several tests (attention, MXFP8, native FP4) need
 NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading, launches); the tests are:
 
 | Test | Covers |
@@ -107,74 +107,54 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 | `test_products.py` | The installed CUDA products against `native-products.json`. |
 
 `native-products.json` defines the two supported targets: `x86_64-linux-gnu` (`linux-x64`)
-and `x86_64-windows-gnu` (`windows-x64`). There is no macOS CUDA product. `nativeBuild` builds
-both products, each into the layout the server jar carries, at `build/native/<product>/`:
+and `x86_64-windows-gnu` (`windows-x64`). There is no macOS CUDA product. `cargo xtask native` builds
+both products, each into the layout the server bundle carries, at `build/native/<product>/`:
 
-- `lib/`: the CUDA library, llguidance, and the CUDA runtime and NVRTC (with its builtins) it links;
-- `share/euhedral_cuda/`: the runtime-compiled CUDA tree, which `nativeVerify` checks equals `src/`;
+- `lib/`: the CUDA library, and the CUDA runtime and NVRTC (with its builtins) it links;
+- `share/euhedral_cuda/`: the runtime-compiled CUDA tree, which `cargo xtask native-verify` checks equals `src/`;
 - `cuda/include/`: the CUDA headers NVRTC compiles the kernels against;
 - `files.sha256`: every file's SHA-256 and relative path.
 
 The Linux library carries the search path `$ORIGIN`, so it finds the runtime beside it; on Windows the engine loads the
 runtime DLLs from the same directory by full path before the library. The engine passes the headers' directory
-(`cuda/include` beside `lib/`) to the library (`euhedral_cuda_set_include_directory`). `:api:bootJarLinuxX64` and
-`:api:bootJarWindowsX64` embed a product under `META-INF/euhedral-native/<product>/` of
-`euhedral-inference-<product>.jar`, and the server unpacks it at startup; `:api:bootJar` builds the host's.
+(`cuda/include` beside `lib/`) to the library (`euhedral_cuda_set_include_directory`). `cargo xtask bundle` puts a
+product and the server binary into one directory (`rust/README.md`).
 
-For ordinary builds Gradle uses the pinned CUDA 13.1 redistributables. Set `CUDA_HOME` or
+For ordinary builds the pinned CUDA 13.1 redistributables are used. Set `CUDA_HOME` or
 `CUDA_PATH` to explicitly select an installed matching host toolkit instead; merely installing
 one at `/usr/local/cuda` or under Program Files does not override the pinned default. A newer
 host NVRTC can emit PTX the installed driver cannot JIT, even if its headers and libraries link.
 The selected host toolkit must have headers at version 13.1 or higher,
 the runtime/NVRTC link libraries, and the target driver stub/import library. When no suitable
-host toolkit is selected, Gradle downloads the official NVIDIA 13.1 cudart, NVRTC, CUDA CRT,
+host toolkit is selected, `cargo xtask native` downloads the official NVIDIA 13.1 cudart, NVRTC, CUDA CRT,
 and CCCL redistributable archives for each target, checks the SHA-256 values in the manifest,
-and caches them under the Gradle user home. The Windows driver import is generated with the
+and caches them under the user cache directory. The Windows driver import is generated with the
 pinned Zig `dlltool` from an explicit driver ABI export list; it does not link the host's
 Linux driver stub or NVIDIA's Windows static loader. Downloads include no NVIDIA kernel driver.
+Rust links llguidance as a crate, so the products carry no llguidance library.
 
-The Rust build makes the same trees without Gradle (and without llguidance, which Rust links as a crate):
-`cargo xtask native` and `cargo xtask native-verify`, described in `rust/README.md`.
-
-Use Java 25, Gradle 9.6.1, and Zig 0.16.0 (the versions recorded in `mise.toml`).
-Gradle invokes Zig directly with argument lists (and honors `ZIG` when set); no shell is needed
-by the host build. Build and verify both products with:
+Use Zig 0.16.0 (the version recorded in `mise.toml`; `ZIG` names another binary). Build and verify the products with:
 
 ```text
-./gradlew nativeVerify :api:bootJar
+cd rust
+cargo xtask native
+cargo xtask native-verify
 ```
 
-Explicit per-target overrides take precedence over discovery and download:
-
-```text
--Peuhedral.cuda.linux-x64.include-dir=/path/to/linux/cuda/include
--Peuhedral.cuda.linux-x64.library-dir=/path/to/linux/cuda/lib
--Peuhedral.cuda.windows-x64.include-dir=C:/path/to/windows/cuda/include
--Peuhedral.cuda.windows-x64.library-dir=C:/path/to/windows/cuda/lib/x64
-```
-
-Legacy `euhedral.cuda.include-dir` and `euhedral.cuda.library-dir` apply only to the matching
-host target. Overrides must be paired, originate from one toolkit root, and provide matching
-CUDA driver and runtime header versions (13.1+). Windows cross
-builds still require Windows CUDA import libraries, never Linux `.so` files. Set
-`-Peuhedral.cuda.force-download=true` to choose the pinned 13.1 archives over an installed
-toolkit. `nativeBuildLinuxX64` and `nativeBuildWindowsX64` are individual tasks; only the matching
-product is executed in CUDA integration tests, which load it from its layout; a compatible host
-driver is still required.
+`--product linux-x64` or `--product windows-x64` selects one product, and `--force-download` chooses the pinned 13.1
+archives over an installed toolkit. Windows cross builds still require Windows CUDA import libraries, never Linux
+`.so` files. Only the matching product is executed in the device tests, which load it from its layout; a compatible
+host driver is still required.
 
 Build and test with the tasks of `mise.toml`:
 
 ```text
-mise run native-build      # ./gradlew nativeBuildLinuxX64
-mise run native-test       # python3 -m unittest discover -s native/tests -p 'test_*.py' (needs a GPU)
-mise run native-verify     # ./gradlew nativeVerify: both products, installed tree equals src/
-mise run cuda-test         # ./gradlew :core:cudaIntegrationTest :api:cudaIntegrationTest --rerun-tasks (reserve the GPU first)
-mise run full-build        # ./gradlew nativeVerify :api:bootJar build
+mise run rust-native         # cargo xtask native --product linux-x64
+mise run rust-native-verify  # cargo xtask native-verify --product linux-x64
+mise run native-test         # python3 -m unittest discover -s native/tests -p 'test_*.py' (needs a GPU)
 ```
 
-The full-model CUDA integration tests need a `q3` artifact (`-Peuhedral.qwen.artifact`) and enough free device memory to keep it
-resident; some also take an `nvfp4` artifact (`-Peuhedral.qwen.nvfp4-artifact`) or a `q3-compressed` artifact
-(`-Peuhedral.qwen.q3-compressed-artifact`). Do not overlap the core and API suites on one GPU.
+The device tests of the Rust crates that load a model are listed in `docs/evaluation/TESTING.md`. Do not overlap them on one GPU.
 
 The runtime needs only a compatible NVIDIA driver installed on the host (or injected by NVIDIA
 Container Toolkit); the product layout carries the CUDA user-space runtime, NVRTC and headers.

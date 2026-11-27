@@ -39,7 +39,7 @@ overrides the same key of the YAML, and the server refuses a retired variable at
 The engine reads the model through io_uring, which Docker's default seccomp profile blocks, so deploy runs the
 container with `--security-opt seccomp=unconfined`. Docker cannot add system calls to its default profile from the
 command line, and a custom profile would have to carry a full copy of that profile. The host's
-`kernel.io_uring_disabled` must be 0. The root `Dockerfile` still builds the Java image, but deploy no longer uses it.
+`kernel.io_uring_disabled` must be 0.
 
 ## Environment file
 
