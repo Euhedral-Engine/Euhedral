@@ -7,9 +7,10 @@
 //! dynamic shared memory it sets as the function's maximum, and whether it registers the kernel for programmatic
 //! dependent launch (`euhedral_cuda_pdl_register`).
 //!
-//! The families are the ones the Rust engine calls (`ops.rs`). The native library has more kernels (the Q3 gate-up
-//! SwiGLU, the multi-expert GEMMs, `euhedral_linear_bf16_to_float`, `euhedral_gdn_control_fp32`, the native gate-up
-//! SwiGLU); they stay out until the engine calls them.
+//! The families are the ones the Rust engine calls (`ops.rs`), the Flash-Next MoE kernels among them (the router, the
+//! shared expert's SwiGLU, and the expert gate-up, down and combine kernels, which the layer's MoE stages launch). The
+//! native library has more kernels (the Q3 gate-up SwiGLU, `euhedral_linear_bf16_to_float`,
+//! `euhedral_gdn_control_fp32`, the native gate-up SwiGLU); they stay out until the engine calls them.
 
 use crate::DevicePtr;
 

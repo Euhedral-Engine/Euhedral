@@ -91,3 +91,58 @@ fn the_graph_validates_and_holds_the_host_nodes_without_lanes() {
     let host = plan.nodes().iter().filter(|node| node.kind.host()).count();
     assert_eq!(host, PARTS + 1);
 }
+
+#[test]
+fn a_moe_layer_has_a_route_a_shared_expert_a_plan_a_fetch_and_an_expert_per_slot_and_a_finish_between_its_block_and_its_end() {
+    let plan = DensePlan::with_moe(&tiny_config(), 2).unwrap();
+    let at = |kind| plan.index_of(kind).unwrap();
+    let after = |kind| plan.nodes()[at(kind)].after.clone();
+    let completed = |kind| plan.nodes()[at(kind)].completed.clone();
+    assert_eq!(after(NodeKind::MoeRoute(1)), [at(NodeKind::Block(1))]);
+    assert_eq!(after(NodeKind::MoeShared(1)), [at(NodeKind::Block(1))]);
+    // The plan reads what the route copied to the host, so it waits for the route's device work, not its submission.
+    assert!(after(NodeKind::MoePlan(1)).is_empty());
+    assert_eq!(completed(NodeKind::MoePlan(1)), [at(NodeKind::MoeRoute(1))]);
+    for slot in 0..2 {
+        assert_eq!(after(NodeKind::MoeFetch(1, slot)), [at(NodeKind::MoePlan(1))]);
+        assert_eq!(
+            after(NodeKind::MoeExpert(1, slot)),
+            [at(NodeKind::MoeFetch(1, slot)), at(NodeKind::MoePlan(1))]
+        );
+    }
+    assert_eq!(
+        after(NodeKind::MoeFinish(1)),
+        [
+            at(NodeKind::MoeShared(1)),
+            at(NodeKind::MoeExpert(1, 0)),
+            at(NodeKind::MoeExpert(1, 1))
+        ]
+    );
+    assert_eq!(after(NodeKind::End(1)), [at(NodeKind::MoeFinish(1))]);
+    assert_eq!(after(NodeKind::Block(1)), [at(NodeKind::Ple)]);
+    assert!(plan.index_of(NodeKind::MoeFetch(1, 2)).is_none(), "the width is fixed");
+}
+
+#[test]
+fn the_next_layers_block_waits_for_the_end_of_the_layer_before_it() {
+    let plan = DensePlan::with_moe(&tiny_config(), 2).unwrap();
+    let at = |kind| plan.index_of(kind).unwrap();
+    assert_eq!(plan.nodes()[at(NodeKind::Block(0))].after, [at(NodeKind::Embed)]);
+    assert_eq!(plan.nodes()[at(NodeKind::End(0))].after, [at(NodeKind::MoeFinish(0))]);
+    assert_eq!(plan.nodes()[at(NodeKind::FinalMix)].after, [at(NodeKind::End(1))]);
+}
+
+#[test]
+fn the_moe_graph_validates_with_experts_on_one_lane_and_on_several_and_the_fetches_have_none() {
+    let plan = DensePlan::with_moe(&tiny_config(), 3).unwrap();
+    plan.spec(LaneId(0)).unwrap();
+    plan.spec_on(LaneId(0), &[LaneId(1), LaneId(2)]).unwrap();
+    let fetches = plan.nodes().iter().filter(|node| matches!(node.kind, NodeKind::MoeFetch(..))).count();
+    assert_eq!(fetches, 2 * 3);
+    assert!(plan.nodes().iter().filter(|node| matches!(node.kind, NodeKind::MoeFetch(..))).all(|node| node.kind.host()));
+}
+
+#[test]
+fn a_moe_plan_of_no_experts_is_refused() {
+    assert!(DensePlan::with_moe(&tiny_config(), 0).is_err());
+}
