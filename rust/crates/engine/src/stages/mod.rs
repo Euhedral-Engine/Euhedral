@@ -1571,6 +1571,7 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
     let modes = quantum.lanes.modes(quantum.mode.row_exact);
     let table = quantum.lanes.kernels();
     let waits = cx.waits.iter().copied().chain(stage.waits(quantum));
+    eprintln!("DBG stage {} lane {}", std::any::type_name_of_val(stage), id.0);
     let marker = submit_on(&**lane, waits, &quantum.unmarked, |queue| {
         stage.launch(
             quantum,

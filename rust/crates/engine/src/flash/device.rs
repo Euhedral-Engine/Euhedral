@@ -40,7 +40,7 @@ use super::step::{Buckets, FlashStep};
 use crate::generation::Address;
 use crate::model::ModelConfig;
 use crate::quantum::Started;
-use crate::runtime::Core;
+use crate::runtime::{Core, Units};
 use crate::stages::sampling::{RowReadback, Selection};
 use crate::stages::{InputRecordRef, Outcome, Quantum, SequenceRefs, conclude};
 use crate::state::SequenceDevice;
@@ -114,6 +114,9 @@ pub struct DeviceStepper {
     // Freed after the graphs and the state that address them.
     _logits: DeviceBuffer,
     _regions: DeviceBuffer,
+    /// The unit admitted on the lakes: they take frames only while one is, so the stages of a quantum run only
+    /// while the stepper lives.
+    _units: Units,
 }
 
 impl Debug for DeviceStepper {
@@ -127,6 +130,7 @@ impl DeviceStepper {
     /// quantum is posted to `address`. Returns the stepper and the limits its owner admits requests by.
     pub(crate) fn new(model: &FlashModel, address: &Arc<OwnerAddress>) -> Result<(Self, Limits), FlashError> {
         let core = Arc::clone(model.core());
+        let units = core.admit().map_err(refuse("the lakes"))?;
         let library = &core.library;
         let config = model.artifact.config();
         let max_tokens = u32::try_from(model.plan.max_context_tokens)
@@ -216,6 +220,7 @@ impl DeviceStepper {
             LaneId(0),
             &stages,
             move |quantum, outcome| {
+                eprintln!("DBG retire callback");
                 retiring.post(Message::Retired(retired(&quantum, &outcome)));
             },
         )
@@ -241,6 +246,7 @@ impl DeviceStepper {
             flight: None,
             _logits: logits,
             _regions: regions_buffer,
+            _units: units,
         };
         Ok((stepper, limits))
     }
@@ -269,6 +275,7 @@ impl DeviceStepper {
         let (state, fresh_context) = (&mut self.state, &self.fresh_context);
         let (workspace, config, device) = (&self.workspace, &self.config, &self.device);
         let (selection, readback) = (&self.selection, &self.readback);
+        eprintln!("DBG launch submit rows={rows} fresh={}", step.fresh);
         let (quantum, marker) = core
             .lane_table()
             .submit_ops(core.owner_lane(), false, |lane| {
@@ -314,12 +321,14 @@ impl DeviceStepper {
                 freed.map(|()| quantum)
             })
             .map_err(|error| format!("preparing the quantum: {error}"))?;
+        eprintln!("DBG submitted");
         let mut quantum = quantum;
         quantum.prepared_after(marker);
         let started = self
             .step
             .start(quantum, Arc::new(AtomicBool::new(false)), &[])
             .map_err(|error| error.to_string())?;
+        eprintln!("DBG started");
         self.flight = Some(InFlight {
             _started: started,
             _retained: retained,
