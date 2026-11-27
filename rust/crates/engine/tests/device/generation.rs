@@ -1,9 +1,8 @@
 //! Greedy and sampled generation on a GPU: the sequence's accounting, stops, cancellation, concurrency and staging. The
 //! tests are `#[ignore]`d. Each loads the 12 GB artifact, so a run is queued on the card.
 //!
-//! The prompt is a chat prompt's token ids, the first line of `greedy-rco.txt` in the directory named by
-//! `euhedral.rust.goldens` (`EUHEDRAL_TEST_RUST_GOLDENS`); a test skips with a message when it is absent. The tokens a
-//! test expects are the engine's own greedy tokens for that prompt, taken first on the engine under test.
+//! The prompt is a chat prompt's token ids, [`CHAT_PROMPT`]. The tokens a test expects are the engine's own greedy
+//! tokens for that prompt, taken first on the engine under test.
 //!
 //! The artifact comes from `euhedral.qwen.rco-artifact` and the library from `euhedral.cuda.library`.
 
@@ -51,26 +50,16 @@ use euhedral_inference_tokenizer::Tokenizer;
 struct Machine {
     artifact: PathBuf,
     library: PathBuf,
-    goldens: PathBuf,
 }
 
 fn machine() -> Option<Machine> {
     let library = PathBuf::from(test_support::require_property("euhedral.cuda.library")?);
     let artifact = PathBuf::from(test_support::require_property("euhedral.qwen.rco-artifact")?);
-    let goldens = PathBuf::from(test_support::require_property("euhedral.rust.goldens")?);
     if !artifact.is_file() {
         println!("skipped: euhedral.qwen.rco-artifact names no file");
         return None;
     }
-    if !goldens.is_dir() {
-        println!("skipped: euhedral.rust.goldens names no directory");
-        return None;
-    }
-    Some(Machine {
-        artifact,
-        library,
-        goldens,
-    })
+    Some(Machine { artifact, library })
 }
 
 fn settings(artifact: &Path, max_tokens: u32) -> Settings {
@@ -131,20 +120,15 @@ struct Greedy {
     generated: Vec<u32>,
 }
 
-/// The token ids of the chat prompt the tests use.
-fn prompt_of(machine: &Machine) -> Vec<u32> {
-    let text = fs::read_to_string(machine.goldens.join("greedy-rco.txt")).unwrap();
-    let line = text.lines().next().unwrap();
-    line.strip_prefix("prompt ")
-        .unwrap_or_else(|| panic!("a `prompt` line, found `{line}`"))
-        .split_whitespace()
-        .map(|id| id.parse().unwrap())
-        .collect()
-}
+/// The token ids of the chat prompt the tests use: a system turn, then a user turn, then the assistant's opening.
+pub const CHAT_PROMPT: [u32; 29] = [
+    248045, 846, 198, 814, 20139, 11, 303, 264, 2342, 2716, 41228, 11, 1204, 264, 3992, 1558, 18082, 1414, 799, 3817,
+    506, 264, 854, 13, 248046, 198, 248045, 74455, 198,
+];
 
 /// The prompt and the 128 tokens `runtime` selects after it, with no stop token.
-fn greedy_reference(machine: &Machine, runtime: &EngineRuntime) -> Greedy {
-    let prompt = prompt_of(machine);
+fn greedy_reference(runtime: &EngineRuntime) -> Greedy {
+    let prompt = CHAT_PROMPT.to_vec();
     let recording = generate(runtime, &prompt, 128, &[]);
     assert_eq!(recording.outcome.reason, FinishReason::Length);
     assert_eq!(recording.tokens.len(), 128);
@@ -385,7 +369,7 @@ fn greedy_tokens_repeat_on_a_reset_sequence_and_replay_the_graphs() {
     let Some(machine) = machine() else { return };
     let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
     let (_card, runtime) = shared_engine(&machine);
-    let reference = greedy_reference(&machine, &runtime);
+    let reference = greedy_reference(&runtime);
 
     // Twice on one engine: the second request resets the sequence and replays the graphs the first recorded.
     for round in 0..2 {
@@ -443,7 +427,7 @@ fn greedy_tokens_when_staged_equal_those_of_a_resident_engine() {
     let Some(machine) = machine() else { return };
     let reference = {
         let (_resident, runtime) = start(&machine, 2048);
-        greedy_reference(&machine, &runtime)
+        greedy_reference(&runtime)
     };
     let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
     let mut engine = settings(&machine.artifact, 2048);
@@ -473,7 +457,7 @@ fn greedy_tokens_when_staged_equal_those_of_a_resident_engine() {
 fn a_stop_token_ends_the_generation_and_leaves_no_overshoot_in_the_sequence() {
     let Some(machine) = machine() else { return };
     let (_card, runtime) = shared_engine(&machine);
-    let reference = greedy_reference(&machine, &runtime);
+    let reference = greedy_reference(&runtime);
     let prompt_rows = reference.prompt.len() as u64;
 
     // The token selected sixth ends the generation when it is a stop token: the quantum that already
@@ -539,7 +523,7 @@ fn context_end_stops_cleanly() {
     let Some(machine) = machine() else { return };
     let context = 600u32;
     let (_card, runtime) = start(&machine, context);
-    let reference = greedy_reference(&machine, &runtime);
+    let reference = greedy_reference(&runtime);
     let capacity = u64::from(context);
     assert_eq!(runtime.plan().max_context_tokens as u64, capacity);
     let prompt_rows = reference.prompt.len() as u64;
@@ -581,7 +565,7 @@ fn a_panic_in_the_owner_ends_the_request_with_a_failure_and_the_engine_serves_th
     // The engine is the test's own: its owner panics, and the next test starts from a clean one.
     let _card = common::card();
     let (owner, runtime) = common::start_engine(&settings(&machine.artifact, 4096), &machine.library);
-    let reference = greedy_reference(&machine, &runtime);
+    let reference = greedy_reference(&runtime);
 
     // The owner panics in the turn that has admitted a third quantum, with two in flight: the request fails, the quanta
     // in flight run to their end and are discarded, and the listener is told as the last call.
@@ -614,7 +598,7 @@ fn sampled_requests_select_on_the_host_and_agree_with_greedy_at_top_k_one() {
     let Some(machine) = machine() else { return };
     let tokens = 32;
     let (_card, runtime) = shared_engine(&machine);
-    let reference = greedy_reference(&machine, &runtime);
+    let reference = greedy_reference(&runtime);
     let expected = &reference.generated[..tokens as usize];
 
     // Temperature 0 is greedy: the device selects, no row is copied.
@@ -690,7 +674,7 @@ fn forced_rows(runtime: &EngineRuntime, prompt: &[u32], forced: &[u32]) -> Vec<V
 fn sampled_tokens_are_drawn_at_the_position_they_follow() {
     let Some(machine) = machine() else { return };
     let reference = Greedy {
-        prompt: prompt_of(&machine),
+        prompt: CHAT_PROMPT.to_vec(),
         generated: Vec::new(),
     };
     let config = SamplingConfig::new(50.0, 40, 1.0, 77, false).unwrap();
@@ -732,7 +716,7 @@ fn sampled_tokens_are_drawn_at_the_position_they_follow() {
 fn a_sampled_first_token_can_be_the_stop_token_or_the_whole_budget() {
     let Some(machine) = machine() else { return };
     let reference = Greedy {
-        prompt: prompt_of(&machine),
+        prompt: CHAT_PROMPT.to_vec(),
         generated: Vec::new(),
     };
     let config = SamplingConfig::new(50.0, 40, 1.0, 5, false).unwrap();
@@ -768,7 +752,7 @@ fn a_sampled_first_token_can_be_the_stop_token_or_the_whole_budget() {
 #[ignore = "needs a GPU, the native library, the RCO artifact and the prompt"]
 fn two_sequences_start_hold_a_spare_generate_the_same_tokens_and_shut_down_clean() {
     let Some(machine) = machine() else { return };
-    let prompt = prompt_of(&machine);
+    let prompt = CHAT_PROMPT.to_vec();
     let eos = tokenizer(&machine.artifact).eos_ids().to_vec();
 
     let one = {
@@ -1327,7 +1311,7 @@ fn disk_settings(machine: &Machine, sequences: u32) -> (Settings, u64) {
 /// The prompt and the tokens a resident engine selects after it: what a run with weights in the file must also give.
 fn resident_reference(machine: &Machine) -> Greedy {
     let (_card, runtime) = shared_engine(machine);
-    greedy_reference(machine, &runtime)
+    greedy_reference(&runtime)
 }
 
 /// The logits rows of 64 teacher-forced steps with part of the weights read from the artifact file through the window

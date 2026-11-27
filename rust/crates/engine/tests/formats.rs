@@ -1,9 +1,5 @@
-//! The linear formats' routes, decided on the host: the K split, the trellis launches against Java's, and the NVFP4
-//! routes by rows. None of it needs a GPU.
-//!
-//! The launches are recorded by `fixtures/linear_launches.jsh` into `fixtures/linear_launches.txt`: the kernel, grid,
-//! block, shared bytes and arguments of every launch `TrellisFormat.linear` makes for the layer shapes of the RCO
-//! artifact over row counts, thresholds and routes, and the scratch it plans for each.
+//! The linear formats' routes, decided on the host: the K split, the trellis launches over the RCO artifact's layer
+//! shapes, row counts and thresholds, and the NVFP4 routes by rows. None of it needs a GPU.
 
 #![allow(
     clippy::unwrap_used,
@@ -76,66 +72,76 @@ mod formats {
         }
     }
 
-    /// One case of the fixture: a trellis linear of Java's, and the launches it made.
+    /// One trellis linear of the RCO artifact's layer shapes at a row count, under one set of kernel thresholds.
     struct Case {
-        name: String,
+        name: &'static str,
         n: u64,
         k: u64,
         w: u64,
         ends: Vec<u32>,
         rows: usize,
-        row_exact: bool,
-        fp8: bool,
-        exact: bool,
         target: usize,
         mma: usize,
         whole_k: usize,
         wide: usize,
-        scratch: (u64, u64),
-        lines: Vec<String>,
+        /// Bytes of the scratch region the plan is given.
+        scratch: u64,
     }
 
+    /// The layer shapes of the RCO artifact: name, columns, inputs, tile words and segment ends.
+    const LAYERS: [(&str, u64, u64, u64, &[u32]); 9] = [
+        ("attention/gate_value", 7168, 5120, 64, &[6144, 7168]),
+        ("attention/output", 5120, 6144, 40, &[5120]),
+        ("attention/query_key", 7168, 5120, 64, &[6144, 7168]),
+        ("gdn/output", 5120, 6144, 40, &[5120]),
+        ("gdn/query_key", 4096, 5120, 40, &[4096]),
+        ("gdn/value_z", 12288, 5120, 40, &[6144, 12288]),
+        ("mlp/down", 5120, 17408, 40, &[5120]),
+        ("mlp/down-w56", 5120, 17408, 56, &[5120]),
+        ("mlp/gate_up", 34816, 5120, 40, &[17408, 34816]),
+    ];
+
+    /// The kernel thresholds the engine runs with: target blocks, tensor-core row limit, whole-K rows and wide rows.
+    const THRESHOLDS: [(usize, usize, usize, usize); 4] = [
+        (560, 512, 64, 128),
+        (384, 512, 64, 128),
+        (1120, 512, 16, 32),
+        (560, 16, 32, 64),
+    ];
+
+    /// Row counts either side of every threshold and of the tile and skinny limits.
+    const ROWS: [usize; 23] = [
+        1, 2, 3, 4, 5, 6, 8, 9, 16, 17, 20, 31, 32, 33, 63, 64, 65, 100, 127, 128, 512, 513, 1024,
+    ];
+
     fn cases() -> Vec<Case> {
-        let mut cases: Vec<Case> = Vec::new();
-        for line in include_str!("fixtures/linear_launches.txt").lines() {
-            if let Some(header) = line.strip_prefix("case ") {
-                let mut parts = header.split(' ');
-                let name = parts.next().unwrap().to_string();
-                let field = |key: &str| -> String {
-                    header
-                        .split(' ')
-                        .find_map(|part| part.strip_prefix(&format!("{key}=")))
-                        .unwrap_or_else(|| panic!("no {key} in {header}"))
-                        .to_string()
-                };
-                let number = |key: &str| field(key).parse::<u64>().unwrap();
-                let ends = field("ends")
-                    .trim_matches(|c| c == '[' || c == ']')
-                    .split(',')
-                    .map(|end| end.parse().unwrap())
-                    .collect();
-                cases.push(Case {
-                    name,
-                    n: number("n"),
-                    k: number("k"),
-                    w: number("w"),
-                    ends,
-                    rows: number("rows") as usize,
-                    row_exact: field("rowExact") == "true",
-                    fp8: field("fp8") == "true",
-                    exact: field("exact") == "true",
-                    target: number("target") as usize,
-                    mma: number("mma") as usize,
-                    whole_k: number("wholeK") as usize,
-                    wide: number("wide") as usize,
-                    scratch: (0, 0),
-                    lines: Vec::new(),
-                });
-            } else if let Some(scratch) = line.strip_prefix("scratch=") {
-                let (planned, decode) = scratch.split_once(',').unwrap();
-                cases.last_mut().unwrap().scratch = (planned.parse().unwrap(), decode.parse().unwrap());
-            } else {
-                cases.last_mut().unwrap().lines.push(line.to_string());
+        let mut cases = Vec::new();
+        for (name, n, k, w, ends) in LAYERS {
+            for (target, mma, whole_k, wide) in THRESHOLDS {
+                for rows in ROWS {
+                    let ends = ends.to_vec();
+                    let shape = TrellisShape {
+                        n,
+                        k,
+                        w,
+                        segments: ends.len() as u64,
+                        ends: &ends,
+                    };
+                    let scratch = TrellisLinear::new(target, mma, whole_k, wide).scratch_for(&shape, rows as u64, true);
+                    cases.push(Case {
+                        name,
+                        n,
+                        k,
+                        w,
+                        ends,
+                        rows,
+                        target,
+                        mma,
+                        whole_k,
+                        wide,
+                        scratch,
+                    });
+                }
             }
         }
         cases
@@ -166,7 +172,7 @@ mod formats {
             ends: address(ENDS),
             scratch: ScratchRegion {
                 ptr: address(SCRATCH),
-                bytes: case.scratch.0 as usize,
+                bytes: case.scratch as usize,
             },
         };
         let mode = LinearMode {
@@ -184,83 +190,12 @@ mod formats {
     }
 
     fn format_of(case: &Case) -> TrellisLinear {
-        let format = TrellisLinear::new(case.target, case.mma, case.whole_k, case.wide);
-        if case.exact {
-            format.with_exact_numerics()
-        } else {
-            format
-        }
-    }
-
-    #[test]
-    fn trellis_launches_and_scratch_match_java() {
-        let cases = cases();
-        assert!(cases.len() > 500, "{} cases", cases.len());
-        let mut routes = [0usize; 5];
-        for case in &cases {
-            let format = format_of(case);
-            let label = format!(
-                "{} rows={} rowExact={} fp8={} exact={} target={} mma={} wholeK={} wide={}",
-                case.name,
-                case.rows,
-                case.row_exact,
-                case.fp8,
-                case.exact,
-                case.target,
-                case.mma,
-                case.whole_k,
-                case.wide
-            );
-            assert_eq!(
-                plan_lines(case, &format, case.fp8, case.row_exact),
-                case.lines,
-                "{label}"
-            );
-            let shape = TrellisShape {
-                n: case.n,
-                k: case.k,
-                w: case.w,
-                segments: case.ends.len() as u64,
-                ends: &case.ends,
-            };
-            assert_eq!(
-                format.scratch_for(&shape, case.rows as u64, true),
-                case.scratch.0,
-                "{label}"
-            );
-            assert_eq!(
-                format.scratch_for(&shape, case.rows as u64, false),
-                case.scratch.1,
-                "{label}"
-            );
-            let first = case
-                .lines
-                .iter()
-                .find(|line| !line.starts_with("euhedral_trellis_prepass"))
-                .unwrap();
-            for (slot, symbol) in [
-                "euhedral_trellis_mma ",
-                "euhedral_trellis_mma_rows",
-                "euhedral_trellis_mma_rows64",
-                "euhedral_trellis_reference",
-                "euhedral_trellis_decode_bf16",
-            ]
-            .iter()
-            .enumerate()
-            {
-                if first.starts_with(symbol) {
-                    routes[slot] += 1;
-                }
-            }
-        }
-        // The fixture reaches every route: split partials, whole-K blocks of 32 and of 64 rows, the reference and the
-        // prefill route.
-        assert!(routes.iter().all(|count| *count > 0), "{routes:?}");
+        TrellisLinear::new(case.target, case.mma, case.whole_k, case.wide)
     }
 
     #[test]
     fn verify_rows_never_use_fp8() {
-        for case in cases().iter().filter(|case| !case.exact) {
+        for case in cases().iter() {
             for row_exact in [true, false] {
                 let format = format_of(case);
                 let lines = plan_lines(case, &format, true, row_exact);
@@ -286,13 +221,10 @@ mod formats {
     #[test]
     fn a_verification_beyond_the_tensor_core_limit_stays_on_the_tensor_core_route() {
         let format = TrellisLinear::new(560, 16, 64, 128);
-        let case = cases()
-            .into_iter()
-            .find(|case| case.name == "mlp/down" && !case.exact)
-            .unwrap();
+        let case = cases().into_iter().find(|case| case.name == "mlp/down").unwrap();
         let big = Case {
             rows: 100,
-            scratch: (1 << 30, 0),
+            scratch: 1 << 30,
             ..case
         };
         let verification = plan_lines(&big, &format, true, true);

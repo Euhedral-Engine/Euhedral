@@ -2,8 +2,7 @@
 //! `#[ignore]`d and run locally, one at a time (each loads the 12 GB artifact), through the GPU runner:
 //! `/mnt/Samsung_980_1TB/euhedral-dev/bin/gpu-run -m 24G -t 30m -- cargo test -p euhedral-inference-engine --test device -- --ignored mtp::`.
 //!
-//! The reference is the engine's own greedy decode (`Speculation::Off`), whose tokens equal the Java engine's
-//! (`generation_gpu`). The prompts are the chat corpus of the benchmark crate. The artifact comes from
+//! The reference is the engine's own greedy decode (`Speculation::Off`). The prompts are the chat corpus of the benchmark crate. The artifact comes from
 //! `euhedral.qwen.rco-artifact` and the library from `euhedral.cuda.library`.
 
 #![allow(
