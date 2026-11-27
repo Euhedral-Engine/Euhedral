@@ -3,8 +3,8 @@
 //!
 //! The library comes from the `euhedral.cuda.library` property; a test skips with a message when it is absent.
 //! The references follow the kernels' own roundings (BF16 after every step the kernel rounds), so the tolerances only
-//! cover the order of the sums. The NVFP4 projections and the gated delta rule are shared kernels, covered by the
-//! format and GDN suites; here the launches that are new to the Flash-Next table run.
+//! cover the order of the sums. The gated delta rule is a shared kernel, covered by the GDN suite; here the launches
+//! that are new to the Flash-Next table run, and the NVFP4 projections run against the linear format's own launch.
 
 #![allow(
     clippy::unwrap_used,

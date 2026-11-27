@@ -252,6 +252,15 @@ impl PleShape {
         }
     }
 
+    /// The expansion scratch the two projections take for `rows` rows on `device`: what [`PleApply::new`] asks of the
+    /// regions.
+    pub fn expansion_bytes(&self, device: &Nvfp4Device, rows: u32) -> u64 {
+        let embed_dim = self.embed_dim();
+        device
+            .expansion_bytes(rows, embed_dim, self.state_width())
+            .max(device.expansion_bytes(rows, embed_dim, self.hidden))
+    }
+
     /// The bytes of the scratch of `rows` rows.
     pub fn scratch_bytes(&self, rows: u32) -> u64 {
         let mut carver = Carver::new(DevicePtr::NULL);
@@ -309,7 +318,7 @@ impl PleApply {
             StreamShape::new(shape.hidden, shape.streams)?,
             ScratchSizes {
                 layer: shape.scratch_bytes(rows),
-                expansion: Self::expansion_bytes(&shape, &device, rows),
+                expansion: shape.expansion_bytes(&device, rows),
                 ..ScratchSizes::default()
             },
         )?;
@@ -320,14 +329,6 @@ impl PleApply {
             regions,
             device,
         })
-    }
-
-    /// The expansion scratch the two projections take for `rows` rows.
-    fn expansion_bytes(shape: &PleShape, device: &Nvfp4Device, rows: u32) -> u64 {
-        let embed_dim = shape.embed_dim();
-        device
-            .expansion_bytes(rows, embed_dim, shape.state_width())
-            .max(device.expansion_bytes(rows, embed_dim, shape.hidden))
     }
 
     /// The operations after the records are on the device, in Java's order, ending with the add into the streams.

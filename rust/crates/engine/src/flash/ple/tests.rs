@@ -56,7 +56,7 @@ fn weights() -> PleWeights {
 fn sizes(shape: &PleShape, capacity: u32) -> ScratchSizes {
     ScratchSizes {
         layer: shape.scratch_bytes(capacity),
-        expansion: PleApply::expansion_bytes(shape, &device(), capacity),
+        expansion: shape.expansion_bytes(&device(), capacity),
         ..ScratchSizes::default()
     }
 }
