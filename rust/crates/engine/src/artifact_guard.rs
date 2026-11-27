@@ -32,7 +32,14 @@ pub enum GuardError {
     /// The path names another file than the one held: it was renamed over or replaced.
     #[error("{} is not the file the engine holds: it was renamed or replaced while the engine started", path.display())]
     Replaced { path: PathBuf },
-    /// The file could not be opened or locked: the file system may not support file locks.
+    /// The file could not be opened (it is missing or unreadable): the file's own error, not a refusal of the lock.
+    #[error("cannot open {}: {source}", path.display())]
+    Open {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The file could not be locked or compared: the file system may not support file locks.
     #[error("cannot lock {}: {source}", path.display())]
     Lock {
         path: PathBuf,
@@ -52,18 +59,14 @@ pub struct ArtifactGuard {
 
 impl ArtifactGuard {
     /// Holds `path`. Blocking: call it at startup, before the other opens of the file. Two guards of one file coexist.
-    /// A file that is not there, or a file system without locks, is refused with the path and the error: the engine
-    /// does not run on a file it cannot hold. A path that names another file once the lock is taken (a writer renamed
+    /// A file that cannot be opened ([`GuardError::Open`]) or a file system without locks ([`GuardError::Lock`]) is
+    /// refused with the path and the error: the engine does not run on a file it cannot hold. A path that names another file once the lock is taken (a writer renamed
     /// its output over it between the open and the lock) is refused as [`GuardError::Replaced`].
     #[allow(
         clippy::disallowed_methods,
         reason = "no-wait, blocking I/O: one open and one lock at startup, before any frame runs"
     )]
     pub fn hold(path: &Path) -> Result<ArtifactGuard, GuardError> {
-        let lock_error = |source| GuardError::Lock {
-            path: path.to_path_buf(),
-            source,
-        };
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(windows)]
@@ -73,7 +76,10 @@ impl ArtifactGuard {
             const FILE_SHARE_READ: u32 = 0x1;
             options.share_mode(FILE_SHARE_READ);
         }
-        let file = options.open(path).map_err(lock_error)?;
+        let file = options.open(path).map_err(|source| GuardError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Self::lock_opened(path, file)
     }
 
@@ -101,7 +107,10 @@ impl ArtifactGuard {
             file,
         };
         // After the lock: a name that was replaced before it took effect names a file nobody holds.
-        let named = File::open(path).map_err(lock_error)?;
+        let named = File::open(path).map_err(|source| GuardError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
         guard.admit(&named)?;
         Ok(guard)
     }
@@ -277,7 +286,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("absent.edrl");
         let refusal = ArtifactGuard::hold(&path).unwrap_err();
-        assert!(matches!(refusal, GuardError::Lock { .. }));
+        assert!(
+            matches!(&refusal, GuardError::Open { source, .. } if source.kind() == io::ErrorKind::NotFound),
+            "{refusal}"
+        );
         assert!(refusal.to_string().contains(&path.display().to_string()));
         WriteClaim::take(&path).unwrap();
     }
