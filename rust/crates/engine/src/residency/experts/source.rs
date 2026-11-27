@@ -139,7 +139,8 @@ pub struct FileRecordSource {
 
 impl FileRecordSource {
     /// A source of the records of `layout`, each read as up to `split` parts. The records are trusted as the artifact holds
-    /// them: the file is checked when it is opened, not on every read. Refuses a split of 0.
+    /// them: nothing checks a record as it is read while serving. Keeping the file from being changed while the
+    /// engine runs is a guard of its own, not this source's; the bytes are trusted. Refuses a split of 0.
     pub fn new(
         layout: Arc<ExpertLayout>,
         port: Arc<dyn PartPort>,
