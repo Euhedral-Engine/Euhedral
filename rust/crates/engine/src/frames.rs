@@ -42,6 +42,8 @@ pub(crate) enum Kind {
     DiskCopy,
     /// The completions of the parts of one routed-expert record's read, one chain per part.
     ExpertRead,
+    /// The completions of the reads of one gather's n-gram rows, one chain per row.
+    NgramRead,
     /// The copy of a routed-expert record out of the host tier into a staging buffer.
     ExpertCopy,
     /// The delivery of a hidden-rows request's rows to its sink.

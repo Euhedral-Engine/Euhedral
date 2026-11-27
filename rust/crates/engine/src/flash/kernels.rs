@@ -39,6 +39,7 @@ pub enum Qwen4Kernel {
     ExpertDown = 26,
     ExpertCombine = 27,
     SwigluPadded = 28,
+    Nvfp4PadK = 29,
     LinearTc = 30,
     LinearTcSplit = 31,
     LinearTcRows = 32,
@@ -49,7 +50,7 @@ pub enum Qwen4Kernel {
 
 impl Qwen4Kernel {
     /// Every kernel the engine launches from the table.
-    pub const ALL: [Qwen4Kernel; 35] = [
+    pub const ALL: [Qwen4Kernel; 36] = [
         Qwen4Kernel::LinearBf16,
         Qwen4Kernel::GroupedRmsNorm,
         Qwen4Kernel::ScaledSilu,
@@ -79,6 +80,7 @@ impl Qwen4Kernel {
         Qwen4Kernel::ExpertDown,
         Qwen4Kernel::ExpertCombine,
         Qwen4Kernel::SwigluPadded,
+        Qwen4Kernel::Nvfp4PadK,
         Qwen4Kernel::LinearTc,
         Qwen4Kernel::LinearTcSplit,
         Qwen4Kernel::LinearTcRows,
@@ -124,6 +126,7 @@ impl Qwen4Kernel {
             Qwen4Kernel::ExpertDown => "euhedral_q4_expert_down_bf16",
             Qwen4Kernel::ExpertCombine => "euhedral_q4_expert_combine_bf16",
             Qwen4Kernel::SwigluPadded => "euhedral_q4_swiglu_padded_bf16",
+            Qwen4Kernel::Nvfp4PadK => "euhedral_q4_nvfp4_pad_k",
             Qwen4Kernel::LinearTc => "euhedral_q4_linear_tc_bf16",
             Qwen4Kernel::LinearTcSplit => "euhedral_q4_linear_tc_split_bf16",
             Qwen4Kernel::LinearTcRows => "euhedral_q4_linear_tc_rows_bf16",

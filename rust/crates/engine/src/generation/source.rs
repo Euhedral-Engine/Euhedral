@@ -50,9 +50,10 @@ use std::time::{Duration, Instant};
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_gpu::Ran;
-use euhedral_graph::{Marker, QuantumOutcome};
+use euhedral_graph::{Marker, QuantumOutcome, Slot};
 use euhedral_inference_cuda::{DevicePtr, SubmitMode};
 
+use super::conclusion::Conclusion;
 use super::hidden::{Hidden, HiddenRows, HiddenSink, delivery_frame};
 use super::listener::GenerationListener;
 use super::mailbox::{Address, Turn};
@@ -592,6 +593,9 @@ pub(super) struct Flying {
     /// When the owner found it retired.
     pub(super) retired_at: Option<Instant>,
     pub(super) retired: Option<Retired>,
+    /// Its place in the request's conclusion order, completed with the quantum when it retires. Dropped with the
+    /// quantum when it never ran, which passes the place.
+    slot: Option<Slot<Flying>>,
     /// The marker of the reservation made for the quantum on the owner's lane: what `retained` is held for when the
     /// quantum never starts.
     pub(super) reserved: Marker,
@@ -631,7 +635,10 @@ pub(super) struct Run {
     pub(super) decodes: usize,
     /// Tokens selected and reported, or rows handed to the sink.
     pub(super) generated: usize,
+    /// The quanta admitted that have not retired, oldest first. A quantum that retires leaves for `conclusion`.
     pub(super) in_flight: VecDeque<Flying>,
+    /// The order the quanta conclude in, which is the order they were admitted in.
+    conclusion: Conclusion<Flying>,
     /// Whether the workspace's owner holds the last quantum admitted, which the next one is chained behind. Held only
     /// while another quantum may follow: a quantum retires only when its references are dropped.
     pub(super) chain: bool,
@@ -666,6 +673,11 @@ pub(super) struct Run {
 }
 
 impl Run {
+    /// The quanta admitted that have not concluded: in flight, or retired and waiting for the ones before them.
+    pub(super) fn flying(&self) -> usize {
+        self.conclusion.pending()
+    }
+
     /// The next step to admit, or `None` once the request has no more (or has been told to stop).
     pub(super) fn next_step(&self, chunk: usize) -> Option<Step> {
         if self.stopping.is_some() {
@@ -903,7 +915,7 @@ impl Owner {
     /// the error it is given.
     pub(crate) fn withdraw(&mut self) {
         match self.run.take() {
-            Some(run) if run.in_flight.is_empty() && may_end(self.parked.len(), self.sequence.flight()) => {}
+            Some(run) if run.flying() == 0 && may_end(self.parked.len(), self.sequence.flight()) => {}
             Some(run) => {
                 log::error!("a request with quanta in flight cannot be withdrawn");
                 self.run = Some(run);
@@ -1180,6 +1192,7 @@ impl Owner {
             decodes: 0,
             generated: 0,
             in_flight: VecDeque::new(),
+            conclusion: Conclusion::new(),
             chain: false,
             sequence: self.id,
             shared: Arc::clone(&self.shared),
@@ -1215,7 +1228,7 @@ impl Owner {
         // The tokens the host is selecting decide the next step.
         // A hidden request's next quantum overwrites the rows being copied, and waits for a sink that is far behind.
         let copying = run.hidden.as_ref().is_some_and(Hidden::full);
-        if copying || run.selecting() || run.in_flight.len() >= run.depth {
+        if copying || run.selecting() || run.flying() >= run.depth {
             return None;
         }
         // The prefix cache first: the lookup's answer, the restore's job, or a capture of the state the next chunk would
@@ -1233,7 +1246,7 @@ impl Owner {
         }
         let alone = matches!(next, Step::Speculate { .. } | Step::Settle)
             || matches!((&run.mode, next), (Mode::Speculative { .. }, Step::Decode));
-        if alone && !run.in_flight.is_empty() {
+        if alone && run.flying() > 0 {
             return None;
         }
         (run.selections(next) <= self.selections_free()).then_some(next)
@@ -1287,6 +1300,7 @@ impl Owner {
         );
         let cached_prompt_tokens = run.cached_prompt_tokens();
         mem::forget(mem::take(&mut run.in_flight));
+        mem::forget(run.conclusion);
         mem::forget(mem::take(&mut run.carried));
         // The quanta can no longer be accounted for, so a next request on this sequence could race them: it is not given back.
         mem::forget(run.lease);
@@ -1314,17 +1328,19 @@ impl Owner {
                     self.shared.order.retired(self.id, retired.serial);
                 }
                 let waiting = self.run.as_mut().and_then(|run| {
-                    run.in_flight.iter_mut().find(|flying| {
-                        flying.retired.is_none()
-                            && flying.start == retired.start
-                            && flying.kind == retired.kind
-                            && flying.rows == retired.rows
-                    })
+                    let at = run.in_flight.iter().position(|flying| {
+                        flying.start == retired.start && flying.kind == retired.kind && flying.rows == retired.rows
+                    })?;
+                    run.in_flight.remove(at)
                 });
                 match waiting {
-                    Some(flying) => {
+                    Some(mut flying) => {
                         flying.retired_at = Some(Instant::now());
                         flying.retired = Some(retired);
+                        // Concludes with the quanta admitted before it once they retired: see `conclude`.
+                        if let Some(slot) = flying.slot.take() {
+                            slot.complete(flying);
+                        }
                     }
                     None => {
                         log::error!(
@@ -1814,10 +1830,7 @@ impl Owner {
             // quanta that retired behind it.
             self.observe_cancel();
             let Some(run) = self.run.as_mut() else { return };
-            if !run.in_flight.front().is_some_and(|flying| flying.retired.is_some()) {
-                return;
-            }
-            let Some(mut flying) = run.in_flight.pop_front() else {
+            let Some(mut flying) = run.conclusion.next() else {
                 return;
             };
             let Some(retired) = flying.retired.take() else {
@@ -2168,7 +2181,7 @@ impl Owner {
             // the passes of the other sequences, which wait for each member of the last pass to offer or leave.
             // Only with nothing in flight: a step still pending would be withdrawn.
             let sink_behind = run.hidden.as_ref().map(Hidden::behind);
-            if passes_choice(sink_behind, ended, run.in_flight.len()) == PassesChoice::Leave {
+            if passes_choice(sink_behind, ended, run.flying()) == PassesChoice::Leave {
                 run.leave_passes();
             }
         }
@@ -2339,7 +2352,7 @@ impl Owner {
             last_chunk,
             more,
         } = admission;
-        if run.in_flight.is_empty() {
+        if run.flying() == 0 {
             run.cursor = 0;
         }
         // A hidden request's decode runs as a one-row verification: row-exact, as the corpus's reference is, and offered
@@ -2455,6 +2468,7 @@ impl Owner {
         let admitted = Instant::now();
         let id = quantum.id();
 
+        let slot = run.conclusion.admit();
         run.in_flight.push_back(Flying {
             id,
             role,
@@ -2469,6 +2483,7 @@ impl Owner {
             kill: Arc::clone(&kill),
             retired_at: None,
             retired: None,
+            slot: Some(slot),
             reserved,
             checkpoint: false,
         });
@@ -2515,7 +2530,7 @@ impl Owner {
         }
         let ended = run.stopping.is_some() || run.next_step(chunk).is_none();
         let delivering = run.hidden.as_ref().is_some_and(Hidden::busy);
-        if !run.in_flight.is_empty() || delivering || run.selecting() || run.preparing() || !ended {
+        if run.flying() > 0 || delivering || run.selecting() || run.preparing() || !ended {
             return;
         }
         // A restore's reservation that no chunk took (the request ended first) has its table upload queued on the owner's

@@ -28,8 +28,8 @@ fn ids() -> NgramIds {
 
 /// A table of rows of `row_width` values: 32 values in 24-byte records.
 fn table(row_width: u32) -> NgramRows {
-    let shard: Arc<dyn ShardBytes> = Arc::new(vec![0u8; 1 << 16]);
-    NgramRows::new(vec![shard], 100, 100, row_width).unwrap()
+    let shard: Arc<dyn ShardBytes> = Arc::new(MemoryShard(vec![0u8; 1 << 16]));
+    NgramRows::new(vec![shard], 100, 100, row_width, vec![1.0]).unwrap()
 }
 
 /// Four heads of 32-value rows (24-byte records) into 128 values over two streams of 64.

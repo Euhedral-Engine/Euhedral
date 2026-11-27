@@ -11,19 +11,25 @@
 //! What the host stages share with the device stage travels in the quantum ([`PleRows`]), which they reach through
 //! [`Quantum::ple`]; no stage holds a lock or waits for another: the graph's edges order them.
 
+mod file_shard;
 mod ngram;
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-use euhedral_graph::{Stage, StageCx, StageError, Submitted};
+use euhedral_graph::{Gate, GateRef, Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{DevicePtr, KernelOps, PinnedPool, PooledPinned};
 
-pub use self::ngram::{NgramIds, NgramRows, PARTS, PartSlots, PublishError, ShardBytes, part_count, part_range};
+pub use self::file_shard::FileShard;
+pub use self::ngram::{
+    GatherDone, MemoryShard, NgramIds, NgramRows, PARTS, PartSlots, PublishError, RowRead, ShardBytes, part_count,
+    part_range,
+};
 use super::buffers::{Carver, FlashRegions, ScratchSizes, StreamShape, bf16_bytes};
 use super::linear::{Nvfp4Device, Nvfp4Weight};
 use super::sequence::{Op, OpList, queue_all};
 use super::{FlashError, Weight, ops};
+use crate::handoff::Handoff;
 use crate::stages::{Launch, Quantum, fatal};
 
 /// The ids of a quantum's rows and the context after them.
@@ -130,31 +136,78 @@ impl PleGatherStage {
 }
 
 impl Stage<Quantum> for PleGatherStage {
-    fn run(&self, quantum: &Quantum, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        self.gather(rows_of(quantum)?)?;
+    fn run(&self, _quantum: &Quantum, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        // The part was read and published while the stage held its gate (`pass_gate`); nothing is left to do.
         Ok(Submitted::done())
+    }
+
+    fn pass_gate(&self, quantum: &Quantum, gate: GateRef<'_>) -> bool {
+        let rows = match rows_of(quantum) {
+            Ok(rows) => Arc::clone(rows),
+            Err(error) => {
+                gate.hold().fail(error);
+                return false;
+            }
+        };
+        // The gate is shared with the end of the read, which spends it, and with this call, which spends it when the
+        // read could not start and so never calls the end.
+        let held: Arc<Handoff<Gate>> = Handoff::new();
+        held.send(gate.hold());
+        let ended = Arc::clone(&held);
+        let end: GatherEnd = Box::new(move |result| {
+            let Some(gate) = ended.take() else { return };
+            match result {
+                Ok(()) => gate.release(),
+                Err(error) => gate.fail(error),
+            }
+        });
+        if let Err(error) = self.start(rows, end)
+            && let Some(gate) = held.take()
+        {
+            gate.fail(error);
+        }
+        false
     }
 }
 
+/// What the end of a part's gather tells.
+pub type GatherEnd = Box<dyn FnOnce(Result<(), StageError>) + Send>;
+
 impl PleGatherStage {
-    /// Reads this part's records of `rows`' ids and publishes them. Refuses a run before the ids and a part published
-    /// twice.
-    pub fn gather(&self, rows: &PleRows) -> Result<(), StageError> {
+    /// Starts reading this part's records of `rows`' ids and returns at once; `end` runs, as the work of a frame, when
+    /// the part is published (a part of no rows ends at once, in this call), or with what failed. Refuses a start before
+    /// the ids and a part published twice, starting nothing: `end` is then dropped unrun.
+    pub fn start(&self, rows: Arc<PleRows>, end: GatherEnd) -> Result<(), StageError> {
         let ids = rows
             .ids()
             .ok_or_else(|| fatal(format!("part {} ran before the n-gram ids", self.part)))?;
         let range = part_range(ids.len(), self.part);
         if range.is_empty() {
+            end(Ok(()));
             return Ok(());
         }
         let bytes = range.len() * self.table.record_bytes() as usize;
         let mut loan = self.pool.acquire(bytes).map_err(fatal)?;
-        self.table
-            .gather(ids, range.clone(), &mut loan.buffer_mut().as_mut_slice()[..bytes])
-            .map_err(fatal)?;
-        rows.parts
-            .publish(self.part, GatheredPart { loan })
-            .map_err(|(why, _)| fatal(format!("part {} of the gather: {why:?}", self.part)))
+        let part = self.part;
+        let published = Arc::clone(&rows);
+        let done: GatherDone = Box::new(move |records| {
+            let result = records.map_err(fatal).and_then(|records| {
+                let Some(slot) = loan.buffer_mut().as_mut_slice().get_mut(..records.len()) else {
+                    return Err(fatal(format!(
+                        "part {part}: {} bytes of records for a loan too small",
+                        records.len()
+                    )));
+                };
+                slot.copy_from_slice(&records);
+                published
+                    .parts
+                    .publish(part, GatheredPart { loan })
+                    .map_err(|(why, _)| fatal(format!("part {part} of the gather: {why:?}")))
+            });
+            end(result);
+        });
+        // The ids were read above, and `gather` takes the places it needs from them before it returns.
+        self.table.gather(ids, range, done).map_err(fatal)
     }
 }
 

@@ -4,11 +4,15 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use euhedral_data_structures::sync::ClaimCell;
 use euhedral_inference_edrl::NgramLayout;
+use euhedral_io::Continuation;
 
 use crate::flash::FlashError;
+use crate::frames::{Kind, step};
 
 /// The most parts one gather splits into (`Shape.PLE_PARTS`).
 pub const PARTS: usize = 8;
@@ -175,13 +179,48 @@ impl NgramIds {
     }
 }
 
-/// The bytes of one shard of the table: a mapped file, or memory.
-pub trait ShardBytes: AsRef<[u8]> + Send + Sync + fmt::Debug {}
+/// What a started read tells: the bytes read, or why they were not. It returns the frame that runs the rest of the
+/// work, which whoever ended the read runs.
+pub type RowRead = Continuation<Result<Vec<u8>, String>>;
 
-impl<T: AsRef<[u8]> + Send + Sync + fmt::Debug> ShardBytes for T {}
+/// The bytes of one shard of the table, read asynchronously: from the artifact file through RustEE's I/O
+/// ([`FileShard`]), or a fake in a test.
+pub trait ShardBytes: Send + Sync + fmt::Debug {
+    /// The shard's length in bytes.
+    fn size(&self) -> u64;
+
+    /// Starts reading `len` bytes at `offset` of the shard and returns at once; `then` runs when the read has ended
+    /// (it may be before this call returns), with the bytes or the failure, naming the cause. Refuses a range outside
+    /// the shard, or an empty one, starting nothing: `then` is dropped unrun.
+    fn start(&self, offset: u64, len: usize, then: RowRead) -> Result<(), String>;
+}
+
+/// A shard held in memory, whose reads end inside the call that starts them (the frame that continues the work runs
+/// there, as a test or a tool runs it): for tables built from bytes, not for the artifact file.
+#[derive(Debug)]
+pub struct MemoryShard(pub Vec<u8>);
+
+impl ShardBytes for MemoryShard {
+    fn size(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn start(&self, offset: u64, len: usize, then: RowRead) -> Result<(), String> {
+        let end = offset.checked_add(len as u64).filter(|end| *end <= self.size());
+        let (Some(end), true) = (end, len > 0) else {
+            return Err(format!("{len} bytes at {offset} of a shard of {}", self.size()));
+        };
+        // `end` fits the shard, whose length fits `usize`.
+        let bytes = self.0[offset as usize..end as usize].to_vec();
+        then(Ok(bytes))
+            .execute()
+            .map_err(|error| format!("the frame that continued the read failed: {error:?}"))
+    }
+}
 
 /// The n-gram table: shards of `shard_rows` rows each (the last may hold fewer), every shard laid out as
-/// [`NgramLayout`] describes and carrying its own global scale. Reads are shared and never block.
+/// [`NgramLayout`] describes and carrying its own global scale. Reads are shared; a read of a file shard waits for the
+/// page cache as a read of a mapped page does.
 #[derive(Debug)]
 pub struct NgramRows {
     shards: Box<[Arc<dyn ShardBytes>]>,
@@ -195,13 +234,42 @@ pub struct NgramRows {
 }
 
 impl NgramRows {
-    /// The table of `total_rows` rows of `row_width` values over `shards`. Refuses a shard too short for its rows and a
-    /// shard count that does not cover the rows.
+    /// The bytes shard `shard` of a table of `total_rows` rows in shards of `shard_rows` takes, and where its scale (a
+    /// little-endian `f32`) is: the figures to size a shard and to read its scale by. Refuses a shard past the table
+    /// and a table the layout cannot hold.
+    pub fn shard_extent(
+        shard: u64,
+        shard_rows: u64,
+        total_rows: u64,
+        row_width: u32,
+    ) -> Result<(u64, u64), FlashError> {
+        let layout = Self::shard_layout(shard, shard_rows, total_rows, row_width)?;
+        Ok((layout.byte_size(), layout.trailer_offset()))
+    }
+
+    fn shard_layout(shard: u64, shard_rows: u64, total_rows: u64, row_width: u32) -> Result<NgramLayout, FlashError> {
+        const OP: &str = "ngram table";
+        let first = shard.checked_mul(shard_rows).filter(|first| *first < total_rows);
+        let Some(first) = first else {
+            return Err(FlashError::refused(
+                OP,
+                format!("shard {shard} of {shard_rows} rows is past the table's {total_rows} rows"),
+            ));
+        };
+        NgramLayout::new(shard_rows.min(total_rows - first), u64::from(row_width))
+            .map_err(|why| FlashError::refused(OP, format!("shard {shard}: {why}")))
+    }
+
+    /// The table of `total_rows` rows of `row_width` values over `shards`, `scales` holding each shard's scale (read
+    /// from the shard's [`shard_extent`](Self::shard_extent) trailer by the caller: building a table reads nothing).
+    /// Refuses a shard too short for its rows, a shard count that does not cover the rows and a scale count that is
+    /// not the shards'.
     pub fn new(
         shards: Vec<Arc<dyn ShardBytes>>,
         shard_rows: u64,
         total_rows: u64,
         row_width: u32,
+        scales: Vec<f32>,
     ) -> Result<Self, FlashError> {
         const OP: &str = "ngram table";
         if shard_rows == 0 || total_rows == 0 || shards.len() as u64 != total_rows.div_ceil(shard_rows) {
@@ -213,27 +281,25 @@ impl NgramRows {
                 ),
             ));
         }
+        if scales.len() != shards.len() {
+            return Err(FlashError::refused(
+                OP,
+                format!("{} scales for {} shards", scales.len(), shards.len()),
+            ));
+        }
         let mut layouts = Vec::with_capacity(shards.len());
-        let mut scales = Vec::with_capacity(shards.len());
         for (index, shard) in shards.iter().enumerate() {
-            let rows = shard_rows.min(total_rows - index as u64 * shard_rows);
-            let layout = NgramLayout::new(rows, u64::from(row_width))
-                .map_err(|why| FlashError::refused(OP, format!("shard {index}: {why}")))?;
-            let bytes = shard.as_ref().as_ref();
-            if (bytes.len() as u64) < layout.byte_size() {
+            let layout = Self::shard_layout(index as u64, shard_rows, total_rows, row_width)?;
+            if shard.size() < layout.byte_size() {
                 return Err(FlashError::refused(
                     OP,
                     format!(
-                        "shard {index} holds {} bytes, {rows} rows of {row_width} values take {}",
-                        bytes.len(),
+                        "shard {index} holds {} bytes, its rows of {row_width} values take {}",
+                        shard.size(),
                         layout.byte_size()
                     ),
                 ));
             }
-            let at = layout.trailer_offset() as usize;
-            let mut scale = [0u8; 4];
-            scale.copy_from_slice(&bytes[at..at + 4]);
-            scales.push(f32::from_le_bytes(scale));
             layouts.push(layout);
         }
         let row_bytes = layouts[0].row_bytes() as u32;
@@ -265,42 +331,148 @@ impl NgramRows {
         self.total_rows
     }
 
-    /// Writes the records of `ids[range]` to `out`, one [`NgramRows::record_bytes`] each in order
-    /// (`NgramStore.gatherRecordsRange`). Refuses a row outside the table, a range outside `ids` and an `out` of the
-    /// wrong length.
-    pub fn gather(&self, ids: &[u64], range: Range<usize>, out: &mut [u8]) -> Result<(), FlashError> {
+    /// The shard and the offset in it of each row of `ids[range]`. Refuses a row outside the table and a range outside
+    /// `ids`.
+    fn places(&self, ids: &[u64], range: Range<usize>) -> Result<Vec<(usize, u64)>, FlashError> {
         const OP: &str = "ngram gather";
-        let record = self.record_bytes as usize;
-        if range.end > ids.len() || range.start > range.end || out.len() != (range.end - range.start) * record {
+        let Some(rows) = ids.get(range.clone()) else {
             return Err(FlashError::refused(
                 OP,
-                format!(
-                    "rows {}..{} of {} ids into {} bytes of {record}-byte records",
-                    range.start,
-                    range.end,
-                    ids.len(),
-                    out.len()
-                ),
+                format!("rows {}..{} of {} ids", range.start, range.end, ids.len()),
             ));
-        }
-        let row_bytes = self.row_bytes as usize;
-        for (slot, &row) in out.chunks_exact_mut(record).zip(&ids[range]) {
-            if row >= self.total_rows {
-                return Err(FlashError::refused(OP, format!("row {row} of {}", self.total_rows)));
+        };
+        rows.iter()
+            .map(|&row| {
+                if row >= self.total_rows {
+                    return Err(FlashError::refused(OP, format!("row {row} of {}", self.total_rows)));
+                }
+                let shard = (row / self.shard_rows) as usize;
+                // The layout of the shard knows every row of it: the shard of this row was checked at construction.
+                let at = self.layouts[shard]
+                    .row_offset(row % self.shard_rows)
+                    .ok_or_else(|| FlashError::refused(OP, format!("row {row} is not in shard {shard}")))?;
+                Ok((shard, at))
+            })
+            .collect()
+    }
+
+    /// Starts reading the records of `ids[range]` and returns at once; `done` runs, as the work of a frame, when the last
+    /// row has been read, with the records, one [`NgramRows::record_bytes`] each in order (`NgramStore.gatherRecordsRange`),
+    /// or the first failure. Every row is its own read, started here: the I/O engine queues what its ring cannot take.
+    /// Refuses a row outside the table and a range outside `ids`, starting nothing (`done` is dropped unrun); a range of
+    /// no rows ends at once, in this call.
+    pub fn gather(self: &Arc<Self>, ids: &[u64], range: Range<usize>, done: GatherDone) -> Result<(), FlashError> {
+        let places = self.places(ids, range)?;
+        let count = places.len();
+        let gather = Arc::new(Gather {
+            table: Arc::clone(self),
+            rows: (0..count).map(|_| OnceLock::new()).collect(),
+            shards: places.iter().map(|place| place.0).collect(),
+            // The call's own count: no row ends the gather inside it unless the call has started every row.
+            pending: AtomicUsize::new(count + 1),
+            failure: OnceLock::new(),
+            done: ClaimCell::new(Some(done)),
+        });
+        for (index, (shard, at)) in places.into_iter().enumerate() {
+            let ended = Arc::clone(&gather);
+            let then: RowRead = Box::new(move |result| {
+                step(Kind::NgramRead, index, move || {
+                    match result {
+                        Ok(bytes) => {
+                            let _ = ended.rows[index].set(bytes);
+                        }
+                        Err(why) => ended.fail(index, why),
+                    }
+                    ended.tick();
+                })
+            });
+            if let Err(why) = self.shards[shard].start(at, self.row_bytes as usize, then) {
+                // Nothing started: the continuation is gone, unrun.
+                gather.fail(index, why);
+                gather.tick();
             }
-            let shard = (row / self.shard_rows) as usize;
-            let local = row % self.shard_rows;
-            // The layout of the shard knows every row of it: the shard of this row was checked at construction.
-            let at = self.layouts[shard]
-                .row_offset(local)
-                .ok_or_else(|| FlashError::refused(OP, format!("row {row} is not in shard {shard}")))?
-                as usize;
-            let bytes: &[u8] = self.shards[shard].as_ref().as_ref();
-            slot[..row_bytes].copy_from_slice(&bytes[at..at + row_bytes]);
-            slot[row_bytes..record - 4].fill(0);
-            slot[record - 4..].copy_from_slice(&self.scales[shard].to_le_bytes());
         }
+        gather.tick();
         Ok(())
+    }
+}
+
+impl NgramRows {
+    /// The records of `ids[range]`, for a table whose shards end their reads inside the call ([`MemoryShard`]). Refuses
+    /// what [`gather`](Self::gather) refuses, and a table with a read still out.
+    pub fn gather_in_memory(self: &Arc<Self>, ids: &[u64], range: Range<usize>) -> Result<Vec<u8>, FlashError> {
+        let slot: Arc<OnceLock<Result<Vec<u8>, FlashError>>> = Arc::new(OnceLock::new());
+        let told = Arc::clone(&slot);
+        self.gather(
+            ids,
+            range,
+            Box::new(move |records| {
+                let _ = told.set(records);
+            }),
+        )?;
+        slot.get()
+            .cloned()
+            .unwrap_or_else(|| Err(FlashError::refused("ngram gather", "a read was still out".to_owned())))
+    }
+}
+
+/// What a gather tells when its last row has been read.
+pub type GatherDone = Box<dyn FnOnce(Result<Vec<u8>, FlashError>) + Send>;
+
+/// The rows of one gather in flight, and what joins them.
+struct Gather {
+    table: Arc<NgramRows>,
+    rows: Box<[OnceLock<Vec<u8>>]>,
+    shards: Vec<usize>,
+    /// Rows not ended, and the starting call's own count.
+    pending: AtomicUsize,
+    /// The first row's failure.
+    failure: OnceLock<FlashError>,
+    /// Taken once, by the one that brings `pending` to zero.
+    done: ClaimCell<Option<GatherDone>>,
+}
+
+impl Gather {
+    fn fail(&self, row: usize, why: String) {
+        // The first failure is the one told; a later one is a consequence or a duplicate.
+        let _ = self.failure.set(FlashError::refused(
+            "ngram gather",
+            format!("row {row} of the gather: {why}"),
+        ));
+    }
+
+    /// One row ended (or was never started): the last one ends the gather.
+    fn tick(&self) {
+        if self.pending.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let Some(mut claim) = self.done.try_claim() else {
+            return;
+        };
+        let Some(done) = claim.take() else {
+            return;
+        };
+        drop(claim);
+        done(self.join());
+    }
+
+    /// The records of the rows, each the row's bytes, zeros, and its shard's scale.
+    fn join(&self) -> Result<Vec<u8>, FlashError> {
+        if let Some(error) = self.failure.get() {
+            return Err(error.clone());
+        }
+        let table = &self.table;
+        let (row_bytes, record) = (table.row_bytes as usize, table.record_bytes as usize);
+        let mut out = vec![0u8; self.rows.len() * record];
+        for ((slot, row), shard) in out.chunks_exact_mut(record).zip(&self.rows).zip(&self.shards) {
+            let bytes = row
+                .get()
+                .filter(|bytes| bytes.len() == row_bytes)
+                .ok_or_else(|| FlashError::refused("ngram gather", "a row ended without its bytes".to_owned()))?;
+            slot[..row_bytes].copy_from_slice(bytes);
+            slot[record - 4..].copy_from_slice(&table.scales[*shard].to_le_bytes());
+        }
+        Ok(out)
     }
 }
 

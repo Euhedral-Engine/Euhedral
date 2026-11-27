@@ -70,6 +70,13 @@ pub enum Op<'a> {
     },
     /// The zero fill of `bytes` device bytes at `address`.
     Zero { address: DevicePtr, bytes: u64 },
+    /// The selection key of the BF16 logits row at `logits`, over its first `entries` entries, written at `keys`
+    /// (`ExecutionGpu.argmaxBf16`).
+    Argmax {
+        logits: DevicePtr,
+        entries: u32,
+        keys: DevicePtr,
+    },
 }
 
 /// The operations of one stage, in the order they are queued.
@@ -170,6 +177,7 @@ impl Op<'_> {
                 unsafe { kernels.copy_device_to_readback_shared(destination, offset, source, bytes) }
             }
             Op::Zero { address, bytes } => kernels.zero_device_memory(address, bytes),
+            Op::Argmax { logits, entries, keys } => kernels.argmax_bf16(logits, entries, keys),
         }
     }
 
@@ -237,6 +245,9 @@ impl Op<'_> {
                 offset, source, bytes, ..
             } => format!("readback {} offset={offset} bytes={bytes}", address(source)),
             Op::Zero { address: target, bytes } => format!("zero {} bytes={bytes}", address(target)),
+            Op::Argmax { logits, entries, keys } => {
+                format!("argmax {},i{entries},{}", address(logits), address(keys))
+            }
         }
     }
 }

@@ -74,15 +74,6 @@ pub enum ExpertError {
         wanted: usize,
         got: usize,
     },
-    #[error(
-        "expert {expert} of {bank} is damaged: its record has CRC-32 {found:#010x}, the artifact says {expected:#010x}"
-    )]
-    Damaged {
-        bank: String,
-        expert: u32,
-        expected: u32,
-        found: u32,
-    },
 }
 
 /// The records of the banks, in bank order and expert order, numbered by one flat key, all inside the artifact.
