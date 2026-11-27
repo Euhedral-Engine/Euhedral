@@ -496,3 +496,23 @@ fn a_checkpoint_directory_gives_the_tokenizer_a_package_would_carry() {
     let error = read_checkpoint_tokenizer(directory.path()).err().unwrap();
     assert!(error.to_string().contains("generation_config.json"), "{error}");
 }
+
+// Mutant caught: a call that is refused at once and still reports through `done` (and returns `Ok`).
+#[test]
+fn a_call_on_an_io_that_is_complete_returns_err_and_never_calls_done() {
+    let run = Run::start();
+    let fixture = Fixture::new(&Checkpoint::standard());
+    run.io.complete();
+    let (sender, receiver) = mpsc::channel::<()>();
+    let refused = package_tokenizer(
+        Arc::clone(&run.io),
+        Arc::clone(&run.host),
+        fixture.to_output(),
+        Box::new(move |_| sender.send(()).unwrap()),
+    );
+    assert!(refused.is_err());
+    // The callback is gone with the call: a callback that was kept would hold the sender, and the channel would not
+    // be disconnected.
+    assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
+    assert!(!fixture.path("out.edrl.part").exists());
+}
