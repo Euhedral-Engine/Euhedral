@@ -347,6 +347,62 @@ fn a_sampled_request_selects_on_the_host() {
 }
 
 #[test]
+fn a_sampled_request_with_top_k_one_takes_the_largest_logit() {
+    let mut rig = rig(8, 64);
+    let mut asked = request(&rig, &[1], 1, &[]);
+    asked.sampling = SamplingConfig::new(0.7, 1, 1.0, 5, false).unwrap();
+    rig.row_for(2);
+    rig.start(asked);
+    rig.retire(&[]);
+    let told = rig.told();
+    assert!(
+        told.contains(&"token 2".to_owned()),
+        "the largest logit was not taken: {told:?}"
+    );
+}
+
+#[test]
+fn a_sampled_request_draws_the_same_tokens_for_the_same_seed() {
+    let mut drawn = Vec::new();
+    for _ in 0..2 {
+        let mut rig = rig(8, 64);
+        let mut asked = request(&rig, &[1], 3, &[]);
+        asked.sampling = SamplingConfig::new(1.0, 0, 1.0, 9, false).unwrap();
+        // Every logit equal: the draw alone chooses.
+        rig.device.lock().unwrap().row = Some(vec![0u8; VOCABULARY * 2]);
+        rig.start(asked);
+        for _ in 0..3 {
+            rig.retire(&[]);
+        }
+        let told = rig.told();
+        let tokens: Vec<String> = told.into_iter().filter(|line| line.starts_with("token ")).collect();
+        assert_eq!(tokens.len(), 3, "a token was not drawn at each step: {tokens:?}");
+        drawn.push(tokens);
+    }
+    assert_eq!(drawn[0], drawn[1], "one seed drew different tokens");
+}
+
+#[test]
+fn the_first_step_of_a_later_request_returns_the_sequence_to_the_start() {
+    let mut rig = rig(8, 64);
+    rig.select(7);
+    rig.start(request(&rig, &[1, 2], 1, &[]));
+    rig.retire(&[10]);
+    rig.retire(&[11]);
+    rig.told();
+    rig.start(request(&rig, &[3], 1, &[]));
+    let begun = rig.begun();
+    let fresh: Vec<bool> = begun.iter().map(|step| step.fresh).collect();
+    assert_eq!(fresh.first(), Some(&true));
+    assert_eq!(
+        fresh.last(),
+        Some(&true),
+        "the second request's first step continued the old position"
+    );
+    assert_eq!(begun.last().map(|step| step.tokens.clone()), Some(vec![3]));
+}
+
+#[test]
 fn a_constrained_greedy_request_selects_on_the_host_and_the_constraint_accepts() {
     let mut rig = rig(8, 64);
     let (prepared, accepted) = (Arc::new(Mutex::new(0)), Arc::new(Mutex::new(Vec::new())));

@@ -5,6 +5,7 @@
 //! request the owner refuses has its listener told. It is the unit the server will hold; nothing dispatches to it yet.
 
 use std::fmt::{self, Debug, Formatter};
+use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,8 +13,12 @@ use euhedral_data_structures::queues::MpscQueue;
 
 use super::FlashError;
 use super::device::{DeviceStepper, OwnerAddress};
-use super::generate::{FlashOwner, Message, Rejected};
+#[cfg(test)]
+use super::generate::Limits;
+use super::generate::{FlashOwner, Message, Rejected, Stepper};
 use super::startup::FlashModel;
+#[cfg(test)]
+use crate::generation::Spawn;
 use crate::generation::{AdmissionError, CancelHandle, Generation, GenerationRequest, Mailbox};
 
 /// Messages a retiring quantum may have queued for the owner at once: one chunk is in flight, so a few suffice.
@@ -24,13 +29,13 @@ fn closed_error() -> AdmissionError {
 }
 
 /// The engine's one sequence and the way to start requests on it.
-pub struct FlashEngine {
-    mailbox: Arc<Mailbox<FlashOwner<DeviceStepper>>>,
+pub struct FlashEngine<S: Stepper = DeviceStepper> {
+    mailbox: Arc<Mailbox<FlashOwner<S>>>,
     /// Kept so the retiring quanta's address stays valid as long as the engine.
-    _address: Arc<OwnerAddress>,
+    _address: Option<Arc<OwnerAddress>>,
 }
 
-impl Debug for FlashEngine {
+impl<S: Stepper> Debug for FlashEngine<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlashEngine").finish_non_exhaustive()
     }
@@ -47,8 +52,20 @@ impl FlashEngine {
         address.set(&mailbox);
         Ok(FlashEngine {
             mailbox,
-            _address: address,
+            _address: Some(address),
         })
+    }
+}
+
+impl<S: Stepper> FlashEngine<S> {
+    /// The engine over `owner`, whose inbox is `queue`'s consumer; `spawn` hands a frame to a worker.
+    #[cfg(test)]
+    fn over(stepper: S, limits: Limits, queue: &MpscQueue<Message>, spawn: Spawn) -> Self {
+        let owner = FlashOwner::new(stepper, queue.consumer(), limits);
+        FlashEngine {
+            mailbox: Arc::new(Mailbox::new(owner, queue.producer(), spawn)),
+            _address: None,
+        }
     }
 
     /// Starts `request`. `Ok` means the listener hears the outcome; an `Err` is the refusal, and the listener hears
@@ -62,7 +79,15 @@ impl FlashEngine {
         });
         match inline {
             // The first quantum is started: its retirement is posted to the owner and drives the mailbox.
-            Ok(Some(started)) => started.map_err(|rejected| rejected.error),
+            Ok(Some(started)) => {
+                let started = started.map_err(|rejected| rejected.error);
+                // A first quantum that could not start leaves its failed outcome with the owner and no retirement is
+                // coming: a turn must tell the listener. With no worker to take it, this thread runs it.
+                if started.is_ok() && !self.mailbox.nudge() {
+                    self.mailbox.drive();
+                }
+                started
+            }
             Ok(None) => Err(closed_error()),
             Err(_) => {
                 let Some((request, cancel)) = begin else {
@@ -87,13 +112,22 @@ impl FlashEngine {
         self.mailbox.stopping().is_some_and(|idle| idle.wait(bound).is_ok())
     }
 
-    /// Ends the engine's sequence and frees its device memory. Nothing may be running: with a request in flight the
-    /// memory stays allocated and this says so. Drop the engine's stages (the model's) after this, before shutting
-    /// the model down.
-    pub fn close(self) {
-        drop(self.mailbox.close());
+    /// Ends the engine's sequence and frees its device memory; `true` when it did. With a request in flight the
+    /// sequence stays allocated and running (the engine's mailbox is kept for as long as the process, so the running
+    /// graph's memory is not freed under it) and this says so and returns `false`. Drop the engine's stages (the
+    /// model's) after this, before shutting the model down.
+    pub fn close(self) -> bool {
+        if let Some(owner) = self.mailbox.close() {
+            drop(owner);
+            return true;
+        }
+        log::error!("a generation is running at shutdown: the sequence's device memory stays allocated");
+        mem::forget(self);
+        false
     }
 }
 
+#[cfg(test)]
+mod contract;
 #[cfg(test)]
 mod tests;

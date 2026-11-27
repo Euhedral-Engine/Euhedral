@@ -102,6 +102,6 @@ fn a_short_prompt_generates_the_same_tokens_twice() {
     assert!(!first.is_empty(), "no token was generated");
     assert_eq!(first, second, "the same prompt generated different tokens");
     assert!(engine.stop(Duration::from_secs(60)), "the engine did not go idle");
-    engine.close();
+    assert!(engine.close(), "the engine kept its sequence");
     model.shutdown(owner);
 }
