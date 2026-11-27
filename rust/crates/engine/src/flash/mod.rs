@@ -25,6 +25,7 @@ macro_rules! eager {
 
 pub mod block;
 pub mod buffers;
+pub mod chunks;
 pub mod embed;
 pub mod gdn;
 pub mod head;
