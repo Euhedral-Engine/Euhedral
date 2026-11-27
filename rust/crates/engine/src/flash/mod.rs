@@ -36,6 +36,7 @@ pub mod plan;
 pub mod ple;
 pub mod qsa;
 pub mod sequence;
+pub mod start;
 
 use euhedral_inference_cuda::DevicePtr;
 use thiserror::Error;
