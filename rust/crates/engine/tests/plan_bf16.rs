@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use euhedral_inference_cuda::DevicePtr;
-use euhedral_inference_edrl::WeightFormat;
+use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::formats::{
-    Bf16Linear, LinearFormat, LinearMode, Nvfp4Linear, TokenEmbedding, TrellisLinear,
+    Bf16Linear, LinearFormat, LinearMode, Nvfp4Linear, ROW_EXACT_KERNELS, TokenEmbedding, TrellisLinear,
 };
 use euhedral_inference_engine::model::{LayerIndex, Residence, Role, WeightRef, object_key};
 use euhedral_inference_engine::plan::{Formats, Plan, PlanBuildError, StageKind, View, WeightLookup};
@@ -93,23 +93,44 @@ fn pointer(value: u64) -> DevicePtr {
 }
 
 fn matrix(n: u64, k: u64) -> WeightRef {
-    let residency = resident();
-    let mut weight = weights(&residency).0.remove(&(LayerIndex(0), Role::Down)).unwrap();
-    weight.shape = vec![n, k];
-    weight.bytes = 2 * n * k;
-    weight.ptr = pointer(0x1000);
-    weight
+    WeightRef {
+        name: format!("text/layers/0/weight_{n}x{k}"),
+        shape: vec![n, k],
+        dtype: TensorDataType::Bf16,
+        format: WeightFormat::Bf16,
+        layout: WeightLayout::ContiguousLeV1,
+        ptr: pointer(0x1000),
+        bytes: 2 * n * k,
+        residence: Residence::Device,
+        trellis: None,
+    }
 }
 
 #[test]
-fn the_plan_of_a_bf16_artifact_builds_with_every_projection_on_the_bf16_format() {
+fn the_plan_of_a_bf16_artifact_builds_with_every_projection_on_a_row_exact_kernel() {
     let residency = resident();
-    let bf16 = residency
+    let projections: Vec<_> = residency
         .device
         .iter()
         .filter(|placement| placement.format == WeightFormat::Bf16 && placement.shape.len() == 2)
-        .count();
-    assert!(bf16 > 300, "the artifact's projections are BF16: {bf16}");
+        .collect();
+    assert!(!projections.is_empty(), "the artifact has BF16 matrices");
+    for placement in projections {
+        let weight = matrix(placement.shape[0], placement.shape[1]);
+        if Bf16Linear::check(&weight).is_err() {
+            // The gated-control inputs (a few rows wide) leave through their own launch, not this format.
+            continue;
+        }
+        for rows in [1usize, 17] {
+            let launch = Bf16Linear::launch(&weight, pointer(0x2000), pointer(0x3000), rows).unwrap();
+            assert!(
+                ROW_EXACT_KERNELS.iter().any(|(_, name)| *name == launch.symbol),
+                "{} x {rows} rows launches {}",
+                placement.name,
+                launch.symbol
+            );
+        }
+    }
     let plan = build(weights(&residency).0, &residency).unwrap();
     let kinds = plan.kinds(View::Decode).unwrap();
     assert!(kinds.contains(&StageKind::Linear) && kinds.contains(&StageKind::Embed));
@@ -142,6 +163,54 @@ fn a_bf16_object_whose_bytes_are_not_its_values_is_refused() {
     let mut vector = matrix(5120, 17_408);
     vector.shape = vec![5120 * 17_408];
     assert!(Bf16Linear::check(&vector).is_err());
+}
+
+#[test]
+fn a_bf16_linear_names_the_value_that_is_not_bf16_contiguous_or_sized() {
+    let mut weight = matrix(5120, 17_408);
+    weight.format = WeightFormat::Q3G64Fp16;
+    let why = Bf16Linear::check(&weight).unwrap_err();
+    assert!(why.contains(&weight.name) && why.contains("Q3G64Fp16"), "{why}");
+    let mut weight = matrix(5120, 17_408);
+    weight.layout = WeightLayout::RowSplitK128V1;
+    let why = Bf16Linear::check(&weight).unwrap_err();
+    assert!(why.contains(&weight.name) && why.contains("RowSplitK128V1"), "{why}");
+    let mut weight = matrix(5120, 17_408);
+    weight.dtype = TensorDataType::Fp16;
+    let why = Bf16Linear::check(&weight).unwrap_err();
+    assert!(why.contains(&weight.name) && why.contains("Fp16"), "{why}");
+    for (n, k) in [(0u64, 17_408u64), (5120, 0)] {
+        let weight = matrix(n, k);
+        let why = Bf16Linear::check(&weight).unwrap_err();
+        assert!(
+            why.contains(&weight.name) && why.contains(&format!("{n} x {k}")),
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn a_bf16_embedding_names_the_value_that_is_not_readable() {
+    let residency = resident();
+    let table = weights(&residency)
+        .0
+        .remove(&(LayerIndex::GLOBAL, Role::Embedding))
+        .unwrap();
+    let mut layout = table.clone();
+    layout.layout = WeightLayout::RowSplitK128V1;
+    let why = TokenEmbedding::check(&layout).unwrap_err();
+    assert!(why.contains(&table.name) && why.contains("cannot read"), "{why}");
+    let mut dtype = table.clone();
+    dtype.dtype = TensorDataType::Fp16;
+    let why = TokenEmbedding::check(&dtype).unwrap_err();
+    assert!(why.contains(&table.name) && why.contains("cannot read"), "{why}");
+    let mut bytes = table.clone();
+    bytes.bytes -= 2;
+    let why = TokenEmbedding::check(&bytes).unwrap_err();
+    assert!(
+        why.contains(&table.name) && why.contains(&bytes.bytes.to_string()),
+        "{why}"
+    );
 }
 
 #[test]

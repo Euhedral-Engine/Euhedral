@@ -471,9 +471,22 @@ mod tests {
                 token_ids: DevicePtr::NULL,
                 ..ok
             },
+            EmbedShape {
+                embedding: DevicePtr::NULL,
+                ..ok
+            },
+            EmbedShape {
+                hidden: DevicePtr::NULL,
+                ..ok
+            },
             EmbedShape { token_count: 0, ..ok },
             EmbedShape {
                 vocabulary_size: 0,
+                ..ok
+            },
+            EmbedShape {
+                hidden_size: 0,
+                embedding_bytes: 0,
                 ..ok
             },
         ] {

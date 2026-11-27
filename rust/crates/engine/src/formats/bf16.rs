@@ -48,9 +48,10 @@ impl Bf16Linear {
         Ok(())
     }
 
-    /// The launch of `rows` rows at `x` over `weight`, the result at `y`.
+    /// The launch of `rows` rows at `x` over `weight`, the result at `y`. The weight was checked when the plan was
+    /// built ([`Formats::of`](crate::plan::Formats::of)).
     pub fn launch(weight: &WeightRef, x: DevicePtr, y: DevicePtr, rows: usize) -> Result<Launch, CudaError> {
-        Self::check(weight).map_err(argument)?;
+        debug_assert!(Self::check(weight).is_ok(), "the plan build checked {}", weight.name);
         let mut planned = None;
         row_exact_bf16(
             x,
