@@ -19,13 +19,14 @@ use std::mem::{self, ManuallyDrop};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::Lake;
 use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, HostWeightsArena, PinnedBuffer, PooledPinned};
 use euhedral_inference_edrl::{
-    DETECT_BYTES, FLASH_HEADER_BYTES, FOOTER_BYTES, FlashArtifact, FlashHeader, ReadPlan, TokenizerFooter,
+    DETECT_BYTES, FLASH_HEADER_BYTES, FOOTER_BYTES, FlashArtifact, FlashConfig, FlashHeader, ReadPlan, TokenizerFooter,
     TokenizerSection, content_end, shard_name,
 };
 use euhedral_inference_settings::Settings;
@@ -130,6 +131,8 @@ impl FlashModel {
     pub fn shutdown(self, owner: RuntimeOwner) {
         let bound = self.core.teardown.cancel_bound;
         let ended = self.held.cache.as_ref().is_none_or(|cache| wait_closed(cache, bound));
+        let allocated = self.core.teardown.device_bytes.load(Ordering::Acquire);
+        let teardown = Arc::clone(&self.core.teardown);
         owner.shutdown_with(move || {
             if ended {
                 self.release();
@@ -138,6 +141,10 @@ impl FlashModel {
                 mem::forget(self);
             }
         });
+        if !ended {
+            // Nothing was freed: the bytes still count as allocated.
+            teardown.device_bytes.store(allocated, Ordering::Release);
+        }
     }
 
     #[allow(
@@ -154,6 +161,7 @@ impl FlashModel {
         drop(ManuallyDrop::into_inner(held));
         drop(reservation);
         let report = core.account.close();
+        core.teardown.leaked_bytes.store(report.bytes(), Ordering::Release);
         if report.is_clean() {
             log::info!("memory account closed: no claim is still held");
         } else {
@@ -366,7 +374,7 @@ fn locate(boot: Boot, path: PathBuf, file: Arc<OwnedFile>, length: u64, read: Ve
                 artifact: Arc::new(artifact),
             });
             match opened {
-                Ok(opened) => boot.then(host_lake, move |boot| plan(boot, opened)),
+                Ok(opened) => boot.then(device, move |boot| lanes(boot, opened)),
                 Err(error) => boot.fail(error),
             }
         }
@@ -401,7 +409,7 @@ fn refuse_unserved(plan: &FlashPlan) -> Result<(), EngineError> {
     if plan.expert_store == ExpertStoreMode::RamResident {
         return Err(EngineError::Runtime(
             "the plan holds every expert record in memory, which this start does not preload: raise \
-             memory.host-margin or lower memory.host-limit so the plan caches the records"
+             memory.host-limit or lower memory.host-margin so the plan caches the records"
                 .to_string(),
         ));
     }
@@ -421,13 +429,15 @@ struct Planned {
     dimensions: FlashModelConfig,
     plan: FlashPlan,
     layout: FixedLayout,
+    experts: Arc<ExpertLayout>,
+    piece: DiskReadPiece,
 }
 
-/// Step 3: opens the lanes, then plans the placement against the device (as the lanes left it) and the host, and
-/// admits the plan. Nothing is allocated on the device.
-fn plan(mut boot: Boot, opened: Opened) {
+/// Step 3a, in a frame of the device lake: refuses what the start cannot serve, opens the lanes (their rings take device
+/// memory), then reads the device's free memory, which is the figure the plan is made from.
+fn lanes(boot: Boot, opened: Opened) {
     let core = Arc::clone(&boot.core);
-    let planned = (|| {
+    let free = (|| {
         one_sequence(&core.settings.batching)?;
         let compute = core.settings.memory.weight_streaming.gpu_streams;
         if compute == 0 {
@@ -436,7 +446,19 @@ fn plan(mut boot: Boot, opened: Opened) {
             ));
         }
         core.open_lanes(1, compute as usize)?;
-        let inputs = startup::device_inputs(&core)?;
+        Ok(startup::device_inputs(&core)?.device_free)
+    })();
+    match free {
+        Ok(free) => boot.then(host_lake, move |boot| plan(boot, opened, free)),
+        Err(error) => boot.fail(error),
+    }
+}
+
+/// Step 3b: plans the placement against the device (`device_free`, as the lanes left it) and the host, checks everything
+/// the later steps rely on, and admits the plan. Allocates nothing on the device.
+fn plan(mut boot: Boot, opened: Opened, device_free: u64) {
+    let core = Arc::clone(&boot.core);
+    let planned = (|| {
         let dimensions = FlashModelConfig::from_flash(opened.artifact.config())?;
         let tables = opened.artifact.tables();
         let plan = plan_flash(
@@ -445,7 +467,7 @@ fn plan(mut boot: Boot, opened: Opened) {
             tables.banks(),
             &core.settings.memory,
             FlashPlanInputs {
-                device_free: inputs.device_free,
+                device_free,
                 host: core.host_budget,
                 max_context_tokens: core.settings.context.max_tokens as usize,
                 mode: FlashMode::TEXT,
@@ -453,6 +475,11 @@ fn plan(mut boot: Boot, opened: Opened) {
         )?;
         refuse_unserved(&plan)?;
         let layout = FixedLayout::of(&plan, tables.tensors()).map_err(flash_failed)?;
+        let experts = Arc::new(ExpertLayout::new(tables.banks(), opened.length).map_err(expert_failed)?);
+        let streaming = &core.settings.memory.weight_streaming;
+        let piece = DiskReadPiece::from_setting(core.settings.memory.disk_read_piece).map_err(EngineError::Runtime)?;
+        check_cache(&plan, &experts, streaming.read_split, streaming.concurrent_reads)?;
+        check_ngram(opened.artifact.config(), &layout)?;
         let reservation = core.account.admit_flash(&plan)?;
         let admitted = reservation.admitted();
         log::info!(
@@ -460,21 +487,78 @@ fn plan(mut boot: Boot, opened: Opened) {
             admitted.device,
             admitted.host
         );
-        Ok((dimensions, plan, layout, reservation))
+        Ok((dimensions, plan, layout, experts, piece, reservation))
     })();
     match planned {
-        Ok((dimensions, plan, layout, reservation)) => {
+        Ok((dimensions, plan, layout, experts, piece, reservation)) => {
             boot.reservation = Some(reservation);
             let planned = Planned {
                 opened,
                 dimensions,
                 plan,
                 layout,
+                experts,
+                piece,
             };
             boot.then(device, move |boot| allocate(boot, planned));
         }
         Err(error) => boot.fail(error),
     }
+}
+
+/// Refuses an expert cache the plan sized for records the layout does not have, and a read setting of zero: the store
+/// takes its slots' sizes from the layout, so a plan that differs would load records into slots too small for them.
+fn check_cache(
+    plan: &FlashPlan,
+    experts: &ExpertLayout,
+    read_split: u32,
+    concurrent_reads: u32,
+) -> Result<(), EngineError> {
+    let (device, staging) = (plan.expert_cache.slot_bytes, plan.expert_staging.slot_bytes);
+    if device != experts.max_record_bytes() {
+        return Err(EngineError::Runtime(format!(
+            "the plan's expert cache slots hold {device} bytes and the largest expert record is {} bytes",
+            experts.max_record_bytes()
+        )));
+    }
+    if staging != experts.slot_bytes() as u64 {
+        return Err(EngineError::Runtime(format!(
+            "the plan's expert staging slots hold {staging} bytes and a staged record needs {} bytes",
+            experts.slot_bytes()
+        )));
+    }
+    if read_split == 0 {
+        return Err(EngineError::Runtime(
+            "memory.weight-streaming.read-split is 0: a record is read in at least 1 part".to_string(),
+        ));
+    }
+    if concurrent_reads == 0 {
+        return Err(EngineError::Runtime(
+            "memory.weight-streaming.concurrent-reads is 0: the cache needs at least 1 read in flight".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses an artifact whose n-gram shards are not all placed: the tables are built over them after the upload.
+fn check_ngram(config: &FlashConfig, layout: &FixedLayout) -> Result<(), EngineError> {
+    for layer in 0..config.text.num_layers {
+        if !config.has_ngram(layer as usize) {
+            continue;
+        }
+        for shard in 0..config.ngram.split_parts {
+            let name = ngram_shard(layer, shard);
+            if layout.home(&name).is_none() {
+                return Err(EngineError::Runtime(format!("the artifact has no n-gram shard {name}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The name of shard `shard` of layer `layer`'s n-gram table.
+fn ngram_shard(layer: u32, shard: u32) -> String {
+    format!("{}ple/ngram/{}", layer_prefix(layer), shard_name(shard))
 }
 
 fn flash_failed(error: FlashError) -> EngineError {
@@ -689,8 +773,11 @@ fn pad(mut boot: Boot, planned: Planned, weights: FixedWeights, mut held: Held, 
         Ok((padded_down, None)) => build_cache(boot, planned, weights, padded_down, held, rest),
         Ok((padded_down, Some((region, marker)))) => {
             held.pad = Some(region);
+            // The frame may run on any lake: the cache is built, and memory freed on failure, in the device lake's.
             let frame = step(Kind::Startup, 0, move || {
-                build_cache(boot, planned, weights, padded_down, held, rest);
+                boot.then(device, move |boot| {
+                    build_cache(boot, planned, weights, padded_down, held, rest)
+                });
             });
             core.completions().after_marker(marker, frame);
         }
@@ -713,13 +800,11 @@ fn build_cache(
     let core = Arc::clone(&boot.core);
     let built = (|| {
         let plan = &planned.plan;
-        let opened = &planned.opened;
-        let tables = opened.artifact.tables();
         let path = &core.settings.model.artifact;
-        let layout = Arc::new(ExpertLayout::new(tables.banks(), opened.length).map_err(expert_failed)?);
+        let layout = Arc::clone(&planned.experts);
         let file =
             ArtifactFile::open(path).map_err(|error| EngineError::io(format!("opening {}", path.display()), error))?;
-        let piece = DiskReadPiece::from_setting(core.settings.memory.disk_read_piece).map_err(EngineError::Runtime)?;
+        let piece = planned.piece;
         let port: Arc<dyn PartPort> = Arc::new(FilePartPort::new(Arc::clone(&core.io), Arc::new(file), piece));
         let split = core.settings.memory.weight_streaming.read_split as usize;
         let source = FileRecordSource::new(Arc::clone(&layout), port, split, true).map_err(expert_failed)?;
@@ -758,6 +843,8 @@ fn build_cache(
     match built {
         Ok((cache, tables)) => {
             held.cache = Some(cache);
+            let allocated = planned.layout.device_bytes() + planned.plan.expert_cache.bytes();
+            core.teardown.device_bytes.store(allocated, Ordering::Release);
             let Planned {
                 opened,
                 dimensions,
@@ -817,7 +904,7 @@ fn ngram_tables(planned: &Planned, weights: &FixedWeights) -> Result<Vec<(u32, A
         }
         let mut shards: Vec<Arc<dyn ShardBytes>> = Vec::with_capacity(parts as usize);
         for shard in 0..parts {
-            let name = format!("{}ple/ngram/{}", layer_prefix(layer), shard_name(shard));
+            let name = ngram_shard(layer, shard);
             let (offset, bytes) = weights.file_range(&name).map_err(flash_failed)?;
             let part = FileShard::over(&planned.opened.file, offset, bytes)
                 .map_err(|error| EngineError::io(format!("sharing the artifact for {name}"), error))?;
