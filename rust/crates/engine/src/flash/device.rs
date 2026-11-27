@@ -323,9 +323,7 @@ impl DeviceStepper {
             .step
             .start(quantum, Arc::new(AtomicBool::new(false)), &[])
             .map_err(|error| error.to_string())?;
-        self.flight = Some(InFlight {
-            _retained: retained,
-        });
+        self.flight = Some(InFlight { _retained: retained });
         Ok(())
     }
 }
