@@ -16,20 +16,24 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
+use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::{Failure, Frame};
 use euhedral_core::generics::{LatticeReceiver, LatticeSource, LatticeTerminal};
 use euhedral_graph::{LaneId, Marker, QueueId};
 use euhedral_inference_edrl::{
     ComponentGroup, ExpertBank, ExpertProjection, ExpertRecord, TensorDataType, WeightFormat, WeightLayout,
 };
+use euhedral_inference_settings::{ModelSettings, Settings as RuntimeSettings};
 use euhedral_io::{Continuation, IoDoneOwned};
 use euhedral_memory::{LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope, SlotArena, TierPool};
 
 use super::host::{CopyJob, CopyLane, DeviceSlots, Frames, SubmitFailure};
 use super::{CacheConfig, CacheError, ExpertCache, ExpertLease, Listener, Outcome};
+use crate::handoff::Handoff;
 use crate::residency::experts::{
-    ExpertError, ExpertId, ExpertLayout, ExpertStore, FileRecordSource, HostArena, PartPort, WritePart,
+    ExpertError, ExpertId, ExpertLayout, ExpertStore, FileRecordSource, HostArena, PartPort, RamTier, WritePart,
 };
+use crate::runtime::lattice_config;
 
 const RECORD: u64 = 4096;
 const EXPERTS: u32 = 6;
@@ -316,6 +320,8 @@ struct Settings {
     device_slot_bytes: Option<u64>,
     /// Slots in the staging free list, when not the arena's.
     free_list: Option<u32>,
+    /// Slots of a host tier between the store and the cache, when it has one.
+    tier_slots: Option<usize>,
 }
 
 impl Default for Settings {
@@ -327,6 +333,7 @@ impl Default for Settings {
             pool_slots: None,
             device_slot_bytes: None,
             free_list: None,
+            tier_slots: None,
         }
     }
 }
@@ -336,9 +343,18 @@ struct Rig {
     cache: ExpertCache,
     port: Arc<FakePort>,
     lane: Arc<FakeLane>,
+    /// The downstream of the owner's source, when the rig is its worker.
     worker: Arc<FakeReceiver>,
     source: Arc<dyn LatticeSource>,
     artifact: Vec<u8>,
+}
+
+/// Hands the owner's source to the fake worker, as a lattice's attach does.
+fn to_the_fake_worker(worker: Arc<FakeReceiver>) -> impl FnOnce(Arc<dyn LatticeSource>) -> Result<(), String> {
+    move |source| {
+        source.add_downstream(worker as Arc<dyn LatticeReceiver>);
+        Ok(())
+    }
 }
 
 /// What a request was told, once.
@@ -426,6 +442,17 @@ impl Rig {
     }
 
     fn try_new(settings: Settings) -> Result<Rig, CacheError> {
+        let worker = Arc::new(FakeReceiver::default());
+        let attach = to_the_fake_worker(Arc::clone(&worker));
+        Rig::build(settings, worker, attach)
+    }
+
+    /// A rig whose owner is attached by `attach`; `worker` is the fake worker when `attach` hands it the source.
+    fn build(
+        settings: Settings,
+        worker: Arc<FakeReceiver>,
+        attach: impl FnOnce(Arc<dyn LatticeSource>) -> Result<(), String>,
+    ) -> Result<Rig, CacheError> {
         let artifact: Vec<u8> = (0..(EXPERTS as usize + 1) * RECORD as usize)
             .map(|position| (position * 7) as u8)
             .collect();
@@ -449,7 +476,16 @@ impl Rig {
         let source = FileRecordSource::new(Arc::clone(&layout), Arc::clone(&port) as Arc<dyn PartPort>, 1, true)
             .expect("a source");
         let staging = HostArena::new(settings.staging_slots as usize, layout.slot_bytes()).expect("an arena");
-        let store = Arc::new(ExpertStore::new(source, None, Arc::clone(&staging)));
+        let (memory, tier) = match settings.tier_slots {
+            Some(slots) => {
+                let (memory, shards) = RamTier::new(Arc::clone(&layout), slots, 1)
+                    .expect("a tier")
+                    .into_parts();
+                (Some(memory), shards)
+            }
+            None => (None, Vec::new()),
+        };
+        let store = Arc::new(ExpertStore::new(source, memory, Arc::clone(&staging)));
         let planner = planner();
         let device = DeviceSlots::lease(
             &pool(
@@ -467,7 +503,7 @@ impl Rig {
         });
         let config = CacheConfig {
             store,
-            tier: Vec::new(),
+            tier,
             device,
             staging_slots: free_list(
                 &planner,
@@ -478,10 +514,13 @@ impl Rig {
             frames: Arc::clone(&lane) as Arc<dyn Frames>,
             copier: Arc::clone(&lane) as Arc<dyn CopyLane>,
         };
-        let cache = ExpertCache::new(config)?;
-        let worker = Arc::new(FakeReceiver::default());
-        let source = cache.source();
-        Arc::clone(&source).add_downstream(Arc::clone(&worker) as Arc<dyn LatticeReceiver>);
+        let attached = Arc::new(Mutex::new(None));
+        let keep = Arc::clone(&attached);
+        let cache = ExpertCache::new(config, move |source| {
+            *locked(&keep) = Some(Arc::clone(&source));
+            attach(source)
+        })?;
+        let source = locked(&attached).take().expect("the cache attached its source");
         Ok(Rig {
             _dir: dir,
             cache,
@@ -502,6 +541,8 @@ impl Rig {
                 return;
             };
             frame.execute().expect("the frame runs");
+            // The executor sends a key home after the frame ran.
+            frame.recycle();
         }
         panic!("the owner's turns never ran out: a turn keeps posting a record for the next");
     }
@@ -1151,6 +1192,184 @@ fn a_listener_that_panics_does_not_stop_the_load_from_retiring_or_the_close_or_t
         late.failure(),
         CacheError::Closed,
         "a listener's panic poisoned the owner"
+    );
+}
+
+#[test]
+fn a_cache_whose_source_the_lattice_refuses_is_not_built() {
+    let error = Rig::build(Settings::default(), Arc::default(), |_| {
+        Err("the lattice is closed".to_owned())
+    })
+    .err()
+    .expect("a cache that nothing would serve is refused");
+    assert_eq!(
+        error,
+        CacheError::Attach {
+            why: "the lattice is closed".to_owned()
+        }
+    );
+}
+
+#[test]
+fn a_lake_whose_hand_off_panics_as_a_load_begins_does_not_leave_the_load_to_hang_the_close() {
+    let rig = Rig::new(Settings {
+        device_slots: 1,
+        tier_slots: Some(3),
+        ..Settings::default()
+    });
+    // Two experts through the one device slot leave the first in the host tier, whose load is then one frame.
+    drop(rig.lease(0));
+    drop(rig.lease(1));
+    locked(&rig.lane.state).panic_offer = true;
+    let (told, _) = rig.fetch(0);
+    assert!(
+        matches!(told.failure(), CacheError::Poisoned { .. }),
+        "the request of the load whose frame was lost was not told the poison"
+    );
+    assert_eq!(
+        rig.lane.units.load(Ordering::SeqCst),
+        0,
+        "the load whose read was never handed off still holds its unit"
+    );
+    locked(&rig.lane.state).panic_offer = false;
+    let closed = rig.cache.close();
+    rig.poll();
+    assert!(
+        closed.wait(HANG).is_ok(),
+        "the close never ended: a load whose read was never handed off was never ended"
+    );
+}
+
+#[test]
+fn a_record_posted_while_a_turn_frame_is_out_is_applied_by_the_next_visit_that_finds_it() {
+    let rig = Rig::new(Settings {
+        device_slots: 1,
+        ..Settings::default()
+    });
+    // The listener drops its lease: a record posted by a listener, after the turn's drain.
+    rig.ask(0, Box::new(drop));
+    rig.poll();
+    rig.port.release_all();
+    rig.poll();
+    rig.lane.run_offered();
+    rig.lane.retire_all();
+    rig.source.request(1);
+    let mut turn = rig
+        .worker
+        .take()
+        .expect("the submission is a record waiting: the turn frame is pushed");
+    turn.execute().expect("the turn runs");
+    rig.source.request(1);
+    assert_eq!(
+        rig.worker.waiting(),
+        0,
+        "a second turn frame was pushed while one is out"
+    );
+    turn.recycle();
+    rig.source.request(1);
+    assert_eq!(
+        rig.worker.waiting(),
+        1,
+        "the release the listener posted during the turn was stranded: the frame that came home pushed nothing"
+    );
+    let (second, _) = rig.fetch(1);
+    assert_eq!(
+        rig.port.held(),
+        1,
+        "the release was not applied: the only slot is still pinned"
+    );
+    assert!(!second.is_told());
+}
+
+#[test]
+fn a_record_posted_from_outside_the_lattice_is_applied_by_a_worker_of_a_real_lattice() {
+    let runtime = RuntimeSettings::with_model(ModelSettings::default());
+    let lattice = ControlPlaneLattice::new(lattice_config(&runtime)).expect("the lattice starts");
+    let rig = Rig::build(Settings::default(), Arc::default(), |source| {
+        lattice
+            .add_upstream(source)
+            .map(drop)
+            .map_err(|error| error.to_string())
+    })
+    .expect("the cache is built");
+    let told = Handoff::<Outcome>::new();
+    let sink = Arc::clone(&told);
+    // A request already cancelled needs no lane: it is ended by the turn and told.
+    let cancel = Arc::new(AtomicBool::new(true));
+    rig.cache
+        .fetch(id(0), false, cancel, Box::new(move |outcome| sink.send(outcome)))
+        .expect("the request is accepted");
+    assert!(
+        matches!(told.wait(HANG), Ok(Outcome::Cancelled)),
+        "no worker of the lattice applied the request posted from outside it"
+    );
+    let closed = rig.cache.close();
+    assert!(
+        closed.wait(HANG).is_ok(),
+        "no worker of the lattice applied the close posted from outside it"
+    );
+    lattice.close();
+}
+
+#[test]
+fn a_closed_cache_that_is_done_refuses_a_request_on_the_calling_thread() {
+    let rig = Rig::new(Settings::default());
+    let closed = rig.cache.close();
+    rig.poll();
+    assert!(closed.wait(HANG).is_ok(), "the close never ended");
+    assert!(rig.source.is_complete(), "a closed cache's source was never completed");
+    let told = Told::default();
+    let sink = told.clone();
+    rig.ask(0, Box::new(move |outcome| *locked(&sink.0) = Some(outcome)));
+    assert_eq!(
+        told.failure(),
+        CacheError::Closed,
+        "a request after the source completed was left for a worker that will never come"
+    );
+    assert!(
+        rig.cache.close().wait(HANG).is_ok(),
+        "a second close of a done cache never ended"
+    );
+}
+
+#[test]
+fn a_retirement_frame_the_lake_drops_without_running_still_ends_the_load_and_the_close() {
+    let rig = Rig::new(Settings::default());
+    let (told, _) = rig.fetch(0);
+    rig.port.release_all();
+    rig.poll();
+    rig.lane.run_offered();
+    rig.poll();
+    drop(told.lease());
+    locked(&rig.lane.state).after.clear();
+    let closed = rig.cache.close();
+    rig.poll();
+    assert!(
+        closed.wait(HANG).is_ok(),
+        "the close never ended: the retirement frame was dropped and posted nothing"
+    );
+    assert_eq!(rig.lane.units.load(Ordering::SeqCst), 0, "the load's unit never ended");
+}
+
+#[test]
+fn a_quarantine_frame_the_lake_drops_without_running_loses_the_slot() {
+    let rig = Rig::new(Settings {
+        staging_slots: 1,
+        ..Settings::default()
+    });
+    locked(&rig.lane.state).uncertain = 1;
+    let (first, _) = rig.fetch(0);
+    let (second, _) = rig.fetch(1);
+    rig.port.release_all();
+    rig.poll();
+    rig.lane.run_offered();
+    locked(&rig.lane.state).after.clear();
+    rig.poll();
+    first.failure();
+    assert_eq!(
+        second.failure(),
+        CacheError::StagingLost { lost: 1 },
+        "the request waiting for the staging slot was never told: the dropped frame posted nothing"
     );
 }
 

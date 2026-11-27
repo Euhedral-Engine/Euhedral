@@ -36,6 +36,8 @@ pub enum CacheError {
     Keys { keys: usize, limit: usize },
     #[error("the cache has {slots} device slots: it needs at least one and at most {limit}")]
     Slots { slots: usize, limit: usize },
+    #[error("the lattice took no source for the cache: {why}")]
+    Attach { why: String },
     #[error("the expert cache is closed")]
     Closed,
     #[error("expert key {key} is outside the {keys} the cache holds")]

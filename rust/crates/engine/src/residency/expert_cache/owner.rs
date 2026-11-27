@@ -20,10 +20,10 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::mem::{self, forget};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
-use euhedral_core::frames::Frame;
+use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_graph::Marker;
 use euhedral_memory::{SlotArena, SlotLease};
@@ -34,7 +34,7 @@ use super::lease::{ExpertLease, Home};
 use super::shard::{Claimed, Reserved, Shard};
 use super::source::Inbox;
 use super::stats::{CacheStats, Cause};
-use crate::frames::{Kind, step};
+use crate::frames::{Kind, id_hash, step};
 use crate::handoff::Handoff;
 use crate::residency::experts::{
     ExpertError, ExpertId, ExpertLayout, ExpertStore, HostArena, LoadEnd, RamTierShard, ReadOutcome, Started,
@@ -55,35 +55,52 @@ pub enum Outcome {
 /// Told once with a request's outcome, on a worker, once the owner's claim is free. It must not wait.
 pub type Listener = Box<dyn FnOnce(Outcome) + Send>;
 
-/// A request's listener, which is told exactly once: a reply dropped untold (the record that held it panicked, or the
-/// owner was dropped) tells it that the request was abandoned.
-pub(crate) struct Reply(Option<Listener>);
+/// A request's listener, which is told exactly once. A reply dropped untold (the record that held it panicked) posts
+/// itself to the owner, whose next turn tells the listener that the request was abandoned: on a worker, with the claim
+/// free, and not in the drop (which may run inside the claim or while a panic unwinds). Only when the owner is gone, and
+/// nothing could tell it, is the listener told in the drop.
+pub(crate) struct Reply {
+    listener: Option<Listener>,
+    inbox: Weak<Inbox>,
+}
 
 impl Reply {
-    pub(super) fn new(listener: Listener) -> Reply {
-        Reply(Some(listener))
+    pub(super) fn new(listener: Listener, inbox: Weak<Inbox>) -> Reply {
+        Reply {
+            listener: Some(listener),
+            inbox,
+        }
     }
 
     fn tell(mut self, outcome: Outcome) {
-        if let Some(listener) = self.0.take() {
+        if let Some(listener) = self.listener.take() {
             listener(outcome);
         }
+    }
+
+    fn abandoned() -> Outcome {
+        let why = "the request was dropped before it was answered".to_owned();
+        Outcome::Failed(CacheError::Abandoned { why })
     }
 }
 
 impl Drop for Reply {
     fn drop(&mut self) {
-        let Some(listener) = self.0.take() else {
+        let Some(listener) = self.listener.take() else {
             return;
         };
-        let why = "the request was dropped before it was answered".to_owned();
-        // A drop may run while a panic unwinds: a listener that panics must not escape it.
-        if catch_unwind(AssertUnwindSafe(|| {
-            listener(Outcome::Failed(CacheError::Abandoned { why }))
-        }))
-        .is_err()
-        {
-            log::error!("a listener of the expert cache panicked while told its request was dropped");
+        let reply = Reply {
+            listener: Some(listener),
+            inbox: Weak::new(),
+        };
+        match self.inbox.upgrade() {
+            Some(inbox) => inbox.post(Message::Orphaned(reply)),
+            None => {
+                // A drop may run while a panic unwinds: a listener that panics must not escape it.
+                if catch_unwind(AssertUnwindSafe(|| reply.tell(Reply::abandoned()))).is_err() {
+                    log::error!("a listener of the expert cache panicked while told its request was dropped");
+                }
+            }
         }
     }
 }
@@ -127,6 +144,8 @@ pub(crate) enum Message {
     Lost {
         staging: u32,
     },
+    /// A request's reply was dropped untold: its listener is told the request was abandoned.
+    Orphaned(Reply),
     /// Some request was cancelled: those waiting here end.
     Sweep,
     /// The cache is closing: `done` is sent when nothing is in flight.
@@ -382,6 +401,7 @@ impl Owner {
             Message::Retired { id } => self.retired(id),
             Message::Unquarantined { staging } => self.unquarantined(staging),
             Message::Lost { staging } => self.lost_slot(staging),
+            Message::Orphaned(reply) => self.told.push(Finished::Told(reply, Reply::abandoned())),
             Message::Sweep => self.sweep(),
             Message::Close(done) => self.shut(done),
         }
@@ -578,14 +598,25 @@ impl Owner {
             },
         );
         self.reads += 1;
-        if let Started::Frame(frame) = started
-            && self.frames.offer(frame).is_err()
-        {
-            // The frame carried the load's end and is gone with its lease: the load can only be ended here.
+        if let Started::Frame(frame) = started {
+            // A hand-off that panics drops the frame, which carried the load's end: as one that refuses, the load can only
+            // be ended here. The panic is not swallowed: it poisons the owner.
+            let handed = catch_unwind(AssertUnwindSafe(|| self.frames.offer(frame)));
+            let why = match handed {
+                Ok(Ok(())) => return,
+                Ok(Err(_)) => None,
+                Err(panic) => Some(panic_text(&*panic)),
+            };
             self.reads -= 1;
             self.changed(Cause::Reads);
-            let error = self.failure(id, "the lake took no frame");
-            self.end_load(id, directive.settle_unstarted(), Outcome::Failed(error));
+            let outcome = match why {
+                Some(why) => {
+                    self.poison(&why);
+                    self.ended_by(id)
+                }
+                None => Outcome::Failed(self.failure(id, "the lake took no frame")),
+            };
+            self.end_load(id, directive.settle_unstarted(), outcome);
         }
     }
 
@@ -867,6 +898,11 @@ impl Owner {
         }
     }
 
+    /// Whether a close was applied and nothing is in flight: the owner has nothing more to do.
+    pub(super) fn is_shut(&self) -> bool {
+        self.closed && self.loads.is_empty()
+    }
+
     /// Tells the handoffs of a close once nothing is in flight, and forces the leases still out shut.
     fn signal_closed(&mut self) {
         if !self.closed || !self.loads.is_empty() {
@@ -917,14 +953,16 @@ fn copy_frame(
             // The owner hears of the submission before the retirement can be: the record is in its inbox before the
             // frame that posts the retirement is registered.
             owner.post(Message::Submitted { id, result: Ok(marker) });
-            let retired = Arc::clone(&owner);
+            // The staging bytes were read by the copy once it has retired.
             frames.after_marker(
                 marker,
-                step(Kind::ExpertRetire, chain, move || {
-                    // The staging bytes were read by the copy that has now retired.
-                    drop(job);
-                    retired.post(Message::Retired { id });
-                }),
+                Posts::frame(
+                    chain,
+                    owner,
+                    Some(job),
+                    Message::Retired { id },
+                    Message::Retired { id },
+                ),
             );
         }
         Err(SubmitFailure::Busy) => {
@@ -952,6 +990,58 @@ fn copy_frame(
             .run();
         }
     })
+}
+
+/// The frame that runs behind a copy's marker: it lets go of the copy's job and posts what the retirement means. A frame
+/// the lake drops without having run (it was discarded as the lattice closed) posts `unrun` instead, so that the load
+/// still ends and a close completes: for a retirement the same record (the lake is going, and nothing will read the
+/// slot), for a quarantine the slot's loss (nothing said the copy ran, so the slot is never written again).
+struct Posts {
+    header: FrameHeader,
+    owner: Arc<Inbox>,
+    job: Option<CopyJob>,
+    run: Option<Message>,
+    unrun: Option<Message>,
+}
+
+impl Posts {
+    fn frame(chain: usize, owner: Arc<Inbox>, job: Option<CopyJob>, run: Message, unrun: Message) -> Box<dyn Frame> {
+        Box::new(Posts {
+            header: FrameHeader::new(id_hash(Kind::ExpertRetire, chain)),
+            owner,
+            job,
+            run: Some(run),
+            unrun: Some(unrun),
+        })
+    }
+}
+
+impl Frame for Posts {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        self.unrun = None;
+        self.job = None;
+        if let Some(message) = self.run.take() {
+            self.owner.post(message);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Posts {
+    fn drop(&mut self) {
+        if let Some(message) = self.unrun.take() {
+            self.job = None;
+            self.owner.post(message);
+        }
+    }
 }
 
 /// A copy that may be queued with no marker of its own, waiting for one behind it.
@@ -984,10 +1074,13 @@ impl Quarantine {
                 let Copy { chain, staging, .. } = copy;
                 frames.after_marker(
                     marker,
-                    step(Kind::ExpertRetire, chain, move || {
-                        drop(job);
-                        owner.post(Message::Unquarantined { staging });
-                    }),
+                    Posts::frame(
+                        chain,
+                        owner,
+                        Some(job),
+                        Message::Unquarantined { staging },
+                        Message::Lost { staging },
+                    ),
                 );
             }
             Err(SubmitFailure::Busy) => {
