@@ -39,7 +39,10 @@ fn head_norm_rope_runs_a_warp_per_head_with_javas_arguments() {
     let launch = norm_rope().launch().unwrap();
     assert_eq!(launch.symbol, "euhedral_q4_head_norm_rope_bf16");
     // ceil(6 rows x 3 heads / 4) CTAs of 128 threads, no dynamic shared memory.
-    assert_eq!((launch.grid, launch.block, launch.shared_bytes), ([5, 1, 1], [128, 1, 1], 0));
+    assert_eq!(
+        (launch.grid, launch.block, launch.shared_bytes),
+        ([5, 1, 1], [128, 1, 1], 0)
+    );
     let expected = KernelArguments::new()
         .pointer(at(A))
         .pointer(at(B))
@@ -70,17 +73,21 @@ fn head_norm_rope_refuses_what_the_kernel_is_not_written_for_with_the_value() {
     assert!(refused(|l| l.width = 48).contains("got 48"));
     assert!(refused(|l| l.width = 288).contains("got 288"));
     assert!(refused(|l| l.rotary = 32).contains("got 32"));
-    assert!(refused(|l| {
-        l.width = 32;
-        l.rotary = 64;
-    })
-    .contains("a head of 64 values or more, got 32"));
+    assert!(
+        refused(|l| {
+            l.width = 32;
+            l.rotary = 64;
+        })
+        .contains("a head of 64 values or more, got 32")
+    );
     // The last position is 16_777_000 + 6 x 1_000.
-    assert!(refused(|l| {
-        l.position = 16_777_000;
-        l.position_step = 1_000;
-    })
-    .contains("reach 16783000"));
+    assert!(
+        refused(|l| {
+            l.position = 16_777_000;
+            l.position_step = 1_000;
+        })
+        .contains("reach 16783000")
+    );
     assert!(refused(|l| l.input = at(A + 2)).contains("input 0x1002 is not 4-byte aligned"));
     // A head with no rotation takes any width the kernel serves.
     let mut plain = norm_rope();
@@ -109,7 +116,10 @@ fn pooling_runs_a_warp_per_completed_block_and_is_nothing_when_none_completes() 
         .int32(640);
     assert_eq!(launch.args, expected);
     // Five blocks need two CTAs of four warps.
-    assert_eq!(pool_keys(at(A), at(B), at(C), 20, 0, 640).unwrap().unwrap().grid, [2, 1, 1]);
+    assert_eq!(
+        pool_keys(at(A), at(B), at(C), 20, 0, 640).unwrap().unwrap().grid,
+        [2, 1, 1]
+    );
     assert!(refusal(pool_keys(at(A), at(B + 2), at(C), 8, 6, 640).unwrap_err()).contains("tail 0x2002"));
 }
 
@@ -157,9 +167,30 @@ fn scores_cover_64_blocks_by_32_rows_per_cta() {
         .int32(192)
         .int32(129);
     assert_eq!(launch.args, expected);
-    assert!(Scores { query_row_stride: 641, ..scores }.launch().is_err());
-    assert!(Scores { blocks_total: 0, ..scores }.launch().is_err());
-    assert!(Scores { keys: at(B + 1), ..scores }.launch().is_err());
+    assert!(
+        Scores {
+            query_row_stride: 641,
+            ..scores
+        }
+        .launch()
+        .is_err()
+    );
+    assert!(
+        Scores {
+            blocks_total: 0,
+            ..scores
+        }
+        .launch()
+        .is_err()
+    );
+    assert!(
+        Scores {
+            keys: at(B + 1),
+            ..scores
+        }
+        .launch()
+        .is_err()
+    );
 }
 
 #[test]
@@ -289,5 +320,7 @@ fn merge_runs_a_warp_per_row_and_head_and_kv_append_a_warp_per_row_and_key_head(
         .int32(512)
         .int32(77);
     assert_eq!(launch.args, expected);
-    assert!(refusal(kv_append(at(A + 8), at(B), at(C), at(D), 5, 2, 512, 512, 77).unwrap_err()).contains("keys 0x1008"));
+    assert!(
+        refusal(kv_append(at(A + 8), at(B), at(C), at(D), 5, 2, 512, 512, 77).unwrap_err()).contains("keys 0x1008")
+    );
 }

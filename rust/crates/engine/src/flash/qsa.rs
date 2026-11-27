@@ -80,7 +80,10 @@ impl QsaShape {
         if qsa.kv_heads != 1 {
             return Err(FlashError::refused(
                 OP,
-                format!("the indexer pools one raw key per token, got {} key heads", qsa.kv_heads),
+                format!(
+                    "the indexer pools one raw key per token, got {} key heads",
+                    qsa.kv_heads
+                ),
             ));
         }
         if qsa.indexer_budget == 0 || !qsa.indexer_budget.is_multiple_of(BLOCK_TOKENS) {
@@ -473,7 +476,9 @@ impl QsaBody {
         let raw = scratch
             .index
             .offset(u64::from(INDEX_HEADS) * u64::from(INDEX_WIDTH) * 2);
-        let tail_in = buffers.tails.offset(u64::from(chunk.tail_slot) * QsaBuffers::TAIL_BYTES);
+        let tail_in = buffers
+            .tails
+            .offset(u64::from(chunk.tail_slot) * QsaBuffers::TAIL_BYTES);
         let tail_out = buffers
             .tails
             .offset(u64::from(chunk.tail_slot ^ 1) * QsaBuffers::TAIL_BYTES);
@@ -481,9 +486,7 @@ impl QsaBody {
             list.push(Op::Launch(pool));
             let completed = completed_blocks(start, rows);
             let first = start / BLOCK_TOKENS;
-            let fresh = buffers
-                .block_keys
-                .offset(u64::from(first) * u64::from(INDEX_WIDTH) * 2);
+            let fresh = buffers.block_keys.offset(u64::from(first) * u64::from(INDEX_WIDTH) * 2);
             list.push(Op::Launch(
                 HeadNormRope {
                     input: fresh,

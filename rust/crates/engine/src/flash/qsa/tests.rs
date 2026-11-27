@@ -227,7 +227,10 @@ fn a_prefill_chunk_lists_the_early_rows_and_scores_the_rest_in_tiles_of_the_scor
     assert_eq!(count(&names, "euhedral_q4_qsa_pool_keys_bf16"), 1);
     let first_select = names.iter().position(|name| name == SELECT).unwrap();
     let first_scores = names.iter().position(|name| name == SCORES).unwrap();
-    assert!(first_select < first_scores, "the listing rows are selected before the scored ones");
+    assert!(
+        first_select < first_scores,
+        "the listing rows are selected before the scored ones"
+    );
 }
 
 #[test]
@@ -311,8 +314,14 @@ fn a_chunk_the_state_cannot_hold_or_the_cache_does_not_back_is_refused_with_the_
     assert!(refuse(1, chunk(4096, 0)).contains("4097 tokens"));
     assert!(body.ops(&call(&body, 1, chunk(4095, 0))).is_ok());
     assert!(refuse(1, chunk(0, 2)).contains("reads slot 2"));
-    let no_keys = ChunkAt { key_table: DevicePtr::NULL, ..chunk(0, 0) };
-    let no_values = ChunkAt { value_table: DevicePtr::NULL, ..chunk(0, 0) };
+    let no_keys = ChunkAt {
+        key_table: DevicePtr::NULL,
+        ..chunk(0, 0)
+    };
+    let no_values = ChunkAt {
+        value_table: DevicePtr::NULL,
+        ..chunk(0, 0)
+    };
     assert!(refuse(1, no_keys).contains("page tables"));
     assert!(refuse(1, no_values).contains("page tables"));
 }
@@ -327,7 +336,9 @@ fn the_shape_refuses_what_the_kernels_are_not_written_for_with_the_value() {
             .to_string()
     };
     let same = |_: &mut AttentionConfig, _: &mut QsaConfig| {};
-    assert!(refused(|_, q| q.compress_ratio = 8, 256, 64).contains("over blocks of 4, got 4 heads of 128 over blocks of 8"));
+    assert!(
+        refused(|_, q| q.compress_ratio = 8, 256, 64).contains("over blocks of 4, got 4 heads of 128 over blocks of 8")
+    );
     assert!(refused(|_, q| q.num_heads = 2, 256, 64).contains("got 2 heads"));
     assert!(refused(|_, q| q.head_dim = 64, 256, 64).contains("heads of 64"));
     assert!(refused(|_, q| q.kv_heads = 2, 256, 64).contains("got 2 key heads"));

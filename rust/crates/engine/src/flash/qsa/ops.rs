@@ -128,17 +128,19 @@ pub fn pool_keys(
         return Ok(None);
     }
     aligned(OP, 4, &[("raw", raw), ("tail", tail), ("blocks", blocks_out)])?;
-    Ok(Some(Qwen4Kernel::QsaPoolKeys.launch(
-        [blocks(OP, u64::from(count), 4)?, 1, 1],
-        [128, 1, 1],
-        KernelArguments::new()
-            .pointer(raw)
-            .pointer(tail)
-            .pointer(blocks_out)
-            .int32(count)
-            .int32(start)
-            .int32(raw_stride),
-    )))
+    Ok(Some(
+        Qwen4Kernel::QsaPoolKeys.launch(
+            [blocks(OP, u64::from(count), 4)?, 1, 1],
+            [128, 1, 1],
+            KernelArguments::new()
+                .pointer(raw)
+                .pointer(tail)
+                .pointer(blocks_out)
+                .int32(count)
+                .int32(start)
+                .int32(raw_stride),
+        ),
+    ))
 }
 
 /// The raw keys of the incomplete trailing block after the chunk, written to `tail_out`, which is not `tail_in`
@@ -198,7 +200,10 @@ impl Scores {
         if !self.query_row_stride.is_multiple_of(2) {
             return Err(FlashError::refused(
                 OP,
-                format!("queries are read in pairs, got a row stride of {}", self.query_row_stride),
+                format!(
+                    "queries are read in pairs, got a row stride of {}",
+                    self.query_row_stride
+                ),
             ));
         }
         aligned(OP, 4, &[("queries", self.queries), ("keys", self.keys)])?;
@@ -312,8 +317,7 @@ impl Attention {
             return Err(FlashError::refused(OP, "ids and counts go together".to_owned()));
         }
         let units = u64::from(self.rows) * u64::from(self.key_heads) * u64::from(self.splits);
-        let grid = u32::try_from(units)
-            .map_err(|_| FlashError::refused(OP, format!("{units} units exceed a grid")))?;
+        let grid = u32::try_from(units).map_err(|_| FlashError::refused(OP, format!("{units} units exceed a grid")))?;
         Ok(Qwen4Kernel::QsaAttention.launch_shared(
             [grid, 1, 1],
             [96, 1, 1],

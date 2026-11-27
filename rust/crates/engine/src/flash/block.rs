@@ -217,7 +217,10 @@ impl BlockStage {
         let start = u32::try_from(segment.start_position)
             .map_err(|_| fatal(format!("position {} exceeds 32 bits", segment.start_position)))?;
         let Some(layer) = self.kv_layer else {
-            return Ok(ChunkAt { start, ..ChunkAt::default() });
+            return Ok(ChunkAt {
+                start,
+                ..ChunkAt::default()
+            });
         };
         let view = segment
             .refs

@@ -44,6 +44,8 @@ use linear_gpu::{Random, Rig, assert_close, bf16, bf16_value, empty, rig, upload
 use crate::common;
 use crate::linear_gpu;
 
+mod qsa;
+
 fn round(value: f32) -> f32 {
     bf16_value(bf16(value))
 }
