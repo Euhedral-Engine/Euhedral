@@ -45,7 +45,7 @@ use euhedral_inference_engine::{EngineRuntime, Handoff};
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
-use euhedral_inference_settings::{ModelSettings, Settings};
+use euhedral_inference_settings::{Auto, ByteSize, ModelSettings, Settings, SpeculationMode};
 use euhedral_inference_tokenizer::Tokenizer;
 
 struct Machine {
@@ -1820,5 +1820,50 @@ fn forced_hidden_rows_are_the_same_alone_and_beside_another_request() {
     assert!(
         beside_rows == alone_rows,
         "the logits rows differ beside another request"
+    );
+}
+
+/// Proof run, not a unit test: the unquantized BF16 artifact, its weights split across the card, host memory and the
+/// artifact file, generates the 128 greedy tokens Java generated (`greedy-bf16.txt`, `prompt` and `generated` lines).
+#[test]
+#[ignore = "proof run: needs a GPU, the native library, the BF16 artifact and its golden"]
+fn proof_run_the_bf16_artifact_generates_the_java_greedy_tokens() {
+    let Some(library) = test_support::require_property("euhedral.cuda.library") else {
+        return;
+    };
+    let Some(artifact) = test_support::require_property("euhedral.qwen.bf16-artifact") else {
+        return;
+    };
+    let Some(goldens) = test_support::require_property("euhedral.rust.goldens") else {
+        return;
+    };
+    let text = fs::read_to_string(PathBuf::from(goldens).join("greedy-bf16.txt")).unwrap();
+    let ids = |key: &str| -> Vec<u32> {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or_else(|| panic!("a `{key}` line"))
+            .split_whitespace()
+            .map(|id| id.parse().unwrap())
+            .collect()
+    };
+    let (prompt, generated) = (ids("prompt "), ids("generated "));
+    let mut settings = settings(Path::new(&artifact), 1024);
+    settings.speculation.mode = SpeculationMode::None;
+    settings.memory.gpu_limit = Auto::Value(ByteSize::gib(28));
+    settings.memory.host_limit = Auto::Value(ByteSize::mib(24_000));
+    let (_card, runtime) = common::engine(&settings, Path::new(&library));
+    let recording = generate(&runtime, &prompt, 128, &[]);
+    let first = recording.token_times[0];
+    let last = *recording.token_times.last().unwrap();
+    println!(
+        "BF16 PROOF: {} tokens, {:.2} tok/s decode, prefill {:.1} ms, equal to the golden: {}",
+        recording.tokens.len(),
+        (recording.tokens.len() - 1) as f64 / (last - first).as_secs_f64(),
+        micros(recording.prefill_done.unwrap() - recording.began) / 1e3,
+        recording.tokens == generated
+    );
+    assert_eq!(
+        recording.tokens, generated,
+        "the BF16 artifact's greedy tokens differ from the golden"
     );
 }

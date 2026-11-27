@@ -19,6 +19,7 @@ mod linear_gpu;
 mod typed;
 
 mod batched;
+mod bf16;
 mod cancel;
 mod capture;
 mod capture_exact;
