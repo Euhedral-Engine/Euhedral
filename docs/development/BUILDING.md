@@ -9,36 +9,38 @@ Run the commands below from the repository root. For running a server, start wit
 
 | Tool | Version |
 |---|---|
-| Java | 25.0.2 |
-| Gradle | 9.6.1; wrapper included |
+| Rust | 1.99.1 |
 | Zig | 0.16.0 |
-| Rust | 1.95.0 |
 | cargo-zigbuild | 0.23.4 |
 
-With mise installed, run `mise install` to install the toolchain. The build resolves the pinned CUDA
-runtime, NVRTC, and CUDA headers automatically. Rust and cargo-zigbuild build llguidance for structured output.
+With mise installed, run `mise install` to install the toolchain. The native build resolves the pinned CUDA
+runtime, NVRTC, and CUDA headers automatically. The Rust workspace is in [rust/](../../rust/README.md); it links
+llguidance for structured output as a crate.
 
 ## Build
 
 ```bash
-./gradlew :api:bootJar             # JAR for the current platform
-./gradlew :api:bootJarWindowsX64   # Windows x64 JAR
-./gradlew build                   # full build, formatting checks, CPU tests, native products
+cd rust
+cargo xtask native --product linux-x64     # the CUDA library and kernel sources, into build/native/linux-x64
+cargo xtask bundle --product linux-x64     # the server bundle, into build/bundle
+cargo xtask native --product windows-x64   # the Windows product
+cargo xtask bundle --product windows-x64   # the Windows bundle (on Windows, or cross-built with cargo zigbuild)
 ```
 
-The server JARs appear in `api/build/libs/`. They package their native libraries, so serving requires
-Java and the NVIDIA driver. See the [native module guide](../../native/README.md) for native build details.
+A bundle holds `bin/euhedral-server` and the native libraries it loads, so serving requires only the NVIDIA driver.
+See the [native module guide](../../native/README.md) for native build details and
+[rust/README.md](../../rust/README.md#server-bundle) for the bundle layout.
 
 ## Test
 
 ```bash
-./gradlew test
-python3 -m unittest discover -s native/tests -p 'test_*.py'
-./gradlew :core:cudaTest :api:cudaTest
+mise run rust-check        # layer check, formatting, clippy and the CPU Rust tests
+mise run native-test       # the Python kernel tests
 ```
 
-The first command runs CPU tests. The Python kernel tests require a GPU and NumPy. The CUDA suites
-also need model artifacts; stop any serving container before running them.
+The first task checks the Rust layers, formatting and lints, then runs the CPU tests (`mise run rust-test` runs
+only the tests). The Python kernel tests require a GPU and NumPy. The device tests of the Rust crates need model
+artifacts; stop any serving container before running them.
 
-See [testing](../evaluation/TESTING.md) for test groups, artifact setup, and selecting individual CUDA tests.
+See [testing](../evaluation/TESTING.md) for test groups, artifact setup, and selecting individual device tests.
 Use the [benchmarking guide](../evaluation/BENCHMARKING.md) to measure performance.

@@ -1,17 +1,7 @@
 [tools]
-gradle = "9.6.1"
-java = "25.0.2"
 zig = "0.16.0"
 rust = { version = "1.99.1", targets = "x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu", profile = "default" }
 "cargo:cargo-zigbuild" = "0.23.4"
-
-[tasks."format-check"]
-description = "Check Java formatting."
-run = "./gradlew spotlessCheck"
-
-[tasks.format]
-description = "Apply Java formatting."
-run = "./gradlew spotlessApply"
 
 [tasks."rust-layers"]
 description = "Check the Rust workspace's dependency layers and clippy.toml copies, proving the check fails on planted violations."
@@ -43,41 +33,9 @@ description = "Check the built Linux host CUDA product."
 dir = "rust"
 run = "cargo xtask native-verify --product linux-x64"
 
-[tasks.test]
-description = "Run all CPU Java tests."
-run = "./gradlew test"
-
-[tasks."native-build"]
-description = "Build the Linux host CUDA product."
-run = "./gradlew nativeBuildLinuxX64"
-
 [tasks."native-test"]
 description = "Run native Python/CUDA tests (requires an available GPU)."
 run = "python3 -m unittest discover -s native/tests -p 'test_*.py'"
-
-[tasks."native-verify"]
-description = "Build and verify both Linux and Windows native products."
-run = "./gradlew nativeVerify"
-
-[tasks."cuda-test"]
-description = "Run core and API CUDA tests (light ones in parallel, then model groups, one model load each); reserve the GPU first."
-run = "./gradlew :core:cudaTest :api:cudaTest --rerun-tasks"
-
-[tasks."benchmark-validate"]
-description = "Validate the baseline benchmark configuration without running it."
-run = "./gradlew :benchmark:run --args='run rust/resources/bench/configs/baseline.json --validate-only'"
-
-[tasks."benchmark-smoke"]
-description = "Run a short model benchmark; reserve the GPU first."
-run = "./gradlew :benchmark:run --args='run rust/resources/bench/configs/smoke.json'"
-
-[tasks."benchmark-baseline"]
-description = "Run the full baseline; reserve the GPU first."
-run = "./gradlew :benchmark:run --args='run rust/resources/bench/configs/baseline.json'"
-
-[tasks."full-build"]
-description = "Build, format-check, test, verify and package both CUDA products and the API."
-run = "./gradlew nativeVerify :api:bootJar build"
 
 [tasks."test-deploy"]
 description = "Exercise cutover, rollback and cleanup-order tests without Docker writes."

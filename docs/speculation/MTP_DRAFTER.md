@@ -1,7 +1,7 @@
 # Training the MTP drafter
 
 The MTP layer drafts the tokens that verification checks ([MTP_CONTRACT.md](MTP_CONTRACT.md)). This page covers
-fine-tuning that layer on the target's own answers, the corpus and trainer that do it (quantization/README.md, *MTP
+fine-tuning that layer on the target's own answers, the corpus and trainer that do it (rust/crates/quantize/README.md, *MTP
 drafter corpus* and *MTP drafter training*), and the drafter NVFP4-Trellis-RCO ships. Verification stays exact:
 outputs are the target's whatever the drafter drafts.
 
@@ -67,7 +67,7 @@ converter's) and BF16 norms; the base artifact's tokenizer is carried.
 NVFP4-Trellis-RCO with the trained drafter, MTP depth 4, greedy, 256 tokens per prompt
 (`MtpDraftLengthScreenCudaIntegrationTest`).
 
-24 drafting prompts (`tools/mtp_draft_prompts.py`, about 1K to 5K tokens):
+24 drafting prompts (a retired prompt-set tool, about 1K to 5K tokens):
 
 | Category | Tokens per verification | tok/s |
 |---|---|---|

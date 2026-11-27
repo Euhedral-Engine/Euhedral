@@ -4,7 +4,7 @@ The execution contracts below were checked against `498f7d2c` on 2026-10-20. Mea
 
 A Qwen execution plan defines a static DAG of execution stages. A reusable runtime instance represents
 those stages as independent Euhedral frames. Admission exposes only root frames, through the runtime's
-`InferenceLake`. Successful stages create successor readiness and publish ready
+lake. Successful stages create successor readiness and publish ready
 successors to the lake. CUDA stream order carries ordinary device dependencies; actual device
 completion is reserved for state-publication and ownership boundaries.
 
@@ -24,10 +24,10 @@ through `ShapeBuilder` (`runtime/graph`), the same builder Qwen4's shape uses, a
 its DAG as a `StageTopology`: stages numbered in topological order, each edge tagged with the boundary it
 waits for.
 
-`StageGraph` is one reusable runtime instance of a plan view. It is built once and then rebound to one
+stage graph is one reusable runtime instance of a plan view. It is built once and then rebound to one
 quantum at a time:
 
-- one `StageFrame` per stage, created with its immutable stage spec: `Shape.createStage` builds the typed
+- one stage frame per stage, created with its immutable stage spec: `Shape.createStage` builds the typed
   frame for the spec's kind from `Stages` (`Stages.Embed`, `WeightTransfer`, `RmsNorm`, `Linear`,
   `CausalAttention`, `KvAppend`, the GDN stages, and the DFlash2 kinds under `Stages.DFlash2`), so a stage
   body is one small class instead of a switch over operations;
@@ -72,7 +72,7 @@ seal) that runs once.
 
 ## Admission
 
-Admission is a frame on the workspace's owner: its `idHash` is `WorkspaceOwner.HASH` and it stays ordered on it,
+Admission is a frame on the workspace's owner: its `idHash` is the workspace owner's hash and it stays ordered on it,
 so admissions run one at a time. A generation's `Admit` admits its quantum itself (Qwen3.8 and Qwen4 alike); only a
 caller outside the owner (tests and tools) publishes the admission as a frame (`publishOnOwner`). Frames keep their publication order when they enter the lattice
 through one source and no queue of more than one partition. The lake's sinks are like GPU streams: each has one
@@ -87,10 +87,10 @@ Admission is small:
 2. prepare quantum-owned resources with the graph's stream selected (the sequence's admission,
    persistent state on first use, the binding of the graph's workspace storage), so any initialization it
    queues precedes every stage;
-3. bind the graph behind the previous users of each workspace buffer it touches (`WorkspaceOwner.bind`), then publish
+3. bind the graph behind the previous users of each workspace buffer it touches (the workspace owner's bind), then publish
    the root stages to the lake.
 
-Binding also orders carried sequence state through `SequenceOwner`: GDN and KV per layer, draft seeds, device draft tokens, DFlash2 taps/ring and the shared device region for host KV pages. A graph's first users wait on the previous graph's last users of each key for that sequence. Different sequences have separate records.
+Binding also orders carried sequence state through sequence owner: GDN and KV per layer, draft seeds, device draft tokens, DFlash2 taps/ring and the shared device region for host KV pages. A graph's first users wait on the previous graph's last users of each key for that sequence. Different sequences have separate records.
 
 After that, admission is out of the execution path. A quantum whose preparation fails reaches its
 terminal outcome at admission, after the stream proves that queued initialization stopped. A quantum is
@@ -124,7 +124,7 @@ quantum at a time, so the edge only orders a graph behind the previous one.
 
 ## The lake
 
-Graphs publish ready frames into the runtime's `InferenceLake`: several queue ingest sinks, each an upstream source of
+Graphs publish ready frames into the runtime's lake: several queue ingest sinks, each an upstream source of
 the lattice, chosen by a frame's routing hash. Publishing only enqueues, so a stage on a worker, a request thread and a
 CUDA driver callback all publish the same way. The lake counts the quanta and host tasks it was asked to carry; closing
 the runtime refuses new admissions and completes once every admitted unit terminated.
@@ -157,7 +157,7 @@ failed, or was cancelled.
 
 ## Device lanes
 
-CPU scheduling and CUDA ordering are separate. The runtime owns a pool of CUDA streams, its lanes. Without staged weights it uses one compute lane per JVM-available processor, at most 64. With staged weights it uses at most 63 compute lanes plus one reserved transfer lane, keeping the total at most 64. Each graph
+CPU scheduling and CUDA ordering are separate. The runtime owns a pool of CUDA streams, its lanes. Without staged weights it uses one compute lane per available processor, at most 64. With staged weights it uses at most 63 compute lanes plus one reserved transfer lane, keeping the total at most 64. Each graph
 has a home lane, which prepares its quantum and carries its retirement boundary. A stage chooses its lane each time it runs and
 submits with that lane selected on the submitting thread, whichever Euhedral worker runs it:
 
@@ -358,7 +358,7 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   a worker polls every attached source, so after a request a worker whose polls find nothing yields in a loop: the
   production server with one worker (`EUHEDRAL_HOST_CPUS=0`) sat at 100% of that core with no generation
   active, no context switch in two seconds and the stack in `ControlPlaneFragment.runCycle` (`Thread.yield`) over
-  `QueueIngestSink` polls. The sinks are therefore attached for a busy period (`InferenceLake`): beside them the lake
+  `QueueIngestSink` polls. The sinks are therefore attached for a busy period (lake): beside them the lake
   attaches an idle watch, a source polled like the sinks, and when no unit has been admitted for a second
   (`host.idle-release`, 0 keeps them attached) the watch detaches both; the next unit attaches a fresh set.
   A frame is published only while a unit it belongs to is admitted, so none is in flight when the sinks go. Sources the
@@ -461,7 +461,7 @@ represented-NVFP4 tolerance for decode attention.
   11.1 ms. A Q4/Q5 half group is 16 code bytes plus one 32-bit word of fifth bits, so a lane reads its 32 codes with one 16-byte
   load (`euhedral_q4_decode_contiguous`, `euhedral_q5_decode_contiguous`): Q5 5120 -> 12288 52 us, Q4 5120 -> 4096 15 us, near 800
   GB/s. The FP32 accumulation order differs from the scalar references (`native/src/reference/kernels.cu`), which are the exact
-  oracle that `CudaGpuMemory.selectExactNumerics` selects (tests only). Against them fewer than 0.1% of outputs differ, never by
+  oracle that the launch table selects (tests only). Against them fewer than 0.1% of outputs differ, never by
   more than one BF16 ulp, and the error against an FP64 evaluation is unchanged. The 2 to 8 row twins reproduce the one-row kernel
   bit for bit ([MTP_VERIFIER.md](../speculation/MTP_VERIFIER.md)).
 - **GDN convolution.** 32-row blocks give 1280 CTAs at 512 rows (68 us); each output reads only the previous three inputs.
@@ -489,7 +489,7 @@ represented-NVFP4 tolerance for decode attention.
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous Q3/Q4/Q5 decode, the MXFP8 and
 native FP4 prefill routes, the one-row residual norm, the prefill attention softmax sum, the column-owned GDN recurrence, the
 contiguous and GQA decode attention) is replaced by the exact kernel under exact numerics, and
-`RelaxedNumericsDriftCudaIntegrationTest` compares the two end to end. The Q3 artifact's relaxed numerics measure a hidden-state
+`euhedral-bench drift` ([QUALITY.md](../evaluation/QUALITY.md)) does not compare the two: it runs the artifact on all-GPU settings and then on the host-tier settings (or on the same settings again, which must agree bitwise). A check of exact against relaxed numerics end to end is not automated. The Q3 artifact's relaxed numerics measure a hidden-state
 relative error of 6.0e-2, KL 5.1e-3 and top-1 agreement 0.961 over 8 windows of 48 positions, with no growth by position
 ([PREFILL_MX.md](../kernels/PREFILL_MX.md)); a single one-ulp perturbation (the decode attention merge order) gives about 5.4% and KL 2.6e-3,
 so the combined error stays at the model's sensitivity floor: one-ulp BF16 differences settle at this level in the 64-layer
@@ -548,7 +548,7 @@ Allocation (JFR allocation samples over a Flash-Next decode, steady state): the 
 percent of it. A slot now owns the load object and the load context (its read parts, join, submit, copy, retire and
 failure frames and its tier directive) from the time the cache is made, a fetch stage owns its request, and the
 source's blocked list is an array: a miss, a request and a poll allocate nothing, for about 3 MB of host memory (one
-context per device slot). Leases (one per pin) and the FFM memory segments of the submissions are what the path still
+context per device slot). Leases (one per pin) and the host memory of the submissions are what the path still
 allocates. By far the largest allocator on a worker is Euhedral's own `QueueIngestSink`: its `drainRequests` makes the
 terminal's `push` method reference on every `request`, about 22 MB/s while workers poll.
 
@@ -575,7 +575,4 @@ Known costs this leaves:
 Nothing that runs per quantum or per token takes a lock, waits blocking or starts a thread, in either model. State is
 confined by routing every frame that touches it to its owner (the workspace, the prefix cache) or by making it a source
 that one poller at a time owns (the expert cache). Device completions arrive as frames, and order comes from edges and from a sequence's admission order (`Sequencer`).
-`ArchitectureTest.theHotPathHoldsNoLockBlocksNorStartsThreads` scans `model/qwen38`, `model/qwen4`, `runtime`,
-`generation`, `prefix` and `state` for locks, blocking waits, `join`s, futures' blocking `get`s, threads and executors.
-It allows them only in named lifecycle and tool methods (opening lanes and pools, closing, the blocking caller-thread
-`generate`) and in the startup loaders.
+The hot path holds no lock block, blocking wait or thread start: the engine's blocking calls live in named lifecycle and tool functions (opening lanes and pools, closing, the blocking caller-thread `generate`) and in the startup loaders.

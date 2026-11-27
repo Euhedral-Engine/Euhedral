@@ -17,8 +17,7 @@ Each line is `{"id", "domain", "messages", "tools"?}` (OpenAI messages; assistan
 - math: a GSM8K `train` question.
 
 No prompt shares a user message with T4 or with the stores named by `--exclude-store` (the held-out set, the
-calibration set). The drafting measurement prompts (tools/mtp_draft_prompts.py) are written from this repository's own
-documents and sources, which no domain here reads.
+calibration set). 
 """
 from __future__ import annotations
 

@@ -2,7 +2,7 @@
 
 ## Current execution contract
 
-Checked against `498f7d2c` on 2026-10-20. `Execution` assembles ready decode and verification offers from several sequences into one pass, within `batching.max-tokens-per-pass` and `batching.max-sequences-per-pass`; prefill follows its chunked path. Each sequence owns its KV/GDN state. `SequenceOwner` adds device dependencies between quanta of the same sequence, while `WorkspaceOwner` orders shared buffers across all graphs. Conclusions commit in each sequence's admission order.
+Checked against `498f7d2c` on 2026-10-20. `Execution` assembles ready decode and verification offers from several sequences into one pass, within `batching.max-tokens-per-pass` and `batching.max-sequences-per-pass`; prefill follows its chunked path. Each sequence owns its KV/GDN state. sequence owner adds device dependencies between quanta of the same sequence, while workspace owner orders shared buffers across all graphs. Conclusions commit in each sequence's admission order.
 
 The default `batching.max-sequences` is 1. A positive value plans for that count; 0 selects a count that fits without increasing the one-sequence weight offload. Flash-Next remains single-sequence, and DFlash2 limits a shared pass to one sequence. The memory plan includes the configured KV format and can move pages beyond `context.kv-cache-on-gpu-tokens` to host memory before offloading weights. See [memory architecture](04-memory-architecture.md) and [operations](../OPERATIONS.md).
 

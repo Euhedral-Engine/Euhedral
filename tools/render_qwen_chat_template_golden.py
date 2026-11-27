@@ -1,4 +1,4 @@
-"""Regenerates api/src/test/resources/qwen-chat-template-golden.json from the checkpoint chat template.
+"""Regenerates rust/crates/api-protocol/tests/data/qwen-chat-template-golden.json from the checkpoint chat template.
 
 Renders with jinja2 the way Hugging Face `apply_chat_template` does: an immutable sandbox with
 `trim_blocks`/`lstrip_blocks`, the `loopcontrols` extension, `raise_exception`, and a `tojson` filter that

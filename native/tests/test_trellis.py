@@ -19,7 +19,7 @@ except ImportError:
 from gpu_harness import Gpu, NVRTC, SKIP_REASON
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURE = ROOT / "quantization/src/test/resources/trellis-fixture"
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "trellis-fixture"
 EXTREMES = Path(__file__).resolve().parent / "fixtures" / "trellis-activation-extremes.json"
 UNAVAILABLE = (f"CUDA probes unavailable: {SKIP_REASON}" if NVRTC is None
                else "NumPy unavailable" if np is None else None)

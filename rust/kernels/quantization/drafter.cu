@@ -1,4 +1,4 @@
-// Kernels of the MTP drafter's training (quantization/README.md, `train-drafter`): NVFP4 rounding as the converter
+// Kernels of the MTP drafter's training (rust/crates/quantize/README.md, `train-drafter`): NVFP4 rounding as the converter
 // does it, the attention of drafts unrolled over depths, and the draft head's cross-entropy. FP32 and row-major,
 // as train.cu; backward kernels accumulate (+=) into gradients unless a name says otherwise.
 #include <cuda_fp16.h>

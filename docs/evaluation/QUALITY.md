@@ -1,13 +1,15 @@
 # Measuring quality
 
+> Commands in this document run from the repository root. The engine loads the CUDA library from `build/native/linux-x64/lib/libeuhedral_cuda.so` by default (build it with `(cd rust && cargo xtask native --product linux-x64)`); pass `--cuda-library FILE` to use another.
+
 Four different quantities are measured, because they answer different questions and add up to no single score.
 
 | Quantity | Question | Tool |
 |---|---|---|
 | Model/quantization error | How far is the artifact from the BF16 checkpoint? | teacher-forced NLL and KL against a BF16 reference |
 | Compression-induced error | What does the compressed form cost over the uncompressed one? | teacher-forced reports of the two artifacts, compared |
-| Relaxed-execution drift | How far do the production kernels' relaxed accumulation orders move a given artifact from exact arithmetic on the same weights? | `RelaxedNumericsDriftCudaIntegrationTest` |
-| Exact speculative verifier | Does MTP decoding produce exactly the tokens and state that ordinary greedy decoding produces? | `SpeculativeVerifyCudaIntegrationTest`, `SpeculativeDecodeCudaIntegrationTest` |
+| Route drift | How far does a candidate route (for example weights streamed from host memory) move a given artifact from the all-GPU route on the same weights? | `euhedral-bench drift` |
+| Exact speculative verifier | Does MTP decoding produce exactly the tokens and state that ordinary greedy decoding produces? | the engine's speculative device tests |
 
 All teacher-forced measurements use the same 2560 tokens: `rust/resources/bench/chat-corpus-v1-document.md`
 tokenized with the Qwen tokenizer. A report is the model's BF16 logits at 1279 forced positions (a 1281-token prefill, then
@@ -26,12 +28,12 @@ llama-perplexity -m Qwen3.8-27B-BF16.gguf -f chat-corpus-v1-document.md -c 2560 
 An artifact converted from another checkpoint is measured against that checkpoint's BF16 reference: for Swift-1.5, convert it
 with llama.cpp's `convert_hf_to_gguf.py --outtype bf16` and run the same command on the result.
 
-Each artifact is teacher-forced over the same positions (prefix 1281, 1279 steps) by the quantization module's `score`
-command (quantization/README.md):
+Each artifact is teacher-forced over the same positions (prefix 1281, 1279 steps) by the `score`
+command of the quantization tool (`rust/crates/quantize`):
 
 ```bash
-./gradlew :quantization:run --args="score --artifact /models/qwen3_8_27b_q3.edrl --results results.txt \
-    --reference bf16.kld --name q3-t1"
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- score --artifact /models/qwen3_8_27b_q3.edrl --results results.txt \
+    --reference bf16.kld --name q3-t1
 ```
 
 `score` prints the mean NLL of the forced tokens, the paired NLL difference to the reference with its standard
@@ -66,8 +68,8 @@ only at release checkpoints, confirms them.
 
 ```bash
 llama-perplexity -m Swift-1.5-BF16.gguf -f t2.txt -c 2560 -b 2560 -ub 2560 --chunks 25 -ngl 0 --kl-divergence-base swift_t2.kld
-./gradlew :quantization:run --args="score --artifact qwen3_8_27b_nvfp4_compressed.edrl --results results.txt \
-    --reference swift_t2.kld --name nvfp4c-t2"
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- score --artifact qwen3_8_27b_nvfp4_compressed.edrl --results results.txt \
+    --reference swift_t2.kld --name nvfp4c-t2
 ```
 
 `score` forces every chunk of the reference on a fresh sequence, three chunks at a time, scores each logits row on the
@@ -149,7 +151,7 @@ serving `nvfp4-compressed`, 64 wikitext-2 and 64 source windows) is retired: on 
 (`nvfp4-compressed`), 0.053 (`nvfp4`), 0.124 (`q3`) and 0.152 (`q3-compressed`). T1-T4 were built the way it was and
 score it lower: they do not choose between calibration sets.
 
-**Calibration** (`quantization/README.md`) runs the sequences through the BF16 checkpoint on the engine's own kernels
+**Calibration** (`rust/crates/quantize/README.md`) runs the sequences through the BF16 checkpoint on the engine's own kernels
 one layer at a time: the Hessians accumulate on the GPU while the sequences pass through the layer, the layer's
 objects are rounded (cuSOLVER for the Cholesky factor, the module's kernels for the column runs), and the sequences
 pass through the rounded layer to give the next layer its inputs. The hidden states stay in pinned host memory. It
@@ -270,21 +272,22 @@ python3 tools/compare_teacher_forced.py q3_compressed_expanded.bin q3_compressed
 python3 tools/compare_teacher_forced.py nvfp4.bin nvfp4_compressed.bin
 ```
 
-## Relaxed-execution drift
+## Route drift
 
-The test runs one sequence on the exact kernels (the scalar references) and one on the production kernels over the same forced
-tokens, and reports per-step hidden-state error, KL and top-1 agreement against the exact arm:
+`euhedral-bench drift` decodes the same forced tokens of the corpus document twice, once on the engine's default settings
+(every layer on the GPU) and once on the settings of `--config` (`--candidate host-tier`), or on the same settings again
+(`--candidate exact`, whose rows must agree bitwise). It reports per-step hidden-state error, KL and top-1 agreement
+against the first run:
 
 ```bash
-./gradlew :core:cudaIntegrationTest --tests '*RelaxedNumericsDriftCudaIntegrationTest' \
-    -Peuhedral.qwen.artifact=/models/qwen3_8_27b_q3.edrl \
-    -Peuhedral.numerics.drift.steps=512 -Peuhedral.numerics.drift.prefix=512
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-bench -- drift --artifact /models/qwen3_8_27b_q3.edrl \
+    --prefix 512 --steps 512 --candidate host-tier --config host-tier.yaml
 ```
 
-It fails when the mean KL reaches 1e-2 at a starting position, when more than 2% of the positions flip the top-1 token
-where the exact arm's top-1 logit led the production arm's choice by more than 0.25 (flips within that lead, two BF16
+It exits 1 when the mean KL reaches 1e-2, when more than 2% of the steps flip the top-1 token
+where the first run's top-1 logit led the second run's choice by more than 0.25 (flips within that lead, two BF16
 steps, are near-ties: 3 to 17 per 256 positions on the NVFP4 artifacts, depending on the weights), or when the median
-over the starting positions of the peak 32-step hidden-state error reaches 12% or of its late/early ratio exceeds 1.5.
+of the peak 32-step hidden-state error reaches 12% or of its late/early ratio exceeds 1.5.
 
 ## KV cache
 
@@ -322,7 +325,6 @@ of E2M1 at 32K on both artifacts; a 3-bit cache would still need long-context re
 ## Exact speculative verifier
 
 Speculative decoding verifies drafts with the base model in row-exact mode: every row of a verification is bit for bit what a
-one-row decode at that position computes. `SpeculativeVerifyCudaIntegrationTest` checks the logits and the KV and GDN state
-against one-row decode; `SpeculativeDecodeCudaIntegrationTest` checks that generated tokens and final state equal those of
-ordinary greedy decoding, across prompts that exercise accepted, partly accepted and rejected drafts. Pass
-`-Peuhedral.speculative.artifact=ARTIFACT` and, for NVFP4 on a 16 GB card, `-Peuhedral.speculative.host-mib=1280`.
+one-row decode at that position computes. The engine's device tests check the logits and the KV and GDN state
+against one-row decode, and that generated tokens and final state equal those of
+ordinary greedy decoding, across prompts that exercise accepted, partly accepted and rejected drafts.

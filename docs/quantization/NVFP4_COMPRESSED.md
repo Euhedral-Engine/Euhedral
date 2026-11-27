@@ -1,5 +1,7 @@
 # NVFP4 at 64K: compressed scales and host-mapped embedding
 
+> Commands in this document run from the repository root. The engine loads the CUDA library from `build/native/linux-x64/lib/libeuhedral_cuda.so` by default (build it with `(cd rust && cargo xtask native --product linux-x64)`); pass `--cuda-library FILE` to use another.
+
 The `nvfp4-compressed` artifact makes NVFP4 usable at 64K context on the 16 GB card. Two mechanisms cover the 1.9 GiB that 64K
 needs beyond the free device memory; staging covers the rest ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md)):
 
@@ -154,8 +156,7 @@ compares the artifacts on the same tokens:
 KL is a fifth of Q3's. Greedy generation answers the factual prompt identically (" Paris.").
 
 ```bash
-./gradlew :core:cudaIntegrationTest --tests '*TeacherForcedQualityCudaIntegrationTest' --rerun \
-    -Peuhedral.quality.report=/tmp/sd4.bin -Peuhedral.quality.artifact=ARTIFACT -Peuhedral.quality.host-mib=512
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-bench -- dump --artifact ARTIFACT --prefix N --steps N --out /tmp/sd4.bin
 python3 tools/compare_teacher_forced.py /tmp/nvfp4.bin /tmp/sd4.bin
 ```
 

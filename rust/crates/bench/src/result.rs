@@ -1,6 +1,6 @@
 //! The result row: schema `euhedral-inference.benchmark-result` version 1, with the field names, the field order and the
-//! null-for-absent convention of the Java benchmark's `BenchmarkResult`, so one reader (and `tools/rust_gate.py`) takes
-//! rows of both engines. Timings are integer nanoseconds and rates are tokens per second; a value is `null` when the
+//! null-for-absent convention of the Java benchmark's `BenchmarkResult`, so one reader takes
+//! rows of any run, old or new. Timings are integer nanoseconds and rates are tokens per second; a value is `null` when the
 //! work it describes did not complete.
 //!
 //! A Rust row differs from a Java row in values only: `implementation` is `rust`, and `engine` (free-form in the schema)

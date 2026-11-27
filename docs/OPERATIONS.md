@@ -13,7 +13,7 @@ with every problem named on its own line of standard error and exit status 2.
 handles the image build and mounts. YAML uses `model.artifact`, `model.name`, and `server.port`; `.env` uses
 `EUHEDRAL_ARTIFACT_FILE` (or `EUHEDRAL_MODEL_ARTIFACT`), `EUHEDRAL_MODEL_NAME`, and `EUHEDRAL_SERVER_PORT`
 (or `PORT`). Relative host paths resolve from the settings file's directory. Deploy mounts the artifact at
-`/models/model.edrl` and overrides the container setting to match. The Java application never reads `.env`.
+`/models/model.edrl` and overrides the container setting to match. The server never reads `.env`.
 See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 
 | Setting | Default | Meaning |
@@ -38,23 +38,23 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `batching.forced-rows` | 0 | The rows one step of a teacher-forced run takes at a time (scoring a context against a reference). Every sequence is sized to verify that many rows, so a larger value costs device memory; 0 or 1 sizes nothing for it and forces one row a step. Only the Rust engine reads it. |
 | `batching.prefill-chunk-tokens` | 512 | The rows the workspace holds per pass, the longest prefill chunk it runs. |
 | `memory.host-limit` | automatic | Host memory the engine may use (pinned weights, the expert tier): by default what the machine can spare (90% of the available memory, never closer than 4 GiB to exhaustion, or as `memory.host-margin` says; no runtime reserve is subtracted). |
-| `memory.host-margin` | the larger of 4 GiB and 10% of the available memory | Host memory kept for the system when the host budget is derived from what the machine can spare; `0` keeps none. It also covers the runtime's own use of host memory: the Rust engine subtracts no separate runtime reserve. Where the engine cannot learn the available memory (Windows today), nothing spills to the host unless `memory.host-limit` or `memory.host-weights-limit` is set, and a plan that needs host memory is refused naming them; the prefix cache keeps its `prefix-cache.size`. Read by the Rust engine; the Java engine checks the value and ignores it. |
-| `memory.staging-slots` | 4 | Pinned staging slots for weights that stream through host memory; for a Flash-Next plan, the slots of the device ring that staged fixed objects pass through. Read by the Rust engine; the Java engine checks the value and ignores it. |
-| `memory.disk-window-slots` | twice `memory.staging-slots` | Pinned window slots the artifact is read into for weights that stay on disk. Each holds the largest disk-backed object rounded up to 4 KiB, plus one 4 KiB block for an unaligned start. Must be a whole multiple of `memory.staging-slots` (one times it included); the plan is refused otherwise. Read by the Rust engine; the Java engine checks the value and ignores it. |
-| `memory.disk-read-piece` | each slot whole | The most bytes one piece of a read of the artifact moves for weights that stay on disk. A direct read keeps one request per piece on the device, so the default reads a slot whole, in one request. A value must be a multiple of 4 KiB and at most 2147479552 bytes (the I/O ring's limit); the plan is refused otherwise, naming the value. Read by the Rust engine; the Java engine checks the value and ignores it. |
+| `memory.host-margin` | the larger of 4 GiB and 10% of the available memory | Host memory kept for the system when the host budget is derived from what the machine can spare; `0` keeps none. It also covers the runtime's own use of host memory: the Rust engine subtracts no separate runtime reserve. Where the engine cannot learn the available memory (Windows today), nothing spills to the host unless `memory.host-limit` or `memory.host-weights-limit` is set, and a plan that needs host memory is refused naming them; the prefix cache keeps its `prefix-cache.size`. |
+| `memory.staging-slots` | 4 | Pinned staging slots for weights that stream through host memory; for a Flash-Next plan, the slots of the device ring that staged fixed objects pass through. |
+| `memory.disk-window-slots` | twice `memory.staging-slots` | Pinned window slots the artifact is read into for weights that stay on disk. Each holds the largest disk-backed object rounded up to 4 KiB, plus one 4 KiB block for an unaligned start. Must be a whole multiple of `memory.staging-slots` (one times it included); the plan is refused otherwise. |
+| `memory.disk-read-piece` | each slot whole | The most bytes one piece of a read of the artifact moves for weights that stay on disk. A direct read keeps one request per piece on the device, so the default reads a slot whole, in one request. A value must be a multiple of 4 KiB and at most 2147479552 bytes (the I/O ring's limit); the plan is refused otherwise, naming the value. |
 | `memory.host-weights-limit` | the host limit's pinnable part | Pinned host memory for host-backed weights and the disk window. |
 | `memory.gpu-limit` | the free device memory | Device memory the residency plan, dense or Flash-Next, may use, at most what is free. |
 | `memory.gpu-reserve` | 700MiB | Device memory a Flash-Next plan leaves free for other programs on the GPU, beside `memory.runtime-reserve`. The dense Qwen3.8 plan does not use it: its budget is the free memory, at most `memory.gpu-limit`. |
-| `memory.runtime-headroom` | 320MiB | Device memory the Rust engine's plan keeps above what the workspace, the decode scratch, the first sequence's state and the MTP cache need, for what the driver takes after the plan is admitted: the code and local memory of each kernel family, loaded at its first launch. Counted where that demand raises `memory.runtime-reserve` above its value; below it the reserve's own slack pays. Read by the Rust engine; the Java engine checks the value. |
-| `memory.runtime-reserve` | 1280MiB (1024MiB for a Flash-Next plan, which keeps the setting as its whole runtime reserve and takes no raise from the workspace) | Device memory the plan keeps beside the weights and the cache for the first sequence's GDN state, the execution workspaces, the shared scratch and the kernel modules loaded after the model. For the dense plan a floor: it raises the reserve to what the workspace, the decode scratch, the first sequence's state and the MTP cache need at the given settings (a larger `batching.prefill-chunk-tokens` or a longer context), and logs the raise. Read by the Rust engine; the Java engine checks the value and uses 1280MiB. |
+| `memory.runtime-headroom` | 320MiB | Device memory the Rust engine's plan keeps above what the workspace, the decode scratch, the first sequence's state and the MTP cache need, for what the driver takes after the plan is admitted: the code and local memory of each kernel family, loaded at its first launch. Counted where that demand raises `memory.runtime-reserve` above its value; below it the reserve's own slack pays. |
+| `memory.runtime-reserve` | 1280MiB (1024MiB for a Flash-Next plan, which keeps the setting as its whole runtime reserve and takes no raise from the workspace) | Device memory the plan keeps beside the weights and the cache for the first sequence's GDN state, the execution workspaces, the shared scratch and the kernel modules loaded after the model. For the dense plan a floor: it raises the reserve to what the workspace, the decode scratch, the first sequence's state and the MTP cache need at the given settings (a larger `batching.prefill-chunk-tokens` or a longer context), and logs the raise. |
 | `memory.pinned-buffer-pool` | 1/256 of the machine's memory, at least 64 MiB | Released pinned staging buffers kept for reuse. |
 | `memory.weight-streaming.*` | 8, 1, 4, 2 | Flash-Next expert streaming: `concurrent-reads` (records read from the artifact at once), `read-split` (parts one record read is split into), `copy-streams` (CUDA streams copying experts to the GPU), `gpu-streams` (device lanes a step spreads over). |
 | `host.task-parallelism` | 8 | Ingest sinks of each pool of ready host work: more spread the contention of the workers that publish and take frames. |
-| `host.max-batch-size` | auto | Most frames a lattice worker takes from its cache at once (auto is the runtime's default). `1` or `2` makes the workers poll their caches one frame at a time, so other workers can steal what waits behind a heavy frame. Read by the Rust engine; the Java engine checks the value and ignores it. |
-| `host.copy-chunk-bytes` | 16MiB | The most bytes one read and write of a file copy moves; the quantization tools copy an artifact's content in pieces this size (`package-tokenizer --out`). Read by the Rust quantization tools; the Java engine checks the value and ignores it. An in-place `package-tokenizer` cuts the artifact back to its content before it writes the tokenizer section: a run that fails after the cut leaves the artifact without a section, and running the command again writes it. |
+| `host.max-batch-size` | auto | Most frames a lattice worker takes from its cache at once (auto is the runtime's default). `1` or `2` makes the workers poll their caches one frame at a time, so other workers can steal what waits behind a heavy frame. |
+| `host.copy-chunk-bytes` | 16MiB | The most bytes one read and write of a file copy moves; the quantization tools copy an artifact's content in pieces this size (`package-tokenizer --out`). An in-place `package-tokenizer` cuts the artifact back to its content before it writes the tokenizer section: a run that fails after the cut leaves the artifact without a section, and running the command again writes it. |
 | `host.idle-release` | 1s | Idle time before the workers stop polling an idle pool of work; `0` never releases them. |
-| `kernels.graphs.captures-per-view` | 0 | CUDA graphs a sequence keeps for each of decode, verification and draft, counted together (the cache holds this many times the number of views and releases the graph used least recently, of any view, when it is full); The default `0` captures nothing and every quantum runs stage by stage; a positive value turns captures on (8 is a usual choice). Read by the Rust engine; the Java engine checks the value and ignores it. |
-| `kernels.compile.stack` | 256MiB | Stack of the thread that compiles a kernel module at load; the compiler recurses deeply on the largest modules. Applies when the Rust engine loads its kernels through RustEE, which it does not do yet; the Java engine checks the value and ignores it. |
+| `kernels.graphs.captures-per-view` | 0 | CUDA graphs a sequence keeps for each of decode, verification and draft, counted together (the cache holds this many times the number of views and releases the graph used least recently, of any view, when it is full); The default `0` captures nothing and every quantum runs stage by stage; a positive value turns captures on (8 is a usual choice). |
+| `kernels.compile.stack` | 256MiB | Stack of the thread that compiles a kernel module at load; the compiler recurses deeply on the largest modules. Applies when the Rust engine loads its kernels through RustEE, which it does not do yet. |
 | `kernels.rms-norm-decode-slices` | auto | Slices of the output pass of a one-row RMS norm (a decode step). `auto` is 40 on every card, the value chosen with the sliced kernel; 1 to 65535, and the output is the same for any count, so try other values on another card. |
 | `kernels.fused-verify-from` | auto | The fewest keys at which the fused verifier kernel serves each of 0 to 8 verified rows, as nine comma-separated whole numbers or `never`. `auto` is `never,never,49152,16384,4096,2048,16384,16384,12288`, measured on an RTX 5070 Ti. The fused kernel serves only from 2048 keys, so entries below 2048 have no effect. |
 | `kernels.trellis.*` | 512, auto, 64, 128 | Trellis kernel thresholds ([TRELLIS.md](quantization/TRELLIS.md#speed)): `tensor-core-max-tokens`, `target-blocks` (auto = 8 per streaming multiprocessor), `whole-k-min-tokens`, `wide-block-min-tokens`. |
@@ -64,8 +64,8 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `server.requests.max-body-size` | 1MiB | Request body limit (413 beyond). |
 | `server.requests.timeout` | 30m | Per-request limit. |
 
-The machine needs only the NVIDIA driver: each platform's jar (`euhedral-inference-linux-x64.jar`,
-`euhedral-inference-windows-x64.jar`) carries the CUDA runtime, NVRTC and the CUDA headers the kernels compile against.
+The machine needs only the NVIDIA driver: each platform's server bundle (`euhedral-server-linux-x64`,
+`euhedral-server-windows-x64`) carries the CUDA runtime, NVRTC and the CUDA headers the kernels compile against.
 
 ### Artifacts and their tokenizer
 
@@ -75,8 +75,10 @@ its weights ([FLASH_NEXT_ARTIFACT.md](flash-next/FLASH_NEXT_ARTIFACT.md#tokenize
 assemble` / `export-drafter` write it. An artifact without one stops the server with the command that adds it, which
 writes only that section and leaves every other byte of the artifact as it is:
 
+From the repository root:
+
 ```bash
-./gradlew :quantization:run --args="package-tokenizer --artifact ARTIFACT.edrl --tokenizer CHECKPOINT_DIR"
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- package-tokenizer --artifact ARTIFACT.edrl --tokenizer CHECKPOINT_DIR
 ```
 
 `--out COPY.edrl` writes a copy with the section and leaves the artifact alone. Running it again replaces the section.
@@ -122,9 +124,9 @@ Correct what the messages above name. The settings and their environment variabl
 ```
 
 What fails later, while the engine loads, is reported the same way, with the messages of its causes instead of the
-chain of Spring beans around them: worker CPUs this process may not run on, a context longer than the model's positions
+chain of wrappers around them: worker CPUs this process may not run on, a context longer than the model's positions
 or than the GPU can hold with every weight in host memory, a GPU that is missing or not a Blackwell, a CUDA runtime
-the native library cannot load. A port in use is reported by Spring Boot, after the weights have loaded.
+the native library cannot load. A port in use is reported after the weights have loaded.
 
 A successful start logs the context and how it fits, the prefix cache, and the time from the process's start to the open
 port (the Rust server, RTX 5070 Ti, `qwen3_8_27b_nvfp4_trellis_rco`, the default context; the first start also compiles
@@ -148,9 +150,8 @@ engine has closed. The image's Docker health check calls it.
 
 ## Container images
 
-The root `Dockerfile` builds the Java server's image. `rust/Dockerfile` builds the Rust server's, in the same
-distroless `cc` base with the same default settings file (`/etc/euhedral/config.yaml`, also `EUHEDRAL_CONFIG`), the NVIDIA
-environment, the `nonroot` user and the same health check timing. Build it from the repository root; the build compiles
+`rust/Dockerfile` builds the server's image in a distroless `cc` base with the default settings file (`/etc/euhedral/config.yaml`, also `EUHEDRAL_CONFIG`), the NVIDIA
+environment, the `nonroot` user and a health check. Build it from the repository root; the build compiles
 the native library with the pinned toolchains, so it needs network access and takes a while:
 
 ```bash
@@ -166,8 +167,7 @@ default plus `io_uring_setup`, `io_uring_enter` and `io_uring_register` also wor
 `kernel.io_uring_disabled` must be 0. If it is 1 or 2, the same error appears, and a container cannot change it.
 
 The image holds the linux-x64 server bundle (`cargo xtask bundle --product linux-x64`, see `rust/README.md`) under
-`/opt/euhedral`: `bin/euhedral-server` is the entry point and finds `lib/` beside it. Settings are given as for the
-Java image: `--config <mounted file>`, or variables (`docker run -e`, `--env-file`). The distroless base has no shell
+`/opt/euhedral`: `bin/euhedral-server` is the entry point and finds `lib/` beside it. Settings are given as `--config <mounted file>`, or variables (`docker run -e`, `--env-file`). The distroless base has no shell
 or curl, so the health check is `bin/euhedral-health-probe`, which asks `GET /health` of `127.0.0.1` on
 `EUHEDRAL_SERVER_PORT`, else `PORT`, else 1738, allows two seconds each to connect, to send the request and to read the answer, and exits 1 unless the answer is `200`. A
 server that listens on another port through a settings file needs the same port in one of those variables for the
@@ -176,7 +176,7 @@ check to follow it.
 ## Shutting down
 
 On `SIGTERM` or `SIGINT` the server stops accepting connections and waits up to
-`spring.lifecycle.timeout-per-shutdown-phase` (30 s, fixed) for the requests in flight, queued ones included, to
+the shutdown window (30 s, fixed) for the requests in flight, queued ones included, to
 finish. What is left after that is answered before the server stops: a request still queued gets 503 (`The server is shutting down.`),
 the running generation is stopped at its next quantum and gets an error (in a stream, an `error` event), and the engine
 then closes its sessions, its workers and the GPU. A second signal exits at once.
@@ -259,8 +259,7 @@ platform cannot report is left out rather than written as zero. On Windows the f
 every request (`http_server_requests_seconds`, with `_count`, `_sum` and `_max`) is labelled by route template (`uri`,
 for example `/v1/models/{model}`), method, status and outcome; every path that is no route is `uri="/**"`. A request is
 timed from the moment the router has it (its head and body already read) to the last byte handed to the connection; a
-stream cut after its head is timed to the moment it was cut, as a `200`. The JVM's metrics (`jvm_*`) and
-`http_server_requests_active_seconds` belong to the Java server: the Rust server has none.
+stream cut after its head is timed to the moment it was cut, as a `200`.
 
 ### Examples
 

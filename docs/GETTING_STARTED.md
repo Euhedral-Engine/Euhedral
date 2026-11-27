@@ -67,19 +67,19 @@ See the [Messages API guide](ANTHROPIC_API.md) for streaming and request options
 
 ## Windows
 
-Build the Windows JAR with:
+Build the Windows bundle (on Windows, or cross-built on Linux with `cargo zigbuild`; see [rust/README.md](../rust/README.md#server-bundle)):
 
 ```bash
-./gradlew :api:bootJarWindowsX64
+(cd rust && cargo xtask native --product windows-x64 && cargo xtask bundle --product windows-x64)
 ```
 
 On Windows, set `model.artifact` to the artifact's Windows path in `euhedral.yaml`, then run:
 
 ```powershell
-java --enable-native-access=ALL-UNNAMED -jar api/build/libs/euhedral-inference-windows-x64.jar --config euhedral.yaml
+build\bundle\euhedral-server-windows-x64\bin\euhedral-server.exe --config euhedral.yaml
 ```
 
-Both platform JARs include the native libraries they need. Install Java 25 and a current NVIDIA driver
+Both platform bundles include the native libraries they need. Install a current NVIDIA driver
 on the serving machine. Build tool requirements are in [building and testing](development/BUILDING.md).
 
 ## Configure the server

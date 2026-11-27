@@ -122,7 +122,7 @@ GGUF run by llama.cpp as the reference, the engine's teacher-forced KL over T2 (
 
 ## GPTQ
 
-`gptq/calibration.py` builds the GPTQ calibration set; the `quantization` module (quantization/README.md) rounds an
+`gptq/calibration.py` builds the GPTQ calibration set; the `quantization` command (rust/crates/quantize) rounds an
 artifact's decoder layers and heads by GPTQ on the engine's kernels and writes the codes for `--codes-from`
 (docs/evaluation/QUALITY.md#gptq). The calibration set needs `tokenizers` and `jinja2`:
 
@@ -133,8 +133,9 @@ python -m gptq.calibration prompts $C/prompts.jsonl $HOLDOUT/t4_prompts.jsonl
 python -m gptq.calibration generate http://localhost:8080 $C/prompts.jsonl $C/generations.jsonl --parallel 2
 python -m gptq.calibration tokens $CHECKPOINT $C            # writes $C/tokens.npy
 # the codes, one layer at a time on the GPU; then the artifact
-(cd .. && ./gradlew :quantization:run --args="calibrate --model $CHECKPOINT --quantization nvfp4 --compressed \
-    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $CODES --act-order")
+cargo run --release --manifest-path ../rust/Cargo.toml -p euhedral-inference-quantize -- calibrate --model $CHECKPOINT --quantization nvfp4 --compressed \
+    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $CODES --act-order \
+    --cuda-library ../build/native/linux-x64/lib/libeuhedral_cuda.so
 python3 convert_checkpoint.py --model $CHECKPOINT --quantization nvfp4 --compressed \
     --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --imatrix imatrix-swift15-v1mix.gguf --codes-from $CODES \
     --out $OUT/qwen3_8_27b_nvfp4_compressed.edrl
@@ -163,8 +164,9 @@ to compare an artifact with the quantization module's own figures, which used an
 default head and convert a second time with `--output-head BF16`; the draft head still needs its codes.
 
 ```bash
-(cd .. && ./gradlew :quantization:run --args="calibrate --model $CHECKPOINT --format trellis --bits 3.5 \
-    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $EXL3")
+cargo run --release --manifest-path ../rust/Cargo.toml -p euhedral-inference-quantize -- calibrate --model $CHECKPOINT --quantization trellis --format trellis --bits 3.5 \
+    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $EXL3 \
+    --cuda-library ../build/native/linux-x64/lib/libeuhedral_cuda.so
 python3 convert_checkpoint.py --model $CHECKPOINT --quantization trellis --trellis-from $EXL3 \
     --codes-from $EXL3/heads --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $OUT/qwen3_8_27b_trellis.edrl
 ```
@@ -210,7 +212,7 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
   upstream source tree) over fixed inputs and writes every intermediate as fixtures (docs/speculation/DFLASH2.md).
 - `dflash2_compare.py`: per-tensor relative error between two DFlash2 fixture directories (NumPy).
 - `dflash2_quality.py`: compares two drafters' quality records (DFlash2QualityCudaIntegrationTest).
-- `render_qwen_chat_template_golden.py`: renders chat-template golden prompts (jinja2).
+- `render_qwen_chat_template_golden.py`: regenerates `rust/crates/api-protocol/tests/data/qwen-chat-template-golden.json` from the checkpoint chat template (jinja2).
 
 ## Conversation generation
 

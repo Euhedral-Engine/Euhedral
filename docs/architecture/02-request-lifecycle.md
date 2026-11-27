@@ -61,9 +61,9 @@ The core generation chain is `Admit → quantum → Select → Admit/Finish`. A 
 
 ## Implementation anchors
 
-- [Controllers](../../api/src/main/java/io/euhedral_execution/inference/api/web/OpenAiController.java) and [AnthropicController](../../api/src/main/java/io/euhedral_execution/inference/api/web/AnthropicController.java).
-- [ConversationPlanner](../../api/src/main/java/io/euhedral_execution/inference/api/chat/ConversationPlanner.java), [GenerationService](../../api/src/main/java/io/euhedral_execution/inference/api/chat/GenerationService.java) and [ChatGeneration](../../api/src/main/java/io/euhedral_execution/inference/api/chat/ChatGeneration.java).
-- [EngineInferenceBackend](../../api/src/main/java/io/euhedral_execution/inference/api/engine/EngineInferenceBackend.java): constraints, session creation and callbacks.
-- [Generation](../../core/src/main/java/io/euhedral_execution/inference/core/generation/Generation.java) and [Session](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/Session.java).
+- [router](../../rust/crates/api-server/src/router.rs), [admission](../../rust/crates/api-server/src/admission.rs) and [limits](../../rust/crates/api-server/src/limits.rs): the OpenAI and Anthropic routes and request admission.
+- [planning](../../rust/crates/api-server/src/planning.rs) and [answer](../../rust/crates/api-server/src/answer/mod.rs): conversation planning and the reply and stream owners.
+- [engine backend](../../rust/crates/api-server/src/engine_backend/mod.rs): constraints, session creation and callbacks.
+- [generation](../../rust/crates/engine/src/generation/mod.rs): the request, its mailbox and its listener.
 
 This diagram omits protocol-specific event schemas, tool parsing and individual execution stages. See [execution engine](03-execution-engine.md) and [speculative decoding](05-speculative-decoding.md).

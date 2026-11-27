@@ -1,12 +1,10 @@
 """Scores candidate artifacts on the frozen evaluation set and prints aggregate and per-domain numbers only.
 
 Usage (from the repository root): python3 tools/t5/run.py STORE --baseline NAME NAME=ARTIFACT...
-                                  [--engine java|rust] [--gradle ./gradlew] [--rust-bench PATH]
-                                  [--cuda-library PATH] [--resamples 10000]
+                                  --rust-bench PATH [--cuda-library PATH] [--resamples 10000]
 
 The runner refuses a store whose files differ from STORE/frozen/manifest.json, scores every artifact with
-`quantization score --values` (`--engine java`, the default) or `euhedral-bench score --values` (`--engine rust`, with
-`--rust-bench` naming the binary) into a private directory under STORE/runs, prints the report, and deletes the per-token
+`euhedral-bench score --values` (`--rust-bench` names the binary) into a private directory under STORE/runs, prints the report, and deletes the per-token
 values: nothing per token, per chunk or per prompt leaves the runner.
 
 Per domain and overall: mean KL(reference || candidate) over scored tokens, top-1 agreement, KL p95 and p99, dNLL
@@ -49,17 +47,13 @@ def read_values(path: Path) -> list[list[tuple[float, ...]]]:
 
 
 def score_command(args: argparse.Namespace, name: str, artifact: str, private: Path) -> list[str]:
-    """The command that scores one artifact with the chosen engine; both write DIR/NAME.values and the same summary."""
+    """The command that scores one artifact; it writes DIR/NAME.values and the summary."""
     reference = args.store / "frozen" / "reference.kld"
-    if args.engine == "rust":
-        command = [str(args.rust_bench), "score", "--artifact", artifact, "--results", str(private / "score.txt"),
-                   "--reference", str(reference), "--name", name, "--values", str(private)]
-        if args.cuda_library is not None:
-            command += ["--cuda-library", str(args.cuda_library)]
-        return command
-    return [args.gradle, "--no-daemon", "-q", ":quantization:run",
-            f"--args=score --artifact {artifact} --results {private / 'score.txt'} "
-            f"--reference {reference} --name {name} --values {private}"]
+    command = [str(args.rust_bench), "score", "--artifact", artifact, "--results", str(private / "score.txt"),
+               "--reference", str(reference), "--name", name, "--values", str(private)]
+    if args.cuda_library is not None:
+        command += ["--cuda-library", str(args.cuda_library)]
+    return command
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -137,18 +131,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("store", type=Path)
     parser.add_argument("--baseline", required=True, help="the NAME the others are compared with")
     parser.add_argument("artifacts", nargs="+", help="NAME=ARTIFACT")
-    parser.add_argument("--engine", choices=("java", "rust"), default="java",
-                        help="the engine that scores the candidates (default java)")
-    parser.add_argument("--gradle", default="./gradlew", help="the Gradle wrapper of --engine java")
-    parser.add_argument("--rust-bench", type=Path, help="the euhedral-bench binary of --engine rust")
-    parser.add_argument("--cuda-library", type=Path, help="the CUDA library of --engine rust, when not at its default")
+    parser.add_argument("--rust-bench", type=Path, required=True, help="the euhedral-bench binary")
+    parser.add_argument("--cuda-library", type=Path, help="the CUDA library, when not at its default")
     parser.add_argument("--resamples", type=int, default=10000)
     args = parser.parse_args(argv)
     artifacts = dict(item.split("=", 1) for item in args.artifacts)
     if args.baseline not in artifacts:
         raise SystemExit("error: the baseline must be one of the artifacts")
-    if args.engine == "rust" and (args.rust_bench is None or not args.rust_bench.is_file()):
-        raise SystemExit("error: --engine rust needs --rust-bench, the path of the euhedral-bench binary")
+    if not args.rust_bench.is_file():
+        raise SystemExit(f"error: --rust-bench {args.rust_bench} is not a file")
     check_store(args.store)
     started = datetime.datetime.now().astimezone()
     runs = args.store / "runs"

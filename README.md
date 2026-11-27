@@ -10,15 +10,18 @@ All five formats were tested with contexts up to **128K tokens**. See the [bench
 
 ## Quick start
 
-You need a Blackwell GPU with a current NVIDIA driver, Java 25, and a model in Euhedral's `.edrl` format.
+You need a Blackwell GPU with a current NVIDIA driver, and a model in Euhedral's `.edrl` format.
 An artifact is a model file ready to serve. To make one from a Hugging Face checkpoint, follow the
 [conversion guide](docs/GETTING_STARTED.md#convert-a-checkpoint).
 
 **1. Build the server.** [Build requirements](docs/development/BUILDING.md) are listed separately.
 
 ```bash
-./gradlew :api:bootJar
+(cd rust && cargo xtask native --product linux-x64 && cargo xtask bundle --product linux-x64)
 ```
+
+The bundle is `build/bundle/euhedral-server-linux-x64/`. To run in a container instead, see
+[Docker deployment](docs/DEPLOYMENT.md).
 
 **2. Save this as `euhedral.yaml`**, using your artifact's path:
 
@@ -31,7 +34,7 @@ model:
 **3. Start the server** (Linux):
 
 ```bash
-java --enable-native-access=ALL-UNNAMED -jar api/build/libs/euhedral-inference-linux-x64.jar --config euhedral.yaml
+build/bundle/euhedral-server-linux-x64/bin/euhedral-server --config euhedral.yaml
 ```
 
 **4. Send a request:**

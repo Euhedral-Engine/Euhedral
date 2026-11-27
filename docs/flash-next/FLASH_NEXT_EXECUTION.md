@@ -17,7 +17,7 @@ Flash-Next's operators are many small kernels that differ in their arguments. Th
 (`native/src/qwen4/kernels.cu`) behind one native entry point, `euhedral_cuda_qwen4_launch(kernel, grid, block, shared,
 words, sizes, count)`: a table of kernel names in `native/src/host/qwen4_ops.c` and the enum `Kernel` list the same
 names in the same order (a test compares them). The launcher checks the number and width (4 or 8 bytes) of every argument
-against the compiled kernel with `cuFuncGetParamInfo`, so a mismatch between a Java caller and the CUDA source fails the
+against the compiled kernel with `cuFuncGetParamInfo`, so a mismatch between a Rust caller and the CUDA source fails the
 call. Launches go through `euhedral_launch_kernel`, so they are hashed and recorded like every other submission. Adding a
 kernel is a `.cuh`, an entry in the table and the enum, and a typed wrapper in `Ops`.
 

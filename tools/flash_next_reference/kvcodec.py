@@ -1,7 +1,7 @@
 """The engine's NVFP4 KV cache codec in torch (`--kv-format nvfp4`).
 
 Ported from native/src/attention/nvfp4_kv.cuh (the device codec) with the semantics of
-core/.../Nvfp4KvReference.java (the mathematical reference):
+the codec's mathematical reference:
 
   * a row is one head, 256 BF16 values;
   * the row is rotated by the normalized Sylvester H256 (entries +-1/16) in FP32 with the device's fixed butterfly:

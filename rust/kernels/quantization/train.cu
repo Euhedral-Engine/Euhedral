@@ -1,4 +1,4 @@
-// Block-wise training of a quantized decoder layer (quantization/README.md): forward and backward passes of the
+// Block-wise training of a quantized decoder layer (rust/crates/quantize/README.md): forward and backward passes of the
 // layer's operations in FP32, with the engine's semantics (native/src/gdn, native/src/attention, norm, elementwise):
 // - RMSNorm, (1 + w) form for layer and q/k norms, w form for the GDN gated norm;
 // - GDN: alpha = exp(-exp(A_log) softplus(a + dt_bias)), beta = sigmoid(b); a causal depthwise convolution with SiLU;
