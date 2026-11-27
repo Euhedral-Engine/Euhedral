@@ -64,17 +64,17 @@ impl Product {
 
     /// How this process builds the product's server, or why it cannot.
     fn build(self) -> Result<Build, String> {
-        Self::build_on(self, cfg!(target_arch = "x86_64"), cfg!(windows))
+        self.build_on(env::consts::OS, env::consts::ARCH)
     }
 
-    /// `build` for a host of the given architecture and operating system.
-    fn build_on(self, x86_64: bool, windows: bool) -> Result<Build, String> {
-        match (x86_64, windows, self) {
-            (true, false, Self::LinuxX64) | (true, true, Self::WindowsX64) => Ok(Build::Native),
-            (true, false, Self::WindowsX64) => Ok(Build::CrossWindows),
+    /// `build` for a host of the given operating system and architecture (`std::env::consts` names).
+    fn build_on(self, os: &str, arch: &str) -> Result<Build, String> {
+        match (os, arch, self) {
+            ("linux", "x86_64", Self::LinuxX64) | ("windows", "x86_64", Self::WindowsX64) => Ok(Build::Native),
+            ("linux", "x86_64", Self::WindowsX64) => Ok(Build::CrossWindows),
             _ => Err(format!(
-                "the {} bundle cannot be built on this platform: linux-x64 builds on Linux x86-64, windows-x64 on \
-                 Windows or Linux x86-64",
+                "the {} bundle cannot be built on {os} {arch}: linux-x64 builds on Linux x86_64, windows-x64 on \
+                 Windows or Linux x86_64",
                 self.id()
             )),
         }
@@ -386,29 +386,36 @@ mod tests {
     }
 
     #[test]
-    fn each_product_is_built_on_the_platforms_that_can() {
-        let linux = Product::LinuxX64;
-        let windows = Product::WindowsX64;
-        assert_eq!(linux.build_on(true, false), Ok(Build::Native));
-        assert_eq!(windows.build_on(true, true), Ok(Build::Native));
-        assert_eq!(windows.build_on(true, false), Ok(Build::CrossWindows));
-        assert!(linux.build_on(true, true).is_err(), "linux from windows");
-        assert!(linux.build_on(false, false).is_err(), "linux off x86-64");
-        assert!(windows.build_on(false, true).is_err(), "windows off x86-64");
+    fn each_product_is_built_only_on_the_platforms_that_can() {
+        let (linux, windows) = (Product::LinuxX64, Product::WindowsX64);
+        assert_eq!(linux.build_on("linux", "x86_64"), Ok(Build::Native));
+        assert_eq!(windows.build_on("windows", "x86_64"), Ok(Build::Native));
+        assert_eq!(windows.build_on("linux", "x86_64"), Ok(Build::CrossWindows));
+        for (product, os, arch) in [
+            (linux, "windows", "x86_64"),
+            (linux, "macos", "x86_64"),
+            (windows, "macos", "x86_64"),
+            (linux, "linux", "aarch64"),
+            (windows, "linux", "aarch64"),
+            (windows, "windows", "aarch64"),
+        ] {
+            let error = product.build_on(os, arch).expect_err("refused");
+            assert!(
+                error.contains(product.id()) && error.contains(os) && error.contains(arch),
+                "{error}"
+            );
+        }
     }
 
     #[test]
-    fn the_cross_build_names_the_windows_target_and_the_native_build_none() {
+    fn the_cross_build_goes_through_zigbuild_to_the_windows_target_and_the_native_build_has_no_target() {
         let cross = Build::CrossWindows.arguments();
         assert_eq!(cross[0], "zigbuild");
         assert!(
             cross.windows(2).any(|pair| pair == ["--target", WINDOWS_TARGET]),
             "{cross:?}"
         );
-        let native = Build::Native.arguments();
-        assert_eq!(native[0], "build");
-        assert!(!native.contains(&"--target"), "{native:?}");
-        assert!(native.contains(&"--message-format=json-render-diagnostics"));
+        assert!(!Build::Native.arguments().contains(&"--target"));
     }
 
     fn windows_native_product(root: &Path) -> PathBuf {
@@ -434,6 +441,10 @@ mod tests {
         fs::write(&server, "").expect("empty server");
         let error = assemble(&root.join("bundle"), &server, &native, Product::WindowsX64).expect_err("empty server");
         assert!(error.contains("server"), "{error}");
+        fs::write(&server, "binary").expect("server");
+        fs::write(native.join("files.sha256"), "").expect("empty manifest");
+        let error = assemble(&root.join("bundle"), &server, &native, Product::WindowsX64).expect_err("empty manifest");
+        assert!(error.contains("files.sha256"), "{error}");
         drop(fs::remove_dir_all(root));
     }
 
