@@ -25,6 +25,7 @@ mod shard_tests;
 
 pub use cache::{CacheConfig, ExpertCache};
 pub use host::{CopyJob, CopyLane, DeviceSlots, Frames, SubmitFailure};
+pub(crate) use lanes::RuntimeLanes;
 pub use lease::ExpertLease;
 pub use owner::{Listener, Outcome};
 pub use stats::{CacheSnapshot, CacheStats, Cause};

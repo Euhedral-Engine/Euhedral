@@ -17,10 +17,6 @@ use crate::runtime::Core;
 use crate::stages::SubmitError;
 
 /// The runtime's lake, completions and one transfer lane, as the cache's frames and copy lane.
-#[expect(
-    dead_code,
-    reason = "the MoE layer that builds the cache over the runtime is a later change"
-)]
 pub(crate) struct RuntimeLanes {
     core: Arc<Core>,
     chain: usize,
@@ -35,10 +31,6 @@ impl fmt::Debug for RuntimeLanes {
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "the MoE layer that builds the cache over the runtime is a later change"
-)]
 impl RuntimeLanes {
     /// The lanes of `core`, copying on upload chain `chain`'s transfer lane. Refuses a chain the runtime has no lane for.
     pub(crate) fn new(core: Arc<Core>, chain: usize) -> Result<RuntimeLanes, String> {

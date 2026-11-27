@@ -1,4 +1,5 @@
 use euhedral_inference_edrl::TensorDataType;
+use std::slice::from_ref;
 
 use euhedral_inference_edrl::WeightFormat;
 
@@ -209,8 +210,8 @@ fn pieces_cover_each_loaded_object_once_cut_to_the_piece_size_and_skip_the_file_
 #[test]
 fn an_nvfp4_tensor_is_checked_where_its_format_has_something_to_check() {
     let weight = nvfp4_tensor("w", 4096, 128, 256);
-    let plan = plan_of(std::slice::from_ref(&weight), &[StorageClass::DeviceResident]);
-    let layout = FixedLayout::of(&plan, std::slice::from_ref(&weight)).unwrap();
+    let plan = plan_of(from_ref(&weight), &[StorageClass::DeviceResident]);
+    let layout = FixedLayout::of(&plan, from_ref(&weight)).unwrap();
     let pieces = layout.pieces(1 << 20);
     let scales = nvfp4::scale_offset(128, 256);
     let checks: Vec<_> = pieces
@@ -226,8 +227,8 @@ fn an_nvfp4_tensor_is_checked_where_its_format_has_something_to_check() {
 #[test]
 fn a_cut_scale_plane_checks_each_piece_from_where_it_starts_in_the_plane() {
     let weight = nvfp4_tensor("w", 0, 128, 512);
-    let plan = plan_of(std::slice::from_ref(&weight), &[StorageClass::DeviceResident]);
-    let layout = FixedLayout::of(&plan, std::slice::from_ref(&weight)).unwrap();
+    let plan = plan_of(from_ref(&weight), &[StorageClass::DeviceResident]);
+    let layout = FixedLayout::of(&plan, from_ref(&weight)).unwrap();
     let pieces = layout.pieces(1024);
     let froms: Vec<u64> = pieces
         .iter()
@@ -243,6 +244,7 @@ fn a_cut_scale_plane_checks_each_piece_from_where_it_starts_in_the_plane() {
 fn objects_resolve_to_their_arena_addresses_and_a_host_object_needs_the_host_arena() {
     let (tensors, plan) = three();
     let layout = FixedLayout::of(&plan, &tensors).unwrap();
+    // SAFETY: the address is only compared and offset, never dereferenced.
     let base = |address| unsafe { DevicePtr::from_raw(address) };
     let weights = layout.resolve(base(0x1000), Some(base(0x9000))).unwrap();
     assert_eq!(
@@ -286,6 +288,7 @@ fn padded_rig(width: u32, extra: Option<u64>) -> (FixedWeights, u32) {
     let plan = plan_of(&tensors, &[StorageClass::DeviceResident, StorageClass::DeviceResident]);
     let weights = FixedLayout::of(&plan, &tensors)
         .unwrap()
+        // SAFETY: the address is only compared and offset, never dereferenced.
         .resolve(unsafe { DevicePtr::from_raw(0x10_0000) }, None)
         .unwrap();
     (weights, hidden)
@@ -299,6 +302,7 @@ fn a_shared_width_that_is_not_a_multiple_of_256_widens_each_plain_tensor_into_it
     assert_eq!(jobs.len(), 2);
     assert_eq!(jobs[1].target_offset, target.next_multiple_of(256));
     assert_eq!(bytes, 2 * target.next_multiple_of(256));
+    // SAFETY: the address is only compared and offset, never dereferenced.
     let base = unsafe { DevicePtr::from_raw(0x90_0000) };
     let launches = pad_launches(&jobs, base, hidden, 128, 256).unwrap();
     assert_eq!(launches.len(), 2);
@@ -317,6 +321,7 @@ fn a_tensor_of_another_size_than_the_plain_layout_is_left_alone_and_a_wide_enoug
 fn a_width_the_kernel_cannot_take_is_refused_when_the_launches_are_built() {
     let (weights, hidden) = padded_rig(128, None);
     let (jobs, _) = padding(&weights, 2, hidden, 128, 256);
+    // SAFETY: the address is only compared and offset, never dereferenced.
     let base = unsafe { DevicePtr::from_raw(0x90_0000) };
     assert!(pad_launches(&jobs, base, hidden, 100, 256).is_err());
 }

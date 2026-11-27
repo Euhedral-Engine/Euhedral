@@ -222,18 +222,18 @@ impl Drop for Startup {
     }
 }
 
-fn control(core: &Core) -> &Arc<Lake> {
+pub(crate) fn control(core: &Core) -> &Arc<Lake> {
     &core.control
 }
 
-fn host(core: &Core) -> &Arc<Lake> {
+pub(crate) fn host(core: &Core) -> &Arc<Lake> {
     &core.host
 }
 
 /// The lake of the startup's device work. Its waiting calls (the allocators and frees of the device, pinned
 /// allocations, the kernel compiler) are startup's and shutdown's alone, each under a scoped allow, and run in the
 /// frames of this lake, one at a time, before any request exists.
-fn device(core: &Core) -> &Arc<Lake> {
+pub(crate) fn device(core: &Core) -> &Arc<Lake> {
     &core.stages
 }
 
@@ -278,34 +278,47 @@ fn read_range(
     next: impl FnOnce(Startup, Vec<u8>) + Send + 'static,
 ) {
     let core = Arc::clone(&startup.core);
+    read_region(&core, file, path, range, what, move |read| match read {
+        Ok(bytes) => next(startup, bytes),
+        Err(error) => startup.fail(error),
+    });
+}
+
+/// Reads `range` of `file`; `then` gets the bytes (all of them) or the failure, in a frame of its own. A read the I/O
+/// refuses drops `then` unrun, which ends a startup that owns it (see [`Startup`]'s `Drop`).
+pub(crate) fn read_region(
+    core: &Arc<Core>,
+    file: &Arc<OwnedFile>,
+    path: &Path,
+    range: Range<u64>,
+    what: &'static str,
+    then: impl FnOnce(Result<Vec<u8>, EngineError>) + Send + 'static,
+) {
     let length = (range.end - range.start) as usize;
     let path = path.to_path_buf();
-    let then = Box::new(move |done: IoDone| -> Box<dyn Frame> {
-        step(Kind::Startup, 0, move || match done.result {
-            Ok(read) if read == length => {
-                let mut bytes = done.buf.bytes;
-                bytes.truncate(read);
-                next(startup, bytes);
-            }
-            Ok(read) => startup.fail(EngineError::io(
-                format!("reading the {what} of {}", path.display()),
-                io::Error::new(
+    let done = Box::new(move |done: IoDone| -> Box<dyn Frame> {
+        step(Kind::Startup, 0, move || {
+            let failed = |error: io::Error| EngineError::io(format!("reading the {what} of {}", path.display()), error);
+            then(match done.result {
+                Ok(read) if read == length => {
+                    let mut bytes = done.buf.bytes;
+                    bytes.truncate(read);
+                    Ok(bytes)
+                }
+                Ok(read) => Err(failed(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!("{read} of {length} bytes arrived"),
-                ),
-            )),
-            Err(error) => startup.fail(EngineError::io(
-                format!("reading the {what} of {}", path.display()),
-                error,
-            )),
+                ))),
+                Err(error) => Err(failed(error)),
+            });
         })
     });
     let buf = IoBuf {
         bytes: vec![0; length],
         filled: 0,
     };
-    // A submission that fails drops `then`, and the startup with it (see the `Drop`).
-    let _ = core.io.read(raw_file(file), range.start, buf, then);
+    // A submission that fails drops `done`, and the continuation with it.
+    let _ = core.io.read(raw_file(file), range.start, buf, done);
 }
 
 /// An artifact file opened, with the regions its index is read from.
@@ -364,7 +377,7 @@ fn open_index(
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O: one fstat at startup, before any frame runs"
 )]
-fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
+pub(crate) fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
     let file = File::from(file);
     (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))
 }
@@ -375,7 +388,7 @@ fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O: one fstat at startup, before any frame runs"
 )]
-fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
+pub(crate) fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
     let file = File::from(file);
     (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))
 }
@@ -723,7 +736,7 @@ fn plan(startup: Startup, artifact: Artifact, ends: HashMap<String, Arc<[u32]>>)
 }
 
 /// What the plan reads of the device now: the free memory (a failed read is an error, not zero).
-fn device_inputs(core: &Core) -> Result<PlanInputs, EngineError> {
+pub(crate) fn device_inputs(core: &Core) -> Result<PlanInputs, EngineError> {
     let device_free = core.library.free_bytes().map_err(EngineError::from)?;
     Ok(PlanInputs {
         device_free,
