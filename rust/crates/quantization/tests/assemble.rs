@@ -18,7 +18,7 @@ use std::time::Duration;
 use checkpoint_support::World;
 use euhedral_inference_edrl::tiny::{DRAFTER_PROJECTION, PROJECTIONS, TOKENIZER, TinyArtifact};
 use euhedral_inference_edrl::{MAX_DRAFT_DEPTH, TokenizerTexts};
-use euhedral_inference_engine::Handoff;
+use euhedral_inference_engine::{ArtifactGuard, GuardError, Handoff};
 use euhedral_inference_quantization::assemble::{
     ArtifactFile, AssembleError, Done, Request, SourceSet, View, run, view, write,
 };
@@ -292,6 +292,62 @@ fn an_output_that_is_a_source_is_refused_and_the_source_and_the_temporary_file_a
 }
 
 #[test]
+fn an_output_that_a_running_engine_holds_is_refused_by_path_and_not_touched() {
+    let fixture = Fixture::new();
+    let sources = fixture.open(&fixture.two()).unwrap();
+    let composite = view(&sources, &allocation(&[]), None).unwrap();
+    let out = fixture.dir.path().join("served.edrl");
+    fs::write(&out, b"served").unwrap();
+    let guard = ArtifactGuard::hold(&out).unwrap();
+    let error = fixture.write(&composite, &out, 1 << 20).unwrap_err().to_string();
+    assert!(error.contains(&out.display().to_string()), "{error}");
+    assert_eq!(fs::read(&out).unwrap(), b"served");
+    assert!(!fixture.dir.path().join("served.edrl.part").exists());
+    drop(guard);
+    fixture.write(&composite, &out, 1 << 20).unwrap();
+    fixture.world.finish();
+}
+
+#[test]
+fn a_write_keeps_its_claim_on_the_output_until_it_ends() {
+    // On Windows a claim holds nothing (the engine's guard stops a write at its open), so only the Unix lock shows.
+    if cfg!(windows) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let sources = fixture.open(&fixture.two()).unwrap();
+    let composite = view(&sources, &allocation(&[]), None).unwrap();
+    let out = fixture.dir.path().join("served.edrl");
+    fs::write(&out, b"served").unwrap();
+    // A world whose I/O only the test drives: the write is in flight, at its first step, until the test runs it.
+    let driven = World::driven();
+    let ended = Handoff::new();
+    let sender = Arc::clone(&ended);
+    write(
+        &driven.io,
+        &driven.host,
+        &composite,
+        &out,
+        1 << 20,
+        Arc::new(move |result| sender.send(result)),
+    )
+    .unwrap();
+    let refusal = ArtifactGuard::hold(&out).unwrap_err();
+    assert!(matches!(refusal, GuardError::Held { .. }), "{refusal}");
+    // After the step that opens the `.part` file the chain has gone on and still waits for the next one.
+    driven.drive_step();
+    let refusal = ArtifactGuard::hold(&out).unwrap_err();
+    assert!(
+        matches!(refusal, GuardError::Held { .. }),
+        "after the first step: {refusal}"
+    );
+    driven.drive_until(&ended).unwrap();
+    drop(ArtifactGuard::hold(&out).unwrap());
+    driven.finish();
+    fixture.world.finish();
+}
+
+#[test]
 fn a_view_without_a_tokenizer_cannot_be_written() {
     let fixture = Fixture::new();
     let sources = fixture.open(&fixture.two()).unwrap();
@@ -494,7 +550,7 @@ fn a_stale_temporary_file_is_replaced() {
 
 #[cfg(unix)]
 #[test]
-fn an_output_name_that_cannot_be_compared_ends_the_run_and_leaves_the_temporary_file() {
+fn an_output_name_that_cannot_be_opened_is_refused_before_any_file_is_made() {
     use std::os::unix::fs::symlink;
     let fixture = Fixture::new();
     let sources = fixture.open(&fixture.two()).unwrap();
@@ -502,8 +558,8 @@ fn an_output_name_that_cannot_be_compared_ends_the_run_and_leaves_the_temporary_
     let out = fixture.dir.path().join("loop.edrl");
     symlink(&out, &out).unwrap();
     let error = fixture.write(&composite, &out, 1 << 20).unwrap_err().to_string();
-    assert!(error.contains("cannot compare"), "{error}");
-    assert!(fixture.dir.path().join("loop.edrl.part").exists());
+    assert!(error.contains("cannot lock") && error.contains("loop.edrl"), "{error}");
+    assert!(!fixture.dir.path().join("loop.edrl.part").exists());
     assert_eq!(fs::read_link(&out).unwrap(), out);
     fixture.world.finish();
 }

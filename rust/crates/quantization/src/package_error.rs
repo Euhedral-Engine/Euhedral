@@ -4,6 +4,7 @@ use std::io;
 use std::path::PathBuf;
 
 use euhedral_inference_edrl::EdrlError;
+use euhedral_inference_engine::GuardError;
 
 /// A failed `package-tokenizer`: which step, and why.
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +61,9 @@ pub enum PackageError {
         removal: io::Error,
         cause: Box<PackageError>,
     },
+    /// A running engine holds the file the run would write.
+    #[error(transparent)]
+    Guard(#[from] GuardError),
     /// The host lake would not take a frame of the run.
     #[error("the host lake refused work: {0}")]
     Lake(String),

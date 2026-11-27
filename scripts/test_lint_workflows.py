@@ -162,7 +162,7 @@ class FailFastTest(unittest.TestCase):
     """One workflow runs for a pull request, and every job of it cancels the run when it fails."""
 
     ACTION = "uses: ./.gitea/actions/fail-fast"
-    AGGREGATES = ("device", "gate-ok")  # cancelled with the run; they only report
+    AGGREGATES = ("device", "gate-ok", "land-guard")  # cancelled with the run; they only report
 
     def test_only_ci_runs_for_a_pull_request(self):
         for path in sorted((ROOT / ".gitea/workflows").glob("*.y*ml")):
