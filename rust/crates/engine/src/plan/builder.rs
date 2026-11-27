@@ -22,6 +22,7 @@ use crate::formats::{LinearFormat, TokenEmbedding};
 use crate::model::{LayerIndex, LayerKind, ModelConfig, MtpRole, NormKind, Role, WeightRef, Weights};
 use crate::residency::disk::DiskUse;
 use crate::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
+use crate::stages::drafter::{DrafterBody, DrafterContext, DrafterSelect, DrafterTap, DrafterWeights};
 use crate::stages::elementwise::{ResidualAdd, Swiglu};
 use crate::stages::embed::Embed;
 use crate::stages::gdn::{GdnConvolution, GdnGatedRmsNorm, GdnProjectControl, GdnRecurrence};
@@ -140,6 +141,14 @@ pub enum StageKind {
     SelectedToken,
     /// The copy of a host-held weight into a staging slot.
     WeightTransfer,
+    /// The copy of a tapped layer's rows into the sequence's tap buffer.
+    DrafterTap,
+    /// The drafter's context update.
+    DrafterContext,
+    /// The drafter's layers over a block.
+    DrafterBody,
+    /// The drafter's selector.
+    DrafterSelect,
 }
 
 impl StageKind {
@@ -165,6 +174,10 @@ impl StageKind {
             StageKind::CopyRows => "copy-rows",
             StageKind::SelectedToken => "selected-token",
             StageKind::WeightTransfer => "weight-transfer",
+            StageKind::DrafterTap => "drafter-tap",
+            StageKind::DrafterContext => "drafter-context",
+            StageKind::DrafterBody => "drafter-body",
+            StageKind::DrafterSelect => "drafter-select",
         }
     }
 }
@@ -238,6 +251,20 @@ pub(crate) enum Make {
     },
     CopyRows,
     SelectedToken,
+    /// The copy of the rows of the hidden state after the tapped layer number `tap` (of the drafter's taps) into the
+    /// tap buffer.
+    DrafterTap {
+        tap: usize,
+    },
+    DrafterContext {
+        weights: Arc<DrafterWeights>,
+    },
+    DrafterBody {
+        weights: Arc<DrafterWeights>,
+    },
+    DrafterSelect {
+        weights: Arc<DrafterWeights>,
+    },
     /// The stage `inner`, which reads the staging slot `slot` in place of its weight.
     Staged {
         slot: usize,
@@ -284,6 +311,10 @@ impl Make {
             Make::Argmax { .. } => StageKind::Argmax,
             Make::CopyRows => StageKind::CopyRows,
             Make::SelectedToken => StageKind::SelectedToken,
+            Make::DrafterTap { .. } => StageKind::DrafterTap,
+            Make::DrafterContext { .. } => StageKind::DrafterContext,
+            Make::DrafterBody { .. } => StageKind::DrafterBody,
+            Make::DrafterSelect { .. } => StageKind::DrafterSelect,
             Make::Staged { inner, .. } => inner.kind(),
             Make::Transfer { .. } | Make::DiskTransfer { .. } => StageKind::WeightTransfer,
         }
@@ -313,6 +344,10 @@ impl Make {
             | Make::Argmax { .. }
             | Make::CopyRows
             | Make::SelectedToken
+            | Make::DrafterTap { .. }
+            | Make::DrafterContext { .. }
+            | Make::DrafterBody { .. }
+            | Make::DrafterSelect { .. }
             | Make::Transfer { .. }
             | Make::DiskTransfer { .. } => Vec::new(),
         }
@@ -350,6 +385,28 @@ impl Make {
             Make::Argmax { .. } => (vec![Logits], vec![]),
             Make::CopyRows => (vec![Logits, FinalHiddenState], vec![]),
             Make::SelectedToken => (vec![], vec![]),
+            Make::DrafterTap { .. } => (vec![FinalHiddenState], vec![]),
+            Make::DrafterContext { .. } => (vec![], vec![HiddenState, InputNormalized, QkProjected]),
+            Make::DrafterBody { .. } => (
+                vec![HiddenState],
+                vec![
+                    HiddenState,
+                    InputNormalized,
+                    MixerHidden,
+                    PostMixerNormalized,
+                    QkProjected,
+                    ValueZProjected,
+                    AttentionQkNormalized,
+                    AttentionContext,
+                    MixerDelta,
+                    FfnDelta,
+                    GateUp,
+                    SwigluSlot,
+                    Logits,
+                    FinalNormalized,
+                ],
+            ),
+            Make::DrafterSelect { .. } => (vec![Logits, FinalNormalized], vec![HiddenState]),
             Make::Staged { slot, inner } => {
                 return Access {
                     slot_read: Some(*slot),
@@ -501,6 +558,10 @@ impl Make {
                 entry(self.kind(), CopyRows::new(Logits, FinalHiddenState, rows))
             }
             Make::SelectedToken => entry(self.kind(), SelectedToken),
+            Make::DrafterTap { tap } => entry(self.kind(), DrafterTap::new(tap, FinalHiddenState)),
+            Make::DrafterContext { weights } => entry(self.kind(), DrafterContext::new(weights)),
+            Make::DrafterBody { weights } => entry(self.kind(), DrafterBody::new(weights)),
+            Make::DrafterSelect { weights } => entry(self.kind(), DrafterSelect::new(weights)),
             Make::Staged { inner, .. } => inner.stage(variant, formats)?,
             Make::DiskTransfer {
                 tier,
@@ -682,10 +743,19 @@ fn head<W: WeightLookup + ?Sized>(
 }
 
 /// The base model's views: embedding, every layer in the fused form, the final norm, the head and the selection.
+///
+/// With `tapped`, the rows of the hidden state after each of the drafter's tapped layers are copied to the sequence's
+/// tap buffer (`ExecutionPlan`'s tap stage after the next layer's input norm).
 pub(crate) fn base_nodes<W: WeightLookup + ?Sized>(
     config: &ModelConfig,
     weights: &W,
+    tapped: bool,
 ) -> Result<Vec<Node>, PlanBuildError> {
+    let taps: &[usize] = match (&config.dflash2, tapped) {
+        (Some(drafter), true) => &drafter.taps,
+        (None, true) => return Err(PlanBuildError::Geometry("the model has no drafter to tap for".into())),
+        (_, false) => &[],
+    };
     let global = LayerIndex::GLOBAL;
     let layers = config.layer_kinds.len();
     let mut nodes = Nodes {
@@ -799,6 +869,9 @@ pub(crate) fn base_nodes<W: WeightLookup + ?Sized>(
                 &[mixer, down],
             );
         }
+        if let Some(tap) = taps.iter().position(|layer| *layer == index) {
+            nodes.push(Make::DrafterTap { tap }, &[previous]);
+        }
     }
     let final_norm = nodes.norm_weight(global, NormKind::Final)?;
     let lm_head = nodes.weight(global, Role::LmHead)?;
@@ -905,5 +978,66 @@ pub(crate) fn mtp_nodes<W: WeightLookup + ?Sized>(
         .map_err(|_| PlanBuildError::Geometry("the draft head has too many rows".into()))?;
     let selected = head(&mut nodes, finish, final_norm, draft_head, vocabulary, false);
     nodes.push(Make::SelectedToken, &[selected]);
+    Ok(nodes.list)
+}
+
+/// The drafter's weights, found by layer and role.
+fn drafter_weights<W: WeightLookup + ?Sized>(
+    nodes: &Nodes<'_, W>,
+    config: &ModelConfig,
+) -> Result<Arc<DrafterWeights>, PlanBuildError> {
+    let drafter = config
+        .dflash2
+        .as_ref()
+        .ok_or_else(|| PlanBuildError::Geometry("the model has no DFlash2 drafter".into()))?;
+    DrafterWeights::new(drafter, |layer, role| nodes.weight(layer, Role::Dflash2(role))).map(Arc::new)
+}
+
+/// The drafter's context view (`dflash2Context`): the context update, which reads the tap buffer.
+pub(crate) fn context_nodes<W: WeightLookup + ?Sized>(
+    config: &ModelConfig,
+    weights: &W,
+) -> Result<Vec<Node>, PlanBuildError> {
+    let mut nodes = Nodes {
+        weights,
+        list: Vec::with_capacity(1),
+    };
+    let drafter = drafter_weights(&nodes, config)?;
+    nodes.push(Make::DrafterContext { weights: drafter }, &[]);
+    Ok(nodes.list)
+}
+
+/// The drafter's block view (`dflash2Block`): the embedding of the anchor and the mask rows, the drafter's layers, the
+/// target's head over the mask rows, and the selector.
+pub(crate) fn block_nodes<W: WeightLookup + ?Sized>(
+    config: &ModelConfig,
+    weights: &W,
+) -> Result<Vec<Node>, PlanBuildError> {
+    let global = LayerIndex::GLOBAL;
+    let mut nodes = Nodes {
+        weights,
+        list: Vec::with_capacity(4),
+    };
+    let drafter = drafter_weights(&nodes, config)?;
+    let table = nodes.weight(global, Role::Embedding)?;
+    let embedding = nodes.push(Make::Embed { table }, &[]);
+    let body = nodes.push(
+        Make::DrafterBody {
+            weights: Arc::clone(&drafter),
+        },
+        &[embedding],
+    );
+    let lm_head = nodes.weight(global, Role::LmHead)?;
+    let logits = nodes.push(
+        Make::Linear {
+            weight: lm_head,
+            input: FinalNormalized,
+            output: Logits,
+            rows: LinearRows::Logits,
+            swiglu: None,
+        },
+        &[body],
+    );
+    nodes.push(Make::DrafterSelect { weights: drafter }, &[logits]);
     Ok(nodes.list)
 }

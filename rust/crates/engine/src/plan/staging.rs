@@ -387,7 +387,7 @@ mod tests {
                 Residence::Device
             }
         });
-        base_nodes(&config(), &lookup).unwrap()
+        base_nodes(&config(), &lookup, false).unwrap()
     }
 
     fn base() -> Vec<Node> {

@@ -95,6 +95,8 @@ impl CaptureKey {
             View::Verify { rows } => (2, rows),
             View::Draft { rows } => (3, rows),
             View::CatchUp { rows } => (4, rows),
+            View::Context { rows } => (5, rows),
+            View::Block => (6, 0),
         };
         bytes.push(view_tag);
         bytes.extend_from_slice(&(view_rows as u64).to_le_bytes());
@@ -103,6 +105,8 @@ impl CaptureKey {
             QuantumKind::Decode => 1,
             QuantumKind::Verify => 2,
             QuantumKind::Draft => 3,
+            QuantumKind::Context => 4,
+            QuantumKind::Block => 5,
         });
         bytes.extend_from_slice(&(*rows as u64).to_le_bytes());
         bytes.extend_from_slice(&(*logits as u64).to_le_bytes());

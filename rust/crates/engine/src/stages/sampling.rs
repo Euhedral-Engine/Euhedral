@@ -20,7 +20,7 @@ use crate::state::attention::DRAFT_TOKEN_SLOTS;
 use crate::workspace::BufferSlot;
 
 /// Bytes of one key.
-const KEY_BYTES: usize = 8;
+pub(crate) const KEY_BYTES: usize = 8;
 
 /// The words a quantum's argmax writes on the device and the pinned memory their copy lands in.
 ///
@@ -72,6 +72,12 @@ impl Selection {
     /// the capacity.
     pub fn token(&self, row: usize) -> Option<u32> {
         token_of(self.key(row)?)
+    }
+
+    /// The 32-bit word `index` of the readback as the host sees it, once the quantum that wrote it has retired: for a
+    /// stage that writes plain words in place of keys. `None` beyond the readback.
+    pub fn word(&self, index: usize) -> Option<u32> {
+        (index < 2 * self.capacity).then(|| self.readback.word(index).load(Ordering::Acquire))
     }
 
     /// The device address of the keys.

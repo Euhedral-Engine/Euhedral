@@ -24,6 +24,7 @@ use euhedral_inference_edrl::{TensorDataType, WeightFormat, WeightLayout};
 use thiserror::Error;
 
 use crate::model::Speculation;
+use crate::model::dflash2::Dflash2Config;
 use crate::model::{LayerIndex, LayerKind, ModelConfig, Residence, Role, WeightRef};
 use crate::quantum::home::lane_for;
 use crate::residency::disk::DiskUse;
@@ -32,7 +33,7 @@ use crate::stages::transfer::DiskTier;
 use crate::stages::{Chain, Placed, Quantum};
 use buffers::Access;
 pub use builder::{Entry, Formats, StageKind, WeightLookup};
-use builder::{Make, Node, base_nodes, mtp_nodes};
+use builder::{Make, Node, base_nodes, block_nodes, context_nodes, mtp_nodes};
 pub use staging::StagingRing;
 pub(crate) use views::Variant;
 pub use views::{DECODE_MAX_ROWS, MAX_CAPTURED_ROWS, View};
@@ -131,6 +132,9 @@ pub struct Plan {
     variants: Vec<Option<VariantPlan>>,
     lanes: usize,
     draft_depth: usize,
+    /// Whether the drafts are the DFlash2 drafter's (its context and block views, and the taps of the base views), not
+    /// the MTP layer's.
+    dflash2: bool,
     /// The disk tier the plan's views read through, when any of them reads a weight from disk.
     disk: Option<Arc<DiskTier>>,
 }
@@ -185,7 +189,8 @@ impl Plan {
             )));
         }
         let drafts = residency.profile.speculation == Speculation::Mtp && residency.draft_depth > 0;
-        let mut base = base_nodes(config, weights)?;
+        let dflash2 = residency.profile.speculation == Speculation::Dflash2 && residency.draft_depth > 0;
+        let mut base = base_nodes(config, weights, dflash2)?;
         let mut slots = 0;
         if staging.is_none()
             && let Some(name) = staging::first_held(&base)
@@ -207,10 +212,26 @@ impl Plan {
         } else {
             None
         };
+        // The drafter's views stage nothing: its weights, and the head the block scores with, are held on the device.
+        let drafter = if dflash2 {
+            let context = context_nodes(config, weights)?;
+            let block = block_nodes(config, weights)?;
+            if let Some(name) = staging::first_held(&block) {
+                return Err(PlanBuildError::NoStagingRing { name });
+            }
+            Some((Arc::new(context), Arc::new(block)))
+        } else {
+            None
+        };
         let mut variants: Vec<Option<VariantPlan>> = Vec::with_capacity(Variant::ALL.len());
         for variant in Variant::ALL {
             let nodes = if variant.mtp() {
                 mtp.clone()
+            } else if variant.dflash() {
+                drafter.as_ref().map(|(context, block)| match variant {
+                    Variant::Context => Arc::clone(context),
+                    _ => Arc::clone(block),
+                })
             } else {
                 Some(Arc::clone(&base))
             };
@@ -219,7 +240,7 @@ impl Plan {
                     variant,
                     nodes,
                     formats,
-                    if variant.mtp() { 0 } else { slots },
+                    if variant.mtp() || variant.dflash() { 0 } else { slots },
                     transfer_lane,
                 )?),
                 None => None,
@@ -240,7 +261,8 @@ impl Plan {
             config: Arc::clone(config),
             variants,
             lanes,
-            draft_depth: if drafts { residency.draft_depth } else { 0 },
+            draft_depth: if drafts || dflash2 { residency.draft_depth } else { 0 },
+            dflash2,
             disk: disk.filter(|_| variants_read_disk).cloned(),
         })
     }
@@ -284,11 +306,40 @@ impl Plan {
             draft_depth: None,
             dflash2: None,
         };
+        let drafter = Dflash2Config {
+            layers: 1,
+            hidden: 1,
+            intermediate: 1,
+            heads: 1,
+            kv_heads: 1,
+            head_dim: 1,
+            block_size: 1,
+            mask_token: 0,
+            conv_kernel: 1,
+            conv_group: 1,
+            selector_top_k: 1,
+            selector_rank: 1,
+            sliding_window: 1,
+            vocab: 1,
+            eps: 1.0,
+            theta: 1.0,
+            taps: vec![0],
+        };
+        let drafting = ModelConfig {
+            dflash2: Some(drafter),
+            ..config.clone()
+        };
         let stub = Described(weight);
-        [base_nodes(&config, &stub), mtp_nodes(&config, &stub)]
-            .into_iter()
-            .flatten()
-            .collect()
+        [
+            base_nodes(&config, &stub, false),
+            mtp_nodes(&config, &stub),
+            base_nodes(&drafting, &stub, true),
+            context_nodes(&drafting, &stub),
+            block_nodes(&drafting, &stub),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// The lanes the graphs of any model of this family need, from the topology of its views alone: the width of the
@@ -340,9 +391,14 @@ impl Plan {
         &self.config
     }
 
-    /// Whether the plan has the MTP layer's views.
+    /// Whether the plan has a drafter's views: the MTP layer's, or the DFlash2 drafter's.
     pub fn drafts(&self) -> bool {
         self.draft_depth > 0
+    }
+
+    /// Whether the drafter is the DFlash2 drafter, whose rows the base views tap.
+    pub fn dflash2(&self) -> bool {
+        self.dflash2
     }
 
     /// The lanes the plan's graphs need: the width of the widest of them, the most stages that can run at once

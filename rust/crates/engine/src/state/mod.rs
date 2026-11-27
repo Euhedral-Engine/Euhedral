@@ -16,13 +16,13 @@ use thiserror::Error;
 use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, KernelOps, PinnedPool};
 
 use crate::error::EngineError;
-use crate::model::ModelConfig;
+use crate::model::{ModelConfig, Speculation};
 use crate::residency::footprint::{DRAFT_TWIN_ROWS, MINIMUM_VERIFY_ROWS};
 use crate::residency::planner::ResidencyPlan;
 use crate::stages::SequenceRefs;
 use crate::stages::attention::KvSource;
 use crate::stages::sampling::{RowReadbackPool, SelectionPool};
-use attention::AttentionScratch;
+use attention::{AttentionScratch, DrafterBuffers};
 use gdn::GdnStates;
 use kv::KvCache;
 pub use kv::KvView;
@@ -177,7 +177,8 @@ impl SequenceState {
         plan: &ResidencyPlan,
         kernels: &mut dyn KernelOps,
     ) -> Result<SequenceState, EngineError> {
-        let drafts = plan.draft_depth > 0;
+        let drafts = plan.draft_depth > 0 && plan.profile.speculation == Speculation::Mtp;
+        let dflash2 = plan.draft_depth > 0 && plan.profile.speculation == Speculation::Dflash2;
         let verified_rows = plan.verified_rows();
         let kv = KvCache::new(
             library,
@@ -212,13 +213,28 @@ impl SequenceState {
         } else {
             verified_rows.max(1)
         };
-        let scratch = AttentionScratch::allocate(
+        // The DFlash2 drafter has no seed rows: its draft token slots are all the scratch it takes from the MTP's.
+        let mut scratch = AttentionScratch::allocate(
             library,
             config,
             decode_rows,
-            drafts,
-            plan.rows.rows.max(MINIMUM_VERIFY_ROWS),
+            drafts || dflash2,
+            if dflash2 {
+                1
+            } else {
+                plan.rows.rows.max(MINIMUM_VERIFY_ROWS)
+            },
         )?;
+        if dflash2 {
+            let drafter = config.dflash2.as_ref().ok_or_else(|| {
+                EngineError::Runtime("the plan drafts with DFlash2 but the model has no drafter".into())
+            })?;
+            let tap_rows = plan.rows.rows.max(verified_rows).max(MINIMUM_VERIFY_ROWS);
+            scratch = scratch.with_drafter(
+                DrafterBuffers::allocate(library, drafter, tap_rows)
+                    .map_err(|error| EngineError::Runtime(error.to_string()))?,
+            );
+        }
         // A step's quanta that select (a catch-up, the recursive drafts and the verification) are all admitted before
         // the first retires, and a decode chain keeps one more behind the one it follows.
         let selections = SelectionPool::new(library, (plan.draft_depth + 2).max(2), (verified_rows as usize).max(1))
@@ -288,13 +304,23 @@ impl SequenceState {
                 calls: epoch.wrapping_sub(before),
             });
         }
+        Ok(self.references())
+    }
+
+    /// The references of a quantum that appends to no cache (the drafter's context and block): it claims no
+    /// reservation, so the epoch check of [`SequenceState::refs`] does not see it.
+    pub fn refs_reading(&self) -> SequenceRefs {
+        self.references()
+    }
+
+    fn references(&self) -> SequenceRefs {
         let mut refs = SequenceRefs::new(Arc::clone(&self.device))
             .with_kv(self.kv.view())
             .in_flight(self.flight.begin());
         if let Some(mtp) = &self.mtp_kv {
             refs = refs.with_mtp_kv(mtp.view());
         }
-        Ok(refs)
+        refs
     }
 
     /// Makes the sequence one that has seen no token: the caches are empty (their pages stay reserved) and the GDN

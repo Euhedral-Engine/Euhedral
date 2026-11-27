@@ -3,9 +3,9 @@
 
 use euhedral_inference_settings::KvFormat;
 
-use crate::model::ModelConfig;
+use crate::model::{ModelConfig, Speculation};
 use crate::residency::planner::ResidencyPlan;
-use crate::state::attention::DRAFT_TOKEN_SLOTS;
+use crate::state::attention::{DRAFT_TOKEN_SLOTS, DrafterBuffers};
 
 /// Tokens in one KV page (`AttentionKvState.PAGE_TOKENS`).
 pub const PAGE_TOKENS: u64 = 256;
@@ -151,15 +151,31 @@ pub fn first_sequence_bytes(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
         config,
         plan.kv_format,
         plan.verified_rows(),
-        plan.draft_depth > 0,
+        plan.profile.speculation == Speculation::Mtp && plan.draft_depth > 0,
         plan.rows.rows,
-    )
+    ) + drafter_bytes(config, plan.profile.speculation, plan.draft_depth, plan.rows.rows)
+}
+
+/// What a sequence that drafts with the DFlash2 drafter holds beyond what a plain sequence does (0 for any other
+/// drafter): the tap rows of the most rows of a base quantum (`tap_rows`, a prefill chunk's at least a verification's),
+/// the key/value rings, the draft token buffer, one seed row and the recursion hidden, and the selection keys of the
+/// drafts and the step's quanta that select ([`extra_sequence_bytes`] counts two).
+pub fn drafter_bytes(config: &ModelConfig, speculation: Speculation, draft_depth: usize, tap_rows: u64) -> u64 {
+    let (Speculation::Dflash2, Some(drafter), true) = (speculation, &config.dflash2, draft_depth > 0) else {
+        return 0;
+    };
+    let verified_rows = 1 + draft_depth as u64;
+    let hidden = config.hidden_size as u64;
+    DrafterBuffers::bytes(drafter, tap_rows.max(verified_rows).max(MINIMUM_VERIFY_ROWS))
+        + DRAFT_TOKENS_BYTES
+        + 2 * hidden * 2
+        + (verified_rows + 1) * verified_rows * SELECTION_KEY_BYTES
 }
 
 /// The MTP layer's cache of the plan's first sequence at `max_context_tokens`: 0 without a drafter. The runtime
 /// reserve pays for it.
 pub fn mtp_cache_bytes_of(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
-    if plan.draft_depth > 0 {
+    if plan.draft_depth > 0 && plan.profile.speculation == Speculation::Mtp {
         mtp_cache_bytes(config, plan.kv_format, plan.max_context_tokens as u64)
     } else {
         0

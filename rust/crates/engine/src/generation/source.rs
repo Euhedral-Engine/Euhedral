@@ -753,8 +753,8 @@ pub(super) struct Admission {
     pub(super) rows: usize,
     /// The position of the quantum's first row in the cache it appends to.
     pub(super) start: u64,
-    /// The cache the quantum appends to.
-    pub(super) source: KvSource,
+    /// The cache the quantum appends to; none for a quantum that appends to no cache (the drafter's).
+    pub(super) source: Option<KvSource>,
     /// Whether its launches overlap with the quantum before it (programmatic dependent launch).
     pub(super) pdl: bool,
     /// The logits rows it scores; a quantum that scores any takes a selection.
@@ -2152,7 +2152,7 @@ impl Owner {
                 kind: QuantumKind::Prefill,
                 rows,
                 start,
-                source: KvSource::Base,
+                source: Some(KvSource::Base),
                 pdl: false,
                 logits: usize::from(last && run.wanted > 0),
                 replay: Vec::new(),
@@ -2170,7 +2170,7 @@ impl Owner {
                 kind: QuantumKind::Decode,
                 rows: 1,
                 start,
-                source: KvSource::Base,
+                source: Some(KvSource::Base),
                 pdl: start < OVERLAP_MAX_START_POSITION,
                 logits: 1,
                 replay: match &mut run.mode {
@@ -2299,8 +2299,9 @@ impl Owner {
                     self.used = false;
                 }
                 let cache = match source {
-                    KvSource::Base => &mut self.sequence.kv,
-                    KvSource::Mtp => match self.sequence.mtp_kv.as_mut() {
+                    None => return Ok(()),
+                    Some(KvSource::Base) => &mut self.sequence.kv,
+                    Some(KvSource::Mtp) => match self.sequence.mtp_kv.as_mut() {
                         Some(cache) => cache,
                         None => return Err("the sequence has no MTP cache".to_string()),
                     },
@@ -2312,12 +2313,13 @@ impl Owner {
                 Ok(())
             })
             .map_err(why("the reservation"))?;
-        let refs = self
-            .sequence
-            .refs(source)
-            .map_err(why("the sequence's references"))?
-            .ordered_after(reserved, core.lanes())
-            .with_replay_rows(replay);
+        let refs = match source {
+            Some(source) => self.sequence.refs(source),
+            None => Ok(self.sequence.refs_reading()),
+        }
+        .map_err(why("the sequence's references"))?
+        .ordered_after(reserved, core.lanes())
+        .with_replay_rows(replay);
         let taken = take.then(|| refs.clone());
         let mode = SubmitMode {
             pdl,

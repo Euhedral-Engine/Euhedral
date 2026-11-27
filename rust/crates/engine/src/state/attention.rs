@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer};
+use euhedral_inference_cuda::{AllocationId, CudaError, CudaLibrary, DeviceBuffer, DevicePtr};
 
 use crate::model::ModelConfig;
+use crate::model::dflash2::Dflash2Config;
 use crate::residency::footprint::decode_scratch_bytes;
 
 /// Slots of the draft token buffer: the step's current token and up to 16 drafts
@@ -25,6 +26,74 @@ pub struct DraftBuffers {
     pub tokens: DeviceBuffer,
 }
 
+/// What the DFlash2 drafter keeps for one sequence: the tap rows of the base model's committed rows, which the
+/// drafter's context update reads, and the drafter's key/value rings (`DFlash2State`).
+#[derive(Debug)]
+pub struct DrafterBuffers {
+    taps: DeviceBuffer,
+    tap_capacity: u64,
+    ring_keys: DeviceBuffer,
+    ring_values: DeviceBuffer,
+    ring_bytes: u64,
+}
+
+impl DrafterBuffers {
+    /// Bytes of one layer's ring of keys (or of values): the window's rows of the key/value width, BF16.
+    pub fn ring_bytes(config: &Dflash2Config) -> u64 {
+        (config.sliding_window * config.kv_width() * 2) as u64
+    }
+
+    /// Bytes the buffers hold for `tap_rows` tap rows.
+    pub fn bytes(config: &Dflash2Config, tap_rows: u64) -> u64 {
+        tap_rows * config.tap_width() as u64 * 2 + 2 * config.layers as u64 * Self::ring_bytes(config)
+    }
+
+    /// Buffers for `tap_rows` tap rows (the most rows one base quantum has). The waiting allocator: startup only.
+    pub fn allocate(library: &Arc<CudaLibrary>, config: &Dflash2Config, tap_rows: u64) -> Result<Self, CudaError> {
+        let ring_bytes = Self::ring_bytes(config);
+        let rings = ring_bytes as usize * config.layers;
+        Ok(Self {
+            taps: DeviceBuffer::alloc(library, tap_rows as usize * config.tap_width() * 2)?,
+            tap_capacity: tap_rows,
+            ring_keys: DeviceBuffer::alloc(library, rings)?,
+            ring_values: DeviceBuffer::alloc(library, rings)?,
+            ring_bytes,
+        })
+    }
+
+    /// The tap rows: one row of `tap width` BF16 values per row of the base quantum that wrote them.
+    pub fn taps(&self) -> DevicePtr {
+        self.taps.ptr()
+    }
+
+    /// The rows the taps hold.
+    pub fn tap_capacity(&self) -> u64 {
+        self.tap_capacity
+    }
+
+    /// The ring of keys of the drafter's layer `layer`.
+    pub fn ring_keys(&self, layer: usize) -> DevicePtr {
+        self.ring_keys.ptr().offset(layer as u64 * self.ring_bytes)
+    }
+
+    /// The ring of values of the drafter's layer `layer`.
+    pub fn ring_values(&self, layer: usize) -> DevicePtr {
+        self.ring_values.ptr().offset(layer as u64 * self.ring_bytes)
+    }
+
+    fn generations(&self) -> [AllocationId; 3] {
+        [
+            self.taps.generation(),
+            self.ring_keys.generation(),
+            self.ring_values.generation(),
+        ]
+    }
+
+    fn device_bytes(&self) -> u64 {
+        (self.taps.bytes() + self.ring_keys.bytes() + self.ring_values.bytes()) as u64
+    }
+}
+
 /// Device scratch owned by one sequence, allocated once at load.
 #[derive(Debug)]
 pub struct AttentionScratch {
@@ -32,6 +101,7 @@ pub struct AttentionScratch {
     decode_rows: u64,
     query_heads: u64,
     draft: Option<DraftBuffers>,
+    drafter: Option<DrafterBuffers>,
 }
 
 impl AttentionScratch {
@@ -62,7 +132,19 @@ impl AttentionScratch {
             decode_rows,
             query_heads,
             draft,
+            drafter: None,
         })
+    }
+
+    /// The same scratch with the DFlash2 drafter's buffers.
+    pub fn with_drafter(mut self, drafter: DrafterBuffers) -> AttentionScratch {
+        self.drafter = Some(drafter);
+        self
+    }
+
+    /// The DFlash2 drafter's buffers, when the sequence drafts with it.
+    pub fn drafter(&self) -> Option<&DrafterBuffers> {
+        self.drafter.as_ref()
     }
 
     /// The split-KV decode scratch: one area of `query heads x 64 splits x 258 floats` per row. One serves every
@@ -96,6 +178,9 @@ impl AttentionScratch {
                 draft.tokens.generation(),
             ]);
         }
+        if let Some(drafter) = &self.drafter {
+            out.extend(drafter.generations());
+        }
     }
 
     /// The device bytes the scratch holds.
@@ -104,5 +189,6 @@ impl AttentionScratch {
             + self.draft.as_ref().map_or(0, |draft| {
                 (draft.seed_rows.bytes() + draft.recursion_hidden.bytes() + draft.tokens.bytes()) as u64
             })
+            + self.drafter.as_ref().map_or(0, DrafterBuffers::device_bytes)
     }
 }
