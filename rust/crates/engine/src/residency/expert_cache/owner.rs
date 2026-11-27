@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
-use std::mem;
+use std::mem::{self, forget};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -74,7 +74,7 @@ pub(crate) enum Message {
     /// The copy of the load of `id` was submitted, or why it was not.
     Submitted {
         id: ExpertId,
-        result: Result<Marker, String>,
+        result: Result<Marker, Unsubmitted>,
     },
     /// The copy of the load of `id` retired.
     Retired {
@@ -82,6 +82,13 @@ pub(crate) enum Message {
     },
     /// Some request was cancelled: those waiting here end.
     Sweep,
+}
+
+/// Why a copy was not submitted, and whether the device may still read its staging slot.
+pub(crate) struct Unsubmitted {
+    why: String,
+    /// The copy may be queued: the staging slot is never reused.
+    leaked: bool,
 }
 
 /// An outcome to tell, or the end of a shutdown.
@@ -509,16 +516,16 @@ impl Owner {
         }
     }
 
-    fn submitted(&mut self, id: ExpertId, result: Result<Marker, String>) {
+    fn submitted(&mut self, id: ExpertId, result: Result<Marker, Unsubmitted>) {
         let Some(load) = self.loads.get_mut(&id) else {
             log::error!("a copy was submitted for an expert with no load: {id:?}");
             return;
         };
         let (slot, generation, bytes) = (load.slot, load.generation, load.bytes);
         match result {
-            Err(why) => {
+            Err(Unsubmitted { why, leaked }) => {
                 let failure = self.failure(id, why);
-                self.end_load(id, None, Outcome::Failed(failure));
+                self.finish_load(id, None, Outcome::Failed(failure), leaked);
             }
             Ok(marker) => {
                 if let Err(error) = self.shard.submitted(slot, generation, marker) {
@@ -560,6 +567,12 @@ impl Owner {
 
     /// Ends the load of `id` that has not submitted its copy, as `outcome`, telling its request if it still waits.
     fn end_load(&mut self, id: ExpertId, settle: Option<TierSettle>, outcome: Outcome) {
+        self.finish_load(id, settle, outcome, false);
+    }
+
+    /// As [`end_load`](Owner::end_load); with `leaked` the staging slot is never given back, as the device may still
+    /// read it.
+    fn finish_load(&mut self, id: ExpertId, settle: Option<TierSettle>, outcome: Outcome, leaked: bool) {
         let Some(mut load) = self.loads.remove(&id) else {
             return;
         };
@@ -578,7 +591,11 @@ impl Owner {
         if let Some(request) = load.request.take() {
             self.told.push(Finished::Told(request.listener, outcome));
         }
-        drop(load);
+        if leaked {
+            forget(load.staging);
+        } else {
+            drop(load);
+        }
         self.changed(Cause::Slots);
         self.changed(Cause::Copying);
         self.changed(Cause::Staging);
@@ -616,7 +633,7 @@ fn copy_frame(
             let retired = Arc::clone(&owner);
             frames.after_marker(
                 marker,
-                step(Kind::ExpertRetire, 0, move || {
+                step(Kind::ExpertRetire, chain, move || {
                     // The staging bytes were read by the copy that has now retired.
                     drop(job);
                     retired.post(Message::Retired { id });
@@ -627,11 +644,17 @@ fn copy_frame(
             let again = copy_frame(Arc::clone(&copier), frames, owner, id, chain, job);
             copier.when_room(again);
         }
-        Err(SubmitFailure::Refused(why)) => owner.post(Message::Submitted { id, result: Err(why) }),
+        Err(SubmitFailure::Refused(why)) => owner.post(Message::Submitted {
+            id,
+            result: Err(Unsubmitted { why, leaked: false }),
+        }),
         Err(SubmitFailure::Uncertain(why)) => {
             // The copy may still read the staging slot: it is never reused.
             mem::forget(job);
-            owner.post(Message::Submitted { id, result: Err(why) });
+            owner.post(Message::Submitted {
+                id,
+                result: Err(Unsubmitted { why, leaked: true }),
+            });
         }
     })
 }
@@ -654,8 +677,15 @@ impl Turn for Owner {
 
     fn abandon(&mut self, why: &str) -> Vec<Finished> {
         self.closed = true;
-        for load in self.loads.values() {
-            load.cancel.store(true, Ordering::Release);
+        let loads: Vec<ExpertId> = self.loads.keys().copied().collect();
+        for id in loads {
+            if let Some(load) = self.loads.get_mut(&id) {
+                load.cancel.store(true, Ordering::Release);
+                if let Some(request) = load.request.take() {
+                    let error = CacheError::Abandoned { why: why.to_owned() };
+                    self.told.push(Finished::Told(request.listener, Outcome::Failed(error)));
+                }
+            }
         }
         for waiting in mem::take(&mut self.blocked) {
             let error = CacheError::Abandoned { why: why.to_owned() };

@@ -25,7 +25,9 @@ use euhedral_io::{Continuation, IoDoneOwned};
 use euhedral_memory::{LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope, SlotArena, TierPool};
 
 use super::host::{CopyJob, CopyLane, DeviceSlots, Frames, SubmitFailure};
+use super::owner::Owner;
 use super::{CacheConfig, CacheError, ExpertCache, ExpertLease, Outcome};
+use crate::generation::Turn;
 use crate::residency::experts::{
     ExpertError, ExpertId, ExpertLayout, ExpertStore, FileRecordSource, HostArena, PartPort, WritePart,
 };
@@ -132,14 +134,22 @@ struct FakeLane {
     units: Arc<AtomicUsize>,
 }
 
+/// What one copy was asked to do: its destination, the bytes it would read, and what it waits behind.
+struct Submission {
+    device: u64,
+    bytes: Vec<u8>,
+    waits: Vec<Marker>,
+}
+
 #[derive(Default)]
 struct LaneState {
     offered: VecDeque<Box<dyn Frame>>,
     after: VecDeque<(Marker, Box<dyn Frame>)>,
     room: VecDeque<Box<dyn Frame>>,
-    submitted: Vec<(u64, usize, Vec<Marker>)>,
+    submitted: Vec<Submission>,
     busy: usize,
     refuse: bool,
+    refuse_admit: bool,
 }
 
 struct Unit(Arc<AtomicUsize>);
@@ -192,6 +202,9 @@ impl Frames for FakeLane {
     }
 
     fn admit(&self) -> Result<Box<dyn Send>, String> {
+        if locked(&self.state).refuse_admit {
+            return Err("the lake is closed".to_owned());
+        }
         self.units.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(Unit(Arc::clone(&self.units))))
     }
@@ -207,7 +220,11 @@ impl CopyLane for FakeLane {
         if state.refuse {
             return Err(SubmitFailure::Refused("the lane is shut".to_owned()));
         }
-        state.submitted.push((job.device, job.bytes, job.waits.clone()));
+        state.submitted.push(Submission {
+            device: job.device,
+            bytes: job.staging.bytes()[..job.bytes].to_vec(),
+            waits: job.waits.clone(),
+        });
         Ok(Marker::new(self.queue, LaneId(0), state.submitted.len() as u64))
     }
 
@@ -222,6 +239,12 @@ struct Settings {
     device_slots: usize,
     staging_slots: u32,
     max_reads: usize,
+    /// Slots in the device pool, when not the cache's.
+    pool_slots: Option<u32>,
+    /// The device slot size, when not the record's.
+    device_slot_bytes: Option<u64>,
+    /// Slots in the staging free list, when not the arena's.
+    free_list: Option<u32>,
 }
 
 impl Default for Settings {
@@ -230,6 +253,9 @@ impl Default for Settings {
             device_slots: 2,
             staging_slots: 2,
             max_reads: 2,
+            pool_slots: None,
+            device_slot_bytes: None,
+            free_list: None,
         }
     }
 }
@@ -353,7 +379,11 @@ impl Rig {
         let store = Arc::new(ExpertStore::new(source, None, Arc::clone(&staging)));
         let planner = planner();
         let device = DeviceSlots::lease(
-            &pool(&planner, settings.device_slots as u32, layout.max_record_bytes()),
+            &pool(
+                &planner,
+                settings.pool_slots.unwrap_or(settings.device_slots as u32),
+                settings.device_slot_bytes.unwrap_or(layout.max_record_bytes()),
+            ),
             planner.open_owner(OwnerSpec::new("leaser", Priority(10), Scope::Epoch(1))),
             settings.device_slots,
         )?;
@@ -366,7 +396,11 @@ impl Rig {
             store,
             tier: Vec::new(),
             device,
-            staging_slots: free_list(&planner, settings.staging_slots, layout.slot_bytes() as u64),
+            staging_slots: free_list(
+                &planner,
+                settings.free_list.unwrap_or(settings.staging_slots),
+                layout.slot_bytes() as u64,
+            ),
             max_reads: settings.max_reads,
             frames: Arc::clone(&lane) as Arc<dyn Frames>,
             copier: Arc::clone(&lane) as Arc<dyn CopyLane>,
@@ -476,9 +510,9 @@ fn the_copy_is_made_to_the_slots_address_from_the_experts_record() {
     let rig = Rig::new(Settings::default());
     let lease = rig.lease(3);
     let state = locked(&rig.lane.state);
-    let (device, bytes, _) = &state.submitted[0];
-    assert_eq!((*device, *bytes), (lease.device_address(), RECORD as usize));
-    assert_eq!(rig.record(3).len(), RECORD as usize);
+    let copy = &state.submitted[0];
+    assert_eq!(copy.device, lease.device_address());
+    assert_eq!(copy.bytes, rig.record(3), "the copy reads the expert's own record");
 }
 
 #[test]
@@ -529,6 +563,7 @@ fn a_read_that_fails_fails_the_request_with_the_experts_name_and_frees_what_it_h
         device_slots: 1,
         staging_slots: 1,
         max_reads: 1,
+        ..Settings::default()
     });
     let (told, _) = rig.fetch(4);
     rig.port.release(true);
@@ -604,17 +639,35 @@ fn a_request_cancelled_before_its_copy_is_submitted_gets_no_lease_and_its_slot_i
 }
 
 #[test]
-fn a_request_cancelled_after_its_copy_is_submitted_has_its_lease_released() {
+fn a_request_cancelled_between_its_read_and_its_copy_gets_no_lease_and_its_slot_is_free() {
     let rig = Rig::new(Settings {
         device_slots: 1,
         ..Settings::default()
     });
     let (told, cancel) = rig.fetch(0);
     rig.port.release_all();
-    rig.lane.run_offered();
     cancel.store(true, Ordering::Release);
+    rig.lane.run_offered();
+    assert!(
+        told.cancelled(),
+        "a request cancelled before its read ended is not leased"
+    );
     rig.lane.retire_all();
-    drop(told);
+    assert_eq!(rig.cache.stats().cancelled_misses, 1);
+    drop(rig.lease(1));
+}
+
+#[test]
+fn a_request_cancelled_before_its_read_ends_has_no_copy_made() {
+    let rig = Rig::new(Settings {
+        device_slots: 1,
+        ..Settings::default()
+    });
+    let (told, cancel) = rig.fetch(0);
+    cancel.store(true, Ordering::Release);
+    rig.port.release_all();
+    assert!(told.cancelled(), "the read ended for a request that was cancelled");
+    assert_eq!(rig.lane.submitted(), 0, "no copy was made for it");
     drop(rig.lease(1));
 }
 
@@ -624,6 +677,7 @@ fn reads_in_flight_are_limited_and_the_next_miss_is_asked_again_when_one_ends() 
         device_slots: 3,
         staging_slots: 3,
         max_reads: 1,
+        ..Settings::default()
     });
     let (first, _) = rig.fetch(0);
     let (second, _) = rig.fetch(1);
@@ -642,6 +696,7 @@ fn staging_buffers_in_use_hold_the_next_miss_until_a_copy_retires() {
         device_slots: 3,
         staging_slots: 1,
         max_reads: 2,
+        ..Settings::default()
     });
     let (first, _) = rig.fetch(0);
     let (second, _) = rig.fetch(1);
@@ -704,7 +759,7 @@ fn a_lease_dropped_after_the_close_is_harmless() {
     let rig = Rig::new(Settings::default());
     let lease = rig.lease(0);
     let closed = rig.cache.close().expect("the owner is free");
-    assert!(closed.wait(HANG).is_ok());
+    assert!(closed.wait(HANG).is_ok(), "the close was never told");
     drop(lease);
     let (late, _) = rig.fetch(1);
     assert!(late.cancelled(), "a request after the close is cancelled");
@@ -740,4 +795,92 @@ fn the_cache_refuses_what_it_cannot_serve() {
         )
         .expect_err("no such expert");
     assert!(matches!(error, ExpertError::NoSuchExpert { .. }), "{error}");
+}
+
+#[test]
+fn a_lease_fence_is_waited_for_by_the_next_copy_into_its_slot() {
+    let rig = Rig::new(Settings {
+        device_slots: 1,
+        ..Settings::default()
+    });
+    let fence = Marker::new(QueueId::next(), LaneId(7), 42);
+    let mut lease = rig.lease(0);
+    lease.fence_after(fence);
+    drop(lease);
+    drop(rig.lease(1));
+    let state = locked(&rig.lane.state);
+    assert!(state.submitted[0].waits.is_empty());
+    assert_eq!(
+        state.submitted[1].waits,
+        vec![fence],
+        "the copy into the slot waits for the work that read it"
+    );
+}
+
+#[test]
+fn a_lake_that_admits_no_unit_fails_the_request_with_the_experts_name_and_frees_the_slot() {
+    let rig = Rig::new(Settings {
+        device_slots: 1,
+        ..Settings::default()
+    });
+    locked(&rig.lane.state).refuse_admit = true;
+    let (told, _) = rig.fetch(2);
+    match told.failure() {
+        CacheError::Transfer { bank, expert, why } => {
+            assert_eq!((bank.as_str(), expert), ("experts", 2));
+            assert!(why.contains("closed"), "{why}");
+        }
+        other => panic!("expected a transfer failure, got {other:?}"),
+    }
+    locked(&rig.lane.state).refuse_admit = false;
+    drop(rig.lease(2));
+}
+
+#[test]
+fn requests_in_loads_are_told_when_the_owner_is_abandoned() {
+    let rig = Rig::new(Settings::default());
+    let (told, _) = rig.fetch(0);
+    let (waiting, _) = rig.fetch(1);
+    let (third, _) = rig.fetch(2);
+    let finished = rig
+        .cache
+        .mailbox
+        .with(|owner| owner.abandon("the turn panicked"))
+        .expect("the claim is free");
+    assert_eq!(finished.len(), 3);
+    for one in finished {
+        Owner::deliver(one);
+    }
+    assert!(matches!(told.failure(), CacheError::Abandoned { .. }));
+    assert!(matches!(waiting.failure(), CacheError::Abandoned { .. }));
+    assert!(matches!(third.failure(), CacheError::Abandoned { .. }));
+}
+
+#[test]
+fn the_pool_must_hold_the_slots_and_the_slots_the_record() {
+    let error = Rig::try_new(Settings {
+        device_slots: 3,
+        pool_slots: Some(2),
+        ..Settings::default()
+    })
+    .err()
+    .expect("a pool too small");
+    assert_eq!(error, CacheError::PoolTooSmall { wanted: 3, free: 2 });
+    let error = Rig::try_new(Settings {
+        device_slot_bytes: Some(RECORD - 1),
+        ..Settings::default()
+    })
+    .err()
+    .expect("a slot too small");
+    assert!(
+        matches!(error, CacheError::SlotTooSmall { what: "device", .. }),
+        "{error}"
+    );
+    let error = Rig::try_new(Settings {
+        free_list: Some(3),
+        ..Settings::default()
+    })
+    .err()
+    .expect("a free list longer than the arena");
+    assert_eq!(error, CacheError::StagingSlots { free_list: 3, arena: 2 });
 }

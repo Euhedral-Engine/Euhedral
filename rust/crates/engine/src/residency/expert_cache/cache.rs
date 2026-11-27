@@ -46,7 +46,7 @@ impl fmt::Debug for CacheConfig {
 
 /// The device cache of routed experts.
 pub struct ExpertCache {
-    mailbox: Arc<Mailbox<Owner>>,
+    pub(super) mailbox: Arc<Mailbox<Owner>>,
     address: Arc<Address<Owner>>,
     store: Arc<ExpertStore>,
     stats: Arc<CacheStats>,

@@ -98,7 +98,7 @@ impl CopyLane for RuntimeLanes {
         match queued {
             Ok(((), marker)) => Ok(marker),
             Err(SubmitError::Busy) => Err(SubmitFailure::Busy),
-            Err(SubmitError::Work(why)) => Err(SubmitFailure::Refused(why)),
+            // The work's own refusal included: the copy call may have queued part of itself before it failed.
             Err(error) => Err(SubmitFailure::Uncertain(error.to_string())),
         }
     }
