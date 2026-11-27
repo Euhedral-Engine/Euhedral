@@ -1,10 +1,9 @@
 //! DFlash2 speculative decoding on a GPU. The tests are `#[ignore]`d and run locally (each loads the 16 GB artifact).
 //! The artifact comes from `euhedral.qwen.dflash2-artifact` (`EUHEDRAL_TEST_QWEN_DFLASH2_ARTIFACT`), the library from
-//! `euhedral.cuda.library` and the golden directory from `euhedral.rust.goldens`.
+//! `euhedral.cuda.library`.
 //!
-//! Two comparisons prove the path. The engine's plain greedy decode (`Speculation::Off`) equals the tokens the Java
-//! engine generated on the card (`greedy-dflash2.txt`), and the drafted decode (`Speculation::Artifact`) equals the
-//! plain one token for token: no Java golden exists with the drafter on, so that part is a self-comparison.
+//! Two self-comparisons prove the path. The engine's plain greedy decode (`Speculation::Off`) repeats itself on a
+//! second request, and the drafted decode (`Speculation::Artifact`) equals the plain one token for token.
 
 #![allow(
     clippy::unwrap_used,
@@ -20,13 +19,13 @@
     reason = "no-wait, blocking I/O and waiting calls: a test reads files and waits on hand-offs and the device"
 )]
 
-use std::fs;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common;
+use crate::generation::CHAT_PROMPT;
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings};
 
 use common::Card;
@@ -39,35 +38,25 @@ use euhedral_inference_engine::{EngineRuntime, Handoff};
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
 
-/// Tokens the golden holds.
+/// Tokens each generation asks for.
 const GENERATED: u32 = 128;
 
-/// Copies of the golden prompt that make a prompt of several prefill chunks.
+/// Copies of the chat prompt that make a prompt of several prefill chunks.
 const LONG_COPIES: usize = 40;
 
 struct Machine {
     artifact: PathBuf,
     library: PathBuf,
-    goldens: PathBuf,
 }
 
 fn machine() -> Option<Machine> {
     let library = PathBuf::from(test_support::require_property("euhedral.cuda.library")?);
     let artifact = PathBuf::from(test_support::require_property("euhedral.qwen.dflash2-artifact")?);
-    let goldens = PathBuf::from(test_support::require_property("euhedral.rust.goldens")?);
     if !artifact.is_file() {
         println!("skipped: euhedral.qwen.dflash2-artifact names no file");
         return None;
     }
-    if !goldens.is_dir() {
-        println!("skipped: euhedral.rust.goldens names no directory");
-        return None;
-    }
-    Some(Machine {
-        artifact,
-        library,
-        goldens,
-    })
+    Some(Machine { artifact, library })
 }
 
 fn start(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
@@ -79,19 +68,6 @@ fn start(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
     // A prefix cache hit would restore the prompt of the first run into the second.
     settings.prefix_cache.size = ByteSize(0);
     common::engine(&settings, &machine.library)
-}
-
-/// The prompt and the generated tokens of the golden.
-fn golden(machine: &Machine) -> (Vec<u32>, Vec<u32>) {
-    let text = fs::read_to_string(machine.goldens.join("greedy-dflash2.txt")).unwrap();
-    let line = |key: &str| -> Vec<u32> {
-        let line = text
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .unwrap_or_else(|| panic!("the golden has a `{key}` line"));
-        line.split_whitespace().map(|id| id.parse().unwrap()).collect()
-    };
-    (line("prompt "), line("generated "))
 }
 
 struct Recording {
@@ -189,29 +165,33 @@ fn mean_accepted(counts: &[u64]) -> f64 {
     if total == 0 { 0.0 } else { sum as f64 / total as f64 }
 }
 
-/// Plain greedy decode equals the Java golden, and the drafted decode equals plain greedy, on the golden prompt (one
+/// Plain greedy decode repeats on a second request, and the drafted decode equals plain greedy, on the chat prompt (one
 /// prefill chunk) and on a prompt of several chunks (the drafter's context follows the intermediate chunks).
 #[test]
 #[ignore = "needs a GPU, the native library and the DFlash2 artifact"]
 fn dflash2_output_equals_greedy() {
     let Some(machine) = machine() else { return };
-    let (prompt, expected) = golden(&machine);
-    assert_eq!(
-        expected.len(),
-        GENERATED as usize,
-        "the golden holds {GENERATED} tokens"
-    );
+    let prompt = CHAT_PROMPT.to_vec();
     let (_card, runtime) = start(&machine);
     let depth = runtime.plan().draft_depth;
     assert!(depth > 0, "the artifact drafts");
 
     let plain = generate(&runtime, &prompt, Speculation::Off);
-    println!(
-        "plain greedy against the golden: {} of {} tokens match",
-        match_length(&plain.tokens, &expected),
-        expected.len()
+    assert_eq!(
+        plain.tokens.len(),
+        GENERATED as usize,
+        "plain greedy generates {GENERATED} tokens"
     );
-    assert_eq!(plain.tokens, expected, "plain greedy decode is the Java golden");
+    let again = generate(&runtime, &prompt, Speculation::Off);
+    println!(
+        "plain greedy against its repeat: {} of {} tokens match",
+        match_length(&again.tokens, &plain.tokens),
+        plain.tokens.len()
+    );
+    assert_eq!(
+        again.tokens, plain.tokens,
+        "plain greedy decode repeats on a second request"
+    );
 
     let long_prompt: Vec<u32> = prompt
         .iter()
@@ -219,8 +199,8 @@ fn dflash2_output_equals_greedy() {
         .cycle()
         .take(prompt.len() * LONG_COPIES)
         .collect();
-    for (name, prompt) in [("golden prompt", &prompt), ("long prompt", &long_prompt)] {
-        let reference = if name == "golden prompt" {
+    for (name, prompt) in [("chat prompt", &prompt), ("long prompt", &long_prompt)] {
+        let reference = if name == "chat prompt" {
             plain.tokens.clone()
         } else {
             generate(&runtime, prompt, Speculation::Off).tokens

@@ -11,7 +11,7 @@
       cargo does, and the run stops at the first failing binary. The engine binary runs the tests of the group's modules
       by exact name. With --archive FILE, first unpacks it into the root and sets the test environment: the
       library is device-native/lib/libeuhedral_cuda.so in the root, EUHEDRAL_NVRTC_DIR (required) is the directory holding libnvrtc, and
-      EUHEDRAL_TEST_QWEN_RCO_ARTIFACT, EUHEDRAL_TEST_RUST_GOLDENS and EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES are
+      EUHEDRAL_TEST_QWEN_RCO_ARTIFACT and EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES are
       passed on when set and not empty.
   ci-device.py check [--root DIR]
       Fails unless every ignored test of every device binary is in exactly one group, and prints the count of each.
@@ -172,7 +172,7 @@ def unpack_and_set_environment(root, archive):
     os.environ["EUHEDRAL_TEST_CUDA_LIBRARY"] = str(library)
     os.environ["EUHEDRAL_NVRTC"] = f"{nvrtc}/libnvrtc.so.13"
     os.environ["LD_LIBRARY_PATH"] = nvrtc
-    for variable in ("QWEN_RCO_ARTIFACT", "RUST_GOLDENS", "QUANTIZATION_CUDA_LIBRARIES"):
+    for variable in ("QWEN_RCO_ARTIFACT", "QUANTIZATION_CUDA_LIBRARIES"):
         value = os.environ.get(f"EUHEDRAL_TEST_{variable}", "")
         if not value:
             os.environ.pop(f"EUHEDRAL_TEST_{variable}", None)

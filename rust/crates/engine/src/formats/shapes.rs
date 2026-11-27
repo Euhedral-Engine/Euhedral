@@ -4,9 +4,8 @@
 //! bytes, and its arguments. The formats build that list and queue it, so what a test records is what the device ran.
 //!
 //! [`ShapeRecorder`] keeps the list a format queued, one line per launch, in the line format
-//! `<symbol> grid=<x>,<y>,<z> block=<x>,<y>,<z> smem=<bytes> args=<arguments>` that the Java side prints from its own
-//! launches (`tests/fixtures/linear_launches.jsh`): pointers as `p<hex>`, 32-bit values as `i<decimal>`. A format
-//! records only when it was built for recording, which is for tests.
+//! `<symbol> grid=<x>,<y>,<z> block=<x>,<y>,<z> smem=<bytes> args=<arguments>`: pointers as `p<hex>`, 32-bit values
+//! as `i<decimal>`. A format records only when it was built for recording, which is for tests.
 
 use std::cell::RefCell;
 use std::fmt::Write;
@@ -264,7 +263,7 @@ mod tests {
         );
         assert_eq!(planned.args.words(), &[0xabc0, 7]);
         assert_eq!(planned.args.sizes(), &[8, 4]);
-        // The recorded line is the Java side's: pointers as p<hex>, 32-bit values as i<decimal>.
+        // The recorded line: pointers as p<hex>, 32-bit values as i<decimal>.
         assert_eq!(
             launch.line(),
             "euhedral_trellis_epilogue grid=3,2,1 block=128,1,1 smem=64 args=pabc0,i7"
