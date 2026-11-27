@@ -38,6 +38,7 @@ pub mod ops;
 pub mod plan;
 pub mod ple;
 pub mod qsa;
+pub mod seq_state;
 pub mod sequence;
 pub mod start;
 pub mod startup;
