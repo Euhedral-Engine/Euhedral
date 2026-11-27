@@ -107,7 +107,7 @@ fn phase_of(event: &QuantumEvent) -> Phase {
     match event.kind {
         QuantumKind::Prefill => Phase::Prefill,
         QuantumKind::Decode => Phase::Decode,
-        QuantumKind::Verify | QuantumKind::Draft => Phase::Other,
+        QuantumKind::Verify | QuantumKind::Draft | QuantumKind::Context | QuantumKind::Block => Phase::Other,
     }
 }
 

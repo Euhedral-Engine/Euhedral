@@ -34,7 +34,7 @@ use euhedral_inference_settings::{Auto, ByteSize, KvFormat, Settings, Speculatio
 
 mod common;
 
-use common::{config, rco_table, rco_table_without, settings};
+use common::{config, dflash2_config, dflash2_table_without, rco_table, rco_table_without, settings};
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -948,4 +948,37 @@ fn a_plan_of_several_sequences_sizes_the_logits_for_a_pass_and_counts_them() {
     assert!(
         four.workspace_bytes > workspace_bytes_with_records(&config, one.rows, 4 * input_records(four.draft_depth))
     );
+}
+
+#[test]
+fn an_artifact_with_the_dflash2_drafter_plans_its_drafts_its_weights_and_its_state() {
+    let config = dflash2_config();
+    let table = dflash2_table_without(true, |_| false);
+    let plan = plan_with(&config, &table, &settings(32_768), inputs(40 * GIB)).unwrap();
+    assert_eq!(plan.profile.speculation, Speculation::Dflash2);
+    assert_eq!(plan.draft_depth, 6);
+    // The drafter's weights are on the device, and the MTP layer's, which the artifact also holds, are not.
+    assert!(plan.placement("dflash2/fc").is_some());
+    assert!(plan.device.iter().all(|placement| !placement.name.starts_with("mtp/")));
+    // No MTP cache is planned; the drafter's buffers are paid for by the sequence's state.
+    assert_eq!(footprint::mtp_cache_bytes_of(&plan, &config), 0);
+    let drafter = footprint::drafter_bytes(&config, plan.profile.speculation, plan.draft_depth, plan.rows.rows);
+    let shape = config.dflash2.as_ref().unwrap();
+    let rings = 2 * (shape.layers * shape.sliding_window * shape.kv_width() * 2) as u64;
+    assert!(
+        drafter > rings,
+        "{drafter} bytes cannot hold the {rings} bytes of rings and the tap rows"
+    );
+    let plain = plan_with(&config, &table, &with_speculation_none(32_768), inputs(40 * GIB)).unwrap();
+    assert_eq!(
+        footprint::drafter_bytes(&config, plain.profile.speculation, plain.draft_depth, 512),
+        0
+    );
+    assert!(plan.runtime_reserve_bytes >= plain.runtime_reserve_bytes);
+}
+
+fn with_speculation_none(tokens: u32) -> Settings {
+    let mut none = settings(tokens);
+    none.speculation.mode = SpeculationMode::None;
+    none
 }

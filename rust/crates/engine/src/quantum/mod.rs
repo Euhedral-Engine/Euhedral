@@ -174,7 +174,9 @@ impl Quantum {
     /// The first KV source the quantum's attention reads: the MTP cache for a draft quantum, else the base cache of a
     /// model with attention layers.
     fn attention_source(&self) -> Option<KvSource> {
-        if self.kind == QuantumKind::Draft {
+        if matches!(self.kind, QuantumKind::Context | QuantumKind::Block) {
+            None
+        } else if self.kind == QuantumKind::Draft {
             Some(KvSource::Mtp)
         } else if self.config.attention_layers() > 0 {
             Some(KvSource::Base)

@@ -423,11 +423,6 @@ pub fn plan_closest(
     validate_inventory(config, table)?;
     let profile = ArtifactProfile::of(table, config)?.under(settings.speculation.mode);
     let draft_depth = profile.speculative_depth()?;
-    if draft_depth > 0 && profile.speculation != Speculation::Mtp {
-        return Err(PlanError::Unsupported(
-            "the engine drafts with the artifact's MTP layer only".to_string(),
-        ));
-    }
     let context = settings.context;
     let max_tokens = u64::from(context.max_tokens);
     if max_tokens == 0 {
@@ -529,8 +524,10 @@ pub fn plan_closest(
     // The runtime reserve pays for what the settings make grow: the workspace's slots (with the rows of a pass), the
     // decode scratch, the first sequence's state and the MTP layer's cache at the longest context. When they are
     // more than the setting, the reserve is what they need: admission counts it and the account refuses less.
-    let first_state = footprint::first_state_bytes(config, kv_format, verified_rows, draft_depth > 0, chunk);
-    let mtp_cache = if draft_depth > 0 {
+    let mtp = draft_depth > 0 && profile.speculation == Speculation::Mtp;
+    let drafter = footprint::drafter_bytes(config, profile.speculation, draft_depth, chunk);
+    let first_state = footprint::first_state_bytes(config, kv_format, verified_rows, mtp, chunk) + drafter;
+    let mtp_cache = if mtp {
         footprint::mtp_cache_bytes(config, kv_format, max_tokens)
     } else {
         0
@@ -557,7 +554,7 @@ pub fn plan_closest(
         );
     }
     let extra = if sequences > 1 {
-        footprint::extra_sequence_bytes(config, kv_format, max_tokens, verified_rows, draft_depth > 0, chunk)
+        footprint::extra_sequence_bytes(config, kv_format, max_tokens, verified_rows, mtp, chunk) + drafter
     } else {
         0
     };

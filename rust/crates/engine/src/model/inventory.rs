@@ -8,6 +8,7 @@ use euhedral_inference_edrl::{TensorDataType, TensorEntry, TensorTable, WeightFo
 
 use crate::error::PlanError;
 use crate::model::config::{LayerKind, ModelConfig};
+use crate::model::dflash2::{CONFIG_OBJECT, Dflash2Config};
 use crate::model::weights::{MTP_ATTENTION_PACK, companion_name, is_companion};
 
 /// The suffixes of a trellis object's companions, in the order its format lists them.
@@ -23,6 +24,8 @@ enum Expected {
     },
     /// A projection stored in any quantized format (or BF16): the logical `[n, k]` shape.
     Projection { shape: Vec<u64> },
+    /// A drafter projection, stored as BF16 or as NVFP4 in the K128 row-split layout: the logical `[n, k]` shape.
+    DrafterProjection { shape: Vec<u64> },
 }
 
 fn is_trellis(entry: &TensorEntry) -> bool {
@@ -95,6 +98,130 @@ pub fn expected_names(config: &ModelConfig) -> Vec<String> {
         }
     }
     names
+}
+
+/// The names of every object the DFlash2 drafter holds, `dflash2/config` first.
+pub fn drafter_names(drafter: &Dflash2Config) -> Vec<String> {
+    let mut names = vec![
+        CONFIG_OBJECT.to_string(),
+        "dflash2/fc".to_string(),
+        "dflash2/hidden_norm".to_string(),
+        "dflash2/final_norm".to_string(),
+        "dflash2/selector/hidden_projection".to_string(),
+        "dflash2/selector/predecessor".to_string(),
+        "dflash2/selector/successor".to_string(),
+    ];
+    for layer in 0..drafter.layers {
+        for tail in [
+            "input_norm",
+            "post_attention_norm",
+            "attention/query",
+            "attention/key_value",
+            "attention/output",
+            "attention/query_norm",
+            "attention/key_norm",
+            "mlp/gate_up",
+            "mlp/down",
+            "attention_conv/base",
+            "attention_conv/projection",
+            "mlp_conv/base",
+            "mlp_conv/projection",
+        ] {
+            names.push(format!("dflash2/layers/{layer}/{tail}"));
+        }
+    }
+    names
+}
+
+/// What the drafter object `name` must be (`DFlash2Inventory.expected`).
+fn drafter_expected(drafter: &Dflash2Config, name: &str) -> Option<Expected> {
+    let hidden = drafter.hidden;
+    let norm = |width: usize| direct(&[width], TensorDataType::Bf16, WeightFormat::Bf16);
+    let proj = |rows: usize, columns: usize| Expected::DrafterProjection {
+        shape: vec![rows as u64, columns as u64],
+    };
+    let bf16 = |shape: &[usize]| direct(shape, TensorDataType::Bf16, WeightFormat::Bf16);
+    let rest = name.strip_prefix("dflash2/")?;
+    Some(match rest {
+        "fc" => proj(hidden, drafter.tap_width()),
+        "hidden_norm" | "final_norm" => norm(hidden),
+        "selector/hidden_projection" => bf16(&[drafter.selector_rank, hidden]),
+        "selector/predecessor" | "selector/successor" => bf16(&[drafter.vocab, drafter.selector_rank]),
+        _ => {
+            let (index, tail) = rest.strip_prefix("layers/")?.split_once('/')?;
+            if index.parse::<usize>().ok()? >= drafter.layers {
+                return None;
+            }
+            match tail {
+                "input_norm" | "post_attention_norm" => norm(hidden),
+                "attention/query" => proj(drafter.query_width(), hidden),
+                "attention/key_value" => proj(2 * drafter.kv_width(), hidden),
+                "attention/output" => proj(hidden, drafter.query_width()),
+                "attention/query_norm" | "attention/key_norm" => norm(drafter.head_dim),
+                "mlp/gate_up" => proj(2 * drafter.intermediate, hidden),
+                "mlp/down" => proj(hidden, drafter.intermediate),
+                "attention_conv/base" | "mlp_conv/base" => bf16(&[2, drafter.conv_kernel, hidden]),
+                "attention_conv/projection" | "mlp_conv/projection" => proj(drafter.conv_projection_width(), hidden),
+                _ => return None,
+            }
+        }
+    })
+}
+
+/// Checks the drafter's objects: the configuration object is present, and every object the drafter holds is there with
+/// its shape and format and nothing else under `dflash2/` is.
+fn validate_drafter(config: &ModelConfig, table: &TensorTable) -> Result<(), PlanError> {
+    let invalid = |why: String| Err(PlanError::Inventory(why));
+    let present = table.entries().iter().filter(|entry| is_drafter(entry.name())).count();
+    if present == 0 {
+        return Ok(());
+    }
+    let Some(drafter) = &config.dflash2 else {
+        return invalid(format!(
+            "the artifact holds {present} drafter objects but its '{CONFIG_OBJECT}' was not read"
+        ));
+    };
+    let config_entry = table.get(CONFIG_OBJECT);
+    if !config_entry.is_some_and(|entry| {
+        entry.dtype() == TensorDataType::Int32
+            && entry.format() == WeightFormat::I32
+            && entry.layout() == WeightLayout::ContiguousLeV1
+    }) {
+        return invalid(format!("the drafter's '{CONFIG_OBJECT}' must be an I32 vector"));
+    }
+    drafter.check_against(config)?;
+    let names = drafter_names(drafter);
+    if present != names.len()
+        && let Some(extra) = table
+            .entries()
+            .iter()
+            .find(|entry| is_drafter(entry.name()) && !names.iter().any(|name| name == entry.name()))
+    {
+        return invalid(format!(
+            "the artifact contains unknown drafter object '{}'",
+            extra.name()
+        ));
+    }
+    for name in names.iter().filter(|name| name.as_str() != CONFIG_OBJECT) {
+        let Some(entry) = table.get(name) else {
+            return invalid(format!("the artifact is missing drafter object '{name}'"));
+        };
+        if let Some(expected) = drafter_expected(drafter, name)
+            && !accepts(&expected, entry)
+        {
+            return invalid(format!(
+                "runtime metadata of '{name}' conflicts with the drafter: shape {:?}, {:?}/{:?}",
+                entry.shape(),
+                entry.format(),
+                entry.layout()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_drafter(name: &str) -> bool {
+    name.starts_with("dflash2/")
 }
 
 fn direct(shape: &[usize], dtype: TensorDataType, format: WeightFormat) -> Expected {
@@ -186,12 +313,28 @@ fn accepts(expected: &Expected, entry: &TensorEntry) -> bool {
             // A quantized or BF16 projection: its stored shape is the logical one.
             entry.shape() == shape.as_slice()
         }
+        Expected::DrafterProjection { shape } => {
+            let stored = matches!(
+                (entry.format(), entry.layout()),
+                (WeightFormat::Bf16, WeightLayout::ContiguousLeV1)
+                    | (WeightFormat::Nvfp4, WeightLayout::RowSplitK128V1)
+            );
+            stored && entry.dtype() == TensorDataType::Bf16 && entry.shape() == shape.as_slice()
+        }
     }
 }
 
-/// Checks that `table` holds exactly the model's objects with the shapes the model gives them, every trellis object
-/// with its three well-formed companions, and nothing else.
+/// Checks the whole artifact: the model's objects ([`validate_base_inventory`]) and, when it holds a drafter, the
+/// drafter's, whose configuration `config` must carry.
 pub fn validate_inventory(config: &ModelConfig, table: &TensorTable) -> Result<(), PlanError> {
+    validate_base_inventory(config, table)?;
+    validate_drafter(config, table)
+}
+
+/// Checks that `table` holds exactly the model's objects with the shapes the model gives them, every trellis object
+/// with its three well-formed companions, and nothing else but the drafter's objects, which the drafter's
+/// configuration is needed to check.
+pub fn validate_base_inventory(config: &ModelConfig, table: &TensorTable) -> Result<(), PlanError> {
     let invalid = |why: String| Err(PlanError::Inventory(why));
     let mut companions: Vec<String> = Vec::new();
     for entry in table.entries() {
@@ -261,10 +404,10 @@ pub fn validate_inventory(config: &ModelConfig, table: &TensorTable) -> Result<(
         .chain(companions.iter().map(String::as_str))
         .collect();
     let want = expected_names.len() + companions.len();
-    if table.len() != want {
+    let model_objects = table.len() - table.entries().iter().filter(|entry| is_drafter(entry.name())).count();
+    if model_objects != want {
         return invalid(format!(
-            "a compact Qwen artifact must contain {want} runtime objects, found {}",
-            table.len()
+            "a compact Qwen artifact must contain {want} runtime objects, found {model_objects}"
         ));
     }
     for name in &expected_names {
@@ -295,6 +438,7 @@ pub fn validate_inventory(config: &ModelConfig, table: &TensorTable) -> Result<(
     }
     for entry in table.entries() {
         if !known.contains(entry.name())
+            && !is_drafter(entry.name())
             && !(is_companion(entry.name()) && companions.iter().any(|c| c == entry.name()))
         {
             return invalid(format!(

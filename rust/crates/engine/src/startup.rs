@@ -40,9 +40,10 @@ use crate::error::{EngineError, PlanError};
 use crate::frames::{Kind, step};
 use crate::generation::{Generation, Generations};
 use crate::handoff::Handoff;
+use crate::model::dflash2::{CONFIG_OBJECT, Dflash2Config};
 use crate::model::{
-    LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Residence, Role, TrellisParts, WeightRef, Weights, companion_name,
-    trellis_logical, validate_inventory,
+    LayerIndex, MTP_ATTENTION_PACK, ModelConfig, Residence, Role, Speculation, TrellisParts, WeightRef, Weights,
+    companion_name, trellis_logical, validate_base_inventory, validate_inventory,
 };
 use crate::residency::accounting::{Consumer, PlanReservation};
 use crate::residency::budget::{self, HostBudget};
@@ -514,7 +515,7 @@ fn parse(startup: Startup, base: Indexed, parts: Vec<Indexed>) {
         let mut config = ModelConfig::from(&metadata);
         config.draft_depth = composed_depth(config.draft_depth, &table, &startup.composite)?;
         config.check_supported()?;
-        validate_inventory(&config, &table)?;
+        validate_base_inventory(&config, &table)?;
         Ok::<_, EngineError>((table, config, source_of))
     })();
     let (table, config, source_of) = match parsed {
@@ -543,6 +544,10 @@ fn parse(startup: Startup, base: Indexed, parts: Vec<Indexed>) {
             ))
         })
         .collect();
+    // The drafter's configuration: a few words, read with the segments, which the inventory check needs.
+    let drafter = table
+        .get(CONFIG_OBJECT)
+        .map(|entry| (entry.range(), source_of.get(entry.name()).copied().unwrap_or(0)));
     let readers = files.clone();
     let artifact = Artifact {
         files,
@@ -550,7 +555,7 @@ fn parse(startup: Startup, base: Indexed, parts: Vec<Indexed>) {
         table,
         config,
     };
-    if objects.is_empty() {
+    if objects.is_empty() && drafter.is_none() {
         return startup.then(host, move |startup| plan(startup, artifact, HashMap::new()));
     }
     let core = Arc::clone(&startup.core);
@@ -558,14 +563,27 @@ fn parse(startup: Startup, base: Indexed, parts: Vec<Indexed>) {
         .iter()
         .map(|(name, n, rows, _, _)| (name.clone(), *n, *rows))
         .collect();
-    let reads = SegmentReads::new(objects.len(), move |parts| {
-        let checked = check_segments(&names, parts);
+    let has_drafter = drafter.is_some();
+    let reads = SegmentReads::new(objects.len() + usize::from(has_drafter), move |mut parts| {
+        let config = if has_drafter { parts.pop().flatten() } else { None };
+        let mut artifact = artifact;
+        let checked = check_segments(&names, parts).and_then(|ends| {
+            if has_drafter {
+                artifact.config.dflash2 = Some(read_drafter(config)?);
+                validate_inventory(&artifact.config, &artifact.table)?;
+            }
+            Ok(ends)
+        });
         startup.then(host, move |startup| match checked {
             Ok(ends) => plan(startup, artifact, ends),
             Err(error) => startup.fail(error),
         });
     });
-    for (part, (_, _, _, range, file)) in objects.into_iter().enumerate() {
+    let reads_of = objects
+        .into_iter()
+        .map(|(_, _, _, range, file)| (range, file))
+        .chain(drafter);
+    for (part, (range, file)) in reads_of.enumerate() {
         let length = (range.end - range.start) as usize;
         let arrival = Arrival::new(&reads, part);
         let then = Box::new(move |done: IoDone| -> Box<dyn Frame> {
@@ -584,6 +602,20 @@ fn parse(startup: Startup, base: Indexed, parts: Vec<Indexed>) {
         // A refused read drops `then` and its arrival without running them, which counts the part as arrived.
         let _ = core.io.read(raw_file(&readers[file]), range.start, buf, then);
     }
+}
+
+/// The drafter's configuration from the bytes of its object.
+fn read_drafter(read: Option<io::Result<Vec<u8>>>) -> Result<Dflash2Config, EngineError> {
+    let bytes = match read {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(source)) => return Err(EngineError::io(format!("reading '{CONFIG_OBJECT}'"), source)),
+        None => {
+            return Err(EngineError::Runtime(format!(
+                "the read of '{CONFIG_OBJECT}' did not start"
+            )));
+        }
+    };
+    Ok(Dflash2Config::parse(&bytes)?)
 }
 
 /// What the continuation of the segment reads gets: each part's bytes or failure, `None` for a part that never ran.
@@ -1284,7 +1316,8 @@ impl DraftIds {
 /// The pinned buffer for the draft head's token ids, when the plan drafts. A plan that drafts and cannot have them is
 /// an error: speculation is not silently left off.
 fn draft_ids_loan(core: &Core, plan: &ResidencyPlan, weights: &Weights) -> Result<Option<DraftIds>, EngineError> {
-    if plan.draft_depth == 0 {
+    // The DFlash2 drafter selects whole-vocabulary ids on the device: it has no draft head and no id table.
+    if plan.draft_depth == 0 || plan.profile.speculation == Speculation::Dflash2 {
         return Ok(None);
     }
     let ids = weights

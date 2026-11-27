@@ -4,6 +4,7 @@ use euhedral_inference_edrl::{LayerType, ModelMetadata, TensorTable, WeightForma
 use euhedral_inference_settings::{KvFormat, SpeculationMode};
 
 use crate::error::PlanError;
+use crate::model::dflash2::Dflash2Config;
 
 /// What a decoder layer mixes tokens with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +40,9 @@ pub struct ModelConfig {
     pub mtp_layer_count: usize,
     /// The MTP draft depth the artifact stores.
     pub draft_depth: Option<u8>,
+    /// The DFlash2 drafter's configuration, read from the artifact's `dflash2/config` object once the file is open;
+    /// `None` for an artifact without the drafter, and until the object is read.
+    pub dflash2: Option<Dflash2Config>,
 }
 
 impl From<&ModelMetadata> for ModelConfig {
@@ -74,6 +78,7 @@ impl From<&ModelMetadata> for ModelConfig {
             attention_output_gate: metadata.attention_output_gate,
             mtp_layer_count: size(metadata.mtp_layer_count),
             draft_depth: metadata.draft_depth,
+            dflash2: None,
         }
     }
 }

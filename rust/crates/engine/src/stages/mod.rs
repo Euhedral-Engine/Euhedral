@@ -17,6 +17,7 @@
 //! quantum. They belong to the sequence's owner, who sets them on the quantum at admission.
 
 pub mod attention;
+pub mod drafter;
 pub mod elementwise;
 pub mod embed;
 pub mod gdn;
@@ -67,6 +68,11 @@ pub enum QuantumKind {
     Verify,
     /// Drafting: rows of the MTP layer at MTP positions, writing only the MTP layer's cache.
     Draft,
+    /// The DFlash2 drafter's context update: the committed rows' taps, projected into the drafter's key/value rings.
+    Context,
+    /// The DFlash2 drafter's block: the anchor and the mask rows through the drafter, whose proposal the verification
+    /// reads.
+    Block,
 }
 
 /// Where a quantum's input record sits in the workspace: the start position of its rows. The record itself (the
