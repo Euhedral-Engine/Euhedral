@@ -64,6 +64,8 @@ fn settings(artifact: &Path, cache: ByteSize) -> Settings {
         name: "test".to_string(),
     });
     settings.context.max_tokens = 4096;
+    // One sequence: the rings read back are the only sequence's.
+    settings.batching.max_sequences = 1;
     settings.prefix_cache.size = cache;
     settings
 }

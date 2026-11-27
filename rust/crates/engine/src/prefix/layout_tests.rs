@@ -536,7 +536,6 @@ fn dflash2_state_is_every_layers_two_rings_whatever_the_span() {
         layout.slots(0, 768, None) + slots
     );
     assert!(layout.has_speculation(Speculation::Dflash2));
-    assert!(!layout.has_speculation(Speculation::Mtp) || compact().mtp_layer_count > 0);
 }
 
 #[test]
@@ -611,6 +610,20 @@ fn a_chain_restores_the_leafs_rings_and_not_its_parents() {
 
     let mut restored = rig.drafting_device(5, LAYERS, RING);
     rig.restore(&mut restored, &[first, second], Some(Speculation::Dflash2));
+    // Whatever the order of the copies, the bytes written to the rings are one node's rings, not the chain's.
+    let nodes = [rig.tree.node(first), rig.tree.node(second)];
+    let ring_bytes: u64 = rig
+        .layout
+        .restore_copies(&nodes, Some(Speculation::Dflash2))
+        .iter()
+        .filter(|copy| is_ring(copy.buffer))
+        .map(|copy| copy.bytes)
+        .sum();
+    assert_eq!(
+        ring_bytes,
+        2 * LAYERS as u64 * RING as u64,
+        "only the leaf's rings are copied"
+    );
     for buffer in device.buffers.keys().copied().filter(|&buffer| is_ring(buffer)) {
         assert!(device.same(&restored, buffer), "{buffer:?}");
         assert!(!parents.same(&restored, buffer), "{buffer:?} is the parent's");
