@@ -14,6 +14,8 @@ pub const MAX_NGRAM_LAYERS: usize = 64;
 pub const MAX_SPLIT_PARTS: u32 = 4096;
 /// The most routed experts per layer.
 pub const MAX_EXPERTS: u32 = 65536;
+/// The most heads or values per head a GDN layer may name: the conv channel count is derived from them.
+pub const MAX_GDN_DIMENSION: u32 = 1 << 20;
 
 /// The token mixer of a layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,7 +446,7 @@ impl FlashConfig {
 
     /// The relations between the fields that every later size and shape computation relies on. The divisors are
     /// checked positive first: a zero would otherwise be a division by zero, not a refusal.
-    fn validate(&self) -> Result<(), EdrlError> {
+    pub(crate) fn validate(&self) -> Result<(), EdrlError> {
         let (t, a, g, e, h, n, p, x) = (
             &self.text,
             &self.attention,
@@ -478,6 +480,12 @@ impl FlashConfig {
         require(
             g.num_key_heads > 0 && g.num_value_heads.is_multiple_of(g.num_key_heads),
             || "GDN value heads are not a positive multiple of the key heads".into(),
+        )?;
+        require(
+            [g.num_key_heads, g.num_value_heads, g.key_head_dim, g.value_head_dim]
+                .iter()
+                .all(|dimension| *dimension <= MAX_GDN_DIMENSION),
+            || format!("GDN heads and head dimensions are at most {MAX_GDN_DIMENSION}"),
         )?;
         require(g.ssm_dtype == "float32", || {
             format!("unsupported GDN state type {}", g.ssm_dtype)

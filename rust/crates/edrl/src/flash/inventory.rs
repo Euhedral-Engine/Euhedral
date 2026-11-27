@@ -187,6 +187,7 @@ impl Builder {
 impl ExpectedInventory {
     /// The inventory `config` implies.
     pub fn from_config(config: &FlashConfig) -> Result<ExpectedInventory, EdrlError> {
+        config.validate()?;
         let mut b = Builder {
             tensors: HashMap::new(),
             banks: Vec::new(),
@@ -263,7 +264,10 @@ impl ExpectedInventory {
     /// geometry. Refuses with every problem found (the first few are in the message).
     pub fn validate(&self, tables: &FlashTables) -> Result<InventoryReport, EdrlError> {
         let mut problems = Vec::new();
-        for (name, want) in &self.tensors {
+        let mut names: Vec<&String> = self.tensors.keys().collect();
+        names.sort();
+        for name in names {
+            let want = &self.tensors[name];
             let Some(tensor) = tables.tensor(name) else {
                 problems.push(InventoryProblem::Missing { name: name.clone() });
                 continue;

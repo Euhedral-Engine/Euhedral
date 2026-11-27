@@ -24,15 +24,11 @@ const KEY: &str = "euhedral.flash-next.artifact";
 
 #[test]
 fn the_real_artifact_opens_and_its_inventory_validates() {
+    // `require_property` prints the skip line, naming the key, when it is unset or names no path.
     let Some(path) = test_support::require_property(KEY) else {
-        println!("skipped: {KEY} is not set");
         return;
     };
     let path = PathBuf::from(path);
-    if !path.is_file() {
-        println!("skipped: {KEY} names no file");
-        return;
-    }
     let mut file = File::open(&path).expect("the artifact opens");
     let file_len = file.metadata().expect("the artifact's length").len();
     let mut head = [0; euhedral_inference_edrl::DETECT_BYTES];

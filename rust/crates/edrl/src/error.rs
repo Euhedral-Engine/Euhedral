@@ -11,8 +11,11 @@ pub enum EdrlError {
     /// The first four bytes are not the EDRL magic.
     #[error("unsupported artifact magic {found:#010x}")]
     BadMagic { found: u32 },
-    /// Only container version 2 (tensor descriptors carry a persistent weight layout) is supported.
-    #[error("unsupported artifact version {found}: only compact version 2 artifacts are supported")]
+    /// The container version is not the one the reader takes: version 2 for the dense reader (tensor descriptors carry a
+    /// persistent weight layout), version 3 for the Flash-Next reader.
+    #[error(
+        "unsupported artifact version {found}: the dense reader takes version 2 and the Flash-Next reader version 3"
+    )]
     UnsupportedVersion { found: u32 },
     /// A version 3 file names an architecture other than `qwen4_exp`.
     #[error("unsupported artifact architecture {found}: only qwen4_exp (1) is supported")]

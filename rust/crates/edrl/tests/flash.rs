@@ -355,6 +355,37 @@ fn a_configuration_with_a_zero_divisor_is_refused_not_trapped() {
 }
 
 #[test]
+fn a_gdn_size_that_overflows_the_channel_count_is_refused_not_trapped() {
+    let mut config = tiny_config();
+    config.gdn.num_key_heads = u32::MAX;
+    config.gdn.key_head_dim = u32::MAX;
+    let message = invalid(ExpectedInventory::from_config(&config).unwrap_err());
+    assert!(message.contains("GDN"), "{message}");
+}
+
+#[test]
+fn an_inventory_is_not_derived_from_a_configuration_that_does_not_validate() {
+    let mut config = tiny_config();
+    config.text.layer_types.pop();
+    let message = invalid(ExpectedInventory::from_config(&config).unwrap_err());
+    assert!(message.contains("layer types"), "{message}");
+    let mut config = tiny_config();
+    config.ngram.size = 1;
+    assert!(ExpectedInventory::from_config(&config).is_err());
+}
+
+#[test]
+fn an_unknown_version_is_refused_with_a_message_naming_both_readers() {
+    let mut image = tiny().image();
+    image.bytes[7] = 4;
+    let message = image.open().unwrap_err().to_string();
+    assert!(
+        message.contains("version 4") && message.contains("version 3"),
+        "{message}"
+    );
+}
+
+#[test]
 fn a_tokenizer_section_with_a_damaged_body_is_refused() {
     let mut image = tiny().image();
     let flip = image.bytes.len() - 24 - 3;
@@ -368,7 +399,10 @@ fn a_truncated_tokenizer_section_is_refused() {
     let cut = image.bytes.len() - 24 - 5;
     image.bytes.drain(cut..cut + 5);
     let message = invalid(image.open().unwrap_err());
-    assert!(message.contains("content") || message.contains("end"), "{message}");
+    assert!(
+        message.contains("header declares") && message.contains("content holds"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -377,5 +411,9 @@ fn a_file_longer_than_its_content_without_a_section_is_refused() {
     tiny.tokenizer = false;
     let mut image = tiny.image();
     image.bytes.extend_from_slice(&[0; 512]);
-    assert!(image.open().is_err());
+    let message = invalid(image.open().unwrap_err());
+    assert!(
+        message.contains("header declares") && message.contains("content holds"),
+        "{message}"
+    );
 }
