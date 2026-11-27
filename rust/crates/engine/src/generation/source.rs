@@ -467,6 +467,76 @@ impl Mode {
     }
 }
 
+/// How a request's speculation is served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// No drafts: the device selects each token (greedy) or the host does (sampled, constrained, hidden rows).
+    Plain,
+    /// The artifact's MTP layer drafts `depth` tokens; the host selects with samplers if the request is sampled.
+    Mtp(usize),
+    /// The DFlash2 drafter drafts `depth` tokens of a greedy request.
+    Dflash2(usize),
+}
+
+impl Route {
+    fn depth(self) -> Option<usize> {
+        match self {
+            Route::Plain => None,
+            Route::Mtp(depth) | Route::Dflash2(depth) => Some(depth),
+        }
+    }
+}
+
+/// The route of a request that asks for `speculation`. `host_selects`: the host selects the tokens (a sampled,
+/// constrained or hidden-row request); `mtp` and `dflash2`: the draft depths of the artifact's drafters. A constrained
+/// request never speculates. The DFlash2 drafter drafts a greedy request's tokens only, so any other request on a
+/// DFlash2 artifact decodes plainly; the MTP drafts of a sampled request stay.
+fn route(
+    speculation: &Speculation,
+    host_selects: bool,
+    constrained: bool,
+    mtp: Option<usize>,
+    dflash2: Option<usize>,
+) -> Result<Route, AdmissionError> {
+    match speculation {
+        _ if constrained => Ok(Route::Plain),
+        Speculation::Off => Ok(Route::Plain),
+        Speculation::Artifact => match (dflash2, mtp) {
+            (Some(_), _) if host_selects => Ok(Route::Plain),
+            (Some(depth), _) => Ok(Route::Dflash2(depth)),
+            (None, Some(depth)) => Ok(Route::Mtp(depth)),
+            (None, None) => Err(AdmissionError::SpeculationUnavailable),
+        },
+    }
+}
+
+/// The state of a request that speculates by `route`, or `None` for a request that does not.
+fn speculating(route: Route, capacity: u64, prompt: usize, max_tokens: usize) -> Option<Speculating> {
+    match route {
+        Route::Plain => None,
+        Route::Mtp(depth) => Some(Speculating::new(depth, capacity, prompt, max_tokens)),
+        Route::Dflash2(depth) => Some(Speculating::new(depth, capacity, prompt, max_tokens).with_drafter()),
+    }
+}
+
+/// What a request does with the prefix cache.
+#[derive(Debug, PartialEq, Eq)]
+enum Caching {
+    /// It neither restores a checkpoint nor stores one: the drafter's context of a restored prefix would be missing.
+    Skips,
+    /// It uses checkpoints of `kind` (those that hold the draft's state too, when it drafts).
+    Uses(Option<CheckpointKind>),
+}
+
+/// The use of the prefix cache by a speculative request.
+fn speculative_caching(state: &Speculating) -> Caching {
+    if state.drafter().is_some() {
+        Caching::Skips
+    } else {
+        Caching::Uses(state.drafting().then_some(CheckpointKind::Mtp))
+    }
+}
+
 /// Why a request that asks for its hidden states is refused: it speculates (its drafts' rows are not the rows of the
 /// tokens it commits), or the artifact has no draft layer whose state the rows come from.
 fn hidden_refusal(hidden: bool, speculation: &Speculation, drafts: bool) -> Option<AdmissionError> {
@@ -920,84 +990,54 @@ impl Owner {
         if let Some(error) = hidden_refusal(hidden.is_some(), &speculation, self.shared.drafts.is_some()) {
             return Err(Rejected::new(error, Audience::Greedy(listener)));
         }
-        let mode = match speculation {
-            // The host selects the tokens: its drafts, if it speculates, stay greedy.
-            _ if hidden.is_some() || !sampling.is_greedy() || constraint.is_some() => {
-                if self.sequence.row_readbacks.is_exhausted() {
-                    // Refused before the prompt prefills: the last chunk would find no row to copy its logits to.
-                    let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
+        let host_selects = hidden.is_some() || !sampling.is_greedy() || constraint.is_some();
+        let route = match route(
+            &speculation,
+            host_selects,
+            constraint.is_some(),
+            self.shared.drafts.as_ref().map(|drafts| drafts.depth),
+            self.shared.dflash2,
+        ) {
+            Ok(route) => route,
+            Err(error) => return Err(Rejected::new(error, Audience::Greedy(listener))),
+        };
+        let mode = if host_selects {
+            if self.sequence.row_readbacks.is_exhausted() {
+                // Refused before the prompt prefills: the last chunk would find no row to copy its logits to.
+                let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
+                return Err(Rejected::new(error, Audience::Greedy(listener)));
+            }
+            let vocabulary = self.shared.config.vocab_size;
+            // One sampler for each row a quantum selects from at once: a verification's rows, or one.
+            let rows = route.depth().map_or(1, |depth| depth + 1);
+            let samplers = match samplers(sampling, vocabulary, rows) {
+                Ok(samplers) => SampledRows::new(samplers),
+                Err(error) => {
+                    let error = AdmissionError::Engine(format!("the sampler: {error}"));
                     return Err(Rejected::new(error, Audience::Greedy(listener)));
                 }
-                let vocabulary = self.shared.config.vocab_size;
-                let drafts = match speculation {
-                    // A constrained request never speculates.
-                    _ if constraint.is_some() => None,
-                    Speculation::Off => None,
-                    // The DFlash2 drafter drafts a greedy request's tokens only: the host selects this one's.
-                    Speculation::Artifact if self.shared.dflash2.is_some() => None,
-                    Speculation::Artifact => match self.shared.drafts.as_ref() {
-                        Some(drafts) => Some(drafts.depth),
-                        None => {
-                            return Err(Rejected::new(
-                                AdmissionError::SpeculationUnavailable,
-                                Audience::Greedy(listener),
-                            ));
-                        }
-                    },
-                };
-                // One sampler for each row a quantum selects from at once: a verification's rows, or one.
-                let rows = drafts.map_or(1, |depth| depth + 1);
-                let samplers = match samplers(sampling, vocabulary, rows) {
-                    Ok(samplers) => SampledRows::new(samplers),
-                    Err(error) => {
-                        let error = AdmissionError::Engine(format!("the sampler: {error}"));
-                        return Err(Rejected::new(error, Audience::Greedy(listener)));
-                    }
-                };
-                match drafts {
-                    None => Mode::Sampled {
-                        listener,
-                        state: Box::new(Sampling {
-                            rows: samplers,
-                            next: None,
-                            constraint: constraint.map(|constraint| Constraining::new(Guarded::new(constraint))),
-                        }),
-                    },
-                    Some(depth) => Mode::Speculative {
-                        listener,
-                        state: Box::new(
-                            Speculating::new(depth, self.shared.capacity, prompt.len(), max_tokens as usize)
-                                .sampled(samplers),
-                        ),
-                    },
-                }
-            }
-            Speculation::Off => Mode::Greedy { listener },
-            Speculation::Artifact if self.shared.dflash2.is_some() => {
-                let depth = self.shared.dflash2.unwrap_or(0);
-                Mode::Speculative {
+            };
+            match speculating(route, self.shared.capacity, prompt.len(), max_tokens as usize) {
+                None => Mode::Sampled {
                     listener,
-                    state: Box::new(
-                        Speculating::new(depth, self.shared.capacity, prompt.len(), max_tokens as usize).with_drafter(),
-                    ),
-                }
-            }
-            Speculation::Artifact => {
-                let Some(drafts) = self.shared.drafts.as_ref() else {
-                    return Err(Rejected::new(
-                        AdmissionError::SpeculationUnavailable,
-                        Audience::Greedy(listener),
-                    ));
-                };
-                Mode::Speculative {
+                    state: Box::new(Sampling {
+                        rows: samplers,
+                        next: None,
+                        constraint: constraint.map(|constraint| Constraining::new(Guarded::new(constraint))),
+                    }),
+                },
+                Some(state) => Mode::Speculative {
                     listener,
-                    state: Box::new(Speculating::new(
-                        drafts.depth,
-                        self.shared.capacity,
-                        prompt.len(),
-                        max_tokens as usize,
-                    )),
-                }
+                    state: Box::new(state.sampled(samplers)),
+                },
+            }
+        } else {
+            match speculating(route, self.shared.capacity, prompt.len(), max_tokens as usize) {
+                None => Mode::Greedy { listener },
+                Some(state) => Mode::Speculative {
+                    listener,
+                    state: Box::new(state),
+                },
             }
         };
         self.start_run(units, lease, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
@@ -1024,10 +1064,10 @@ impl Owner {
         }
         let kind = match &run.mode {
             Mode::Greedy { .. } | Mode::Sampled { .. } => None,
-            // The drafter's context of a restored prefix would be missing: a request that drafts with it does not use
-            // the cache.
-            Mode::Speculative { state, .. } if state.drafter().is_some() => return,
-            Mode::Speculative { state, .. } => state.drafting().then_some(CheckpointKind::Mtp),
+            Mode::Speculative { state, .. } => match speculative_caching(state) {
+                Caching::Skips => return,
+                Caching::Uses(kind) => kind,
+            },
             Mode::Forced { .. } => return,
         };
         let address = Arc::clone(&self.shared.address);
@@ -2698,6 +2738,64 @@ mod kill_tests {
 #[cfg(test)]
 mod routing_tests {
     use super::*;
+
+    const DEPTH: usize = 6;
+
+    #[test]
+    fn a_greedy_request_on_a_dflash2_artifact_drafts_with_the_drafter() {
+        let route = route(&Speculation::Artifact, false, false, Some(3), Some(DEPTH)).unwrap();
+        assert_eq!(route, Route::Dflash2(DEPTH));
+        let state = speculating(route, 4096, 30, 128).unwrap();
+        assert!(state.drafter().is_some());
+        assert_eq!(
+            speculative_caching(&state),
+            Caching::Skips,
+            "the drafter's context is not restored"
+        );
+    }
+
+    #[test]
+    fn a_sampled_or_constrained_request_on_a_dflash2_artifact_decodes_plainly() {
+        // `host_selects`: a sampled request, a constrained one and a hidden-row one.
+        for constrained in [false, true] {
+            let route = route(&Speculation::Artifact, true, constrained, None, Some(DEPTH)).unwrap();
+            assert_eq!(route, Route::Plain, "constrained: {constrained}");
+            assert!(speculating(route, 4096, 30, 128).is_none());
+        }
+        let greedy_constrained = route(&Speculation::Artifact, false, true, None, Some(DEPTH)).unwrap();
+        assert_eq!(greedy_constrained, Route::Plain);
+        assert_eq!(
+            route(&Speculation::Off, false, false, None, Some(DEPTH)).unwrap(),
+            Route::Plain
+        );
+    }
+
+    #[test]
+    fn an_mtp_artifact_keeps_its_drafts_for_a_sampled_request_but_not_a_constrained_one() {
+        assert_eq!(
+            route(&Speculation::Artifact, true, false, Some(3), None).unwrap(),
+            Route::Mtp(3)
+        );
+        assert_eq!(
+            route(&Speculation::Artifact, false, false, Some(3), None).unwrap(),
+            Route::Mtp(3)
+        );
+        assert_eq!(
+            route(&Speculation::Artifact, true, true, Some(3), None).unwrap(),
+            Route::Plain
+        );
+        let state = speculating(Route::Mtp(3), 4096, 30, 128).unwrap();
+        assert!(state.drafter().is_none());
+        assert_eq!(speculative_caching(&state), Caching::Uses(Some(CheckpointKind::Mtp)));
+    }
+
+    #[test]
+    fn a_request_for_drafts_an_artifact_cannot_make_is_refused() {
+        assert!(matches!(
+            route(&Speculation::Artifact, false, false, None, None),
+            Err(AdmissionError::SpeculationUnavailable)
+        ));
+    }
 
     #[test]
     fn a_forced_step_that_scores_copies_its_row_in_the_quantum() {

@@ -23,6 +23,7 @@ use euhedral_graph::{
     RetryCounts, Stage, StageCx, StageError, StageGraph, Submitted,
 };
 use euhedral_inference_cuda::DevicePtr;
+use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
@@ -33,7 +34,7 @@ use euhedral_inference_settings::{ModelSettings, Settings, TrellisKernelSettings
 
 mod common;
 
-use common::{config, rco_table, settings};
+use common::{config, dflash2_config, dflash2_table_without, rco_table, settings};
 
 use euhedral_inference_engine::model::{LayerIndex, Role};
 
@@ -55,43 +56,51 @@ struct Built {
 /// plan of 64 layers and six views takes a moment in a debug build).
 fn built() -> &'static Built {
     static BUILT: OnceLock<Built> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let config = Arc::new(config());
-        let residency = residency(&config, &rco_table(), &settings(8192), 15 << 30).unwrap();
-        let weights = Described(
-            residency
-                .device
-                .iter()
-                .filter_map(|placement| {
-                    let key = object_key(&placement.name, 64)?;
-                    Some((
-                        key,
-                        WeightRef {
-                            name: placement.name.clone(),
-                            shape: placement.shape.clone(),
-                            dtype: placement.dtype,
-                            format: placement.format,
-                            layout: placement.layout,
-                            ptr: DevicePtr::NULL,
-                            bytes: placement.bytes,
-                            residence: Residence::Device,
-                            trellis: None,
-                        },
-                    ))
-                })
-                .collect(),
-        );
-        let formats = Formats::new(
-            Arc::new(TrellisLinear::from_settings(&TrellisKernelSettings::default(), 70)),
-            Arc::new(Nvfp4Linear::with_native_route(true, 70)),
-        );
-        let plan = Plan::build(&config, &weights, &residency, &formats, None, None).unwrap();
-        Built {
-            config,
-            residency,
-            plan,
-        }
-    })
+    BUILT.get_or_init(|| build(config(), &rco_table(), 15 << 30))
+}
+
+/// The same for the artifact with the DFlash2 drafter.
+fn built_with_drafter() -> &'static Built {
+    static BUILT: OnceLock<Built> = OnceLock::new();
+    BUILT.get_or_init(|| build(dflash2_config(), &dflash2_table_without(true, |_| false), 40 << 30))
+}
+
+fn build(config: ModelConfig, table: &TensorTable, budget: u64) -> Built {
+    let config = Arc::new(config);
+    let residency = residency(&config, table, &settings(8192), budget).unwrap();
+    let weights = Described(
+        residency
+            .device
+            .iter()
+            .filter_map(|placement| {
+                let key = object_key(&placement.name, 64)?;
+                Some((
+                    key,
+                    WeightRef {
+                        name: placement.name.clone(),
+                        shape: placement.shape.clone(),
+                        dtype: placement.dtype,
+                        format: placement.format,
+                        layout: placement.layout,
+                        ptr: DevicePtr::NULL,
+                        bytes: placement.bytes,
+                        residence: Residence::Device,
+                        trellis: None,
+                    },
+                ))
+            })
+            .collect(),
+    );
+    let formats = Formats::new(
+        Arc::new(TrellisLinear::from_settings(&TrellisKernelSettings::default(), 70)),
+        Arc::new(Nvfp4Linear::with_native_route(true, 70)),
+    );
+    let plan = Plan::build(&config, &weights, &residency, &formats, None, None).unwrap();
+    Built {
+        config,
+        residency,
+        plan,
+    }
 }
 
 use StageKind::{
@@ -406,6 +415,48 @@ fn every_stage_is_an_ancestor_of_the_sink_in_every_view() {
         );
         assert_eq!(plan.roots(view).unwrap(), vec![0], "{view:?}");
     }
+}
+
+/// The views of a plan with the DFlash2 drafter: the base views with the tap copies, and the drafter's own.
+#[test]
+fn a_plan_with_the_dflash2_drafter_has_its_views_each_ordered_behind_one_sink_and_fits_the_lanes() {
+    let plan = &built_with_drafter().plan;
+    assert!(plan.dflash2() && plan.drafts());
+    let views = [
+        View::Decode,
+        View::Verify { rows: 7 },
+        View::PrefillChunk,
+        View::Context { rows: 1 },
+        View::Context { rows: 7 },
+        View::Context { rows: 512 },
+        View::Block,
+    ];
+    for view in views {
+        let edges = plan
+            .edges(view)
+            .unwrap_or_else(|| panic!("{view:?}: the plan has the view"));
+        let sink = plan.sink(view).unwrap();
+        assert_eq!(sink, edges.len() - 1, "{view:?}");
+        let reaches = ancestors_of_last(edges);
+        let loose: Vec<usize> = (0..edges.len()).filter(|stage| !reaches[*stage]).collect();
+        assert!(
+            loose.is_empty(),
+            "{view:?}: stages {loose:?} are not ancestors of the sink, so its marker would not cover them"
+        );
+        assert_eq!(plan.roots(view).unwrap(), vec![0], "{view:?}");
+        let width = plan.width(view).unwrap();
+        assert!(width <= Plan::lane_width(), "{view:?} fans out {width} wide");
+    }
+    assert!(plan.fan_out_width() <= Plan::lane_width());
+    // The tap copies are in the base views, and the drafter's views are not the MTP's.
+    let taps = plan
+        .kinds(View::Decode)
+        .unwrap()
+        .iter()
+        .filter(|kind| **kind == StageKind::DrafterTap)
+        .count();
+    assert_eq!(taps, built_with_drafter().config.dflash2.as_ref().unwrap().taps.len());
+    assert!(plan.edges(View::Draft { rows: 1 }).is_none());
 }
 
 /// A stage that records the lane the graph gave it.
