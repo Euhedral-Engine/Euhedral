@@ -269,11 +269,12 @@ jobs:
       - name: Install system packages
         run: |
           # shellcheck disable=SC2086 # APT_OPTS is a list of options
-          apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq llvm xz-utils python3-pip gcc libc6-dev >/dev/null
+          apt-get $APT_OPTS update -qq && apt-get $APT_OPTS install -y -qq llvm xz-utils curl ca-certificates python3-pip gcc libc6-dev >/dev/null
       - name: Install the toolchains
         run: mise install >/dev/null
       - name: Build the native library
-        run: mise exec -- gradle -q nativeBuildLinuxX64
+        working-directory: rust
+        run: mise exec -- cargo xtask native --product linux-x64
       # The device profile is the release profile with debug assertions and overflow checks on: the tests run at the speed
       # of the product and still trip on what the debug build would. The quantization crate's other device tests fail,
       # not skip, without their settings: only its kernel tests are built for the groups.

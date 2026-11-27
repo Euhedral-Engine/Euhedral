@@ -9,6 +9,10 @@
 //!
 //! `cargo xtask bundle --product <linux-x64|windows-x64> [--native <dir>] [--out <dir>]` builds `euhedral-server` in
 //! release and assembles a runnable bundle (see [`bundle`]).
+//!
+//! `cargo xtask native [--product <id>] [--force-download]` builds the CUDA library of each product of
+//! `native/native-products.json` into `build/native/<id>`, and `cargo xtask native-verify [--product <id>]` checks the
+//! result (see [`native`]).
 
 // A build tool, not a library crate: it has no clippy.toml of the no-wait bans, and its output, its `expect` and its
 // exit are its interface.
@@ -20,6 +24,9 @@
 )]
 
 mod bundle;
+mod imports;
+mod native;
+mod redist;
 
 use std::env;
 use std::fs;
@@ -39,7 +46,9 @@ fn main() -> ExitCode {
         ["bindings"] => bindings(false),
         ["bindings", "--check"] => bindings(true),
         ["bundle", rest @ ..] => bundle::run(rest),
-        _ => Err("usage: cargo xtask bindings [--check] | bundle --product <linux-x64|windows-x64> [--native <dir>] [--out <dir>]".to_string()),
+        ["native", rest @ ..] => native::run(rest),
+        ["native-verify", rest @ ..] => native::run_verify(rest),
+        _ => Err("usage: cargo xtask bindings [--check] | bundle --product <linux-x64|windows-x64> [--native <dir>] [--out <dir>] | native [--product <id>] [--force-download] | native-verify [--product <id>]".to_string()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

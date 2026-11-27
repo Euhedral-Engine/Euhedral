@@ -53,12 +53,12 @@ impl<'a> Reader<'a> {
 
 /// `value` as a non-negative `u64`, or an error naming `what`: the Java `long` fields are never negative.
 pub(crate) fn non_negative(value: i64, what: &'static str) -> Result<u64, EdrlError> {
-    u64::try_from(value).map_err(|_| EdrlError::invalid(format!("{what} range overflows or is negative")))
+    u64::try_from(value).map_err(|_| EdrlError::invalid(format!("{what} range overflows or is negative: {value}")))
 }
 
 /// The end of the byte range `[offset, offset + size)`, rejecting an overflow.
 pub(crate) fn checked_end(offset: u64, size: u64, what: &'static str) -> Result<u64, EdrlError> {
     offset
         .checked_add(size)
-        .ok_or_else(|| EdrlError::invalid(format!("{what} range overflows or is negative")))
+        .ok_or_else(|| EdrlError::invalid(format!("{what} range overflows or is negative: {offset} + {size}")))
 }

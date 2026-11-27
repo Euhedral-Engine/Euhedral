@@ -7,8 +7,8 @@ use crate::tokenizer_section::{FOOTER_BYTES, TokenizerFooter, content_end};
 /// The size of the fixed header.
 pub const HEADER_BYTES: usize = 48;
 
-const MAGIC: u32 = 0x5157_454E;
-const COMPACT_VERSION: u32 = 2;
+pub(crate) const MAGIC: u32 = 0x5157_454E;
+pub(crate) const COMPACT_VERSION: u32 = 2;
 /// The most tensors, layers and so on the format counts.
 pub(crate) const MAX_COUNT: u32 = 1_000_000;
 pub(crate) const MAX_METADATA_BYTES: u64 = 8 << 20;
@@ -197,7 +197,7 @@ pub struct PlannedRead {
 /// [`ReadPlan::new`] adds the metadata, the table and the tokenizer body once those are parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadPlan {
-    reads: Vec<PlannedRead>,
+    pub(crate) reads: Vec<PlannedRead>,
 }
 
 impl ReadPlan {
@@ -259,6 +259,6 @@ impl ReadPlan {
     }
 }
 
-fn footer_range(file_len: u64) -> Range<u64> {
+pub(crate) fn footer_range(file_len: u64) -> Range<u64> {
     file_len - FOOTER_BYTES as u64..file_len
 }

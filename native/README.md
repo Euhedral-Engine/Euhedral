@@ -133,6 +133,9 @@ and caches them under the Gradle user home. The Windows driver import is generat
 pinned Zig `dlltool` from an explicit driver ABI export list; it does not link the host's
 Linux driver stub or NVIDIA's Windows static loader. Downloads include no NVIDIA kernel driver.
 
+The Rust build makes the same trees without Gradle (and without llguidance, which Rust links as a crate):
+`cargo xtask native` and `cargo xtask native-verify`, described in `rust/README.md`.
+
 Use Java 25, Gradle 9.6.1, and Zig 0.16.0 (the versions recorded in `mise.toml`).
 Gradle invokes Zig directly with argument lists (and honors `ZIG` when set); no shell is needed
 by the host build. Build and verify both products with:

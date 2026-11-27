@@ -154,6 +154,21 @@ pub(crate) fn accepts_byte_size(
     }
 }
 
+/// The payload size of a contiguous or row-split NVFP4 tensor: what [`accepts_byte_size`] accepts.
+#[cfg(feature = "test-util")]
+pub(crate) fn payload_size(
+    shape: &[u64],
+    dtype: TensorDataType,
+    format: WeightFormat,
+    layout: WeightLayout,
+) -> Result<u64, Refusal> {
+    match (format, layout) {
+        (WeightFormat::Nvfp4, WeightLayout::RowSplitK128V1) => nvfp4_size(shape, dtype, layout),
+        (_, WeightLayout::ContiguousLeV1) => direct_size(shape, dtype, format),
+        _ => Err(format!("no payload size for {format:?} in {layout:?}")),
+    }
+}
+
 fn overflow() -> Refusal {
     "compact size overflows".into()
 }
