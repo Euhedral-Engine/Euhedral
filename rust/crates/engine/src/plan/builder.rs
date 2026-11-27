@@ -18,7 +18,7 @@ use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use super::PlanBuildError;
 use super::buffers::Access;
 use super::views::Variant;
-use crate::formats::{LinearFormat, TokenEmbedding};
+use crate::formats::{Bf16Linear, LinearFormat, TokenEmbedding};
 use crate::model::{LayerIndex, LayerKind, ModelConfig, MtpRole, NormKind, Role, WeightRef, Weights};
 use crate::residency::disk::DiskUse;
 use crate::stages::attention::{AttentionCausal, KvAppend, KvSource, QkNormRope};
@@ -64,15 +64,18 @@ impl WeightLookup for Weights {
 pub struct Formats {
     trellis: Arc<dyn LinearFormat>,
     nvfp4: Arc<dyn LinearFormat>,
+    bf16: Arc<dyn LinearFormat>,
     grouped: Option<Arc<dyn LinearFormat>>,
 }
 
 impl Formats {
-    /// The trellis format for trellis weights and the NVFP4 format for NVFP4 weights.
+    /// The trellis format for trellis weights and the NVFP4 format for NVFP4 weights; BF16 weights run on the row-exact
+    /// BF16 format, which has no settings.
     pub fn new(trellis: Arc<dyn LinearFormat>, nvfp4: Arc<dyn LinearFormat>) -> Self {
         Self {
             trellis,
             nvfp4,
+            bf16: Arc::new(Bf16Linear),
             grouped: None,
         }
     }
@@ -87,6 +90,11 @@ impl Formats {
         match weight.format {
             WeightFormat::Trellis => Ok(Arc::clone(&self.trellis)),
             WeightFormat::Nvfp4 => Ok(Arc::clone(&self.nvfp4)),
+            // A BF16 object the row-exact route cannot take is refused here, by name, not at its first launch.
+            WeightFormat::Bf16 => {
+                Bf16Linear::check(weight).map_err(PlanBuildError::Geometry)?;
+                Ok(Arc::clone(&self.bf16))
+            }
             // Only a Q3 tensor is stored compressed: a Q4 or Q5 one in the P2E2 layout is refused, here, by name.
             WeightFormat::Q3G64Fp16 | WeightFormat::Q4G64Fp16 | WeightFormat::Q5G64Fp16
                 if weight.layout == WeightLayout::RowSplitK128V1

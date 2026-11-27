@@ -9,6 +9,7 @@ use crate::launch::catalog::{Arguments, KernelId, Launch};
 
 const EMBEDDING: KernelId = kernel!("euhedral_q3_embedding");
 const EMBEDDING_P2E2: KernelId = kernel!("euhedral_q3_p2e2_embedding");
+const EMBEDDING_BF16: KernelId = kernel!("euhedral_bf16_embedding");
 
 /// The grid limit of both wrappers (`euhedral_cuda_embed_q3` and `euhedral_cuda_embed_q3_p2e2` in `q3_embedding.c`).
 const MAX_GRID: u64 = 2_147_483_647;
@@ -146,6 +147,38 @@ pub fn plan_embed_q3_p2e2(shape: &EmbedShape, sink: &mut impl FnMut(Launch)) -> 
         0,
         args,
     ));
+    Ok(())
+}
+
+/// `euhedral_cuda_embed_bf16`, `q3_embedding.c`: one launch of one block of 128 a token, copying 16 bytes a thread and
+/// step. The table and the output are 16-byte aligned and the width a multiple of 8.
+pub fn plan_embed_bf16(shape: &EmbedShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
+    let s = shape;
+    if s.token_ids.is_null()
+        || s.embedding.is_null()
+        || s.hidden.is_null()
+        || s.token_count == 0
+        || s.vocabulary_size == 0
+        || s.hidden_size == 0
+        || !s.hidden_size.is_multiple_of(8)
+        || s.embedding.get() & 15 != 0
+        || s.hidden.get() & 15 != 0
+    {
+        return Err(PlanError::InvalidArgument);
+    }
+    // Two bytes a value: at most 2^32 * 2^32 * 2, which fits 64 bits.
+    let expected_bytes = u64::from(s.vocabulary_size) * 2 * u64::from(s.hidden_size);
+    if s.embedding_bytes != expected_bytes {
+        return Err(PlanError::FormatMismatch);
+    }
+    let args = Arguments::new()
+        .pointer(s.token_ids)
+        .pointer(s.embedding)
+        .pointer(s.hidden)
+        .u32(s.token_count)
+        .u32(s.vocabulary_size)
+        .u32(s.hidden_size);
+    sink(Launch::new(EMBEDDING_BF16, [s.token_count, 1, 1], [128, 1, 1], 0, args));
     Ok(())
 }
 
@@ -381,5 +414,83 @@ mod tests {
         let (result, launches) = plan_p2e2(&p2e2(u32::MAX, 2000));
         assert_eq!(result, Ok(()));
         assert_eq!(launches[0].grid, [1 << 30, 1, 1]);
+    }
+
+    fn bf16(tokens: u32, vocabulary: u32, hidden: u32, bytes: u64) -> EmbedShape {
+        EmbedShape {
+            token_ids: ptr(0x104),
+            embedding: ptr(0x200),
+            hidden: ptr(0x300),
+            token_count: tokens,
+            vocabulary_size: vocabulary,
+            hidden_size: hidden,
+            embedding_bytes: bytes,
+        }
+    }
+
+    fn plan_bf16(shape: &EmbedShape) -> (Result<(), PlanError>, Vec<Launch>) {
+        let mut launches = Vec::new();
+        (plan_embed_bf16(shape, &mut |l| launches.push(l)), launches)
+    }
+
+    #[test]
+    fn embed_bf16_is_one_block_a_token_over_the_whole_table() {
+        let (result, launches) = plan_bf16(&bf16(5, 1000, 192, 1000 * 192 * 2));
+        assert_eq!(result, Ok(()));
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].kernel, kernel!("euhedral_bf16_embedding"));
+        assert_eq!((launches[0].grid, launches[0].block), ([5, 1, 1], [128, 1, 1]));
+        assert_eq!(launches[0].args.words(), &[0x104, 0x200, 0x300, 5, 1000, 192]);
+        assert_eq!(launches[0].args.sizes(), &[8, 8, 8, 4, 4, 4]);
+    }
+
+    #[test]
+    fn embed_bf16_refuses_what_the_wrapper_refuses() {
+        let ok = bf16(1, 3, 8, 48);
+        assert_eq!(plan_bf16(&ok).0, Ok(()));
+        assert_eq!(plan_bf16(&bf16(1, 3, 8, 47)), (Err(PlanError::FormatMismatch), vec![]));
+        assert_eq!(plan_bf16(&bf16(1, 3, 12, 72)).0, Err(PlanError::InvalidArgument));
+        assert_eq!(
+            plan_bf16(&EmbedShape {
+                embedding: ptr(0x208),
+                ..ok
+            })
+            .0,
+            Err(PlanError::InvalidArgument)
+        );
+        assert_eq!(
+            plan_bf16(&EmbedShape {
+                hidden: ptr(0x308),
+                ..ok
+            })
+            .0,
+            Err(PlanError::InvalidArgument)
+        );
+        for bad in [
+            EmbedShape {
+                token_ids: DevicePtr::NULL,
+                ..ok
+            },
+            EmbedShape {
+                embedding: DevicePtr::NULL,
+                ..ok
+            },
+            EmbedShape {
+                hidden: DevicePtr::NULL,
+                ..ok
+            },
+            EmbedShape { token_count: 0, ..ok },
+            EmbedShape {
+                vocabulary_size: 0,
+                ..ok
+            },
+            EmbedShape {
+                hidden_size: 0,
+                embedding_bytes: 0,
+                ..ok
+            },
+        ] {
+            assert_eq!(plan_bf16(&bad), (Err(PlanError::InvalidArgument), vec![]));
+        }
     }
 }

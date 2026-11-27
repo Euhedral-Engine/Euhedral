@@ -71,6 +71,16 @@ pub trait KernelOps {
         hidden_size: u32,
         embedding_bytes: u64,
     ) -> Result<(), CudaError>;
+    fn embed_bf16(
+        &mut self,
+        token_ids: DevicePtr,
+        embedding: DevicePtr,
+        hidden: DevicePtr,
+        token_count: u32,
+        vocabulary_size: u32,
+        hidden_size: u32,
+        embedding_bytes: u64,
+    ) -> Result<(), CudaError>;
     fn embed_q3_p2e2(
         &mut self,
         token_ids: DevicePtr,

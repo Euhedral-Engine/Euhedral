@@ -9,7 +9,7 @@
 //!
 //! The families are the ones the Rust engine calls (`ops.rs`). The native library has more kernels (the Q3 gate-up
 //! SwiGLU, the multi-expert GEMMs, the drafter's, `euhedral_linear_bf16_to_float`, `euhedral_gdn_control_fp32`,
-//! `euhedral_bf16_embedding`, the native gate-up SwiGLU); they stay out until the engine calls them.
+//! the native gate-up SwiGLU); they stay out until the engine calls them.
 
 use crate::DevicePtr;
 
@@ -226,7 +226,7 @@ const LINEAR_TABLE_LEN: usize = 11;
 /// `native/src/host/qwen4_ops.c:12-50`.
 const QWEN4_TABLE_LEN: usize = 36;
 
-const SPECS: [KernelSpec; 188] = [
+const SPECS: [KernelSpec; 189] = [
     spec(
         Family::LinearTable,
         "euhedral_trellis_prepass",
@@ -1025,6 +1025,13 @@ const SPECS: [KernelSpec; 188] = [
     spec(
         Family::Embedding,
         "euhedral_q3_p2e2_embedding",
+        Module::Embedding,
+        0,
+        false,
+    ),
+    spec(
+        Family::Embedding,
+        "euhedral_bf16_embedding",
         Module::Embedding,
         0,
         false,
