@@ -203,12 +203,27 @@ impl Inputs {
 /// The toolkit home to build `product` against: `CUDA_HOME` or `CUDA_PATH`, for the host's own product only, and not
 /// when the pinned archives are forced.
 fn toolkit_home(product: &Product, force_download: bool) -> Option<PathBuf> {
-    if force_download || Platform::host() != Some(product.host_os) {
+    choose_toolkit(
+        product,
+        force_download,
+        Platform::host(),
+        ["CUDA_HOME", "CUDA_PATH"].iter().map(env::var_os),
+    )
+}
+
+/// [`toolkit_home`] over explicit inputs: `variables` holds the values of `CUDA_HOME` and `CUDA_PATH`, in that order.
+fn choose_toolkit(
+    product: &Product,
+    force_download: bool,
+    host: Option<Platform>,
+    variables: impl IntoIterator<Item = Option<OsString>>,
+) -> Option<PathBuf> {
+    if force_download || host != Some(product.host_os) {
         return None;
     }
-    ["CUDA_HOME", "CUDA_PATH"]
-        .iter()
-        .filter_map(env::var_os)
+    variables
+        .into_iter()
+        .flatten()
         .find(|value| !value.is_empty())
         .map(PathBuf::from)
 }
@@ -643,6 +658,7 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use super::*;
+    use crate::imports::tests::{elf, pe};
 
     const VERSION: &str = "13.1.80";
 
@@ -730,22 +746,15 @@ mod tests {
             // `set_path` refuses `..`: write the name as an archive of another origin would carry it.
             header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
             header.set_entry_type(*kind);
+            let linked = matches!(kind, tar::EntryType::Symlink | tar::EntryType::Link);
+            let empty = linked || matches!(kind, tar::EntryType::Char | tar::EntryType::Block);
+            let data = if empty { &b""[..] } else { data };
             header.set_size(data.len() as u64);
-            if *kind == tar::EntryType::Symlink {
-                header.set_size(0);
+            if linked {
                 header.set_link_name("target").expect("link name");
             }
             header.set_cksum();
-            builder
-                .append(
-                    &header,
-                    if *kind == tar::EntryType::Symlink {
-                        &b""[..]
-                    } else {
-                        data
-                    },
-                )
-                .expect("entry");
+            builder.append(&header, data).expect("entry");
         }
         builder.into_inner().expect("tar")
     }
@@ -755,7 +764,8 @@ mod tests {
         let tar = tar_with(&[
             ("a/include/h.h", b"header", tar::EntryType::Regular),
             ("a/lib/libcudart.so.13.1.80", b"cudart", tar::EntryType::Regular),
-            ("a/lib/libnvrtc.so.13.1.80", b"link", tar::EntryType::Symlink),
+            ("a/include/sub/", b"", tar::EntryType::Directory),
+            ("a/lib/libcudart.so.13", b"link", tar::EntryType::Symlink),
             ("a/lib/libcudart_static.a", b"static", tar::EntryType::Regular),
         ]);
         let destination = tempdir().expect("directory");
@@ -1083,5 +1093,338 @@ mod tests {
         .expect("rewrite");
         let error = verify_product(root.path(), &manifest, &product).expect_err("refused");
         assert!(error.contains("wrong binary format"), "{error}");
+    }
+
+    #[test]
+    fn a_tar_entry_that_is_not_a_regular_file_at_a_used_name_is_refused_naming_it() {
+        for (name, kind) in [
+            ("a/lib/libnvrtc.so.13.1.80", tar::EntryType::Symlink),
+            ("a/lib/libnvrtc.so.13.1.80", tar::EntryType::Link),
+            ("a/lib/stubs/libcuda.so", tar::EntryType::Char),
+            ("a/lib/stubs/libcuda.so", tar::EntryType::Block),
+            ("a/include/h.h", tar::EntryType::Symlink),
+        ] {
+            let tar = tar_with(&[(name, b"", kind)]);
+            let destination = tempdir().expect("directory");
+            let error =
+                redist::unpack_tar(Cursor::new(tar), destination.path(), Platform::Linux, VERSION).expect_err(name);
+            assert!(
+                error.contains(name) && error.contains("not a regular file"),
+                "{kind:?}: {error}"
+            );
+            assert_eq!(list_files(destination.path()).expect("list"), Vec::<String>::new());
+        }
+    }
+
+    fn zip_with_mode(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().unix_permissions(mode);
+        writer.start_file(name, options).expect("start");
+        writer.write_all(data).expect("write");
+        writer.finish().expect("finish").into_inner()
+    }
+
+    #[test]
+    fn a_zip_symlink_at_a_used_name_is_refused_naming_it_and_writes_no_file() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .add_symlink("a/lib/x64/cuda.lib", "other.lib", SimpleFileOptions::default())
+            .expect("symlink");
+        let zip = writer.finish().expect("finish").into_inner();
+        let destination = tempdir().expect("directory");
+        let error =
+            redist::unpack_zip(Cursor::new(zip), destination.path(), Platform::Windows, VERSION).expect_err("refused");
+        assert!(
+            error.contains("a/lib/x64/cuda.lib") && error.contains("not a regular file"),
+            "{error}"
+        );
+        assert_eq!(list_files(destination.path()).expect("list"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_zip_file_with_permission_bits_only_is_a_regular_file() {
+        let zip = zip_with_mode("a/lib/x64/cuda.lib", b"cuda", 0o644);
+        let destination = tempdir().expect("directory");
+        redist::unpack_zip(Cursor::new(zip), destination.path(), Platform::Windows, VERSION).expect("unpack");
+        assert_eq!(list_files(destination.path()).expect("list"), ["lib/cuda.lib"]);
+    }
+
+    fn product(platform: Platform) -> Product {
+        Product {
+            id: "p".to_string(),
+            zig_target: "z".to_string(),
+            filename: "f".to_string(),
+            cuda_platform: "linux-x86_64".to_string(),
+            host_os: platform,
+        }
+    }
+
+    fn touch(root: &Path, names: &[&str]) {
+        for name in names {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+            fs::write(path, "").expect("file");
+        }
+    }
+
+    /// A Linux toolkit home with headers of the given versions and the libraries the build links.
+    fn linux_toolkit_home(runtime: &str, driver: &str) -> tempfile::TempDir {
+        let home = tempdir().expect("directory");
+        headers(&home.path().join("targets/x86_64-linux/include"), runtime, driver);
+        touch(
+            home.path(),
+            &[
+                "targets/x86_64-linux/lib/libcudart.so",
+                "targets/x86_64-linux/lib/libnvrtc.so",
+                "targets/x86_64-linux/lib/stubs/libcuda.so",
+            ],
+        );
+        home
+    }
+
+    #[test]
+    fn a_coherent_local_toolkit_is_the_source_and_needs_no_download() {
+        let (root, home) = (tempdir().expect("root"), linux_toolkit_home("13010", "13010"));
+        let inputs = Inputs::plan(root.path(), &product(Platform::Linux), Some(home.path()));
+        assert_eq!(inputs.source, Source::Toolkit);
+        assert_eq!(check_inputs(&inputs, Platform::Linux), Ok(()));
+    }
+
+    #[test]
+    fn an_incoherent_local_toolkit_is_refused_naming_both_header_versions() {
+        let (root, home) = (tempdir().expect("root"), linux_toolkit_home("13010", "13020"));
+        let inputs = Inputs::plan(root.path(), &product(Platform::Linux), Some(home.path()));
+        let error = check_inputs(&inputs, Platform::Linux).expect_err("refused");
+        assert!(error.contains("13010") && error.contains("13020"), "{error}");
+    }
+
+    #[test]
+    fn without_a_toolkit_the_source_is_the_download_under_the_product_directory() {
+        let root = Path::new("/r");
+        let inputs = Inputs::plan(root, &product(Platform::Linux), None);
+        assert_eq!(inputs.source, Source::Download);
+        assert_eq!(inputs.unpacked, root.join("build/cuda-dev/p"));
+        assert_eq!(inputs.include, root.join("build/cuda-dev/p/include"));
+        assert_eq!(inputs.library, root.join("build/cuda-dev/p/lib"));
+        assert_eq!(inputs.runtime, root.join("build/cuda-dev/p/runtime"));
+    }
+
+    #[test]
+    fn the_driver_directory_follows_the_platform_and_the_source() {
+        let (root, home) = (Path::new("/r"), Path::new("/h"));
+        let driver = |platform, toolkit| Inputs::plan(root, &product(platform), toolkit).driver;
+        assert_eq!(driver(Platform::Linux, None), root.join("build/cuda-dev/p/lib"));
+        assert_eq!(driver(Platform::Windows, None), root.join("build/cuda-import/p"));
+        assert_eq!(
+            driver(Platform::Linux, Some(home)),
+            home.join("targets/x86_64-linux/lib/stubs")
+        );
+        assert_eq!(driver(Platform::Windows, Some(home)), root.join("build/cuda-import/p"));
+    }
+
+    #[test]
+    fn the_toolkit_layout_follows_the_platform() {
+        let (root, home) = (Path::new("/r"), Path::new("/h"));
+        let windows = Inputs::plan(root, &product(Platform::Windows), Some(home));
+        assert_eq!(
+            (windows.include, windows.library, windows.runtime),
+            (home.join("include"), home.join("lib/x64"), home.join("bin/x64"))
+        );
+        let linux = Inputs::plan(root, &product(Platform::Linux), Some(home));
+        let tree = home.join("targets/x86_64-linux");
+        assert_eq!(
+            (linux.include, linux.library, linux.runtime),
+            (tree.join("include"), tree.join("lib"), tree.join("lib"))
+        );
+    }
+
+    #[test]
+    fn the_toolkit_is_chosen_only_for_the_host_platform_and_never_when_forced() {
+        let variables = || [Some(OsString::from("")), Some(OsString::from("/cuda"))];
+        let linux = product(Platform::Linux);
+        let choose = |force, host| choose_toolkit(&linux, force, host, variables());
+        assert_eq!(choose(false, Some(Platform::Linux)), Some(PathBuf::from("/cuda")));
+        assert_eq!(choose(true, Some(Platform::Linux)), None);
+        assert_eq!(choose(false, Some(Platform::Windows)), None);
+        assert_eq!(choose(false, None), None);
+        assert_eq!(choose_toolkit(&linux, false, Some(Platform::Linux), [None, None]), None);
+        assert_eq!(
+            choose_toolkit(
+                &linux,
+                false,
+                Some(Platform::Linux),
+                [Some(OsString::from("/home")), Some(OsString::from("/path"))]
+            ),
+            Some(PathBuf::from("/home"))
+        );
+    }
+
+    #[test]
+    fn a_toolkit_lacking_a_library_is_refused_naming_it_and_the_variables() {
+        let (root, home) = (tempdir().expect("root"), linux_toolkit_home("13010", "13010"));
+        fs::remove_file(home.path().join("targets/x86_64-linux/lib/libnvrtc.so")).expect("remove");
+        let inputs = Inputs::plan(root.path(), &product(Platform::Linux), Some(home.path()));
+        let error = check_inputs(&inputs, Platform::Linux).expect_err("refused");
+        assert!(error.contains("libnvrtc.so") && error.contains("CUDA_HOME"), "{error}");
+    }
+
+    #[test]
+    fn a_download_lacking_a_library_is_refused_naming_it() {
+        let root = tempdir().expect("root");
+        let inputs = Inputs::plan(root.path(), &product(Platform::Linux), None);
+        headers(&inputs.include, "13010", "13010");
+        touch(&inputs.unpacked, &["lib/libcudart.so", "lib/libnvrtc.so"]);
+        let error = check_inputs(&inputs, Platform::Linux).expect_err("refused");
+        assert!(error.contains("libcuda.so") && error.contains("downloaded"), "{error}");
+        touch(&inputs.unpacked, &["lib/libcuda.so"]);
+        assert_eq!(check_inputs(&inputs, Platform::Linux), Ok(()));
+    }
+
+    #[test]
+    fn a_windows_build_without_its_generated_import_library_is_refused() {
+        let root = tempdir().expect("root");
+        let inputs = Inputs::plan(root.path(), &product(Platform::Windows), None);
+        headers(&inputs.include, "13010", "13010");
+        touch(&inputs.unpacked, &["lib/cudart.lib", "lib/nvrtc.lib"]);
+        touch(&inputs.imports, &["nvcuda.lib"]);
+        let error = check_inputs(&inputs, Platform::Windows).expect_err("refused");
+        assert!(error.contains("cudart.lib") && error.contains("cuda-import"), "{error}");
+        touch(&inputs.imports, &["cudart.lib"]);
+        assert_eq!(check_inputs(&inputs, Platform::Windows), Ok(()));
+    }
+
+    fn manifest_with(components: &[&str]) -> Manifest {
+        let archives = components
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    Component {
+                        path: format!("{name}/x.tar.xz"),
+                        sha256: String::new(),
+                    },
+                )
+            })
+            .collect();
+        Manifest {
+            cuda_version: VERSION.to_string(),
+            products: Vec::new(),
+            redistributables: BTreeMap::from([("linux-x86_64".to_string(), archives)]),
+        }
+    }
+
+    #[test]
+    fn a_manifest_without_the_products_platform_is_refused_before_any_download() {
+        let root = tempdir().expect("root");
+        let mut item = product(Platform::Linux);
+        item.cuda_platform = "windows-x86_64".to_string();
+        let inputs = Inputs::plan(root.path(), &item, None);
+        let download = |_: &str, _: &Path| -> Result<(), String> { panic!("downloaded") };
+        let error =
+            prepare_download(&manifest_with(&COMPONENTS), &item, &inputs, root.path(), &download).expect_err("refused");
+        assert!(error.contains("windows-x86_64"), "{error}");
+    }
+
+    #[test]
+    fn a_manifest_missing_a_component_is_refused_naming_it_before_any_download() {
+        let root = tempdir().expect("root");
+        let item = product(Platform::Linux);
+        let inputs = Inputs::plan(root.path(), &item, None);
+        let download = |_: &str, _: &Path| -> Result<(), String> { panic!("downloaded") };
+        let manifest = manifest_with(&["nvrtc", "crt", "cccl"]);
+        let error = prepare_download(&manifest, &item, &inputs, root.path(), &download).expect_err("refused");
+        assert!(error.contains("cudart") && error.contains("linux-x86_64"), "{error}");
+    }
+
+    /// A built Linux product tree that `verify_product` accepts.
+    fn built_tree(root: &Path) -> (Manifest, Product) {
+        let (manifest, product) = product_tree(root, &["k/a.cu"], &["k/a.cu"]);
+        let prefix = root.join("build/native/linux-x64");
+        let wanted = ["libcudart.so.13", "libnvrtc.so.13", "libcuda.so.1"];
+        fs::write(prefix.join("lib/libeuhedral_cuda.so"), elf(&wanted)).expect("library");
+        let bundled: Vec<String> = redist::runtime_files(Platform::Linux, VERSION)
+            .into_iter()
+            .map(|name| format!("lib/{name}"))
+            .chain([
+                "cuda/include/cuda_fp4.h".to_string(),
+                "cuda/include/nvrtc.h".to_string(),
+            ])
+            .collect();
+        touch(&prefix, &bundled.iter().map(String::as_str).collect::<Vec<_>>());
+        fs::write(prefix.join(HASHES), file_hashes(&prefix).expect("hashes")).expect("manifest");
+        (manifest, product)
+    }
+
+    fn built_tree_error(change: impl FnOnce(&Path)) -> String {
+        let root = tempdir().expect("root");
+        let (manifest, product) = built_tree(root.path());
+        change(&root.path().join("build/native/linux-x64"));
+        verify_product(root.path(), &manifest, &product).expect_err("refused")
+    }
+
+    #[test]
+    fn a_complete_product_tree_is_accepted() {
+        let root = tempdir().expect("root");
+        let (manifest, product) = built_tree(root.path());
+        assert_eq!(verify_product(root.path(), &manifest, &product), Ok(()));
+    }
+
+    #[test]
+    fn a_library_that_does_not_import_a_runtime_is_refused_naming_it() {
+        let error = built_tree_error(|prefix| {
+            fs::write(
+                prefix.join("lib/libeuhedral_cuda.so"),
+                elf(&["libcudart.so.13", "libcuda.so.1"]),
+            )
+            .expect("library");
+        });
+        assert!(error.contains("does not import libnvrtc.so.13"), "{error}");
+    }
+
+    #[test]
+    fn a_linux_library_that_imports_a_dll_is_refused_naming_it() {
+        let error = built_tree_error(|prefix| {
+            let wanted = ["libcudart.so.13", "libnvrtc.so.13", "libcuda.so.1", "nvcuda.dll"];
+            fs::write(prefix.join("lib/libeuhedral_cuda.so"), elf(&wanted)).expect("library");
+        });
+        assert!(error.contains("imports nvcuda.dll"), "{error}");
+    }
+
+    #[test]
+    fn a_windows_library_that_imports_a_shared_object_is_refused_naming_it() {
+        let root = tempdir().expect("root");
+        let (manifest, mut item) = built_tree(root.path());
+        item.host_os = Platform::Windows;
+        let prefix = root.path().join("build/native/linux-x64");
+        let wanted = ["cudart64_13.dll", "nvrtc64_130_0.dll", "nvcuda.dll", "libcuda.so"];
+        fs::write(prefix.join("lib/libeuhedral_cuda.so"), pe(&wanted)).expect("library");
+        let error = verify_product(root.path(), &manifest, &item).expect_err("refused");
+        assert!(error.contains("imports libcuda.so"), "{error}");
+    }
+
+    #[test]
+    fn a_product_missing_a_bundled_file_is_refused_naming_it() {
+        for missing in ["lib/libnvrtc.so.13", "cuda/include/nvrtc.h"] {
+            let error = built_tree_error(|prefix| fs::remove_file(prefix.join(missing)).expect("remove"));
+            assert!(error.contains(&format!("missing {missing}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_hash_manifest_that_lists_other_files_is_refused_naming_both_sides() {
+        let error = built_tree_error(|prefix| {
+            let text = fs::read_to_string(prefix.join(HASHES)).expect("manifest");
+            let kept: String = text
+                .lines()
+                .filter(|line| !line.ends_with("lib/libnvrtc.so.13"))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            fs::write(prefix.join(HASHES), format!("{kept}0  lib/ghost.so\n")).expect("manifest");
+        });
+        assert!(
+            error.contains("unlisted") && error.contains("lib/libnvrtc.so.13"),
+            "{error}"
+        );
+        assert!(error.contains("lib/ghost.so"), "{error}");
     }
 }

@@ -4,7 +4,8 @@
 //! The layout under the destination is `include/` (the headers), `lib/` (the link libraries: `cuda`, `cudart` and
 //! `nvrtc`, as `.lib` on Windows and as `libcuda.so` (a driver stub), `libcudart.so` and `libnvrtc.so` on Linux) and
 //! `runtime/` (the libraries the product loads at run time). Only regular files of the archives that the layout names
-//! are written; an entry whose name could leave the destination refuses the whole archive.
+//! are written; an entry whose name could leave the destination, or that is a link or a device at a name the layout
+//! uses, refuses the whole archive.
 
 use std::fmt::Display;
 use std::fs::{self, File};
@@ -19,6 +20,8 @@ use zip::ZipArchive;
 use crate::native::Platform;
 
 const DOWNLOAD_ROOT: &str = "https://developer.download.nvidia.com/compute/cuda/redist/";
+const UNIX_FILE_TYPE: u32 = 0o170_000;
+const UNIX_REGULAR: u32 = 0o100_000;
 const WINDOWS_LINK_LIBRARIES: [&str; 3] = ["cuda.lib", "cudart.lib", "nvrtc.lib"];
 const WINDOWS_RUNTIME: [&str; 3] = ["cudart64_13.dll", "nvrtc64_130_0.dll", "nvrtc-builtins64_131.dll"];
 
@@ -150,8 +153,13 @@ pub(crate) fn unpack_tar(
         let mut entry = entry.map_err(|error| format!("cannot read a tar entry: {error}"))?;
         let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
         let target = layout_path(&name, platform, cuda_version)?;
-        if let (Some(path), EntryType::Regular) = (target, entry.header().entry_type()) {
-            install(destination, &path, &mut entry)?;
+        let Some(path) = target else {
+            continue;
+        };
+        match entry.header().entry_type() {
+            EntryType::Regular => install(destination, &path, &mut entry)?,
+            EntryType::Directory => {}
+            other => return Err(refuse_non_file(&name, &format!("{other:?}"))),
         }
     }
     Ok(())
@@ -171,11 +179,24 @@ pub(crate) fn unpack_zip(
             .map_err(|error| format!("cannot read zip entry {index}: {error}"))?;
         let name = entry.name().to_string();
         let target = layout_path(&name, platform, cuda_version)?;
-        if let (Some(path), false) = (target, entry.is_dir()) {
-            install(destination, &path, &mut entry)?;
+        let Some(path) = target else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        match entry.unix_mode().map(|mode| mode & UNIX_FILE_TYPE) {
+            None | Some(UNIX_REGULAR | 0) => install(destination, &path, &mut entry)?,
+            Some(other) => return Err(refuse_non_file(&name, &format!("unix file type {other:#o}"))),
         }
     }
     Ok(())
+}
+
+/// The refusal of an archive entry that is not a regular file but sits at a name the layout uses: skipping it would
+/// leave the input incomplete, and writing it as a file would store a link's target text as a library.
+fn refuse_non_file(name: &str, kind: &str) -> String {
+    format!("archive entry {name:?} is not a regular file ({kind}) but the layout uses its name")
 }
 
 /// Writes `source` to `relative` under `destination`, which `layout_path` has already vetted.

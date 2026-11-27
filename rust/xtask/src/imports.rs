@@ -180,7 +180,7 @@ fn pe_imports(data: &[u8]) -> Result<BTreeSet<String>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::iter::once;
 
     use super::*;
@@ -188,7 +188,7 @@ mod tests {
     const BASE: u64 = 0x40_0000;
 
     /// A minimal ELF64 shared object: one `PT_LOAD` over the whole file, a `PT_DYNAMIC` with the needed names.
-    fn elf(needed: &[&str]) -> Vec<u8> {
+    pub(crate) fn elf(needed: &[&str]) -> Vec<u8> {
         let strings: Vec<u8> = once(0u8)
             .chain(needed.iter().flat_map(|name| name.bytes().chain([0])))
             .collect();
@@ -229,7 +229,7 @@ mod tests {
     }
 
     /// A minimal PE32+ image: one section mapped at RVA 0x1000 holding an import directory with the given names.
-    fn pe(imports: &[&str]) -> Vec<u8> {
+    pub(crate) fn pe(imports: &[&str]) -> Vec<u8> {
         let (pe_at, optional_size, raw) = (0x40usize, 240usize, 0x200usize);
         let directory = (imports.len() + 1) * PE_IMPORT_DESCRIPTOR;
         let mut names = Vec::new();
