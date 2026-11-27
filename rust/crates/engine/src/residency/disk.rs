@@ -350,6 +350,14 @@ impl ArtifactFile {
         })
     }
 
+    /// The handle reads go through: the one that bypasses the page cache when `direct` and there is one.
+    pub(crate) fn handle(&self, direct: bool) -> &OwnedFile {
+        match &self.direct {
+            Some(direct_handle) if direct => direct_handle,
+            _ => &self.buffered,
+        }
+    }
+
     /// Whether reads can bypass the page cache.
     pub fn has_direct(&self) -> bool {
         self.direct.is_some()
@@ -488,7 +496,7 @@ impl DiskReadPiece {
     }
 
     /// The options of a read in pieces of this size.
-    fn options(self) -> ReadOptions {
+    pub(crate) fn options(self) -> ReadOptions {
         ReadOptions::with_piece(self.0)
     }
 }
@@ -960,7 +968,7 @@ impl DiskOwner {
 
 /// Whether an OS error is the one a direct read gets for a request the file system cannot align: `EINVAL` on Unix,
 /// `ERROR_INVALID_PARAMETER` on Windows.
-fn refuses_alignment(code: i32) -> bool {
+pub(crate) fn refuses_alignment(code: i32) -> bool {
     const EINVAL: i32 = 22;
     const ERROR_INVALID_PARAMETER: i32 = 87;
     if cfg!(windows) {
