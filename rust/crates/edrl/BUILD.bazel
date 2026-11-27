@@ -154,6 +154,53 @@ rust_test(
 )
 
 rust_test(
+    name = "flash_refusals_test",
+    compile_data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ),
+    crate_features = ["test-util"],
+    crate_name = "flash_refusals",
+    crate_root = "tests/flash_refusals.rs",
+    data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ),
+    deps = [
+        ":euhedral_inference_edrl",
+        "//rust/crates/test-support:test_support",
+        "@euhedral_crates//:crc32fast",
+        "@euhedral_crates//:serde_json",
+        "@euhedral_crates//:thiserror",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "rust/crates/edrl",
+        "CARGO_TARGET_TMPDIR": "unused-under-bazel",
+    },
+    srcs = glob(
+        [
+            "tests/flash_refusals.rs",
+            "tests/*/**/*.rs",
+        ],
+        allow_empty = True,
+    ),
+    version = "0.1.0",
+)
+
+rust_test(
     name = "synthetic_test",
     compile_data = glob(
         [
