@@ -12,6 +12,7 @@ use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use euhedral_inference_cuda::PinnedBuffer;
 use euhedral_io::IoMemory;
 
 use super::layout::ExpertError;
@@ -28,6 +29,8 @@ pub struct HostArena {
     slots: usize,
     slot_bytes: usize,
     leases: Box<[AtomicI32]>,
+    /// The page-locked buffer the block is, when it is one: the block is then not this arena's to free.
+    pinned: Option<PinnedBuffer>,
 }
 
 // SAFETY: the block is reached only through leases, which admit one writer or many readers per slot; the pointer is
@@ -68,6 +71,49 @@ impl HostArena {
             slots,
             slot_bytes,
             leases: (0..slots).map(|_| AtomicI32::new(0)).collect(),
+            pinned: None,
+        }))
+    }
+
+    /// An arena of `slots` slots of `slot_bytes` over the page-locked `buffer`, which a device copy can read from
+    /// directly. Refuses a slot that is not a whole number of pages, a buffer that is too small or not page-aligned,
+    /// naming the values.
+    pub fn over(slots: usize, slot_bytes: usize, mut buffer: PinnedBuffer) -> Result<Arc<HostArena>, ExpertError> {
+        if slot_bytes == 0 || !(slot_bytes as u64).is_multiple_of(HOST_ALIGNMENT) {
+            return Err(ExpertError::SlotNotPaged {
+                bytes: slot_bytes,
+                block: HOST_ALIGNMENT,
+            });
+        }
+        let size = slots
+            .checked_mul(slot_bytes)
+            .filter(|&size| size > 0 && size <= buffer.len())
+            .ok_or(ExpertError::ArenaSize {
+                slots,
+                bytes: slot_bytes,
+            })?;
+        let layout = Layout::from_size_align(size, HOST_ALIGNMENT as usize).map_err(|_| ExpertError::ArenaSize {
+            slots,
+            bytes: slot_bytes,
+        })?;
+        let address = buffer.as_mut_ptr();
+        if !(address as usize as u64).is_multiple_of(HOST_ALIGNMENT) {
+            return Err(ExpertError::Unaligned {
+                address: address as usize,
+                block: HOST_ALIGNMENT,
+            });
+        }
+        let base = NonNull::new(address).ok_or(ExpertError::ArenaSize {
+            slots,
+            bytes: slot_bytes,
+        })?;
+        Ok(Arc::new(HostArena {
+            base,
+            layout,
+            slots,
+            slot_bytes,
+            leases: (0..slots).map(|_| AtomicI32::new(0)).collect(),
+            pinned: Some(buffer),
         }))
     }
 
@@ -139,8 +185,10 @@ impl HostArena {
 
 impl Drop for HostArena {
     fn drop(&mut self) {
-        // SAFETY: the block was allocated with this layout; nothing leases it, since every lease holds the arena.
-        unsafe { dealloc(self.base.as_ptr(), self.layout) };
+        if self.pinned.is_none() {
+            // SAFETY: the block was allocated with this layout; nothing leases it, since every lease holds the arena.
+            unsafe { dealloc(self.base.as_ptr(), self.layout) };
+        }
     }
 }
 
@@ -253,6 +301,15 @@ pub struct SlotRead {
 impl SlotRead {
     pub fn slot(&self) -> usize {
         self.slot
+    }
+
+    /// The page-locked buffer the slot is in and the slot's offset in it, for a device copy; `None` when the arena is
+    /// ordinary memory.
+    pub fn pinned(&self) -> Option<(&PinnedBuffer, usize)> {
+        self.arena
+            .pinned
+            .as_ref()
+            .map(|buffer| (buffer, self.slot * self.arena.slot_bytes))
     }
 
     /// The slot's bytes.

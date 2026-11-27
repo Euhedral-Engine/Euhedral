@@ -86,6 +86,11 @@ impl ExpertStore {
         &self.layout
     }
 
+    /// The staging memory loads end in.
+    pub fn staging(&self) -> &Arc<HostArena> {
+        &self.staging
+    }
+
     pub fn source(&self) -> &FileRecordSource {
         &self.source
     }
