@@ -33,6 +33,10 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 # What this process runs; the pull below may bring a newer version of the script.
 SCRIPT_SOURCE = Path(__file__).read_bytes()
 REQUIRED = ("EUHEDRAL_MODEL_NAME",)
+DOCKERFILE = "rust/Dockerfile"
+# The engine reads the model through io_uring, which Docker's default seccomp profile blocks, and Docker cannot add
+# system calls to that profile from the command line.
+SECURITY_OPTIONS = ["--security-opt", "seccomp=unconfined"]
 DEVICES = ("nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-modeset")
 
 
@@ -211,6 +215,8 @@ def get_json(url, data=None):
 
 
 def verify_ready(port):
+    """The Rust server's contract: /health is 200 {"status":"up","engine":"ready"} (503 "closed" once shut down),
+    /v1/models lists the public model, and a chat completion generates text."""
     base = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + 300
     last_error = "no response"
@@ -296,7 +302,8 @@ def deploy(repository, settings):
             raise RuntimeError(f"Rollback container already exists: {previous_name}")
     print(f"Building {image} from {revision}; the current service stays up until the build succeeds", flush=True)
     with build_context(repository) as source:
-        command("docker", "build", "--label", f"org.opencontainers.image.revision={revision}", "-t", image, str(source))
+        command("docker", "build", "-f", str(source / DOCKERFILE), "--label", f"org.opencontainers.image.revision={revision}",
+                "-t", image, str(source))
     new_image_id = command("docker", "image", "inspect", "--format", "{{.Id}}", image)
     old_tags = [
         tag for tag in command("docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}").splitlines()
@@ -319,6 +326,7 @@ def deploy(repository, settings):
             *(mount_file(settings.config_file, "/etc/euhedral/custom.yaml") if settings.config_file else []),
             "-e", "EUHEDRAL_MODEL_ARTIFACT=/models/model.edrl",
             "-e", f"EUHEDRAL_SERVER_PORT={port}", "-p", f"127.0.0.1:{port}:{port}",
+            *SECURITY_OPTIONS,
             *gpu_arguments(settings),
             *mount_file(model, "/models/model.edrl"),
             image,

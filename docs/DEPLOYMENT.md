@@ -8,7 +8,8 @@ mise deploy euhedral.yaml
 mise deploy .env
 ```
 
-The task reads everything it needs from that file. It pulls `origin/main`, builds an image from that commit,
+The task reads everything it needs from that file. It pulls `origin/main`, builds the Rust server's image
+(`rust/Dockerfile`) from that commit,
 mounts the model and configuration, and starts the service on `127.0.0.1` at the configured port. No separate
 image build or mount arguments are needed. Mise manages the Python runner and YAML parser dependencies.
 The host needs a compatible NVIDIA driver. Deploy checks for a Docker NVIDIA runtime or NVIDIA CDI devices;
@@ -32,7 +33,13 @@ Deploy mounts the YAML read-only at `/etc/euhedral/custom.yaml` and the model at
 passes `--config /etc/euhedral/custom.yaml` to the server. It overrides the artifact path inside the container
 without editing your YAML. `model.name` supplies the public model ID used to verify the deployment.
 `server.port` selects the listening, published, and health-check port (default `1738`). All other engine settings
-come from the mounted YAML. The Java application continues to read YAML and environment variables.
+come from the mounted YAML; the Rust server refuses an unknown key and names it. A variable in an `.env` file
+overrides the same key of the YAML, and the server refuses a retired variable at startup.
+
+The engine reads the model through io_uring, which Docker's default seccomp profile blocks, so deploy runs the
+container with `--security-opt seccomp=unconfined`. Docker cannot add system calls to its default profile from the
+command line, and a custom profile would have to carry a full copy of that profile. The host's
+`kernel.io_uring_disabled` must be 0. The root `Dockerfile` still builds the Java image, but deploy no longer uses it.
 
 ## Environment file
 
@@ -50,8 +57,9 @@ in `.env`. Deploy mounts those libraries and passes the NVIDIA device nodes inst
 ## Cutover and rollback
 
 The existing service stays up while the image builds. Deploy switches the `euhedral-inference-serve` container
-only after the build succeeds, then checks Docker health, `/health`, `/v1/models`, and a chat completion.
+only after the build succeeds, then checks Docker health, `/health` (`200` with `"status":"up"` and
+`"engine":"ready"`), `/v1/models`, and a chat completion that generates text.
 It verifies the public model ID against the configuration and restores the previous container if the candidate
-fails. Old Euhedral deployment containers and images are removed after the new service passes those checks.
+fails; that previous container, and so the previous image, is the rollback. Old Euhedral deployment containers and images are removed after the new service passes those checks.
 
 The [operations guide](OPERATIONS.md) covers environment overrides, health checks, metrics, and shutdown.
