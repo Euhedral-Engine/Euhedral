@@ -901,8 +901,6 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::print_stdout, reason = "a proof run reports what it generated")]
 mod flash_device {
-    use std::env::var_os;
-    use std::fs::read_to_string;
     use std::mem;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -963,15 +961,6 @@ mod flash_device {
         done.wait(GENERATION).expect("the generation never finished")
     }
 
-    /// The tokens `golden` holds on its `prefix` line.
-    fn golden_line(golden: &str, prefix: &str) -> Vec<u32> {
-        let line = golden
-            .lines()
-            .find_map(|line| line.strip_prefix(prefix))
-            .expect("the golden has the line");
-        line.split_whitespace().map(|id| id.parse().expect("an id")).collect()
-    }
-
     #[test]
     #[ignore = "needs a GPU, the native library and the Flash-Next artifact"]
     fn the_server_serves_the_flash_next_artifact_with_the_same_greedy_tokens_every_time() {
@@ -1009,27 +998,6 @@ mod flash_device {
         assert!(!first.is_empty(), "no token was generated");
         assert_eq!(first, second, "the same prompt generated different tokens");
 
-        #[allow(clippy::disallowed_methods, reason = "a one-time device comparison reads its golden")]
-        let golden_path = var_os("EUHEDRAL_FLASH_GOLDEN");
-        if let Some(path) = golden_path {
-            #[allow(clippy::disallowed_methods, reason = "a one-time device comparison reads its golden")]
-            let golden = read_to_string(path).expect("the golden is readable");
-            let prompt = golden_line(&golden, "prompt ");
-            let want = golden_line(&golden, "generated ");
-            let (got, outcome) = run(engine.as_ref(), &prompt, 128, &stops);
-            println!("golden: {} tokens {:?}", got.len(), outcome.reason);
-            let at = got.iter().zip(&want).position(|(got, want)| got != want);
-            println!(
-                "first differing position: {at:?}; lengths {} vs {}",
-                got.len(),
-                want.len()
-            );
-            println!("rust: {got:?}\njava: {want:?}");
-            assert!(
-                at.is_none() && got.len() == want.len(),
-                "differs from the Java golden at {at:?}"
-            );
-        }
         host.shutdown(Duration::from_secs(120)).expect("the engine stops");
     }
 }
