@@ -231,6 +231,13 @@ const LINEAR_TABLE_LEN: usize = 11;
 /// `native/src/host/qwen4_ops.c:12-50`.
 const QWEN4_TABLE_LEN: usize = 36;
 
+/// The dynamic shared memory of `euhedral_dflash_attention_tc_bf16`: the expression of `ATTENTION_SHARED_BYTES`
+/// (`native/src/host/dflash.c:27`), whose terms are the kernel's `attentionShared` layout (`dflash/kernels.cu`): 32
+/// score rows of 276 floats, the two BF16 probability planes of 32 rows by 280, the 16 rows of 136 BF16 values, and
+/// 64 floats of row maxima and sums. A name, not the expression, in the table: `native/tests/pdl_wait_check.py`
+/// reads each entry's size as one word.
+const DFLASH_ATTENTION_SHARED_BYTES: u32 = 32 * 276 * 4 + 2 * 32 * 280 * 2 + 16 * 136 * 2 + 64 * 4;
+
 const SPECS: [KernelSpec; 203] = [
     spec(
         Family::LinearTable,
@@ -1123,7 +1130,7 @@ const SPECS: [KernelSpec; 203] = [
         Family::Dflash,
         "euhedral_dflash_attention_tc_bf16",
         Module::Dflash,
-        32 * 276 * 4 + 2 * 32 * 280 * 2 + 16 * 136 * 2 + 64 * 4,
+        DFLASH_ATTENTION_SHARED_BYTES,
         true,
     ),
     spec(
