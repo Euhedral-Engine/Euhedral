@@ -360,6 +360,7 @@ mod tests {
             attention_output_gate: true,
             mtp_layer_count: 1,
             draft_depth: None,
+            dflash2: None,
         }
     }
 
@@ -386,7 +387,7 @@ mod tests {
                 Residence::Device
             }
         });
-        base_nodes(&config(), &lookup).unwrap()
+        base_nodes(&config(), &lookup, false).unwrap()
     }
 
     fn base() -> Vec<Node> {

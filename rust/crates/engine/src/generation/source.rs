@@ -282,6 +282,9 @@ pub(crate) struct Shared {
     pub(crate) capacity: u64,
     /// What speculation needs of the artifact; `None` for an artifact without the draft layer.
     pub(crate) drafts: Option<Drafts>,
+    /// Drafts a step of the DFlash2 drafter makes and its verification checks; `None` for an artifact without the
+    /// drafter. A request that samples or is constrained does not use it.
+    pub(crate) dflash2: Option<usize>,
     /// The prefix cache, when the plan granted it memory and it opened.
     pub(crate) prefix: Option<PrefixCacheHandle>,
     /// Set when the engine stops: no request begins after it.
@@ -322,7 +325,7 @@ pub(super) enum Step {
     Prefill { rows: usize, last: bool },
     /// One row of the sequence.
     Decode,
-    /// The MTP catch-up of the `rows` prompt rows just prefilled.
+    /// The MTP catch-up (or the DFlash2 drafter's context update) of the `rows` prompt rows just prefilled.
     PromptCatchUp { rows: usize },
     /// A speculative step of `drafts` drafts: the catch-up (which makes the first), the recursive drafts and the
     /// verification of the current token and the drafts.
@@ -464,6 +467,76 @@ impl Mode {
     }
 }
 
+/// How a request's speculation is served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// No drafts: the device selects each token (greedy) or the host does (sampled, constrained, hidden rows).
+    Plain,
+    /// The artifact's MTP layer drafts `depth` tokens; the host selects with samplers if the request is sampled.
+    Mtp(usize),
+    /// The DFlash2 drafter drafts `depth` tokens of a greedy request.
+    Dflash2(usize),
+}
+
+impl Route {
+    fn depth(self) -> Option<usize> {
+        match self {
+            Route::Plain => None,
+            Route::Mtp(depth) | Route::Dflash2(depth) => Some(depth),
+        }
+    }
+}
+
+/// The route of a request that asks for `speculation`. `host_selects`: the host selects the tokens (a sampled,
+/// constrained or hidden-row request); `mtp` and `dflash2`: the draft depths of the artifact's drafters. A constrained
+/// request never speculates. The DFlash2 drafter drafts a greedy request's tokens only, so any other request on a
+/// DFlash2 artifact decodes plainly; the MTP drafts of a sampled request stay.
+fn route(
+    speculation: &Speculation,
+    host_selects: bool,
+    constrained: bool,
+    mtp: Option<usize>,
+    dflash2: Option<usize>,
+) -> Result<Route, AdmissionError> {
+    match speculation {
+        _ if constrained => Ok(Route::Plain),
+        Speculation::Off => Ok(Route::Plain),
+        Speculation::Artifact => match (dflash2, mtp) {
+            (Some(_), _) if host_selects => Ok(Route::Plain),
+            (Some(depth), _) => Ok(Route::Dflash2(depth)),
+            (None, Some(depth)) => Ok(Route::Mtp(depth)),
+            (None, None) => Err(AdmissionError::SpeculationUnavailable),
+        },
+    }
+}
+
+/// The state of a request that speculates by `route`, or `None` for a request that does not.
+fn speculating(route: Route, capacity: u64, prompt: usize, max_tokens: usize) -> Option<Speculating> {
+    match route {
+        Route::Plain => None,
+        Route::Mtp(depth) => Some(Speculating::new(depth, capacity, prompt, max_tokens)),
+        Route::Dflash2(depth) => Some(Speculating::new(depth, capacity, prompt, max_tokens).with_drafter()),
+    }
+}
+
+/// What a request does with the prefix cache.
+#[derive(Debug, PartialEq, Eq)]
+enum Caching {
+    /// It neither restores a checkpoint nor stores one: the drafter's context of a restored prefix would be missing.
+    Skips,
+    /// It uses checkpoints of `kind` (those that hold the draft's state too, when it drafts).
+    Uses(Option<CheckpointKind>),
+}
+
+/// The use of the prefix cache by a speculative request.
+fn speculative_caching(state: &Speculating) -> Caching {
+    if state.drafter().is_some() {
+        Caching::Skips
+    } else {
+        Caching::Uses(state.drafting().then_some(CheckpointKind::Mtp))
+    }
+}
+
 /// Why a request that asks for its hidden states is refused: it speculates (its drafts' rows are not the rows of the
 /// tokens it commits), or the artifact has no draft layer whose state the rows come from.
 fn hidden_refusal(hidden: bool, speculation: &Speculation, drafts: bool) -> Option<AdmissionError> {
@@ -495,6 +568,10 @@ pub(super) enum Role {
     PromptCatchUp,
     /// The catch-up of a step, which makes its first draft.
     CatchUp,
+    /// The DFlash2 drafter's context update, of a prompt chunk's rows or of the rows a verification committed.
+    Context,
+    /// The DFlash2 drafter's block of a step, which makes its drafts.
+    Block,
     /// A recursive draft of a step.
     Draft,
     /// The verification of a step, or of several forced rows.
@@ -638,7 +715,11 @@ impl Run {
             Step::Decode => usize::from(!self.copies_rows(Role::Decode)),
             Step::PromptCatchUp { .. } | Step::Settle | Step::Forced { .. } => 0,
             // The drafts are always selected on the device; the verification only when the host does not.
-            Step::Speculate { drafts } => drafts + usize::from(!self.copies_rows(Role::Verify)),
+            Step::Speculate { drafts } => {
+                let drafter = matches!(&self.mode, Mode::Speculative { state, .. } if state.drafter().is_some());
+                // The drafter's block selects its drafts in one quantum.
+                (if drafter { 1 } else { drafts }) + usize::from(!self.copies_rows(Role::Verify))
+            }
         }
     }
 
@@ -753,8 +834,8 @@ pub(super) struct Admission {
     pub(super) rows: usize,
     /// The position of the quantum's first row in the cache it appends to.
     pub(super) start: u64,
-    /// The cache the quantum appends to.
-    pub(super) source: KvSource,
+    /// The cache the quantum appends to; none for a quantum that appends to no cache (the drafter's).
+    pub(super) source: Option<KvSource>,
     /// Whether its launches overlap with the quantum before it (programmatic dependent launch).
     pub(super) pdl: bool,
     /// The logits rows it scores; a quantum that scores any takes a selection.
@@ -909,73 +990,54 @@ impl Owner {
         if let Some(error) = hidden_refusal(hidden.is_some(), &speculation, self.shared.drafts.is_some()) {
             return Err(Rejected::new(error, Audience::Greedy(listener)));
         }
-        let mode = match speculation {
-            // The host selects the tokens: its drafts, if it speculates, stay greedy.
-            _ if hidden.is_some() || !sampling.is_greedy() || constraint.is_some() => {
-                if self.sequence.row_readbacks.is_exhausted() {
-                    // Refused before the prompt prefills: the last chunk would find no row to copy its logits to.
-                    let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
+        let host_selects = hidden.is_some() || !sampling.is_greedy() || constraint.is_some();
+        let route = match route(
+            &speculation,
+            host_selects,
+            constraint.is_some(),
+            self.shared.drafts.as_ref().map(|drafts| drafts.depth),
+            self.shared.dflash2,
+        ) {
+            Ok(route) => route,
+            Err(error) => return Err(Rejected::new(error, Audience::Greedy(listener))),
+        };
+        let mode = if host_selects {
+            if self.sequence.row_readbacks.is_exhausted() {
+                // Refused before the prompt prefills: the last chunk would find no row to copy its logits to.
+                let error = AdmissionError::Engine("the sequence has no row readback to sample from".to_string());
+                return Err(Rejected::new(error, Audience::Greedy(listener)));
+            }
+            let vocabulary = self.shared.config.vocab_size;
+            // One sampler for each row a quantum selects from at once: a verification's rows, or one.
+            let rows = route.depth().map_or(1, |depth| depth + 1);
+            let samplers = match samplers(sampling, vocabulary, rows) {
+                Ok(samplers) => SampledRows::new(samplers),
+                Err(error) => {
+                    let error = AdmissionError::Engine(format!("the sampler: {error}"));
                     return Err(Rejected::new(error, Audience::Greedy(listener)));
                 }
-                let vocabulary = self.shared.config.vocab_size;
-                let drafts = match speculation {
-                    // A constrained request never speculates.
-                    _ if constraint.is_some() => None,
-                    Speculation::Off => None,
-                    Speculation::Artifact => match self.shared.drafts.as_ref() {
-                        Some(drafts) => Some(drafts.depth),
-                        None => {
-                            return Err(Rejected::new(
-                                AdmissionError::SpeculationUnavailable,
-                                Audience::Greedy(listener),
-                            ));
-                        }
-                    },
-                };
-                // One sampler for each row a quantum selects from at once: a verification's rows, or one.
-                let rows = drafts.map_or(1, |depth| depth + 1);
-                let samplers = match samplers(sampling, vocabulary, rows) {
-                    Ok(samplers) => SampledRows::new(samplers),
-                    Err(error) => {
-                        let error = AdmissionError::Engine(format!("the sampler: {error}"));
-                        return Err(Rejected::new(error, Audience::Greedy(listener)));
-                    }
-                };
-                match drafts {
-                    None => Mode::Sampled {
-                        listener,
-                        state: Box::new(Sampling {
-                            rows: samplers,
-                            next: None,
-                            constraint: constraint.map(|constraint| Constraining::new(Guarded::new(constraint))),
-                        }),
-                    },
-                    Some(depth) => Mode::Speculative {
-                        listener,
-                        state: Box::new(
-                            Speculating::new(depth, self.shared.capacity, prompt.len(), max_tokens as usize)
-                                .sampled(samplers),
-                        ),
-                    },
-                }
-            }
-            Speculation::Off => Mode::Greedy { listener },
-            Speculation::Artifact => {
-                let Some(drafts) = self.shared.drafts.as_ref() else {
-                    return Err(Rejected::new(
-                        AdmissionError::SpeculationUnavailable,
-                        Audience::Greedy(listener),
-                    ));
-                };
-                Mode::Speculative {
+            };
+            match speculating(route, self.shared.capacity, prompt.len(), max_tokens as usize) {
+                None => Mode::Sampled {
                     listener,
-                    state: Box::new(Speculating::new(
-                        drafts.depth,
-                        self.shared.capacity,
-                        prompt.len(),
-                        max_tokens as usize,
-                    )),
-                }
+                    state: Box::new(Sampling {
+                        rows: samplers,
+                        next: None,
+                        constraint: constraint.map(|constraint| Constraining::new(Guarded::new(constraint))),
+                    }),
+                },
+                Some(state) => Mode::Speculative {
+                    listener,
+                    state: Box::new(state.sampled(samplers)),
+                },
+            }
+        } else {
+            match speculating(route, self.shared.capacity, prompt.len(), max_tokens as usize) {
+                None => Mode::Greedy { listener },
+                Some(state) => Mode::Speculative {
+                    listener,
+                    state: Box::new(state),
+                },
             }
         };
         self.start_run(units, lease, mode, prompt, max_tokens as usize, stop_tokens, cancel)?;
@@ -1002,7 +1064,10 @@ impl Owner {
         }
         let kind = match &run.mode {
             Mode::Greedy { .. } | Mode::Sampled { .. } => None,
-            Mode::Speculative { state, .. } => state.drafting().then_some(CheckpointKind::Mtp),
+            Mode::Speculative { state, .. } => match speculative_caching(state) {
+                Caching::Skips => return,
+                Caching::Uses(kind) => kind,
+            },
             Mode::Forced { .. } => return,
         };
         let address = Arc::clone(&self.shared.address);
@@ -1820,6 +1885,8 @@ impl Owner {
         let rows = flying.rows as u64;
         let committed = match flying.role {
             Role::Verify => Ok(()),
+            // The drafter's rows are in its rings, which no cache holds.
+            Role::Context | Role::Block => Ok(()),
             Role::PromptCatchUp | Role::CatchUp | Role::Draft => match self.sequence.mtp_kv.as_mut() {
                 Some(cache) => cache.commit(rows),
                 None => return self.fail("a draft quantum retired on a sequence with no MTP cache".to_string()),
@@ -1861,7 +1928,8 @@ impl Owner {
         let Some(run) = self.run.as_mut() else { return };
         match flying.role {
             Role::Settle => return,
-            Role::PromptCatchUp => return,
+            Role::PromptCatchUp | Role::Context => return,
+            Role::Block => return self.blocked(flying),
             Role::CatchUp | Role::Draft => return self.drafted(flying),
             Role::Verify if matches!(run.mode, Mode::Forced { .. }) => return self.forced_rows_retired(flying),
             Role::Verify if run.copies_rows(Role::Verify) => return self.sample(flying),
@@ -2117,7 +2185,9 @@ impl Owner {
     fn admit(&mut self, next: Step) -> Result<(), String> {
         match next {
             Step::Prefill { .. } | Step::Decode => self.admit_row(next),
+            Step::PromptCatchUp { rows } if self.dflash2() => self.admit_prompt_context(rows),
             Step::PromptCatchUp { rows } => self.admit_prompt_catch_up(rows),
+            Step::Speculate { drafts } if self.dflash2() => self.admit_dflash2_speculation(drafts),
             Step::Speculate { drafts } => self.admit_speculation(drafts),
             Step::Settle => self.admit_settle(),
             Step::Forced { rows } => self.admit_forced_rows(rows),
@@ -2130,6 +2200,8 @@ impl Owner {
         let start = run.position;
         let speculative = matches!(run.mode, Mode::Speculative { .. });
         let drafting = matches!(&run.mode, Mode::Speculative { state, .. } if state.drafting());
+        // The DFlash2 drafter reads the tap rows every base quantum writes, not the MTP draft's seed rows.
+        let seeds = self.shared.dflash2.is_none() && drafting;
         let hidden = run.hidden.is_some();
         // A chunk that ends at a checkpoint has nothing chained behind it: it retires, and the state it leaves is captured
         // before the next chunk starts (see `PromptCheckpoints`).
@@ -2152,7 +2224,7 @@ impl Owner {
                 kind: QuantumKind::Prefill,
                 rows,
                 start,
-                source: KvSource::Base,
+                source: Some(KvSource::Base),
                 pdl: false,
                 logits: usize::from(last && run.wanted > 0),
                 replay: Vec::new(),
@@ -2170,7 +2242,7 @@ impl Owner {
                 kind: QuantumKind::Decode,
                 rows: 1,
                 start,
-                source: KvSource::Base,
+                source: Some(KvSource::Base),
                 pdl: start < OVERLAP_MAX_START_POSITION,
                 logits: 1,
                 replay: match &mut run.mode {
@@ -2206,7 +2278,7 @@ impl Owner {
                     Some(previous) => quantum.token_from(previous)?,
                     None => quantum.with_tokens(tokens)?,
                 };
-                if hidden || (drafting && matches!(next, Step::Prefill { .. })) {
+                if hidden || (seeds && matches!(next, Step::Prefill { .. })) {
                     quantum.seeding_draft()
                 } else {
                     Ok(quantum)
@@ -2231,8 +2303,8 @@ impl Owner {
         match next {
             Step::Prefill { rows, last } => {
                 run.offset += rows;
-                if let (Mode::Speculative { state, .. }, true) = (&mut run.mode, drafting && !last) {
-                    state.prefilled(rows);
+                if let (Mode::Speculative { state, .. }, true) = (&mut run.mode, drafting) {
+                    state.prefilled(rows, last)?;
                 }
             }
             _ => run.decodes += 1,
@@ -2299,8 +2371,9 @@ impl Owner {
                     self.used = false;
                 }
                 let cache = match source {
-                    KvSource::Base => &mut self.sequence.kv,
-                    KvSource::Mtp => match self.sequence.mtp_kv.as_mut() {
+                    None => return Ok(()),
+                    Some(KvSource::Base) => &mut self.sequence.kv,
+                    Some(KvSource::Mtp) => match self.sequence.mtp_kv.as_mut() {
                         Some(cache) => cache,
                         None => return Err("the sequence has no MTP cache".to_string()),
                     },
@@ -2312,12 +2385,13 @@ impl Owner {
                 Ok(())
             })
             .map_err(why("the reservation"))?;
-        let refs = self
-            .sequence
-            .refs(source)
-            .map_err(why("the sequence's references"))?
-            .ordered_after(reserved, core.lanes())
-            .with_replay_rows(replay);
+        let refs = match source {
+            Some(source) => self.sequence.refs(source),
+            None => Ok(self.sequence.refs_reading()),
+        }
+        .map_err(why("the sequence's references"))?
+        .ordered_after(reserved, core.lanes())
+        .with_replay_rows(replay);
         let taken = take.then(|| refs.clone());
         let mode = SubmitMode {
             pdl,
@@ -2664,6 +2738,64 @@ mod kill_tests {
 #[cfg(test)]
 mod routing_tests {
     use super::*;
+
+    const DEPTH: usize = 6;
+
+    #[test]
+    fn a_greedy_request_on_a_dflash2_artifact_drafts_with_the_drafter() {
+        let route = route(&Speculation::Artifact, false, false, Some(3), Some(DEPTH)).unwrap();
+        assert_eq!(route, Route::Dflash2(DEPTH));
+        let state = speculating(route, 4096, 30, 128).unwrap();
+        assert!(state.drafter().is_some());
+        assert_eq!(
+            speculative_caching(&state),
+            Caching::Skips,
+            "the drafter's context is not restored"
+        );
+    }
+
+    #[test]
+    fn a_sampled_or_constrained_request_on_a_dflash2_artifact_decodes_plainly() {
+        // `host_selects`: a sampled request, a constrained one and a hidden-row one.
+        for constrained in [false, true] {
+            let route = route(&Speculation::Artifact, true, constrained, None, Some(DEPTH)).unwrap();
+            assert_eq!(route, Route::Plain, "constrained: {constrained}");
+            assert!(speculating(route, 4096, 30, 128).is_none());
+        }
+        let greedy_constrained = route(&Speculation::Artifact, false, true, None, Some(DEPTH)).unwrap();
+        assert_eq!(greedy_constrained, Route::Plain);
+        assert_eq!(
+            route(&Speculation::Off, false, false, None, Some(DEPTH)).unwrap(),
+            Route::Plain
+        );
+    }
+
+    #[test]
+    fn an_mtp_artifact_keeps_its_drafts_for_a_sampled_request_but_not_a_constrained_one() {
+        assert_eq!(
+            route(&Speculation::Artifact, true, false, Some(3), None).unwrap(),
+            Route::Mtp(3)
+        );
+        assert_eq!(
+            route(&Speculation::Artifact, false, false, Some(3), None).unwrap(),
+            Route::Mtp(3)
+        );
+        assert_eq!(
+            route(&Speculation::Artifact, true, true, Some(3), None).unwrap(),
+            Route::Plain
+        );
+        let state = speculating(Route::Mtp(3), 4096, 30, 128).unwrap();
+        assert!(state.drafter().is_none());
+        assert_eq!(speculative_caching(&state), Caching::Uses(Some(CheckpointKind::Mtp)));
+    }
+
+    #[test]
+    fn a_request_for_drafts_an_artifact_cannot_make_is_refused() {
+        assert!(matches!(
+            route(&Speculation::Artifact, false, false, None, None),
+            Err(AdmissionError::SpeculationUnavailable)
+        ));
+    }
 
     #[test]
     fn a_forced_step_that_scores_copies_its_row_in_the_quantum() {

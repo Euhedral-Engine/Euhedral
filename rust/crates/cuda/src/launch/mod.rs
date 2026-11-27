@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod catalog;
+pub mod dflash;
 pub mod elementwise;
 pub mod embedding;
 pub mod gdn;

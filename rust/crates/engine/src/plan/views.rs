@@ -7,6 +7,9 @@ use crate::stages::QuantumKind;
 /// quantum of more rows is a catch-up (`ExecutionPlan.DECODE_MAX_ROWS`).
 pub const DECODE_MAX_ROWS: usize = 8;
 
+/// Rows of the DFlash2 drafter's block: the anchor and the mask rows.
+pub const BLOCK_ROWS: usize = 8;
+
 /// Most rows of a quantum that is captured into a CUDA graph (`Quantum.MAX_CAPTURED_ROWS`).
 pub const MAX_CAPTURED_ROWS: usize = 8;
 
@@ -25,6 +28,10 @@ pub enum View {
     Draft { rows: usize },
     /// An MTP catch-up over more than [`DECODE_MAX_ROWS`] rows, whose quantized linears take the expansion scratch.
     CatchUp { rows: usize },
+    /// The DFlash2 drafter's context update over `rows` committed rows.
+    Context { rows: usize },
+    /// The DFlash2 drafter's block: the anchor and the mask rows.
+    Block,
 }
 
 impl View {
@@ -36,6 +43,8 @@ impl View {
             QuantumKind::Verify => View::Verify { rows },
             QuantumKind::Draft if rows <= DECODE_MAX_ROWS => View::Draft { rows },
             QuantumKind::Draft => View::CatchUp { rows },
+            QuantumKind::Context => View::Context { rows },
+            QuantumKind::Block => View::Block,
         }
     }
 
@@ -44,7 +53,10 @@ impl View {
         match self {
             View::PrefillChunk => None,
             View::Decode => Some(1),
-            View::Verify { rows } | View::Draft { rows } | View::CatchUp { rows } => Some(rows),
+            View::Verify { rows } | View::Draft { rows } | View::CatchUp { rows } | View::Context { rows } => {
+                Some(rows)
+            }
+            View::Block => Some(BLOCK_ROWS),
         }
     }
 
@@ -57,6 +69,8 @@ impl View {
             View::Verify { .. } => Variant::VerifyWide,
             View::Draft { .. } => Variant::Draft,
             View::CatchUp { .. } => Variant::CatchUp,
+            View::Context { .. } => Variant::Context,
+            View::Block => Variant::Block,
         }
     }
 
@@ -64,7 +78,7 @@ impl View {
     /// verification and draft quanta of at most [`MAX_CAPTURED_ROWS`] rows.
     pub fn capturable(self) -> bool {
         match self {
-            View::PrefillChunk | View::CatchUp { .. } => false,
+            View::PrefillChunk | View::CatchUp { .. } | View::Context { .. } | View::Block => false,
             View::Decode => true,
             View::Verify { rows } | View::Draft { rows } => rows <= MAX_CAPTURED_ROWS,
         }
@@ -81,17 +95,21 @@ pub(crate) enum Variant {
     Prefill,
     Draft,
     CatchUp,
+    Context,
+    Block,
 }
 
 impl Variant {
     /// Every variant, in the order the plan stores them.
-    pub(crate) const ALL: [Variant; 6] = [
+    pub(crate) const ALL: [Variant; 8] = [
         Variant::Decode,
         Variant::Verify,
         Variant::VerifyWide,
         Variant::Prefill,
         Variant::Draft,
         Variant::CatchUp,
+        Variant::Context,
+        Variant::Block,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -111,7 +129,14 @@ impl Variant {
             Variant::CatchUp => View::CatchUp {
                 rows: DECODE_MAX_ROWS + 1,
             },
+            Variant::Context => View::Context { rows: 1 },
+            Variant::Block => View::Block,
         }
+    }
+
+    /// Whether the variant is the DFlash2 drafter's, not the base model's.
+    pub(crate) fn dflash(self) -> bool {
+        matches!(self, Variant::Context | Variant::Block)
     }
 
     /// Whether the variant is the MTP layer's (the unfused topology of `mtpDraft`), not the base model's.
@@ -122,7 +147,10 @@ impl Variant {
     /// Whether a quantized linear of a format that takes scratch only on many rows declares it: every view but the
     /// decode and MTP draft views (`Shape.scratchUse`'s `multiRow`).
     pub(crate) fn multi_row(self) -> bool {
-        !matches!(self, Variant::Decode | Variant::Verify | Variant::Draft)
+        !matches!(
+            self,
+            Variant::Decode | Variant::Verify | Variant::Draft | Variant::Context | Variant::Block
+        )
     }
 
     /// Whether the variant runs beside decode on the tensor-core routes only, which gives the value/z projection its

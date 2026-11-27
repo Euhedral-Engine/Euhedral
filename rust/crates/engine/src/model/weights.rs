@@ -43,6 +43,32 @@ pub enum MtpRole {
     FinalNorm,
 }
 
+/// The tensors of the DFlash2 drafter. The ones of its layers take the drafter's layer index as their
+/// [`LayerIndex`]; the others belong to no layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DrafterRole {
+    /// The projection of the concatenated taps to the hidden width.
+    Fc,
+    HiddenNorm,
+    FinalNorm,
+    SelectorHidden,
+    SelectorPredecessor,
+    SelectorSuccessor,
+    InputNorm,
+    PostAttentionNorm,
+    Query,
+    KeyValue,
+    Output,
+    QueryNorm,
+    KeyNorm,
+    GateUp,
+    Down,
+    AttentionConvBase,
+    AttentionConvProjection,
+    MlpConvBase,
+    MlpConvProjection,
+}
+
 /// What a tensor is for within its layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Role {
@@ -72,6 +98,7 @@ pub enum Role {
     DraftTokenIds,
     Embedding,
     Mtp(MtpRole),
+    Dflash2(DrafterRole),
 }
 
 /// The three companions of a trellis object, which stay on the device with it.
@@ -238,6 +265,9 @@ pub fn object_key(name: &str, layers: usize) -> Option<(LayerIndex, Role)> {
         "mtp/final_norm" => return Some((global, Role::Mtp(MtpRole::FinalNorm))),
         _ => {}
     }
+    if let Some(rest) = name.strip_prefix("dflash2/") {
+        return drafter_key(rest);
+    }
     let (layer, rest) = if let Some(rest) = name.strip_prefix("mtp/layer/") {
         (LayerIndex(u16::try_from(layers).ok()?), rest)
     } else {
@@ -266,6 +296,38 @@ pub fn object_key(name: &str, layers: usize) -> Option<(LayerIndex, Role)> {
         _ => return None,
     };
     Some((layer, role))
+}
+
+/// The key of the drafter object `rest` (its name after `dflash2/`) stands for.
+fn drafter_key(rest: &str) -> Option<(LayerIndex, Role)> {
+    let global = |role| Some((LayerIndex::GLOBAL, Role::Dflash2(role)));
+    match rest {
+        "fc" => return global(DrafterRole::Fc),
+        "hidden_norm" => return global(DrafterRole::HiddenNorm),
+        "final_norm" => return global(DrafterRole::FinalNorm),
+        "selector/hidden_projection" => return global(DrafterRole::SelectorHidden),
+        "selector/predecessor" => return global(DrafterRole::SelectorPredecessor),
+        "selector/successor" => return global(DrafterRole::SelectorSuccessor),
+        _ => {}
+    }
+    let (index, tail) = rest.strip_prefix("layers/")?.split_once('/')?;
+    let role = match tail {
+        "input_norm" => DrafterRole::InputNorm,
+        "post_attention_norm" => DrafterRole::PostAttentionNorm,
+        "attention/query" => DrafterRole::Query,
+        "attention/key_value" => DrafterRole::KeyValue,
+        "attention/output" => DrafterRole::Output,
+        "attention/query_norm" => DrafterRole::QueryNorm,
+        "attention/key_norm" => DrafterRole::KeyNorm,
+        "mlp/gate_up" => DrafterRole::GateUp,
+        "mlp/down" => DrafterRole::Down,
+        "attention_conv/base" => DrafterRole::AttentionConvBase,
+        "attention_conv/projection" => DrafterRole::AttentionConvProjection,
+        "mlp_conv/base" => DrafterRole::MlpConvBase,
+        "mlp_conv/projection" => DrafterRole::MlpConvProjection,
+        _ => return None,
+    };
+    Some((LayerIndex(index.parse().ok()?), Role::Dflash2(role)))
 }
 
 /// The MTP layer's packed attention projection (`query_key_gate_value`): the base layers' query and key rows followed
@@ -306,6 +368,15 @@ mod tests {
             key("mtp/input_projection"),
             Some((LayerIndex::GLOBAL, Role::Mtp(MtpRole::InputProjection)))
         );
+        assert_eq!(
+            key("dflash2/layers/4/mlp_conv/projection"),
+            Some((LayerIndex(4), Role::Dflash2(DrafterRole::MlpConvProjection)))
+        );
+        assert_eq!(
+            key("dflash2/selector/successor"),
+            Some((LayerIndex::GLOBAL, Role::Dflash2(DrafterRole::SelectorSuccessor)))
+        );
+        assert_eq!(key("dflash2/config"), None, "the configuration is read on the host");
         assert_eq!(key("text/layers/3/mlp/down.suh"), None, "companions are not objects");
         assert_eq!(key(MTP_ATTENTION_PACK), None, "the pack is split into its halves");
         assert_eq!(key("text/layers/x/mlp/down"), None);

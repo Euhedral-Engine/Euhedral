@@ -63,7 +63,7 @@ impl Owner {
             kind: QuantumKind::Verify,
             rows,
             start,
-            source: KvSource::Base,
+            source: Some(KvSource::Base),
             pdl: start < OVERLAP_MAX_START_POSITION,
             logits: rows,
             replay: Vec::new(),

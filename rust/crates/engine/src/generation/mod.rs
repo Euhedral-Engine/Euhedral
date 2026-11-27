@@ -9,6 +9,7 @@
 
 mod acceptance;
 mod constraint;
+mod dflash2;
 mod draft_length;
 mod hidden;
 mod listener;
@@ -38,8 +39,10 @@ use euhedral_memory::Claim;
 use crate::error::EngineError;
 use crate::formats::{Nvfp4Linear, Q3Linear, TrellisLinear};
 use crate::frames::{Kind, step};
+use crate::model::Speculation as ArtifactSpeculation;
 use crate::model::{LayerIndex, ModelConfig, Role, Weights};
 use crate::pass_assembler::PassStatistics;
+use crate::plan::views::BLOCK_ROWS;
 use crate::plan::{Formats, Plan, StageKind, StagingRing, View};
 use crate::prefix::{
     CacheSpec, Copier, POSITION_GRANULE, PrefixCacheHandle, PrefixCacheStats, open_prefix_cache_claimed,
@@ -173,6 +176,8 @@ pub fn markers_in_flight(plan: &Plan, sequences: usize, transfers: bool) -> usiz
         stages_of(View::Verify {
             rows: plan.verified_rows(),
         }) + stages_of(View::Draft { rows: 1 }) * plan.verified_rows()
+            + stages_of(View::Context { rows: 1 })
+            + stages_of(View::Block)
             + biggest
     } else {
         0
@@ -227,6 +232,35 @@ impl Generation {
             }),
             _ => None,
         };
+        let dflash2 = if residency.draft_depth > 0 && residency.profile.speculation == ArtifactSpeculation::Dflash2 {
+            let drafter = config
+                .dflash2
+                .as_ref()
+                .filter(|_| sequence.device.scratch.drafter().is_some())
+                .ok_or_else(|| {
+                    EngineError::Runtime("the plan drafts with DFlash2 but the sequence has no drafter state".into())
+                });
+            match drafter {
+                Ok(drafter) if drafter.sliding_window < residency.rows.rows as usize => {
+                    let why = format!(
+                        "a prompt chunk of {} rows is longer than the drafter's window of {} rows, which one context update takes whole",
+                        residency.rows.rows, drafter.sliding_window
+                    );
+                    return Err(Box::new((EngineError::Runtime(why), sequence)));
+                }
+                Ok(drafter) if drafter.block_size != BLOCK_ROWS => {
+                    let why = format!(
+                        "the drafter's block of {} rows is not the {BLOCK_ROWS} the plan runs",
+                        drafter.block_size
+                    );
+                    return Err(Box::new((EngineError::Runtime(why), sequence)));
+                }
+                Ok(_) => Some(residency.draft_depth.min(MAX_VERIFIED)),
+                Err(error) => return Err(Box::new((error, sequence))),
+            }
+        } else {
+            None
+        };
         let shared = Arc::new(Shared {
             core: Arc::clone(core),
             config: Arc::clone(config),
@@ -237,6 +271,7 @@ impl Generation {
             chunk: residency.rows.rows as usize,
             capacity,
             drafts,
+            dflash2,
             prefix,
             closing: AtomicBool::new(false),
             #[cfg(feature = "test-oracles")]

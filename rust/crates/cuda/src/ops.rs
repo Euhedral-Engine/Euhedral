@@ -371,6 +371,123 @@ pub trait KernelOps {
     fn argmax_logprob_bf16(&mut self, logits: DevicePtr, count: u32, result: DevicePtr) -> Result<(), CudaError>;
     fn selected_token(&mut self, key: DevicePtr, ids: DevicePtr, token: DevicePtr) -> Result<(), CudaError>;
 
+    /// The DFlash2 drafter's projection `output = input x weights^T` over BF16 weights.
+    fn dflash_linear_bf16(
+        &mut self,
+        input: DevicePtr,
+        weights: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        in_features: u32,
+        out_features: u32,
+    ) -> Result<(), CudaError>;
+    fn dflash_rms_norm_bf16(
+        &mut self,
+        input: DevicePtr,
+        weight: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), CudaError>;
+    /// The drafter's dynamic convolution: `part` 0 prepares, 1 finishes.
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_conv_bf16(
+        &mut self,
+        input: DevicePtr,
+        dynamic: DevicePtr,
+        base: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        width: u32,
+        group: u32,
+        taps: u32,
+        part: u32,
+    ) -> Result<(), CudaError>;
+    /// Writes the keys and values of `rows` committed rows into the drafter's ring, at the slots of the u64 position
+    /// `position` points to.
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_context_kv_bf16(
+        &mut self,
+        kv: DevicePtr,
+        key_norm: DevicePtr,
+        ring_keys: DevicePtr,
+        ring_values: DevicePtr,
+        rows: u32,
+        position: DevicePtr,
+        window: u32,
+        key_value_heads: u32,
+        head_dim: u32,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), CudaError>;
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_block_qk_bf16(
+        &mut self,
+        query: DevicePtr,
+        kv: DevicePtr,
+        query_norm: DevicePtr,
+        key_norm: DevicePtr,
+        query_out: DevicePtr,
+        key_out: DevicePtr,
+        rows: u32,
+        position: DevicePtr,
+        heads: u32,
+        key_value_heads: u32,
+        head_dim: u32,
+        epsilon: f32,
+        theta: f32,
+    ) -> Result<(), CudaError>;
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_attention_bf16(
+        &mut self,
+        query: DevicePtr,
+        block_keys: DevicePtr,
+        kv: DevicePtr,
+        ring_keys: DevicePtr,
+        ring_values: DevicePtr,
+        output: DevicePtr,
+        scratch: DevicePtr,
+        rows: u32,
+        position: DevicePtr,
+        window: u32,
+        heads: u32,
+        key_value_heads: u32,
+        head_dim: u32,
+    ) -> Result<(), CudaError>;
+    fn dflash_swiglu_bf16(
+        &mut self,
+        gate_up: DevicePtr,
+        output: DevicePtr,
+        rows: u32,
+        intermediate: u32,
+    ) -> Result<(), CudaError>;
+    /// The top 16 logits and their indices of each of `rows` rows.
+    fn dflash_topk_bf16(
+        &mut self,
+        logits: DevicePtr,
+        rows: u32,
+        vocabulary: u32,
+        values: DevicePtr,
+        indices: DevicePtr,
+        scratch: DevicePtr,
+    ) -> Result<(), CudaError>;
+    /// Chooses the drafter's tokens from the top-k and the selector.
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_select_bf16(
+        &mut self,
+        hidden: DevicePtr,
+        values: DevicePtr,
+        indices: DevicePtr,
+        predecessor: DevicePtr,
+        successor: DevicePtr,
+        anchor: DevicePtr,
+        positions: u32,
+        rank: u32,
+        tokens: DevicePtr,
+        scores: DevicePtr,
+    ) -> Result<(), CudaError>;
+
     /// Selects row-exact execution for the launches queued after this call.
     fn set_row_exact(&mut self, enabled: bool);
 
