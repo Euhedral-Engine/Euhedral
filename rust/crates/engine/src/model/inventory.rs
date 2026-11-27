@@ -191,17 +191,16 @@ fn validate_drafter(config: &ModelConfig, table: &TensorTable) -> Result<(), Pla
     }
     drafter.check_against(config)?;
     let names = drafter_names(drafter);
-    if present != names.len() {
-        if let Some(extra) = table
+    if present != names.len()
+        && let Some(extra) = table
             .entries()
             .iter()
             .find(|entry| is_drafter(entry.name()) && !names.iter().any(|name| name == entry.name()))
-        {
-            return invalid(format!(
-                "the artifact contains unknown drafter object '{}'",
-                extra.name()
-            ));
-        }
+    {
+        return invalid(format!(
+            "the artifact contains unknown drafter object '{}'",
+            extra.name()
+        ));
     }
     for name in names.iter().filter(|name| name.as_str() != CONFIG_OBJECT) {
         let Some(entry) = table.get(name) else {
@@ -315,11 +314,11 @@ fn accepts(expected: &Expected, entry: &TensorEntry) -> bool {
             entry.shape() == shape.as_slice()
         }
         Expected::DrafterProjection { shape } => {
-            let stored = match (entry.format(), entry.layout()) {
-                (WeightFormat::Bf16, WeightLayout::ContiguousLeV1) => true,
-                (WeightFormat::Nvfp4, WeightLayout::RowSplitK128V1) => true,
-                _ => false,
-            };
+            let stored = matches!(
+                (entry.format(), entry.layout()),
+                (WeightFormat::Bf16, WeightLayout::ContiguousLeV1)
+                    | (WeightFormat::Nvfp4, WeightLayout::RowSplitK128V1)
+            );
             stored && entry.dtype() == TensorDataType::Bf16 && entry.shape() == shape.as_slice()
         }
     }

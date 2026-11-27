@@ -63,8 +63,10 @@ impl Dflash2Config {
             ));
         }
         let words: Vec<i32> = bytes
-            .chunks_exact(4)
-            .map(|word| i32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| i32::from_le_bytes(*word))
             .collect();
         if words.len() < FIXED_WORDS {
             return invalid(format!(

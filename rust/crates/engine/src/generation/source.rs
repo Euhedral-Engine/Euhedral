@@ -282,6 +282,9 @@ pub(crate) struct Shared {
     pub(crate) capacity: u64,
     /// What speculation needs of the artifact; `None` for an artifact without the draft layer.
     pub(crate) drafts: Option<Drafts>,
+    /// Drafts a step of the DFlash2 drafter makes and its verification checks; `None` for an artifact without the
+    /// drafter. A request that samples or is constrained does not use it.
+    pub(crate) dflash2: Option<usize>,
     /// The prefix cache, when the plan granted it memory and it opened.
     pub(crate) prefix: Option<PrefixCacheHandle>,
     /// Set when the engine stops: no request begins after it.
@@ -322,7 +325,7 @@ pub(super) enum Step {
     Prefill { rows: usize, last: bool },
     /// One row of the sequence.
     Decode,
-    /// The MTP catch-up of the `rows` prompt rows just prefilled.
+    /// The MTP catch-up (or the DFlash2 drafter's context update) of the `rows` prompt rows just prefilled.
     PromptCatchUp { rows: usize },
     /// A speculative step of `drafts` drafts: the catch-up (which makes the first), the recursive drafts and the
     /// verification of the current token and the drafts.
@@ -495,6 +498,10 @@ pub(super) enum Role {
     PromptCatchUp,
     /// The catch-up of a step, which makes its first draft.
     CatchUp,
+    /// The DFlash2 drafter's context update, of a prompt chunk's rows or of the rows a verification committed.
+    Context,
+    /// The DFlash2 drafter's block of a step, which makes its drafts.
+    Block,
     /// A recursive draft of a step.
     Draft,
     /// The verification of a step, or of several forced rows.
@@ -638,7 +645,11 @@ impl Run {
             Step::Decode => usize::from(!self.copies_rows(Role::Decode)),
             Step::PromptCatchUp { .. } | Step::Settle | Step::Forced { .. } => 0,
             // The drafts are always selected on the device; the verification only when the host does not.
-            Step::Speculate { drafts } => drafts + usize::from(!self.copies_rows(Role::Verify)),
+            Step::Speculate { drafts } => {
+                let drafter = matches!(&self.mode, Mode::Speculative { state, .. } if state.drafter().is_some());
+                // The drafter's block selects its drafts in one quantum.
+                (if drafter { 1 } else { drafts }) + usize::from(!self.copies_rows(Role::Verify))
+            }
         }
     }
 
@@ -922,6 +933,8 @@ impl Owner {
                     // A constrained request never speculates.
                     _ if constraint.is_some() => None,
                     Speculation::Off => None,
+                    // The DFlash2 drafter drafts a greedy request's tokens only: the host selects this one's.
+                    Speculation::Artifact if self.shared.dflash2.is_some() => None,
                     Speculation::Artifact => match self.shared.drafts.as_ref() {
                         Some(drafts) => Some(drafts.depth),
                         None => {
@@ -960,6 +973,15 @@ impl Owner {
                 }
             }
             Speculation::Off => Mode::Greedy { listener },
+            Speculation::Artifact if self.shared.dflash2.is_some() => {
+                let depth = self.shared.dflash2.unwrap_or(0);
+                Mode::Speculative {
+                    listener,
+                    state: Box::new(
+                        Speculating::new(depth, self.shared.capacity, prompt.len(), max_tokens as usize).with_drafter(),
+                    ),
+                }
+            }
             Speculation::Artifact => {
                 let Some(drafts) = self.shared.drafts.as_ref() else {
                     return Err(Rejected::new(
@@ -1002,6 +1024,9 @@ impl Owner {
         }
         let kind = match &run.mode {
             Mode::Greedy { .. } | Mode::Sampled { .. } => None,
+            // The drafter's context of a restored prefix would be missing: a request that drafts with it does not use
+            // the cache.
+            Mode::Speculative { state, .. } if state.drafter().is_some() => return,
             Mode::Speculative { state, .. } => state.drafting().then_some(CheckpointKind::Mtp),
             Mode::Forced { .. } => return,
         };
@@ -1820,6 +1845,8 @@ impl Owner {
         let rows = flying.rows as u64;
         let committed = match flying.role {
             Role::Verify => Ok(()),
+            // The drafter's rows are in its rings, which no cache holds.
+            Role::Context | Role::Block => Ok(()),
             Role::PromptCatchUp | Role::CatchUp | Role::Draft => match self.sequence.mtp_kv.as_mut() {
                 Some(cache) => cache.commit(rows),
                 None => return self.fail("a draft quantum retired on a sequence with no MTP cache".to_string()),
@@ -1861,7 +1888,8 @@ impl Owner {
         let Some(run) = self.run.as_mut() else { return };
         match flying.role {
             Role::Settle => return,
-            Role::PromptCatchUp => return,
+            Role::PromptCatchUp | Role::Context => return,
+            Role::Block => return self.blocked(flying),
             Role::CatchUp | Role::Draft => return self.drafted(flying),
             Role::Verify if matches!(run.mode, Mode::Forced { .. }) => return self.forced_rows_retired(flying),
             Role::Verify if run.copies_rows(Role::Verify) => return self.sample(flying),
@@ -2117,7 +2145,9 @@ impl Owner {
     fn admit(&mut self, next: Step) -> Result<(), String> {
         match next {
             Step::Prefill { .. } | Step::Decode => self.admit_row(next),
+            Step::PromptCatchUp { rows } if self.dflash2() => self.admit_prompt_context(rows),
             Step::PromptCatchUp { rows } => self.admit_prompt_catch_up(rows),
+            Step::Speculate { drafts } if self.dflash2() => self.admit_dflash2_speculation(drafts),
             Step::Speculate { drafts } => self.admit_speculation(drafts),
             Step::Settle => self.admit_settle(),
             Step::Forced { rows } => self.admit_forced_rows(rows),
@@ -2231,8 +2261,8 @@ impl Owner {
         match next {
             Step::Prefill { rows, last } => {
                 run.offset += rows;
-                if let (Mode::Speculative { state, .. }, true) = (&mut run.mode, drafting && !last) {
-                    state.prefilled(rows);
+                if let (Mode::Speculative { state, .. }, true) = (&mut run.mode, drafting) {
+                    state.prefilled(rows, last)?;
                 }
             }
             _ => run.decodes += 1,

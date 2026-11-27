@@ -180,14 +180,14 @@ pub fn drafter_rows(nvfp4: bool) -> String {
     let words = drafter_words();
     put("dflash2/config", &[words.len()], 6, 3, 0);
     let (hidden, rank) = (drafter.hidden, drafter.selector_rank);
-    let projection = |put: &mut dyn FnMut(&str, &[usize], u32, u32, u32), name: &str, shape: &[usize]| {
-        if nvfp4 {
-            put(name, shape, 0, 7, 1);
-        } else {
-            put(name, shape, 0, 0, 0);
-        }
-    };
-    projection(&mut put, "dflash2/fc", &[hidden, drafter.tap_width()]);
+    let (projected_format, projected_layout) = if nvfp4 { (7, 1) } else { (0, 0) };
+    put(
+        "dflash2/fc",
+        &[hidden, drafter.tap_width()],
+        0,
+        projected_format,
+        projected_layout,
+    );
     put("dflash2/hidden_norm", &[hidden], 0, 0, 0);
     put("dflash2/final_norm", &[hidden], 0, 0, 0);
     put("dflash2/selector/hidden_projection", &[rank, hidden], 0, 0, 0);
@@ -197,19 +197,51 @@ pub fn drafter_rows(nvfp4: bool) -> String {
         let at = |tail: &str| format!("dflash2/layers/{layer}/{tail}");
         put(&at("input_norm"), &[hidden], 0, 0, 0);
         put(&at("post_attention_norm"), &[hidden], 0, 0, 0);
-        projection(&mut put, &at("attention/query"), &[drafter.query_width(), hidden]);
-        projection(&mut put, &at("attention/key_value"), &[2 * drafter.kv_width(), hidden]);
-        projection(&mut put, &at("attention/output"), &[hidden, drafter.query_width()]);
+        put(
+            &at("attention/query"),
+            &[drafter.query_width(), hidden],
+            0,
+            projected_format,
+            projected_layout,
+        );
+        put(
+            &at("attention/key_value"),
+            &[2 * drafter.kv_width(), hidden],
+            0,
+            projected_format,
+            projected_layout,
+        );
+        put(
+            &at("attention/output"),
+            &[hidden, drafter.query_width()],
+            0,
+            projected_format,
+            projected_layout,
+        );
         put(&at("attention/query_norm"), &[drafter.head_dim], 0, 0, 0);
         put(&at("attention/key_norm"), &[drafter.head_dim], 0, 0, 0);
-        projection(&mut put, &at("mlp/gate_up"), &[2 * drafter.intermediate, hidden]);
-        projection(&mut put, &at("mlp/down"), &[hidden, drafter.intermediate]);
+        put(
+            &at("mlp/gate_up"),
+            &[2 * drafter.intermediate, hidden],
+            0,
+            projected_format,
+            projected_layout,
+        );
+        put(
+            &at("mlp/down"),
+            &[hidden, drafter.intermediate],
+            0,
+            projected_format,
+            projected_layout,
+        );
         for conv in ["attention_conv", "mlp_conv"] {
             put(&at(&format!("{conv}/base")), &[2, drafter.conv_kernel, hidden], 0, 0, 0);
-            projection(
-                &mut put,
+            put(
                 &at(&format!("{conv}/projection")),
                 &[drafter.conv_projection_width(), hidden],
+                0,
+                projected_format,
+                projected_layout,
             );
         }
     }

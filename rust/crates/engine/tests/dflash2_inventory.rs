@@ -6,17 +6,15 @@
     reason = "a test file: a failed unwrap is the failure"
 )]
 
+use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_engine::error::PlanError;
-use euhedral_inference_engine::model::{ArtifactProfile, Speculation, drafter_names, validate_inventory};
+use euhedral_inference_engine::model::{ArtifactProfile, ModelConfig, Speculation, drafter_names, validate_inventory};
 
 mod common;
 
 use common::{dflash2_config, dflash2_table_without, drafter_rows};
 
-fn refusal(
-    table: &euhedral_inference_edrl::TensorTable,
-    config: &euhedral_inference_engine::model::ModelConfig,
-) -> String {
+fn refusal(table: &TensorTable, config: &ModelConfig) -> String {
     let error = validate_inventory(config, table).unwrap_err();
     assert!(
         matches!(error, PlanError::Inventory(_) | PlanError::Unsupported(_)),

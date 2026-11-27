@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use euhedral_inference_cuda::DevicePtr;
 
 use super::acceptance::{Accepted, accept, accept_tokens};
+use super::dflash2::{Drafter, DrafterStep};
 use super::request::{FinishReason, Verification};
 use super::sampled::SampledRows;
 use super::source::{Admission, Flying, Mode, OVERLAP_MAX_START_POSITION, Owner, Role, Run, Step};
@@ -73,6 +74,8 @@ pub(super) struct Speculating {
     rows: Option<SampledRows>,
     /// What the selections awaited are for.
     joining: Option<Joining>,
+    /// The DFlash2 drafter's progress, when it drafts and the MTP layer does not (the MTP fields stay unused).
+    drafter: Option<Drafter>,
 }
 
 /// What the host's selections of a quantum's rows decide.
@@ -123,7 +126,57 @@ impl Speculating {
             settled: false,
             rows: None,
             joining: None,
+            drafter: None,
         }
+    }
+
+    /// The state of a request that drafts with the DFlash2 drafter.
+    pub(super) fn with_drafter(mut self) -> Speculating {
+        self.drafter = Some(Drafter::default());
+        self
+    }
+
+    pub(super) fn drafter(&self) -> Option<&Drafter> {
+        self.drafter.as_ref()
+    }
+
+    pub(super) fn drafter_mut(&mut self) -> Option<&mut Drafter> {
+        self.drafter.as_mut()
+    }
+
+    /// The prompt chunk's rows were taken by the context update: nothing is left to catch up.
+    pub(super) fn prompt_chunk_taken(&mut self) {
+        self.prompt_catch_up = None;
+    }
+
+    /// The step of `drafts` drafts at `base` starts: its context update, its anchor and the rows its GDN layers replay.
+    pub(super) fn begin_drafter_step(
+        &mut self,
+        base: u64,
+        drafts: usize,
+        config: &ModelConfig,
+    ) -> Result<DrafterStep, String> {
+        let current = self.current.ok_or("a speculative step has no token to feed")?;
+        let drafter = self
+            .drafter
+            .as_mut()
+            .ok_or("a drafter step in a request without the drafter")?;
+        let context = drafter.begin_step(base, drafts)?;
+        let replay = self.take_replay(config);
+        self.drafts.clear();
+        self.admitted = Some(Instant::now());
+        self.drafted_at = None;
+        Ok(DrafterStep {
+            context,
+            current,
+            replay,
+        })
+    }
+
+    /// The block of the step in flight proposed `tokens`, retiring at `at`.
+    pub(super) fn proposed(&mut self, tokens: Vec<u32>, at: Option<Instant>) {
+        self.drafts = tokens;
+        self.drafted_at = at;
     }
 
     /// The state of a request whose tokens the host selects with `rows`.
@@ -161,9 +214,16 @@ impl Speculating {
         self.current
     }
 
-    /// The prompt chunk of `rows` rows was admitted: its catch-up is next.
-    pub(super) fn prefilled(&mut self, rows: usize) {
-        self.prompt_catch_up = Some(rows);
+    /// The prompt chunk of `rows` rows was admitted: its catch-up (or, with the DFlash2 drafter, its context update) is
+    /// next, unless it is the last, which the first step takes.
+    pub(super) fn prefilled(&mut self, rows: usize, last: bool) -> Result<(), String> {
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.tapped(rows)?;
+        }
+        if !last {
+            self.prompt_catch_up = Some(rows);
+        }
+        Ok(())
     }
 
     /// The prompt resumes from a checkpoint at `position`, whose draft cache holds the rows up to `position - 1` (and
@@ -193,7 +253,7 @@ impl Speculating {
     /// follows them, and with the first token for the last.
     pub(super) fn first_token(&mut self, token: u32, prompt: &[u32]) {
         self.current = Some(token);
-        if self.drafting {
+        if self.drafting && self.drafter.is_none() {
             let from = self.mtp_position as usize + 1;
             self.catch_up = prompt[from..].to_vec();
             self.catch_up.push(token);
@@ -500,7 +560,7 @@ impl Owner {
         }
     }
 
-    fn fail_step(&mut self, why: String) {
+    pub(super) fn fail_step(&mut self, why: String) {
         if let Some(run) = self.run.as_mut() {
             run.stop(FinishReason::Failed(why));
         }
@@ -601,13 +661,21 @@ impl Owner {
         if let Err(error) = self.sequence.kv.commit_prefix(accepted.count as u64) {
             return self.fail_step(format!("committing the verified rows: {error}"));
         }
-        match self.sequence.mtp_kv.as_mut() {
-            Some(cache) => {
-                if let Err(error) = cache.truncate(verifying.start) {
-                    return self.fail_step(format!("dropping the speculative MTP rows: {error}"));
+        match state.drafter_mut() {
+            // The drafter's rings hold the committed rows only: the accepted rows' taps are its next context update.
+            Some(drafter) => {
+                if let Err(why) = drafter.committed(verifying.start, accepted.count) {
+                    return self.fail_step(why);
                 }
             }
-            None => return self.fail_step("a verification retired on a sequence with no MTP cache".to_string()),
+            None => match self.sequence.mtp_kv.as_mut() {
+                Some(cache) => {
+                    if let Err(error) = cache.truncate(verifying.start) {
+                        return self.fail_step(format!("dropping the speculative MTP rows: {error}"));
+                    }
+                }
+                None => return self.fail_step("a verification retired on a sequence with no MTP cache".to_string()),
+            },
         }
         for token in &accepted.outputs {
             run.generated += 1;
