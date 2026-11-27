@@ -72,7 +72,7 @@ impl<'a> SequenceState<'a> {
             .checked_mul(config.gdn_value_head_dim)?
             .checked_mul(4)?;
         let convolution = config
-            .gdn_convolution_channels()
+            .gdn_convolution_channels()?
             .checked_mul(config.gdn_conv_kernel_dim - 1)?
             .checked_mul(2)?;
         config.gdn_layers().checked_mul(state.checked_add(convolution)?)
@@ -95,7 +95,7 @@ impl<'a> SequenceState<'a> {
         let config = self.config;
         let hidden = config.hidden_size;
         let stream = config.hyper_connections.checked_mul(hidden)?.checked_mul(2)?;
-        let gdn_width = config.gdn_convolution_channels().checked_add(
+        let gdn_width = config.gdn_convolution_channels()?.checked_add(
             2u64.checked_mul(config.gdn_value_heads)?
                 .checked_mul(config.gdn_value_head_dim)?,
         )?;

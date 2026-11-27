@@ -99,8 +99,11 @@ impl FlashModelConfig {
     }
 
     /// Channels the GDN convolution runs over: query, key and value.
-    pub fn gdn_convolution_channels(&self) -> u64 {
-        2 * self.gdn_key_heads * self.gdn_key_head_dim + self.gdn_value_heads * self.gdn_value_head_dim
+    pub fn gdn_convolution_channels(&self) -> Option<u64> {
+        let keys = 2u64
+            .checked_mul(self.gdn_key_heads)?
+            .checked_mul(self.gdn_key_head_dim)?;
+        keys.checked_add(self.gdn_value_heads.checked_mul(self.gdn_value_head_dim)?)
     }
 
     /// Refuses a geometry the engine's sizing and kernels do not run: the artifact reader has proved the relations of
@@ -265,7 +268,7 @@ mod tests {
         assert_eq!(config.num_layers, 2);
         assert_eq!(config.sparse_attention_layers, 1);
         assert_eq!(config.gdn_layers(), 1);
-        assert_eq!(config.gdn_convolution_channels(), 2 * 16 + 2 * 64);
+        assert_eq!(config.gdn_convolution_channels(), Some(2 * 16 + 2 * 64));
         assert_eq!((config.num_experts, config.experts_per_token), (3, 2));
     }
 
@@ -315,6 +318,16 @@ mod tests {
         assert!(matches!(
             FlashModelConfig::from_flash(&taps),
             Err(PlanError::Unsupported(why)) if why.contains("1 taps")
+        ));
+    }
+
+    #[test]
+    fn a_zero_routed_expert_width_is_refused_naming_it() {
+        let mut flash = flash_config();
+        flash.moe.intermediate_size = 0;
+        assert!(matches!(
+            FlashModelConfig::from_flash(&flash),
+            Err(PlanError::Unsupported(why)) if why.contains("0 routed")
         ));
     }
 }

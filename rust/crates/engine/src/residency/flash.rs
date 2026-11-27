@@ -18,12 +18,14 @@
 //! while a cached expert is hit only on some, so the plan never moves a fixed object to enlarge the cache.
 //!
 //! The plan keeps no replacement state and asks nothing of the device: it is arithmetic over the artifact's object
-//! sizes, the device's free bytes, the host budget and the settings `memory.gpu-reserve` (kept free beside the
-//! runtime's own reserve) and `memory.weight-streaming.*` (`concurrent-reads` sizes the pinned staging of expert
-//! records; `gpu-streams` is the device lane count the runtime opens). A budget that cannot hold the minimum cache is
-//! refused with the bytes it needed and the bytes there were. The dense model's plan ([`planner`](super::planner))
-//! reads none of these settings; the two share the host budget, the consumers the memory planner admits and the
-//! staging geometry.
+//! sizes, the device's free bytes (at most `memory.gpu-limit`), the host budget and the settings
+//! `memory.runtime-reserve` (the runtime's own reserve; `auto` is [`DEFAULT_RUNTIME_RESERVE_BYTES`]),
+//! `memory.gpu-reserve` (kept free beside it), `memory.staging-slots` (the slots of the ring staged objects pass
+//! through) and `memory.weight-streaming.*` (`concurrent-reads` sizes the pinned staging of expert records;
+//! `gpu-streams` is the device lane count the runtime opens). A budget that cannot hold the minimum cache is refused
+//! with the bytes it needed and the bytes there were. The dense model's plan ([`planner`](super::planner)) reads
+//! neither `memory.gpu-reserve` nor `memory.weight-streaming.*`; the two share the host budget, the consumers the
+//! memory planner admits and the staging geometry.
 
 pub mod selection;
 pub mod state;
@@ -40,9 +42,10 @@ use crate::residency::planner::{ARENA_ALIGNMENT, DEFAULT_STAGING_SLOTS};
 use selection::{Movable, Selection, offload_rank, read_in_place, select};
 pub use state::{PREFILL_CHUNK_TOKENS, SequenceState};
 
-/// The CUDA context, kernel modules and graph pools that exist beside the model (about 0.9 GiB measured on the dense
-/// model's engine). `memory.gpu-reserve` is kept free on top.
-pub const KERNEL_RESERVE_BYTES: u64 = 1024 << 20;
+/// What `memory.runtime-reserve: auto` means for a Flash-Next plan: the CUDA context, kernel modules and graph pools
+/// that exist beside the model (about 0.9 GiB measured on the dense model's engine), Java's `RESERVE_BYTES` for this
+/// model. An explicit `memory.runtime-reserve` replaces it; `memory.gpu-reserve` is kept free on top.
+pub const DEFAULT_RUNTIME_RESERVE_BYTES: u64 = 1024 << 20;
 
 /// The largest prefill chunk the plan makes room for.
 pub const LARGEST_PREFILL_CHUNK_TOKENS: u64 = 4096;
@@ -62,8 +65,8 @@ pub enum StorageClass {
     /// Held on the host; execution stages the object (a fixed projection) or the rows it needs (n-gram tables) to
     /// the device on use.
     HostStaged,
-    /// Read from the artifact file's own mapping, outside the pinned tier (the n-gram tables when the host cannot pin
-    /// them).
+    /// Read from the artifact file's own mapping, outside the pinned tier (the n-gram tables unless every expert
+    /// record is RAM-resident and the host can pin them too).
     FileMapped,
     /// Brought into the bounded device cache on demand and evicted when its slot is needed (routed experts).
     DeviceCached,
@@ -315,18 +318,6 @@ pub fn plan_flash(
     inputs: FlashPlanInputs,
 ) -> Result<FlashPlan, PlanError> {
     let streaming = memory.weight_streaming;
-    if streaming.concurrent_reads == 0 {
-        return Err(PlanError::Setting(
-            "memory.weight-streaming.concurrent-reads is 0: at least one read must be in flight to stage expert \
-             records"
-                .to_owned(),
-        ));
-    }
-    if streaming.gpu_streams == 0 {
-        return Err(PlanError::Setting(
-            "memory.weight-streaming.gpu-streams is 0: the runtime needs at least one device lane".to_owned(),
-        ));
-    }
     let context = inputs.max_context_tokens;
     if context == 0 {
         return Err(PlanError::Setting(
@@ -340,13 +331,20 @@ pub fn plan_flash(
         )));
     }
     config.check_supported()?;
-    let free = inputs.device_free;
+    let free = inputs
+        .device_free
+        .min(memory.gpu_limit.value().map_or(u64::MAX, |size| size.bytes()));
     let gpu_reserve = memory.gpu_reserve.bytes();
-    let runtime_reserve = KERNEL_RESERVE_BYTES.saturating_add(gpu_reserve);
+    let kernel_reserve = memory
+        .runtime_reserve
+        .value()
+        .map_or(DEFAULT_RUNTIME_RESERVE_BYTES, |size| size.bytes());
+    let runtime_reserve = kernel_reserve.saturating_add(gpu_reserve);
+    let ring_slots = memory.staging_slots.value().copied().unwrap_or(DEFAULT_STAGING_SLOTS) as usize;
     if runtime_reserve >= free {
         return Err(PlanError::FlashReserveTooLarge {
             gpu_reserve,
-            runtime_reserve: KERNEL_RESERVE_BYTES,
+            runtime_reserve: kernel_reserve,
             free,
         });
     }
@@ -417,9 +415,13 @@ pub fn plan_flash(
     let indexer = sized(sizes.indexer_bytes(context))?;
     let gdn_state = sized(sizes.gdn_state_bytes())?;
     let padding = sized(sizes.shared_down_padding_bytes())?;
-    let workspace_of = |chunk: u64| sized(sizes.workspace_bytes(chunk)).map(|bytes| bytes + padding);
-    let state = kv + indexer + gdn_state;
-    let reserved_with = |workspace: u64| runtime_reserve + workspace + state;
+    let workspace_of =
+        |chunk: u64| sized(sizes.workspace_bytes(chunk)).and_then(|bytes| sized(bytes.checked_add(padding)));
+    let state = kv
+        .checked_add(indexer)
+        .and_then(|bytes| bytes.checked_add(gdn_state))
+        .ok_or_else(|| PlanError::Unsupported("the sequence state overflows 64 bits".to_owned()))?;
+    let reserved_with = |workspace: u64| runtime_reserve.saturating_add(workspace).saturating_add(state);
 
     // The token embedding is a gather: its rows are read in place from pinned host memory.
     let pinnable = inputs.host.pinnable_bytes;
@@ -455,7 +457,7 @@ pub fn plan_flash(
     let movable_objects: Vec<Movable<'_>> = movable.iter().map(|(_, object)| *object).collect();
     let movable_bytes: u64 = movable_objects.iter().map(|object| object.bytes).sum();
     let minimum_cache = minimum.saturating_mul(slot_bytes);
-    let ring_of = |selection: &Selection| ring_geometry(selection).map_or(0, |ring| ring.bytes());
+    let ring_of = |selection: &Selection| ring_geometry(selection, ring_slots).map_or(0, |ring| ring.bytes());
     let device_need =
         |selection: &Selection| fixed_bytes - selection.staged_bytes - selection.mapped_bytes + ring_of(selection);
 
@@ -476,7 +478,7 @@ pub fn plan_flash(
             return Err(PlanError::FlashDeviceTooSmall {
                 context_tokens: context as u64,
                 free,
-                state_bytes: state + workspace_of(PREFILL_CHUNK_TOKENS)?,
+                state_bytes: state.saturating_add(workspace_of(PREFILL_CHUNK_TOKENS)?),
                 runtime_reserve,
                 fixed_stay_bytes: fixed_bytes - movable_bytes,
                 fixed_after_move_bytes: device_need(&everything),
@@ -490,7 +492,7 @@ pub fn plan_flash(
         }
         target += SELECTION_STEP;
     };
-    let staging = ring_geometry(&selection);
+    let staging = ring_geometry(&selection, ring_slots);
     let ring = staging.map_or(0, |ring| ring.bytes());
     let need = device_need(&selection);
     let resident = need - ring;
@@ -611,11 +613,11 @@ pub fn plan_flash(
     })
 }
 
-/// The ring that stages the objects `selection` moved: [`DEFAULT_STAGING_SLOTS`] slots of the largest one, aligned like
+/// The ring that stages the objects `selection` moved: `slots` (`memory.staging-slots`) slots of the largest one, aligned like
 /// a device allocation; `None` when nothing is staged.
-fn ring_geometry(selection: &Selection) -> Option<StagingGeometry> {
+fn ring_geometry(selection: &Selection, slots: usize) -> Option<StagingGeometry> {
     (selection.staged_max > 0).then(|| StagingGeometry {
-        slots: DEFAULT_STAGING_SLOTS as usize,
+        slots,
         slot_bytes: selection.staged_max.next_multiple_of(ARENA_ALIGNMENT),
     })
 }
