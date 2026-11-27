@@ -139,7 +139,7 @@ fn read_ptr(arena: &DeviceBuffer, ptr: DevicePtr, count: usize) -> Vec<f32> {
 fn hyper_mix_and_inject_match_the_host_reference() {
     let _card = common::card();
     let Some(rig) = rig() else { return };
-    let (streams, hidden, lowrank, rows) = (2usize, 64usize, 4usize, 3usize);
+    let (streams, hidden, lowrank, rows) = (2usize, 64usize, 8usize, 3usize);
     let epsilon = 1e-6f32;
     let width = streams * hidden;
     let shape = HyperShape::new(streams as u32, hidden as u32, lowrank as u32, epsilon).unwrap();
