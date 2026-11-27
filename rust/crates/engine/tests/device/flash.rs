@@ -23,17 +23,22 @@
 
 use std::sync::Arc;
 
-use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, KernelOps};
-use euhedral_inference_edrl::NgramLayout;
+use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, KernelOps, PinnedPool};
+use euhedral_inference_edrl::{NgramLayout, TensorDataType, WeightFormat, WeightLayout};
 use euhedral_inference_engine::flash::Weight;
-use euhedral_inference_engine::flash::buffers::{FlashRegions, StreamShape};
+use euhedral_inference_engine::flash::buffers::{FlashRegions, ScratchSizes, StreamShape};
 use euhedral_inference_engine::flash::embed::EmbedStreams;
 use euhedral_inference_engine::flash::hyper::{HyperShape, HyperWeights};
+use euhedral_inference_engine::flash::linear::{Expansion, Nvfp4Device, Nvfp4Weight};
 use euhedral_inference_engine::flash::ops::{
     conv_history, gdn_control, gdn_conv, gdn_gated_norm, ngram_expand, ple_conv, ple_gate,
 };
-use euhedral_inference_engine::flash::ple::{NgramRows, ShardBytes};
+use euhedral_inference_engine::flash::ple::{
+    NgramIds, NgramRows, PARTS, PleGatherStage, PleIdsStage, PleRows, ShardBytes,
+};
 use euhedral_inference_engine::flash::sequence::{Op, queue_all};
+use euhedral_inference_engine::formats::{LinearMode, Nvfp4Linear};
+use euhedral_inference_engine::model::{Residence, WeightRef};
 use linear_gpu::{Random, Rig, assert_close, bf16, bf16_value, empty, rig, upload};
 
 use crate::common;
@@ -110,9 +115,14 @@ fn embedding_repeats_each_row_into_every_stream() {
         &ids.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<u8>>(),
     );
     let shape = StreamShape::new(hidden, streams).unwrap();
-    let total = FlashRegions::bytes(rows, shape, 256, 256) as usize;
+    let sizes = ScratchSizes {
+        hyper: 256,
+        layer: 256,
+        expansion: 0,
+    };
+    let total = FlashRegions::bytes(rows, shape, sizes) as usize;
     let arena = empty(&rig.library, total);
-    let regions = FlashRegions::over(arena.ptr(), rows, shape, 256, 256).unwrap();
+    let regions = FlashRegions::over(arena.ptr(), rows, shape, sizes).unwrap();
     let state = regions.state;
     let embed = EmbedStreams::new(weight(&table_device, table.len() * 2), vocabulary, shape, regions).unwrap();
     queue(&rig, &embed.ops(ids_device.ptr(), rows).unwrap());
@@ -568,4 +578,106 @@ fn gdn_conv_control_and_gated_norm_match_the_host_reference() {
         0.05,
         "gated norm, sigmoid",
     );
+}
+
+/// The flash linear of a prefill, 40 rows over 512 values into 1024, against the format's own launch over the same
+/// weight: the stage plans the native route, and what it queues is what the format queues. Below nine rows both run
+/// the decode kernels. The weight is arbitrary bytes, so the outputs are compared bit for bit.
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn nvfp4_projections_of_a_prefill_take_the_formats_route() {
+    let _card = common::card();
+    let Some(rig) = rig() else { return };
+    let (k, n) = (512usize, 1024usize);
+    let mut random = Random::new(47);
+    // The plain layout: the codes, then one E4M3 scale per 16 values, each plane to 256 bytes, then the global scale.
+    let align = |value: usize| value.next_multiple_of(256);
+    let size = align(align(n * k / 2) + n * k / 16) + 4;
+    let mut bytes: Vec<u8> = (0..size).map(|_| random.next_u64() as u8 & 0x77).collect();
+    bytes[size - 4..].copy_from_slice(&1.0f32.to_le_bytes());
+    let weight_device = upload(&rig.library, &bytes);
+    let weight_ref = WeightRef {
+        name: "w".to_string(),
+        shape: vec![n as u64, k as u64],
+        dtype: TensorDataType::Bf16,
+        format: WeightFormat::Nvfp4,
+        layout: WeightLayout::RowSplitK128V1,
+        ptr: weight_device.ptr(),
+        bytes: bytes.len() as u64,
+        residence: Residence::Device,
+        trellis: None,
+    };
+    let device = Nvfp4Device::new(&rig.library);
+    let format = Nvfp4Linear::new(&rig.library);
+    for rows in [3usize, 9, 40, 70] {
+        let x = on_device(&rig, &gaussians(&mut random, rows * k, 1.0));
+        let wanted = rig.linear(
+            &format,
+            &weight_ref,
+            &x,
+            0,
+            k,
+            n,
+            rows,
+            LinearMode {
+                row_exact: false,
+                prefill: true,
+            },
+        );
+        let expansion_bytes = device.expansion_bytes(rows as u32, k as u32, n as u32);
+        let expansion = empty(&rig.library, expansion_bytes as usize);
+        let y = empty(&rig.library, rows * n * 2);
+        let op = device
+            .linear(
+                x.ptr(),
+                Nvfp4Weight {
+                    weight: weight(&weight_device, bytes.len()),
+                    sd4: false,
+                },
+                y.ptr(),
+                rows as u32,
+                k as u32,
+                n as u32,
+                Expansion {
+                    address: expansion.ptr(),
+                    bytes: expansion_bytes,
+                },
+            )
+            .unwrap();
+        queue(&rig, &[op]);
+        let mut host = vec![0u8; rows * n * 2];
+        y.copy_to_host(0, &mut host).unwrap();
+        let actual: Vec<u16> = host
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        assert_eq!(actual, wanted, "{rows} rows");
+        assert_eq!(
+            expansion_bytes > 0,
+            rows >= 9 && rig.library.nvfp4_native_available(),
+            "{rows} rows"
+        );
+    }
+}
+
+/// The gather stage refuses a part past the eight, a run before the ids, and a part published twice.
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn ple_gather_refuses_a_missing_part_a_run_before_the_ids_and_a_second_publication() {
+    let _card = common::card();
+    let Some(rig) = rig() else { return };
+    let layout = NgramLayout::new(16, 32).unwrap();
+    let shard: Arc<dyn ShardBytes> = Arc::new(vec![0u8; layout.byte_size() as usize]);
+    let table = Arc::new(NgramRows::new(vec![shard], 16, 16, 32).unwrap());
+    let ids = Arc::new(NgramIds::new(2, 1, &[3, 5], &[10], &[0], -1).unwrap());
+    let pool = PinnedPool::new(&rig.library, 1 << 20);
+    assert!(PleGatherStage::new(PARTS, Arc::clone(&table), Arc::clone(&pool)).is_err());
+    let stage = PleGatherStage::new(0, table, pool).unwrap();
+    let rows = PleRows::new(ids.fresh_context());
+    assert!(stage.gather(&rows).is_err(), "before the ids");
+    PleIdsStage::new(ids).hash(&rows, &[1; 12], 12).unwrap();
+    stage.gather(&rows).unwrap();
+    assert!(stage.gather(&rows).is_err(), "the part was published already");
 }

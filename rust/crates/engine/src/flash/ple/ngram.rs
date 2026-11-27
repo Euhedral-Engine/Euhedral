@@ -291,7 +291,10 @@ impl NgramRows {
             let shard = (row / self.shard_rows) as usize;
             let local = row % self.shard_rows;
             // The layout of the shard knows every row of it: the shard of this row was checked at construction.
-            let at = self.layouts[shard].row_offset(local).unwrap_or(0) as usize;
+            let at = self.layouts[shard]
+                .row_offset(local)
+                .ok_or_else(|| FlashError::refused(OP, format!("row {row} is not in shard {shard}")))?
+                as usize;
             let bytes: &[u8] = self.shards[shard].as_ref().as_ref();
             slot[..row_bytes].copy_from_slice(&bytes[at..at + row_bytes]);
             slot[row_bytes..record - 4].fill(0);

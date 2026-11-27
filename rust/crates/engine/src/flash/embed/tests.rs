@@ -7,8 +7,14 @@ fn at(address: u64) -> DevicePtr {
 }
 
 fn stage(table_bytes: u64) -> Result<EmbedStreams, FlashError> {
+    stage_over(table_bytes, 4)
+}
+
+/// The stage over regions of `streams` streams, for a four-stream shape.
+fn stage_over(table_bytes: u64, streams: u32) -> Result<EmbedStreams, FlashError> {
     let shape = StreamShape::new(64, 4).unwrap();
-    let regions = FlashRegions::over(at(0x1000000), 8, shape, 0, 0).unwrap();
+    let held = StreamShape::new(64, streams).unwrap();
+    let regions = FlashRegions::over(at(0x1000000), 8, held, ScratchSizes::default()).unwrap();
     let table = Weight {
         address: at(0x100000),
         bytes: table_bytes,
@@ -41,4 +47,10 @@ fn the_lookup_feeds_the_repeat_into_the_streams() {
 fn a_table_of_the_wrong_size_is_refused_with_its_size() {
     let error = stage(1000).unwrap_err().to_string();
     assert!(error.contains("1000"), "{error}");
+}
+
+#[test]
+fn regions_of_another_stream_count_are_refused() {
+    assert!(stage_over(32 * 64 * 2, 4).is_ok());
+    assert!(stage_over(32 * 64 * 2, 2).is_err());
 }

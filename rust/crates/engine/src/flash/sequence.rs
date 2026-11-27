@@ -7,6 +7,8 @@
 use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps, PinnedBuffer};
 use smallvec::SmallVec;
 
+use super::linear::Expansion;
+use crate::formats::nvfp4::ROUTE_UNAVAILABLE;
 use crate::formats::shapes::Launch;
 
 /// One device operation.
@@ -27,6 +29,8 @@ pub enum Op<'a> {
         in_features: u32,
         out_features: u32,
         weights_bytes: u64,
+        /// The expansion scratch when the launch takes the native route, which quantizes the activations into it.
+        native: Option<Expansion>,
     },
     /// The gated delta rule over the convolved rows (`ExecutionGpu.gdnRecurrenceBf16`).
     GdnRecurrence {
@@ -78,7 +82,32 @@ impl Op<'_> {
                 in_features,
                 out_features,
                 weights_bytes,
-            } => kernels.linear_nvfp4_bf16(input, weights, output, rows, in_features, out_features, weights_bytes),
+                native,
+            } => {
+                // A lane that runs verifications takes no native route, whatever the stage settled.
+                if let Some(scratch) = native.filter(|_| !kernels.row_exact()) {
+                    let queued = kernels.linear_nvfp4_native_bf16(
+                        input,
+                        weights,
+                        output,
+                        scratch.address,
+                        rows,
+                        in_features,
+                        out_features,
+                        weights_bytes,
+                        scratch.bytes,
+                    );
+                    match queued {
+                        // The native route declines under exact numerics and for shapes it has no kernel for.
+                        Err(CudaError::Call {
+                            status: ROUTE_UNAVAILABLE,
+                            ..
+                        }) => {}
+                        other => return other,
+                    }
+                }
+                kernels.linear_nvfp4_bf16(input, weights, output, rows, in_features, out_features, weights_bytes)
+            }
             Op::GdnRecurrence {
                 convolved,
                 alpha,
@@ -137,11 +166,13 @@ impl Op<'_> {
                 in_features,
                 out_features,
                 weights_bytes,
+                native,
             } => format!(
-                "nvfp4_linear {},{},{},i{rows},i{in_features},i{out_features},i{weights_bytes}",
+                "nvfp4_linear {},{},{},i{rows},i{in_features},i{out_features},i{weights_bytes}{}",
                 address(input),
                 address(weights),
-                address(output)
+                address(output),
+                native.map_or_else(String::new, |scratch| format!(",native {}", address(scratch.address)))
             ),
             Op::GdnRecurrence {
                 convolved,

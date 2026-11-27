@@ -10,6 +10,7 @@
 use euhedral_inference_cuda::DevicePtr;
 
 use super::FlashError;
+use super::linear::Expansion;
 
 /// The start of every region and scratch buffer.
 pub const ALIGNMENT: u64 = 256;
@@ -80,10 +81,23 @@ impl StreamShape {
     }
 }
 
+/// The sizes of the three scratch regions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScratchSizes {
+    /// The scratch of a hyper-connection mix.
+    pub hyper: u64,
+    /// The scratch of the one block in flight (as large as the largest block's).
+    pub layer: u64,
+    /// The expansion scratch of the NVFP4 linears' native route (as large as the largest linear's).
+    pub expansion: u64,
+}
+
 /// The regions of one session's rows, each addressed for up to [`FlashRegions::capacity_rows`] rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlashRegions {
     capacity_rows: u32,
+    shape: StreamShape,
+    sizes: ScratchSizes,
     /// The residual streams: `[rows, streams, hidden]`.
     pub state: DevicePtr,
     /// The output of the PLE, added into `state`: `[rows, streams, hidden]`.
@@ -95,23 +109,16 @@ pub struct FlashRegions {
     pub block_output: DevicePtr,
     /// The last row after the final mixer, which the output head reads: `[hidden]`.
     pub final_mixed: DevicePtr,
-    /// The scratch of the mixes, and the scratch of the one block in flight (as large as the largest block's).
+    /// The scratch of the mixes, the scratch of the block in flight, and the NVFP4 expansion scratch.
     pub hyper_scratch: DevicePtr,
     pub layer_scratch: DevicePtr,
+    pub expansion: DevicePtr,
 }
 
 impl FlashRegions {
-    /// The bytes of the regions for `capacity_rows` rows, with `hyper_scratch_bytes` for the mixes and
-    /// `layer_scratch_bytes` for a block.
-    pub fn bytes(capacity_rows: u32, shape: StreamShape, hyper_scratch_bytes: u64, layer_scratch_bytes: u64) -> u64 {
-        Self::carve(
-            DevicePtr::NULL,
-            capacity_rows,
-            shape,
-            hyper_scratch_bytes,
-            layer_scratch_bytes,
-        )
-        .1
+    /// The bytes of the regions for `capacity_rows` rows with the scratch of `sizes`.
+    pub fn bytes(capacity_rows: u32, shape: StreamShape, sizes: ScratchSizes) -> u64 {
+        Self::carve(DevicePtr::NULL, capacity_rows, shape, sizes).1
     }
 
     /// The regions laid out over `base`, which holds [`FlashRegions::bytes`] bytes.
@@ -119,8 +126,7 @@ impl FlashRegions {
         base: DevicePtr,
         capacity_rows: u32,
         shape: StreamShape,
-        hyper_scratch_bytes: u64,
-        layer_scratch_bytes: u64,
+        sizes: ScratchSizes,
     ) -> Result<Self, FlashError> {
         if capacity_rows == 0 || base.is_null() || !base.get().is_multiple_of(ALIGNMENT) {
             return Err(FlashError::refused(
@@ -131,37 +137,87 @@ impl FlashRegions {
                 ),
             ));
         }
-        Ok(Self::carve(base, capacity_rows, shape, hyper_scratch_bytes, layer_scratch_bytes).0)
+        Ok(Self::carve(base, capacity_rows, shape, sizes).0)
     }
 
-    fn carve(
-        base: DevicePtr,
-        capacity_rows: u32,
-        shape: StreamShape,
-        hyper_scratch_bytes: u64,
-        layer_scratch_bytes: u64,
-    ) -> (Self, u64) {
+    fn carve(base: DevicePtr, capacity_rows: u32, shape: StreamShape, sizes: ScratchSizes) -> (Self, u64) {
         let rows = u64::from(capacity_rows);
         let streams = rows * u64::from(shape.state_width()) * BF16;
         let single = rows * u64::from(shape.hidden) * BF16;
         let mut carver = Carver::new(base);
         let regions = Self {
             capacity_rows,
+            shape,
+            sizes,
             state: carver.take(streams),
             ple_output: carver.take(streams),
             embedded: carver.take(single),
             mixed: carver.take(single),
             block_output: carver.take(single),
             final_mixed: carver.take(u64::from(shape.hidden) * BF16),
-            hyper_scratch: carver.take(hyper_scratch_bytes),
-            layer_scratch: carver.take(layer_scratch_bytes),
+            hyper_scratch: carver.take(sizes.hyper),
+            layer_scratch: carver.take(sizes.layer),
+            expansion: carver.take(sizes.expansion),
         };
         (regions, carver.bytes())
+    }
+
+    /// The expansion scratch region with its size.
+    pub fn expansion_scratch(&self) -> Expansion {
+        Expansion {
+            address: self.expansion,
+            bytes: self.sizes.expansion,
+        }
     }
 
     /// The rows the regions are sized for.
     pub fn capacity_rows(&self) -> u32 {
         self.capacity_rows
+    }
+
+    /// The stream shape the regions are laid out for.
+    pub fn shape(&self) -> StreamShape {
+        self.shape
+    }
+
+    /// The sizes of the scratch regions.
+    pub fn sizes(&self) -> ScratchSizes {
+        self.sizes
+    }
+
+    /// Refuses regions of another stream shape than `shape`, or with less scratch than `needed` (what the stage of
+    /// `stage` takes at the capacity rows).
+    pub(crate) fn require(
+        &self,
+        stage: &'static str,
+        shape: StreamShape,
+        needed: ScratchSizes,
+    ) -> Result<(), FlashError> {
+        if self.shape != shape {
+            return Err(FlashError::refused(
+                stage,
+                format!(
+                    "the regions hold {} streams of {} values, the stage {} of {}",
+                    self.shape.streams, self.shape.hidden, shape.streams, shape.hidden
+                ),
+            ));
+        }
+        for (name, held, wanted) in [
+            ("hyper scratch", self.sizes.hyper, needed.hyper),
+            ("layer scratch", self.sizes.layer, needed.layer),
+            ("expansion scratch", self.sizes.expansion, needed.expansion),
+        ] {
+            if held < wanted {
+                return Err(FlashError::refused(
+                    stage,
+                    format!(
+                        "the regions hold {held} bytes of {name}, {wanted} are needed for {} rows",
+                        self.capacity_rows
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -187,8 +243,13 @@ mod tests {
     #[test]
     fn regions_are_disjoint_aligned_and_end_inside_the_size() {
         let shape = StreamShape::new(24, 4).unwrap();
-        let total = FlashRegions::bytes(5, shape, 1000, 3000);
-        let regions = FlashRegions::over(at(0x10000), 5, shape, 1000, 3000).unwrap();
+        let sizes = ScratchSizes {
+            hyper: 1000,
+            layer: 3000,
+            expansion: 500,
+        };
+        let total = FlashRegions::bytes(5, shape, sizes);
+        let regions = FlashRegions::over(at(0x10000), 5, shape, sizes).unwrap();
         let spans = [
             (regions.state, 5 * 96 * 2),
             (regions.ple_output, 5 * 96 * 2),
@@ -198,6 +259,7 @@ mod tests {
             (regions.final_mixed, 24 * 2),
             (regions.hyper_scratch, 1000),
             (regions.layer_scratch, 3000),
+            (regions.expansion, 500),
         ];
         let mut end = 0x10000;
         for (start, bytes) in spans {
@@ -220,12 +282,46 @@ mod tests {
         assert!(StreamShape::new(24, 0).is_err());
         let shape = StreamShape::new(24, 4).unwrap();
         assert!(
-            FlashRegions::over(at(0x10008), 5, shape, 0, 0)
+            FlashRegions::over(at(0x10008), 5, shape, ScratchSizes::default())
                 .unwrap_err()
                 .to_string()
                 .contains("0x10008")
         );
-        assert!(FlashRegions::over(DevicePtr::NULL, 5, shape, 0, 0).is_err());
-        assert!(FlashRegions::over(at(0x10000), 0, shape, 0, 0).is_err());
+        assert!(FlashRegions::over(DevicePtr::NULL, 5, shape, ScratchSizes::default()).is_err());
+        assert!(FlashRegions::over(at(0x10000), 0, shape, ScratchSizes::default()).is_err());
+    }
+
+    #[test]
+    fn regions_of_another_shape_or_too_little_scratch_are_refused_with_the_sizes() {
+        let shape = StreamShape::new(24, 4).unwrap();
+        let sizes = ScratchSizes {
+            hyper: 100,
+            layer: 200,
+            expansion: 300,
+        };
+        let regions = FlashRegions::over(at(0x10000), 5, shape, sizes).unwrap();
+        regions.require("stage", shape, sizes).unwrap();
+        let other = StreamShape::new(24, 2).unwrap();
+        assert!(
+            regions
+                .require("stage", other, sizes)
+                .unwrap_err()
+                .to_string()
+                .contains("4 streams of 24")
+        );
+        for (field, error) in [
+            (ScratchSizes { hyper: 101, ..sizes }, "100 bytes of hyper scratch, 101"),
+            (ScratchSizes { layer: 201, ..sizes }, "200 bytes of layer scratch, 201"),
+            (
+                ScratchSizes {
+                    expansion: 301,
+                    ..sizes
+                },
+                "300 bytes of expansion scratch, 301",
+            ),
+        ] {
+            let message = regions.require("stage", shape, field).unwrap_err().to_string();
+            assert!(message.contains(error), "{message}");
+        }
     }
 }

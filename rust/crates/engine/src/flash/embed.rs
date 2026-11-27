@@ -4,7 +4,7 @@
 use euhedral_graph::StageError;
 use euhedral_inference_cuda::{DevicePtr, KernelOps};
 
-use super::buffers::{FlashRegions, StreamShape};
+use super::buffers::{FlashRegions, ScratchSizes, StreamShape};
 use super::sequence::{Op, OpList, queue_all};
 use super::{FlashError, Weight, ops};
 use crate::stages::{Launch, Quantum, fatal};
@@ -20,7 +20,8 @@ pub struct EmbedStreams {
 }
 
 impl EmbedStreams {
-    /// The lookup in `table` (`[vocabulary, hidden]` BF16) into the streams of `regions`.
+    /// The lookup in `table` (`[vocabulary, hidden]` BF16) into the streams of `regions`. Refuses regions of another
+    /// stream shape.
     pub fn new(table: Weight, vocabulary: u32, shape: StreamShape, regions: FlashRegions) -> Result<Self, FlashError> {
         let bytes = u64::from(vocabulary) * u64::from(shape.hidden) * 2;
         if vocabulary == 0 || table.bytes != bytes {
@@ -32,6 +33,7 @@ impl EmbedStreams {
                 ),
             ));
         }
+        regions.require("embed", shape, ScratchSizes::default())?;
         Ok(Self {
             table,
             vocabulary,

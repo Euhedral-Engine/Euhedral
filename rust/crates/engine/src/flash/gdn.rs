@@ -10,6 +10,7 @@ use euhedral_inference_edrl::GdnConfig;
 
 use super::block::{BlockBody, BlockCall};
 use super::buffers::{Carver, bf16_bytes, f32_bytes};
+use super::linear::{Nvfp4Device, Nvfp4Weight};
 use super::ops;
 use super::sequence::{Op, OpList};
 use super::{FlashError, Weight};
@@ -144,15 +145,15 @@ struct GdnScratch {
 /// The weights of one GDN layer: the NVFP4 projections and the BF16 gate projections, convolution and norm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GdnWeights {
-    pub qkv: Weight,
-    pub z: Weight,
+    pub qkv: Nvfp4Weight,
+    pub z: Nvfp4Weight,
     pub a: Weight,
     pub b: Weight,
     pub conv: Weight,
     pub a_log: Weight,
     pub dt_bias: Weight,
     pub norm: Weight,
-    pub out: Weight,
+    pub out: Nvfp4Weight,
 }
 
 /// A sequence's GDN state: the last `taps - 1` qkv rows and the recurrent matrices.
@@ -168,33 +169,55 @@ pub struct GdnBody {
     shape: GdnShape,
     weights: GdnWeights,
     state: GdnState,
+    device: Nvfp4Device,
 }
 
 impl GdnBody {
-    pub fn new(shape: GdnShape, weights: GdnWeights, state: GdnState) -> Self {
-        Self { shape, weights, state }
+    pub fn new(shape: GdnShape, weights: GdnWeights, state: GdnState, device: Nvfp4Device) -> Self {
+        Self {
+            shape,
+            weights,
+            state,
+            device,
+        }
+    }
+
+    /// The linears of the layer as `(in_features, out_features)`.
+    fn linear_shapes(&self) -> [(u32, u32); 3] {
+        let shape = &self.shape;
+        [
+            (shape.hidden, shape.channels()),
+            (shape.hidden, shape.value_width()),
+            (shape.value_width(), shape.hidden),
+        ]
     }
 }
 
 impl BlockBody for GdnBody {
+    fn scratch_bytes(&self, rows: u32) -> u64 {
+        self.shape.scratch_bytes(rows)
+    }
+
+    fn expansion_bytes(&self, rows: u32) -> u64 {
+        self.linear_shapes()
+            .iter()
+            .map(|(k, n)| self.device.expansion_bytes(rows, *k, *n))
+            .max()
+            .unwrap_or(0)
+    }
+
     fn ops(&self, call: &BlockCall) -> Result<OpList<'static>, FlashError> {
         let shape = &self.shape;
         let weights = &self.weights;
         let (rows, exact) = (call.rows, call.exact);
         let scratch = shape.carve(&mut Carver::new(call.scratch), rows);
         let (channels, value_width, heads) = (shape.channels(), shape.value_width(), shape.value_heads);
-        let linear = |input, weight: Weight, output, k, n| Op::Nvfp4Linear {
-            input,
-            weights: weight.address,
-            output,
-            rows,
-            in_features: k,
-            out_features: n,
-            weights_bytes: weight.bytes,
+        let linear = |input, weight: Nvfp4Weight, output, k, n| {
+            self.device.linear(input, weight, output, rows, k, n, call.expansion)
         };
         let mut list = OpList::new();
-        list.push(linear(call.input, weights.qkv, scratch.qkv, shape.hidden, channels));
-        list.push(linear(call.input, weights.z, scratch.z, shape.hidden, value_width));
+        list.push(linear(call.input, weights.qkv, scratch.qkv, shape.hidden, channels)?);
+        list.push(linear(call.input, weights.z, scratch.z, shape.hidden, value_width)?);
         list.push(Op::Launch(ops::linear_bf16(
             call.input,
             weights.a.address,
@@ -269,7 +292,7 @@ impl BlockBody for GdnBody {
             call.output,
             value_width,
             shape.hidden,
-        ));
+        )?);
         Ok(list)
     }
 }

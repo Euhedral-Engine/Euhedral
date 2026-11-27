@@ -20,7 +20,8 @@ use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::{DevicePtr, KernelOps, PinnedPool, PooledPinned};
 
 pub use self::ngram::{NgramIds, NgramRows, PARTS, PartSlots, PublishError, ShardBytes, part_count, part_range};
-use super::buffers::{Carver, FlashRegions, bf16_bytes};
+use super::buffers::{Carver, FlashRegions, ScratchSizes, StreamShape, bf16_bytes};
+use super::linear::{Nvfp4Device, Nvfp4Weight};
 use super::sequence::{Op, OpList, queue_all};
 use super::{FlashError, Weight, ops};
 use crate::stages::{Launch, Quantum, fatal};
@@ -78,6 +79,21 @@ impl PleIdsStage {
     pub fn new(ids: Arc<NgramIds>) -> Self {
         Self { ids }
     }
+
+    /// Hashes `tokens`, the tokens of a quantum of `quantum_rows` rows, into `rows`. Refuses a token count that is not
+    /// the rows and ids that were computed already.
+    pub fn hash(&self, rows: &PleRows, tokens: &[u32], quantum_rows: usize) -> Result<(), StageError> {
+        if tokens.len() != quantum_rows {
+            return Err(fatal(format!(
+                "a quantum of {quantum_rows} rows holds {} tokens",
+                tokens.len()
+            )));
+        }
+        let (ids, next_context) = self.ids.compute(&rows.context, tokens).map_err(fatal)?;
+        rows.hashed
+            .set(Hashed { ids, next_context })
+            .map_err(|_| fatal("the n-gram ids of the quantum were computed twice"))
+    }
 }
 
 /// The hand-over of `quantum`, or the failure of a quantum built without one.
@@ -90,18 +106,7 @@ fn rows_of(quantum: &Quantum) -> Result<&Arc<PleRows>, StageError> {
 
 impl Stage<Quantum> for PleIdsStage {
     fn run(&self, quantum: &Quantum, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let rows = rows_of(quantum)?;
-        if quantum.tokens.len() != quantum.rows {
-            return Err(fatal(format!(
-                "a quantum of {} rows holds {} tokens",
-                quantum.rows,
-                quantum.tokens.len()
-            )));
-        }
-        let (ids, next_context) = self.ids.compute(&rows.context, &quantum.tokens).map_err(fatal)?;
-        rows.hashed
-            .set(Hashed { ids, next_context })
-            .map_err(|_| fatal("the n-gram ids of the quantum were computed twice"))?;
+        self.hash(rows_of(quantum)?, &quantum.tokens, quantum.rows)?;
         Ok(Submitted::done())
     }
 }
@@ -126,13 +131,21 @@ impl PleGatherStage {
 
 impl Stage<Quantum> for PleGatherStage {
     fn run(&self, quantum: &Quantum, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let rows = rows_of(quantum)?;
+        self.gather(rows_of(quantum)?)?;
+        Ok(Submitted::done())
+    }
+}
+
+impl PleGatherStage {
+    /// Reads this part's records of `rows`' ids and publishes them. Refuses a run before the ids and a part published
+    /// twice.
+    pub fn gather(&self, rows: &PleRows) -> Result<(), StageError> {
         let ids = rows
             .ids()
             .ok_or_else(|| fatal(format!("part {} ran before the n-gram ids", self.part)))?;
         let range = part_range(ids.len(), self.part);
         if range.is_empty() {
-            return Ok(Submitted::done());
+            return Ok(());
         }
         let bytes = range.len() * self.table.record_bytes() as usize;
         let mut loan = self.pool.acquire(bytes).map_err(fatal)?;
@@ -141,8 +154,7 @@ impl Stage<Quantum> for PleGatherStage {
             .map_err(fatal)?;
         rows.parts
             .publish(self.part, GatheredPart { loan })
-            .map_err(|(why, _)| fatal(format!("part {} of the gather: {why:?}", self.part)))?;
-        Ok(Submitted::done())
+            .map_err(|(why, _)| fatal(format!("part {} of the gather: {why:?}", self.part)))
     }
 }
 
@@ -160,20 +172,24 @@ pub struct PleShape {
 }
 
 impl PleShape {
-    /// The embedding of `heads` rows of `row_width` values per token, convolved over `taps` rows at `dilation`.
-    /// Refuses a width that is not the heads' rows concatenated.
+    /// The embedding of the rows `ids` addresses in `table`, convolved over `taps` rows at `dilation`. The heads, the
+    /// row width and the record size are those of the id function and the store, so the two cannot disagree (Java's
+    /// constructor refuses "the id function and the store disagree"). Refuses a width that is not the heads' rows
+    /// concatenated.
     #[allow(clippy::too_many_arguments, reason = "the sizes Java's constructor takes")]
     pub fn new(
         hidden: u32,
         streams: u32,
         embed_dim: u32,
-        heads: u32,
-        row_width: u32,
-        record_bytes: u32,
+        ids: &NgramIds,
+        table: &NgramRows,
         taps: u32,
         dilation: u32,
         epsilon: f32,
     ) -> Result<Self, FlashError> {
+        let heads =
+            u32::try_from(ids.heads()).map_err(|_| FlashError::refused("ple", format!("{} heads", ids.heads())))?;
+        let (row_width, record_bytes) = (table.row_width(), table.record_bytes());
         const OP: &str = "ple";
         if u64::from(heads) * u64::from(row_width) != u64::from(embed_dim) || heads == 0 {
             return Err(FlashError::refused(
@@ -184,18 +200,16 @@ impl PleShape {
         let state_ok = hidden > 0 && streams > 0 && u64::from(hidden) * u64::from(streams) <= u64::from(u32::MAX);
         let history = u64::from(taps.saturating_sub(1)) * u64::from(dilation);
         if !state_ok
-            || taps == 0
+            || taps < 2
             || dilation == 0
             || history > 32
             || !row_width.is_multiple_of(16)
-            || !record_bytes.is_multiple_of(4)
-            || u64::from(record_bytes) < u64::from(row_width / 2 + row_width / 16 + 4)
             || !epsilon.is_finite()
         {
             return Err(FlashError::refused(
                 OP,
                 format!(
-                    "hidden {hidden}, streams {streams}, taps {taps}, dilation {dilation} (history {history} of at most 32), record {record_bytes} for rows of {row_width} (a multiple of 16, the codes, scales and global in a multiple of 4 bytes), epsilon {epsilon}"
+                    "hidden {hidden}, streams {streams}, taps {taps}, dilation {dilation} (history {history} of at most 32), rows of {row_width} (a multiple of 16), epsilon {epsilon}"
                 ),
             ));
         }
@@ -261,8 +275,8 @@ struct PleScratch {
 /// The weights of the embedding: the NVFP4 key and value projections, and the BF16 norms and convolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PleWeights {
-    pub key_proj: Weight,
-    pub value_proj: Weight,
+    pub key_proj: Nvfp4Weight,
+    pub value_proj: Nvfp4Weight,
     pub norm_key: Weight,
     pub norm_query: Weight,
     pub norm_conv: Weight,
@@ -277,34 +291,56 @@ pub struct PleApply {
     /// The sequence's convolution history (`(taps - 1) * dilation` rows of the state width).
     history: DevicePtr,
     regions: FlashRegions,
+    device: Nvfp4Device,
 }
 
 impl PleApply {
-    pub fn new(shape: PleShape, weights: PleWeights, history: DevicePtr, regions: FlashRegions) -> Self {
-        Self {
+    /// Refuses regions of another stream shape or with less scratch than the embedding takes for their rows.
+    pub fn new(
+        shape: PleShape,
+        weights: PleWeights,
+        history: DevicePtr,
+        regions: FlashRegions,
+        device: Nvfp4Device,
+    ) -> Result<Self, FlashError> {
+        let rows = regions.capacity_rows();
+        regions.require(
+            "ple",
+            StreamShape::new(shape.hidden, shape.streams)?,
+            ScratchSizes {
+                layer: shape.scratch_bytes(rows),
+                expansion: Self::expansion_bytes(&shape, &device, rows),
+                ..ScratchSizes::default()
+            },
+        )?;
+        Ok(Self {
             shape,
             weights,
             history,
             regions,
-        }
+            device,
+        })
+    }
+
+    /// The expansion scratch the two projections take for `rows` rows.
+    fn expansion_bytes(shape: &PleShape, device: &Nvfp4Device, rows: u32) -> u64 {
+        let embed_dim = shape.embed_dim();
+        device
+            .expansion_bytes(rows, embed_dim, shape.state_width())
+            .max(device.expansion_bytes(rows, embed_dim, shape.hidden))
     }
 
     /// The operations after the records are on the device, in Java's order, ending with the add into the streams.
-    pub fn ops(&self, rows: u32, exact: bool) -> Result<OpList<'static>, FlashError> {
-        let _ = exact;
+    pub fn ops(&self, rows: u32) -> Result<OpList<'static>, FlashError> {
         let shape = &self.shape;
         let weights = &self.weights;
         let scratch = shape.carve(&mut Carver::new(self.regions.layer_scratch), rows);
         let width = shape.state_width();
         let streams = self.regions.state;
-        let linear = |weight: Weight, output, n| Op::Nvfp4Linear {
-            input: scratch.embedding,
-            weights: weight.address,
-            output,
-            rows,
-            in_features: shape.embed_dim(),
-            out_features: n,
-            weights_bytes: weight.bytes,
+        let expansion = self.regions.expansion_scratch();
+        let linear = |weight: Nvfp4Weight, output, n| {
+            self.device
+                .linear(scratch.embedding, weight, output, rows, shape.embed_dim(), n, expansion)
         };
         let mut list = OpList::new();
         list.push(Op::Launch(ops::ngram_expand(
@@ -314,7 +350,7 @@ impl PleApply {
             shape.row_width,
             shape.record_bytes,
         )?));
-        list.push(linear(weights.key_proj, scratch.key, width));
+        list.push(linear(weights.key_proj, scratch.key, width)?);
         list.push(Op::Launch(ops::grouped_rms_norm(
             scratch.key,
             weights.norm_key.address,
@@ -324,7 +360,7 @@ impl PleApply {
             shape.hidden,
             shape.epsilon,
         )?));
-        list.push(linear(weights.value_proj, scratch.value, shape.hidden));
+        list.push(linear(weights.value_proj, scratch.value, shape.hidden)?);
         list.push(Op::Launch(ops::grouped_rms_norm(
             streams,
             weights.norm_query.address,
@@ -380,19 +416,61 @@ impl PleApply {
         Ok(list)
     }
 
-    /// The uploads of `parts` to their places in the records, in part order.
-    fn uploads<'a>(&self, rows: u32, parts: &'a [(Range<usize>, &'a GatheredPart)]) -> OpList<'a> {
+    /// The destination and the byte count of the upload of the records of `range` into the staged records of `rows`
+    /// rows.
+    fn upload_extent(&self, rows: u32, range: &Range<usize>) -> (DevicePtr, usize) {
         let records = shape_records(&self.shape, &self.regions, rows);
         let record = u64::from(self.shape.record_bytes);
+        (
+            records.offset(range.start as u64 * record),
+            range.len() * self.shape.record_bytes as usize,
+        )
+    }
+
+    /// The uploads of `parts` to their places in the records, in part order.
+    fn uploads<'a>(&self, rows: u32, parts: &'a [(Range<usize>, &'a GatheredPart)]) -> OpList<'a> {
         parts
             .iter()
-            .map(|(range, part)| Op::Upload {
-                destination: records.offset(range.start as u64 * record),
-                source: part.loan.buffer(),
-                offset: 0,
-                bytes: range.len() * self.shape.record_bytes as usize,
+            .map(|(range, part)| {
+                let (destination, bytes) = self.upload_extent(rows, range);
+                Op::Upload {
+                    destination,
+                    source: part.loan.buffer(),
+                    offset: 0,
+                    bytes,
+                }
             })
             .collect()
+    }
+
+    /// The gathered parts of a quantum of `rows` rows, in row order. Refuses rows past the regions' capacity, ids that
+    /// are not there or not `rows` of the heads, and a part that never arrived.
+    fn parts<'a>(
+        &self,
+        rows: u32,
+        hand_over: &'a PleRows,
+    ) -> Result<Vec<(Range<usize>, &'a GatheredPart)>, StageError> {
+        if rows > self.regions.capacity_rows() {
+            return Err(fatal(format!(
+                "a quantum of {rows} rows exceeds the {} rows the flash regions hold",
+                self.regions.capacity_rows()
+            )));
+        }
+        let count = hand_over
+            .ids()
+            .ok_or_else(|| fatal("the n-gram embedding ran before the ids"))?
+            .len();
+        let expected = u64::from(rows) * u64::from(self.shape.heads);
+        if count as u64 != expected {
+            return Err(fatal(format!(
+                "{count} n-gram row ids for {rows} rows of {} heads, expected {expected}",
+                self.shape.heads
+            )));
+        }
+        hand_over
+            .parts
+            .join(count)
+            .map_err(|part| fatal(format!("part {part} of the n-gram gather never arrived")))
     }
 }
 
@@ -408,23 +486,9 @@ impl Launch for PleApply {
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let rows = quantum.rows_u32()?;
-        if rows > self.regions.capacity_rows() {
-            return Err(fatal(format!(
-                "a quantum of {rows} rows exceeds the {} rows the flash regions hold",
-                self.regions.capacity_rows()
-            )));
-        }
-        let hand_over = rows_of(quantum)?;
-        let count = hand_over
-            .ids()
-            .ok_or_else(|| fatal("the n-gram embedding ran before the ids"))?
-            .len();
-        let parts = hand_over
-            .parts
-            .join(count)
-            .map_err(|part| fatal(format!("part {part} of the n-gram gather never arrived")))?;
+        let parts = self.parts(rows, rows_of(quantum)?)?;
         queue_all(&self.uploads(rows, &parts), kernels).map_err(fatal)?;
-        let ops = self.ops(rows, kernels.exact_numerics()).map_err(fatal)?;
+        let ops = self.ops(rows).map_err(fatal)?;
         queue_all(&ops, kernels).map_err(fatal)
     }
 }
