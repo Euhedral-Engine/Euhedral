@@ -278,3 +278,24 @@ fn a_cache_layers_stage_refuses_what_it_cannot_place_naming_the_cause() {
     assert!(refused(1, 8, tables).contains("position 8"));
     assert!(refused(1, 1 << 32, tables).contains("exceeds 32 bits"));
 }
+
+#[test]
+fn a_placed_quantum_gives_a_cache_layer_its_position_tail_slot_and_tables() {
+    let placement = ChunkPlacement::new(512, 1, vec![(at(0x1000), at(0x2000)), (at(0xa000), at(0xb000))]).unwrap();
+    assert_eq!(placement.start(), 512);
+    let expected = ChunkAt {
+        start: 512,
+        key_table: at(0xa000),
+        value_table: at(0xb000),
+        tail_slot: 1,
+    };
+    assert_eq!(placement.at(1), Ok(expected));
+}
+
+#[test]
+fn a_placement_refuses_a_missing_layer_and_a_third_tail_slot() {
+    let placement = ChunkPlacement::new(8, 0, vec![(at(0x1000), at(0x2000))]).unwrap();
+    assert!(placement.at(1).unwrap_err().contains("not layer 1"));
+    let refused = ChunkPlacement::new(8, 2, Vec::new()).unwrap_err();
+    assert!(refused.to_string().contains("not 2"));
+}

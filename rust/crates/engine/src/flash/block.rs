@@ -45,6 +45,55 @@ impl Default for ChunkAt {
     }
 }
 
+/// Where one chunk's rows lie in their sequence, for every layer that reads the cache: what the sequence's owner makes
+/// when it builds the chunk's quantum, and what [`BlockStage`] takes the layer's [`ChunkAt`] from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkPlacement {
+    start: u32,
+    tail_slot: u32,
+    /// The K and V page tables of each cache layer, by cache layer index.
+    tables: Vec<(DevicePtr, DevicePtr)>,
+}
+
+impl ChunkPlacement {
+    /// The placement of a chunk starting at `start`, reading raw tail slot `tail_slot` (0 or 1), over `tables`.
+    /// Refuses a slot that is neither.
+    pub fn new(start: u32, tail_slot: u32, tables: Vec<(DevicePtr, DevicePtr)>) -> Result<Self, FlashError> {
+        if tail_slot > 1 {
+            return Err(FlashError::refused(
+                "chunk placement",
+                format!("the raw tail has slots 0 and 1, not {tail_slot}"),
+            ));
+        }
+        Ok(Self {
+            start,
+            tail_slot,
+            tables,
+        })
+    }
+
+    /// The position of the chunk's first row.
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+
+    /// The chunk of the cache layer `layer`: refuses a layer the placement has no tables for.
+    pub fn at(&self, layer: usize) -> Result<ChunkAt, String> {
+        let (key_table, value_table) = self.tables.get(layer).ok_or_else(|| {
+            format!(
+                "the chunk's placement has tables for {} cache layers, not layer {layer}",
+                self.tables.len()
+            )
+        })?;
+        Ok(ChunkAt {
+            start: self.start,
+            key_table: *key_table,
+            value_table: *value_table,
+            tail_slot: self.tail_slot,
+        })
+    }
+}
+
 /// What a block is called with.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockCall {
@@ -210,13 +259,16 @@ impl Launch for BlockStage {
 
 impl BlockStage {
     /// Where the quantum's rows lie: for a layer that reads the cache, the segment's start and its page tables from
-    /// the view the quantum took at admission. A launch knows no tail slot: the cache layer's stage runs only the
-    /// first chunk of a sequence (slot 0), and refuses a later one, because a stale tail would write wrong block keys.
-    /// A sequence with later chunks supplies its slot through [`BlockStage::ops_at`].
+    /// the quantum's chunk placement, which a sequence's owner supplies with the position, the tail slot and the
+    /// tables. Without one, a launch knows no tail slot: the stage runs only the first chunk of a sequence (slot 0) from
+    /// the segment's view, and refuses a later one, because a stale tail would write wrong block keys.
     fn chunk_of(&self, quantum: &Quantum) -> Result<ChunkAt, StageError> {
         let Some(layer) = self.kv_layer else {
             return Ok(ChunkAt::default());
         };
+        if let Some(placement) = quantum.chunk_placement() {
+            return placement.at(layer).map_err(fatal);
+        }
         let segments = quantum.segments();
         let tables = match segments {
             [segment] => segment
