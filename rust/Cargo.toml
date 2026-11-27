@@ -22,6 +22,7 @@ euhedral-hashing = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev 
 euhedral-net = { git = "https://github.com/Euhedral-Engine/RustEE.git", rev = "c10b3c34ba5c5cd7f7f070111d83071a61a29f75" }
 java-properties = "2"
 libloading = "0.8"
+lzma-rs = "0.3"
 llguidance = { version = "=1.9.1", default-features = false, features = ["lark", "referencing", "ahash"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -32,10 +33,12 @@ signal-hook = "0.4"
 socket2 = "0.6"
 sha2 = "0.10"
 same-file = "1.0.6"
+tar = { version = "0.4", default-features = false }
 tempfile = "3.27"
 thiserror = "2"
 toktrie = "=1.9.1"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
