@@ -29,6 +29,7 @@ pub mod buffers;
 pub mod chunks;
 pub mod embed;
 pub mod gdn;
+pub mod generate;
 pub mod head;
 pub mod hyper;
 pub mod kernels;
