@@ -70,6 +70,15 @@ pub struct PaddedDown {
 }
 
 impl PaddedDown {
+    /// No widened copies.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self {
+            jobs: Vec::new(),
+            base: None,
+        }
+    }
+
     /// The widened down projection of `layer`; `None` for a layer that has none (the width needed no widening, or the
     /// layer's tensor is not a plain NVFP4 one).
     pub fn weight(&self, layer: u32) -> Option<Weight> {
@@ -84,7 +93,7 @@ impl PaddedDown {
 /// What the model holds on the device and the host, freed together by [`FlashModel::shutdown`]. Fields drop in
 /// declaration order: the cache, whose slots and staging the others back, goes first.
 struct Held {
-    cache: Option<ExpertCache>,
+    cache: Option<Arc<ExpertCache>>,
     expert_memory: DeviceBuffer,
     pad: Option<DeviceBuffer>,
     _arena: DeviceBuffer,
@@ -118,7 +127,18 @@ impl fmt::Debug for FlashModel {
 impl FlashModel {
     /// The routed-expert cache.
     pub fn cache(&self) -> Option<&ExpertCache> {
-        self.held.cache.as_ref()
+        self.held.cache.as_deref()
+    }
+
+    /// The routed-expert cache, shared with the layers that fetch from it. Whoever holds it lets go before
+    /// [`FlashModel::shutdown`] frees the device memory its slots lie in.
+    pub fn shared_cache(&self) -> Option<Arc<ExpertCache>> {
+        self.held.cache.clone()
+    }
+
+    /// The engine's runtime: its library, pinned pool, lanes and lakes.
+    pub(crate) fn core(&self) -> &Arc<Core> {
+        &self.core
     }
 
     /// The device address of the cache's slots: its memory, `plan.expert_cache.bytes()` long.
@@ -130,7 +150,7 @@ impl FlashModel {
     /// memory. Call it from the thread that started the engine, once no frame is running.
     pub fn shutdown(self, owner: RuntimeOwner) {
         let bound = self.core.teardown.cancel_bound;
-        let ended = self.held.cache.as_ref().is_none_or(|cache| wait_closed(cache, bound));
+        let ended = self.held.cache.as_deref().is_none_or(|cache| wait_closed(cache, bound));
         let allocated = self.core.teardown.device_bytes.load(Ordering::Acquire);
         let teardown = Arc::clone(&self.core.teardown);
         owner.shutdown_with(move || {
@@ -947,7 +967,7 @@ fn build_tables(
     })();
     match built {
         Ok((cache, tables)) => {
-            held.cache = Some(cache);
+            held.cache = Some(Arc::new(cache));
             let allocated = planned.layout.device_bytes() + planned.plan.expert_cache.bytes();
             core.teardown.device_bytes.store(allocated, Ordering::Release);
             let Planned {

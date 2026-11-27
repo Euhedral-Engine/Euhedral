@@ -23,6 +23,7 @@ macro_rules! eager {
     )+};
 }
 
+pub mod assembly;
 pub mod block;
 pub mod buffers;
 pub mod chunks;
