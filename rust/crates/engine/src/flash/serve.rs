@@ -7,9 +7,10 @@
 //! for each request, [`FlashRuntime::shutdown`] last, on the thread that started the engine.
 
 use std::fmt::{self, Debug, Formatter};
+use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_inference_cuda::{CudaLibrary, PinnedPool};
@@ -24,11 +25,11 @@ use crate::runtime::RuntimeOwner;
 
 const MIB: u64 = 1 << 20;
 
-/// The model, its sequence and the owner of its lattice.
+/// The model and its sequence. The owner of the lattice is not here: it stays with whoever shuts the engine down, so
+/// that no last handle ever closes the lattice from a worker.
 pub struct FlashRuntime {
     model: FlashModel,
     engine: FlashEngine,
-    owner: RuntimeOwner,
 }
 
 impl Debug for FlashRuntime {
@@ -38,15 +39,16 @@ impl Debug for FlashRuntime {
 }
 
 impl FlashRuntime {
-    /// The runtime over a ready `model`: allocates the sequence and logs the startup summary. When the sequence cannot
-    /// be allocated the model is shut down here (its memory freed) and the refusal returned.
-    pub fn over(model: FlashModel, owner: RuntimeOwner) -> Result<FlashRuntime, EngineError> {
+    /// The runtime over a ready `model`, and the `owner` back for its shutdown: allocates the sequence and logs the
+    /// startup summary. When the sequence cannot be allocated the model is shut down here (its memory freed) and the
+    /// refusal returned.
+    pub fn over(model: FlashModel, owner: RuntimeOwner) -> Result<(FlashRuntime, RuntimeOwner), EngineError> {
         match FlashEngine::new(&model) {
             Ok(engine) => {
                 for line in summary(&model) {
                     log::info!("{line}");
                 }
-                Ok(FlashRuntime { model, engine, owner })
+                Ok((FlashRuntime { model, engine }, owner))
             }
             Err(error) => {
                 model.shutdown(owner, true);
@@ -96,29 +98,41 @@ impl FlashRuntime {
         &self.model.core().pool
     }
 
-    /// Stops the engine: cancels the running request and waits at most `window` for it to end (and no longer than the
-    /// lattice's close timeout), closes the sequence, then closes the lattice and frees the model's memory. A request
-    /// that did not end leaves the sequence and the model allocated until the process exits (the bytes are logged) and
-    /// is the refusal returned. Call it on the thread that started the engine, with no other handle alive.
-    pub fn shutdown(self: Arc<Self>, window: Duration) -> Result<(), EngineError> {
-        let bound = window.min(self.model.core().teardown.cancel_bound);
-        self.engine.stop(bound);
-        let Ok(runtime) = Arc::try_unwrap(self) else {
+    /// Stops the engine within `window`, as the dense engine's `shutdown_within` does: cancels the running request,
+    /// closes the sequence, closes the lattice through `owner` and frees the model's memory. When the window is spent
+    /// before the lattice has closed, a request did not end, or another handle to the runtime is alive, nothing is
+    /// freed (the device memory stays allocated until the process exits, and the bytes are logged) and the refusal is
+    /// returned. A free that has begun is not interrupted. Call it on the thread that started the engine.
+    pub fn shutdown(runtime: Arc<FlashRuntime>, owner: RuntimeOwner, window: Duration) -> Result<(), EngineError> {
+        let begun = Instant::now();
+        runtime
+            .engine
+            .stop(window.min(runtime.model.core().teardown.cancel_bound));
+        let bytes = runtime.allocated_device_bytes();
+        let Ok((runtime, owner)) = sole(runtime, owner, drop) else {
+            log::error!("{bytes} bytes of device memory stay allocated until the process exits: a handle is alive");
             return Err(EngineError::Runtime(
                 "another handle to the runtime is alive: its device memory stays allocated until the process exits"
                     .to_string(),
             ));
         };
-        let FlashRuntime { model, engine, owner } = runtime;
+        let FlashRuntime { model, engine } = runtime;
         let ended = engine.close();
-        model.shutdown(owner, ended);
-        if ended {
-            return Ok(());
+        model.shutdown_within(owner, ended, window.saturating_sub(begun.elapsed()))
+    }
+}
+
+/// The runtime and the owner back when no other handle to the runtime is alive. Otherwise the owner is closed through
+/// `close` (on this thread: it closes the lattice) and the handle is forgotten, not dropped: the last holder that
+/// is a frame on the lattice must never free the weights or close the lattice, so the runtime is left allocated.
+fn sole<R, O>(runtime: Arc<R>, owner: O, close: impl FnOnce(O)) -> Result<(R, O), ()> {
+    match Arc::try_unwrap(runtime) {
+        Ok(runtime) => Ok((runtime, owner)),
+        Err(shared) => {
+            close(owner);
+            mem::forget(shared);
+            Err(())
         }
-        Err(EngineError::Runtime(
-            "a generation did not end after its cancel: the device memory stays allocated until the process exits"
-                .to_string(),
-        ))
     }
 }
 
@@ -138,4 +152,48 @@ fn summary(model: &FlashModel) -> Vec<String> {
             host.pinned() / MIB,
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU32;
+
+    use super::*;
+
+    /// A runtime stand-in that counts its drops.
+    struct Counted(Arc<AtomicU32>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn a_runtime_nobody_else_holds_is_handed_back_with_its_owner_and_nothing_is_closed() {
+        let drops = Arc::new(AtomicU32::new(0));
+        let mut closed = 0;
+        let runtime = Arc::new(Counted(Arc::clone(&drops)));
+        let (back, owner) = sole(runtime, 7, |_| closed += 1).expect("the only handle");
+        assert_eq!((owner, closed, drops.load(Ordering::Acquire)), (7, 0, 0));
+        drop(back);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_runtime_another_handle_holds_closes_the_owner_once_and_is_never_dropped() {
+        let drops = Arc::new(AtomicU32::new(0));
+        let mut closed = 0;
+        let runtime = Arc::new(Counted(Arc::clone(&drops)));
+        let other = Arc::clone(&runtime);
+        assert!(sole(runtime, 7, |owner| closed += owner).is_err());
+        assert_eq!(closed, 7, "the owner closes the lattice");
+        // The other handle was the last holder: its drop must not free the runtime.
+        drop(other);
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            0,
+            "the runtime was dropped by its last holder"
+        );
+    }
 }

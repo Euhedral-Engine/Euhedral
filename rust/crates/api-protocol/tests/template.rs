@@ -455,3 +455,12 @@ fn control_tokens_are_the_eight_the_rendering_emits() {
         assert!(prompt.contains(token), "{token}");
     }
 }
+
+#[test]
+fn a_user_turn_with_thinking_off_ends_with_the_assistant_turn_and_an_empty_think_block() {
+    let prompt = render_disabled(vec![user("What is 17 times 23?")], Vec::new());
+    assert_eq!(
+        prompt,
+        "<|im_start|>user\nWhat is 17 times 23?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
+}

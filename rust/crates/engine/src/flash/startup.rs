@@ -20,7 +20,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
 use euhedral_graph::Lake;
@@ -155,22 +155,43 @@ impl FlashModel {
     ///
     /// [`FlashEngine::close`]: super::engine::FlashEngine::close
     pub fn shutdown(self, owner: RuntimeOwner, engine_ended: bool) {
-        let bound = self.core.teardown.cancel_bound;
-        let release = Release::decide(engine_ended, || {
+        // Unbounded: the refusal is already logged, and a start that failed has no caller to tell.
+        let _ = self.shutdown_within(owner, engine_ended, Duration::MAX);
+    }
+
+    /// [`shutdown`](FlashModel::shutdown) bounded by `window`, as the dense engine's `shutdown_within` is: the cache's
+    /// wait never exceeds it, and when it is spent before the lattice has closed nothing is freed (the model is
+    /// forgotten, its bytes logged) and [`EngineError::Unfinished`] says so. A free that has begun is not interrupted.
+    pub fn shutdown_within(self, owner: RuntimeOwner, engine_ended: bool, window: Duration) -> Result<(), EngineError> {
+        let begun = Instant::now();
+        let bound = window.min(self.core.teardown.cancel_bound);
+        let decided = Release::decide(engine_ended, || {
             self.held.cache.as_deref().is_none_or(|cache| wait_closed(cache, bound))
         });
         let allocated = self.core.teardown.device_bytes.load(Ordering::Acquire);
         let teardown = Arc::clone(&self.core.teardown);
-        owner.shutdown_with(move || match release {
-            Release::Free => self.release(),
-            Release::Keep(why) => {
-                log::error!("{why}: {allocated} bytes of device memory stay allocated until the process exits");
-                mem::forget(self);
+        let release = owner.shutdown_with(move || {
+            // The lattice has closed by now: the window is checked against it, and a spent one frees nothing.
+            let release = decided.within(begun, window);
+            match release {
+                Release::Free => self.release(),
+                Release::Keep(why) => {
+                    log::error!("{why}: {allocated} bytes of device memory stay allocated until the process exits");
+                    mem::forget(self);
+                }
             }
+            release
         });
-        if release != Release::Free {
-            // Nothing was freed: the bytes still count as allocated.
-            teardown.device_bytes.store(allocated, Ordering::Release);
+        match release {
+            Release::Free => Ok(()),
+            Release::Keep(why) => {
+                // Nothing was freed: the bytes still count as allocated.
+                teardown.device_bytes.store(allocated, Ordering::Release);
+                Err(EngineError::Unfinished {
+                    window,
+                    left: format!("{why}; {allocated} bytes of device memory stay allocated until the process exits"),
+                })
+            }
         }
     }
 
@@ -216,6 +237,16 @@ impl Release {
             return Release::Keep("the expert cache did not end its loads");
         }
         Release::Free
+    }
+
+    /// `self`, unless it frees and the `window` that began at `begun` is spent: a spent window frees nothing.
+    fn within(self, begun: Instant, window: Duration) -> Release {
+        match self {
+            Release::Free if begun.elapsed() >= window => {
+                Release::Keep("the window was spent before the lattice closed")
+            }
+            decided => decided,
+        }
     }
 }
 

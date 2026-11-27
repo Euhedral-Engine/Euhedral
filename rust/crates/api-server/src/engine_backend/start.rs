@@ -523,10 +523,12 @@ impl EngineStarting {
         let Some(owner) = self.pending.owner() else {
             return Err(StartError::Engine("the engine's owner is gone".to_owned()));
         };
-        let runtime = Arc::new(FlashRuntime::over(*model, owner)?);
+        let (runtime, owner) = FlashRuntime::over(*model, owner)?;
+        let runtime = Arc::new(runtime);
         let sink = Arc::new(QueueIngestSink::new());
         if let Err(error) = runtime.lattice().add_upstream(sink.delegate()) {
-            if let Err(stop) = runtime.shutdown(Duration::ZERO) {
+            // Nothing runs on an engine that did not start: no window need bound its stop.
+            if let Err(stop) = FlashRuntime::shutdown(runtime, owner, Duration::MAX) {
                 log::error!("stopping the engine that did not start failed: {stop}");
             }
             return Err(StartError::Engine(format!("the lattice takes no backend: {error:?}")));
@@ -540,11 +542,11 @@ impl EngineStarting {
         let backend = EngineBackend::new(engine, Arc::new(self.tokenizer), sink, self.settings.model.name.clone());
         match backend {
             Ok(backend) => Ok(EngineHost {
-                held: Held::Flash(runtime),
+                held: Held::Flash { owner, runtime },
                 backend: Arc::new(backend),
             }),
             Err(error) => {
-                if let Err(stop) = runtime.shutdown(Duration::ZERO) {
+                if let Err(stop) = FlashRuntime::shutdown(runtime, owner, Duration::MAX) {
                     log::error!("stopping the engine that did not start failed: {stop}");
                 }
                 Err(StartError::Engine(error))
@@ -559,7 +561,10 @@ enum Held {
         owner: RuntimeOwner,
         runtime: Arc<EngineRuntime>,
     },
-    Flash(Arc<FlashRuntime>),
+    Flash {
+        owner: RuntimeOwner,
+        runtime: Arc<FlashRuntime>,
+    },
 }
 
 /// A running engine: its backend, its lattice (the server runs on it too) and the means to stop it.
@@ -579,7 +584,7 @@ impl EngineHost {
     pub fn runtime(&self) -> Option<&Arc<EngineRuntime>> {
         match &self.held {
             Held::Dense { runtime, .. } => Some(runtime),
-            Held::Flash(_) => None,
+            Held::Flash { .. } => None,
         }
     }
 
@@ -587,7 +592,7 @@ impl EngineHost {
     pub fn lattice(&self) -> &Arc<ControlPlaneLattice> {
         match &self.held {
             Held::Dense { runtime, .. } => runtime.lattice(),
-            Held::Flash(runtime) => runtime.lattice(),
+            Held::Flash { runtime, .. } => runtime.lattice(),
         }
     }
 
@@ -598,7 +603,7 @@ impl EngineHost {
         self.backend.close();
         match self.held {
             Held::Dense { owner, runtime } => owner.shutdown_within(runtime, window).map_err(StartError::from),
-            Held::Flash(runtime) => runtime.shutdown(window).map_err(StartError::from),
+            Held::Flash { owner, runtime } => FlashRuntime::shutdown(runtime, owner, window).map_err(StartError::from),
         }
     }
 }
@@ -897,7 +902,7 @@ mod tests {
 }
 
 /// Proof runs on the real Flash-Next artifact through the server's engine path: [`begin_start`] dispatches on the
-/// artifact's family, and the request is the one the backend builds (its stop tokens come from the tokenizer).
+/// artifact's family, and the request carries the stop tokens the backend's codec gives (the test builds the rest itself).
 #[cfg(test)]
 #[allow(clippy::print_stdout, reason = "a proof run reports what it generated")]
 mod flash_device {

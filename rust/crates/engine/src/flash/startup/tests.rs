@@ -295,3 +295,17 @@ fn a_model_is_freed_only_when_the_engine_and_the_cache_have_ended() {
     assert_eq!(Release::decide(true, || true), Release::Free);
     assert!(matches!(Release::decide(true, || false), Release::Keep(_)));
 }
+
+#[test]
+fn a_spent_window_frees_nothing_and_an_open_one_frees() {
+    // A zero window is spent the moment it begins; the longest one never is.
+    let spent = Release::Free.within(Instant::now(), Duration::ZERO);
+    assert!(matches!(spent, Release::Keep(_)), "{spent:?}");
+    assert_eq!(Release::Free.within(Instant::now(), Duration::MAX), Release::Free);
+    let kept = Release::Keep("a reason").within(Instant::now(), Duration::MAX);
+    assert_eq!(
+        kept,
+        Release::Keep("a reason"),
+        "a kept model is never freed by an open window"
+    );
+}
