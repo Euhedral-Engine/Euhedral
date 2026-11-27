@@ -463,7 +463,7 @@ fn transfers_run_on_the_transfer_lane_only() {
     let chosen = set(fixture.candidates(&STAGEABLE));
     let staged = fixture.build(&chosen, 3).unwrap();
     let resident = fixture.unstaged();
-    let stage_lanes = Plan::lane_width() + 1;
+    let stage_lanes = Plan::lane_width(false) + 1;
     for view in BASE_VIEWS {
         let kinds = staged.kinds(view).unwrap();
         let plain = resident.kinds(view).unwrap();
