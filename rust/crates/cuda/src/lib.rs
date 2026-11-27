@@ -27,6 +27,7 @@ pub mod math;
 mod memory;
 pub mod ops;
 mod pool;
+pub mod released;
 
 /// The generated declarations of the C ABI (`cargo xtask bindings` rewrites this file).
 #[rustfmt::skip]
