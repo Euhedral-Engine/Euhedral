@@ -7,7 +7,8 @@ A workflow file fails when:
   - its `on:` has a `push` to any branch but `rust/next*` (a push to main or an integration branch is not a second test of
     the tree the land run tested);
   - a job other than `land-guard` has no `if:` that mentions the added label `land`;
-  - it has no `land-guard` job, or its concurrency group does not tell a land run from another label's run.
+  - it has no `land-guard` job, or its concurrency group does not tell a land run from another label's run, or the whole
+    `concurrency:` block is over 200 characters (Gitea keeps it in a varchar(255); a longer one fails the insert of the run).
 Plain text is read, like scripts/lint-workflows.py: no YAML library.
 
 usage: lint-ci-triggers.py [FILE]   (default .gitea/workflows/ci.yaml; exit 0: clean, 1: a violation)
@@ -19,6 +20,7 @@ from pathlib import Path
 
 LAND = "added_labels.*.name, 'land'"
 GUARD = "land-guard"
+MAX_CONCURRENCY = 200
 
 
 def top_block(lines, key):
@@ -74,9 +76,12 @@ def lint(text):
                 problems.append(f"{GUARD} must have no `needs:` and no `if:`: it runs on every run")
         elif LAND not in condition:
             problems.append(f"job {name} has no `if:` on the added label land")
-    group = "\n".join(top_block(lines, "concurrency") or [])
-    if "'land'" not in group or "'other'" not in group:
+    block = [line for line in (top_block(lines, "concurrency") or []) if line.strip() and not line.lstrip().startswith("#")]
+    if LAND not in "\n".join(block):
         problems.append("the concurrency group must tell a land run from another label's run")
+    size = len("concurrency:\n" + "\n".join(block))
+    if size > MAX_CONCURRENCY:
+        problems.append(f"the concurrency block is {size} characters, over {MAX_CONCURRENCY}: Gitea stores it in a varchar(255)")
     return problems
 
 
