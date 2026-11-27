@@ -166,6 +166,11 @@ impl WriteClaim {
         reason = "no-wait, blocking I/O: one open and one lock before the writer's first frame"
     )]
     pub fn take(target: &Path) -> Result<WriteClaim, GuardError> {
+        // A directory is no artifact and has nothing to lock (Windows refuses to open one without backup semantics):
+        // it is left unclaimed on every platform, and the writer's own open or rename says what is wrong.
+        if target.is_dir() {
+            return Ok(WriteClaim { _file: None });
+        }
         let file = match open_for_claim(target) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(WriteClaim { _file: None }),
@@ -204,12 +209,7 @@ impl WriteClaim {
 fn open_for_claim(target: &Path) -> io::Result<File> {
     #[cfg(unix)]
     match OpenOptions::new().read(true).write(true).open(target) {
-        // A directory cannot be opened for writing either: the writer's own open of it says what is wrong.
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::PermissionDenied | io::ErrorKind::IsADirectory
-            ) => {}
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
         opened => return opened,
     }
     OpenOptions::new().read(true).open(target)
@@ -349,12 +349,11 @@ mod tests {
         assert!(matches!(ArtifactGuard::hold(&path), Err(GuardError::Held { .. })));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn a_directory_output_is_claimed_through_the_read_only_open() {
+    fn a_directory_output_is_left_unclaimed_on_every_platform() {
         let directory = tempfile::tempdir().unwrap();
         let claim = WriteClaim::take(directory.path()).unwrap();
-        assert!(claim._file.is_some());
+        assert!(claim._file.is_none());
     }
 
     #[test]
