@@ -15,9 +15,9 @@ use std::ffi::c_void;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
 
-use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_gpu::{GpuError, LaneEnqueue, LaneStream};
 use euhedral_inference_cuda::launch::ops::FreeFailure;
+use euhedral_inference_cuda::released::Released as GivenUp;
 use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, DevicePtr, PinnedPool, PooledPinned};
 use euhedral_memory::Claim;
 use thiserror::Error;
@@ -59,9 +59,6 @@ impl LaneMemory {
         self.released.waiting()
     }
 }
-
-/// Slots in one chunk of the queue: an allocation step of an unbounded queue, never a limit.
-const CHUNK: usize = 16;
 
 /// The bytes a step charges to the memory planner: take claims of these sizes and pass them with the step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,51 +144,14 @@ impl Claims {
     }
 }
 
-struct Held {
+/// A device buffer with the planner claim it is charged to, the item the queue carries.
+pub struct Held {
     buffer: DeviceBuffer,
     claim: Option<Claim>,
 }
 
 /// The device buffers given up and waiting for the owner of a lane to free them in stream order.
-pub struct Released {
-    producer: Producer<Held, Multi>,
-    consumer: Consumer<Held, Multi>,
-}
-
-impl Debug for Released {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
-        formatter
-            .debug_struct("Released")
-            .field("waiting", &self.consumer.size_long())
-            .finish()
-    }
-}
-
-impl Default for Released {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Released {
-    pub fn new() -> Released {
-        let queue = MpmcQueue::<Held>::new(CHUNK);
-        Released {
-            producer: queue.producer(),
-            consumer: queue.consumer(),
-        }
-    }
-
-    /// Buffers given up and not yet freed.
-    pub fn waiting(&self) -> u64 {
-        self.consumer.size_long()
-    }
-
-    fn give(&self, held: Held) {
-        let offered = self.producer.offer(held);
-        debug_assert!(offered.is_ok(), "an unbounded queue refused a buffer");
-    }
-}
+pub type Released = GivenUp<Held>;
 
 /// Frees, in stream order on the stream `queue` lends, every buffer given up, and returns how many. A buffer the stream
 /// could not free is parked again, still allocated and still charged, for the next call (a plain free would wait for
@@ -203,7 +163,7 @@ pub fn reclaim<Q: LaneStream<Raw = *mut c_void>>(
 ) -> Result<u64, CudaError> {
     let mut failure = None;
     let mut parked = Vec::new();
-    let freed = released.consumer.drain_all(|held| {
+    let freed = released.drain(|held| {
         let Held { buffer, claim } = held;
         match buffer.free_on_lane(library, queue) {
             // The free is enqueued: the bytes are the planner's again.
