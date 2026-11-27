@@ -519,22 +519,15 @@ fn speculating(route: Route, capacity: u64, prompt: usize, max_tokens: usize) ->
     }
 }
 
-/// What a request does with the prefix cache.
-#[derive(Debug, PartialEq, Eq)]
-enum Caching {
-    /// It neither restores a checkpoint nor stores one: the drafter's context of a restored prefix would be missing.
-    Skips,
-    /// It uses checkpoints of `kind` (those that hold the draft's state too, when it drafts).
-    Uses(Option<CheckpointKind>),
-}
-
-/// The use of the prefix cache by a speculative request.
-fn speculative_caching(state: &Speculating) -> Caching {
-    if state.drafter().is_some() {
-        Caching::Skips
+/// The checkpoints a speculative request uses: those that hold the draft's state too, when it drafts: the MTP layer's
+/// cache, or the DFlash2 drafter's rings.
+fn speculative_caching(state: &Speculating) -> Option<CheckpointKind> {
+    let kind = if state.drafter().is_some() {
+        CheckpointKind::Dflash2
     } else {
-        Caching::Uses(state.drafting().then_some(CheckpointKind::Mtp))
-    }
+        CheckpointKind::Mtp
+    };
+    state.drafting().then_some(kind)
 }
 
 /// Why a request that asks for its hidden states is refused: it speculates (its drafts' rows are not the rows of the
@@ -1064,10 +1057,7 @@ impl Owner {
         }
         let kind = match &run.mode {
             Mode::Greedy { .. } | Mode::Sampled { .. } => None,
-            Mode::Speculative { state, .. } => match speculative_caching(state) {
-                Caching::Skips => return,
-                Caching::Uses(kind) => kind,
-            },
+            Mode::Speculative { state, .. } => speculative_caching(state),
             Mode::Forced { .. } => return,
         };
         let address = Arc::clone(&self.shared.address);
@@ -1391,7 +1381,8 @@ impl Owner {
         let core = &shared.core;
         let position = u64::from(hit.position());
         let reset = mem::take(&mut self.used);
-        let drafting = self.drafts();
+        // The MTP layer's draft: the DFlash2 drafter's rings are restored whole, with no row to pair.
+        let drafting = self.drafts() && !self.dflash2();
         // The draft's last row of the checkpoint was paired with the token the stored prompt had at the position: with
         // the same token here it is the row a cold run computes, and is restored with the others.
         let whole = drafting
@@ -1462,12 +1453,14 @@ impl Owner {
         run.position = position;
         run.carried = retained;
         run.carried_marker = Some(reserved);
-        if let Mode::Speculative { state, .. } = &mut run.mode
-            && drafting
-        {
-            // Unless the last row came whole, the draft pairs the hidden row it was restored with and the token at the
-            // position, before the chunks do.
-            state.resumed_at(position as u32, whole);
+        if let Mode::Speculative { state, .. } = &mut run.mode {
+            if drafting {
+                // Unless the last row came whole, the draft pairs the hidden row it was restored with and the token at
+                // the position, before the chunks do.
+                state.resumed_at(position as u32, whole);
+            } else if let Some(drafter) = state.drafter_mut() {
+                drafter.resumed_at(position);
+            }
         }
         Ok(())
     }
@@ -2749,8 +2742,8 @@ mod routing_tests {
         assert!(state.drafter().is_some());
         assert_eq!(
             speculative_caching(&state),
-            Caching::Skips,
-            "the drafter's context is not restored"
+            Some(CheckpointKind::Dflash2),
+            "the drafter's rings are in the checkpoints"
         );
     }
 
@@ -2786,7 +2779,7 @@ mod routing_tests {
         );
         let state = speculating(Route::Mtp(3), 4096, 30, 128).unwrap();
         assert!(state.drafter().is_none());
-        assert_eq!(speculative_caching(&state), Caching::Uses(Some(CheckpointKind::Mtp)));
+        assert_eq!(speculative_caching(&state), Some(CheckpointKind::Mtp));
     }
 
     #[test]

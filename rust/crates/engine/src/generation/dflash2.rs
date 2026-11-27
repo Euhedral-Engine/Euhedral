@@ -23,8 +23,9 @@ use std::mem;
 use std::sync::Arc;
 
 use super::source::{Admission, Flying, Mode, OVERLAP_MAX_START_POSITION, Owner, Role, Run};
-use crate::stages::QuantumKind;
+use crate::prefix::SequenceAddresses;
 use crate::stages::attention::KvSource;
+use crate::stages::{QuantumKind, SequenceRefs};
 
 /// How far the drafter's context is of the sequence's committed rows.
 #[derive(Debug, Default)]
@@ -48,6 +49,14 @@ impl Drafter {
         }
         self.pending = rows;
         Ok(())
+    }
+
+    /// The prompt resumes from a checkpoint at `position`, whose rings hold the rows before it as a cold run's do.
+    pub(super) fn resumed_at(&mut self, position: u64) {
+        *self = Drafter {
+            context_len: position,
+            ..Drafter::default()
+        };
     }
 
     /// The rows the context update takes, as their first position and their count: all that are pending, which it
@@ -132,11 +141,30 @@ impl Owner {
             return Err(format!("a prompt context of {rows} rows with {taken} tapped"));
         }
         state.prompt_chunk_taken();
-        self.admit_context(start, rows)
+        // The chunk that ends at a checkpoint is captured once its rows are in the rings: nothing is chained behind
+        // the update, and the next chunk waits for the capture.
+        let end = start as usize + rows;
+        let checkpoint = run
+            .checkpoints
+            .as_ref()
+            .is_some_and(|checkpoints| checkpoints.wants(end));
+        let refs = self.admit_context(start, rows, checkpoint)?;
+        if let Some(refs) = refs
+            && let Some(run) = self.run.as_mut()
+            && let Some(addresses) = SequenceAddresses::new(refs, &self.shared.config)
+            && let Some(checkpoints) = run.checkpoints.as_mut()
+        {
+            checkpoints.expect(end, Arc::new(addresses));
+            if let Some(flying) = run.in_flight.back_mut() {
+                flying.checkpoint = true;
+            }
+        }
+        Ok(())
     }
 
-    /// Admits the context update of `rows` rows from the position `start`, chained to the quantum behind it.
-    fn admit_context(&mut self, start: u64, rows: usize) -> Result<(), String> {
+    /// Admits the context update of `rows` rows from the position `start`, chained to the quantum behind it unless
+    /// `capture` is set, which returns the references the update was admitted with.
+    fn admit_context(&mut self, start: u64, rows: usize, capture: bool) -> Result<Option<SequenceRefs>, String> {
         let admission = Admission {
             role: Role::Context,
             kind: QuantumKind::Context,
@@ -147,9 +175,9 @@ impl Owner {
             logits: 0,
             replay: Vec::new(),
             last_chunk: false,
-            more: true,
+            more: !capture,
         };
-        self.admit_quantum(admission, move |quantum| quantum.with_tokens(vec![0; rows]))
+        self.admit_quantum_taking(admission, move |quantum| quantum.with_tokens(vec![0; rows]), capture)
     }
 
     /// Admits a step of `drafts` drafts: the context update, the block and the verification, one chain.
@@ -163,7 +191,7 @@ impl Owner {
         };
         let step = state.begin_drafter_step(base, drafts, &config)?;
         if let Some((start, rows)) = step.context {
-            self.admit_context(start, rows)?;
+            self.admit_context(start, rows, false)?;
         }
         let mut tokens = vec![drafter.mask_token; drafter.block_size];
         tokens[0] = step.current;
@@ -286,6 +314,19 @@ mod tests {
         drafter.tapped(40).unwrap();
         assert!(drafter.committed(0, 3).is_err());
         assert!(drafter.tapped(5).is_err());
+    }
+
+    #[test]
+    fn a_prompt_resumed_from_a_checkpoint_has_its_context_end_there() {
+        let mut drafter = Drafter::default();
+        drafter.resumed_at(1024);
+        // The prompt's last chunk after the checkpoint is the first step's context, from the checkpoint's position.
+        drafter.tapped(40).unwrap();
+        assert_eq!(drafter.begin_step(1064, 6).unwrap(), Some((1024, 40)));
+        assert!(
+            Drafter::default().begin_step(1064, 6).is_err(),
+            "a cold context does not end there"
+        );
     }
 
     #[test]

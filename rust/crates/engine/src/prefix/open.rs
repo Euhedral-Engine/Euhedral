@@ -8,6 +8,7 @@ use euhedral_memory::{Claim, LocationKind, LocationSpec, OwnerSpec, Planner, Pri
 
 use crate::generation::Spawn;
 use crate::model::ModelConfig;
+use crate::model::dflash2::Dflash2Config;
 use crate::prefix::cache::{CacheParts, PrefixCacheHandle};
 use crate::prefix::copier::{FIRST_COPY_SERIAL, PinnedArena};
 use crate::prefix::layout::CheckpointLayout;
@@ -17,6 +18,8 @@ use crate::prefix::layout::CheckpointLayout;
 pub struct CacheSpec<'a> {
     pub library: &'a Arc<CudaLibrary>,
     pub config: &'a ModelConfig,
+    /// The DFlash2 drafter whose rings the sequences keep, when they draft with it: its checkpoints hold them.
+    pub drafter: Option<&'a Dflash2Config>,
     pub format: KvFormat,
     pub settings: PrefixCacheSettings,
     /// The pinned bytes the memory plan granted the arena; 0 for none.
@@ -48,7 +51,16 @@ fn open_with(spec: CacheSpec<'_>, spawn: Spawn, granted: Option<Claim>) -> Optio
     if spec.granted == 0 || spec.config.layer_kinds.len() <= 1 {
         return None;
     }
-    let layout = CheckpointLayout::new(spec.config, spec.format)?;
+    let mut layout = CheckpointLayout::new(spec.config, spec.format)?;
+    if let Some(drafter) = spec.drafter {
+        layout = match layout.with_drafter(drafter) {
+            Ok(layout) => layout,
+            Err(error) => {
+                log::warn!("the prefix cache is off: {error}");
+                return None;
+            }
+        };
+    }
     let slot_bytes = layout.slot_bytes();
     let slots = u32::try_from(spec.granted / slot_bytes).unwrap_or(u32::MAX);
     if slots == 0 {
