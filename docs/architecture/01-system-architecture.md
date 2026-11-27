@@ -41,6 +41,6 @@ Quantization is an offline application. It reuses inference kernels and lattice 
 - [startup](../../rust/crates/engine/src/startup.rs) and [runtime](../../rust/crates/engine/src/runtime.rs): model load, the lattice, the lakes and the lanes.
 - [tokenizer section](../../rust/crates/edrl/src/tokenizer_section.rs): embedded tokenizer validation and upgrade diagnostics.
 - [engine model](../../rust/crates/engine/src/model/mod.rs) and [flash](../../rust/crates/engine/src/flash): dense and Flash-Next model ownership.
-- [Quantization workflow](../../quantization/README.md) and [converter](../../tools/convert_checkpoint.py).
+- [Quantization workflow](../../rust/crates/quantize/README.md) and [converter](../../tools/convert_checkpoint.py).
 
 This diagram omits individual layers, kernel variants, request state transitions and physical memory layout. Those are covered by the focused diagrams in this directory.

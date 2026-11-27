@@ -1,4 +1,4 @@
-// Kernels of the MTP drafter tools (quantization/README.md).
+// Kernels of the MTP drafter tools (rust/crates/quantize/README.md).
 
 namespace {
 constexpr int kThreads = 256;

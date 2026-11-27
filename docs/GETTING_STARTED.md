@@ -70,9 +70,7 @@ See the [Messages API guide](ANTHROPIC_API.md) for streaming and request options
 Build the Windows bundle (on Windows, or cross-built on Linux with `cargo zigbuild`; see [rust/README.md](../rust/README.md#server-bundle)):
 
 ```bash
-cd rust
-cargo xtask native --product windows-x64
-cargo xtask bundle --product windows-x64
+(cd rust && cargo xtask native --product windows-x64 && cargo xtask bundle --product windows-x64)
 ```
 
 On Windows, set `model.artifact` to the artifact's Windows path in `euhedral.yaml`, then run:

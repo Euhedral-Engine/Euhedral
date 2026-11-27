@@ -1,5 +1,7 @@
 # Benchmarking
 
+> Commands in this document run from the repository root. The engine loads the CUDA library from `build/native/linux-x64/lib/libeuhedral_cuda.so` by default (build it with `cargo xtask native`); pass `--cuda-library FILE` to use another.
+
 `euhedral-bench` (crate `euhedral-inference-bench`, in `rust/`) is an end-to-end harness. It loads the engine, creates a fresh
 session for every iteration, and runs the real tokenizer -> lattice -> CUDA path. The `run` command writes
 end-to-end engine measurements. The engine derives its execution policy (kernels, speculative
@@ -13,9 +15,8 @@ Change one variable at a time and keep the JSON for every run you compare.
 1. **Build.**
 
    ```bash
-   cd rust
-   cargo xtask native --product linux-x64
-   cargo build --release -p euhedral-inference-bench
+   (cd rust && cargo xtask native --product linux-x64)
+   cargo build --release --manifest-path rust/Cargo.toml -p euhedral-inference-bench
    ```
 
 2. **Correctness and integration tests.** Unit tests need no GPU. The device tests need the
@@ -41,14 +42,14 @@ Change one variable at a time and keep the JSON for every run you compare.
    treating any timing as a baseline.
 
    ```bash
-   cargo run --release -p euhedral-inference-bench -- run resources/bench/configs/baseline.json --validate-only
+   cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-bench -- run rust/resources/bench/configs/baseline.json --validate-only
    ```
 
 5. **Baseline benchmark.** The default suite on all available processors with the default
    context capacity.
 
    ```bash
-   cargo run --release -p euhedral-inference-bench -- run resources/bench/configs/baseline.json
+   cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-bench -- run rust/resources/bench/configs/baseline.json
    ```
 
 6. **Retain the JSON.** Rows are appended to the configured `output` as they complete (JSONL), and a
@@ -72,7 +73,7 @@ Change one variable at a time and keep the JSON for every run you compare.
 8. **Change one variable**, for example the CPU selection:
 
    ```bash
-   cargo run --release -p euhedral-inference-bench -- run resources/bench/configs/custom-cpus.json
+   cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-bench -- run rust/resources/bench/configs/custom-cpus.json
    ```
 
 9. **Rerun and compare** against the retained baseline. Use the same scenarios, prompt seed,
@@ -138,7 +139,7 @@ the same config several times with an appending output:
 
 ```bash
 for fork in 1 2 3; do
-  cargo run --release -p euhedral-inference-bench -- run resources/bench/configs/forks.json --fork-id $fork
+  cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-bench -- run rust/resources/bench/configs/forks.json --fork-id $fork
 done
 ```
 
@@ -225,7 +226,7 @@ below is illustrative; its values are not a measurement.
 {
   "schema": "euhedral-inference.benchmark-result", "schemaVersion": 1,
   "implementation": "rust",
-  "provenance": {"kind": "measured", "tool": "euhedral-bench", "commandLine": "run resources/bench/configs/baseline.json",
+  "provenance": {"kind": "measured", "tool": "euhedral-bench", "commandLine": "run rust/resources/bench/configs/baseline.json",
                  "source": null, "sourceSha256": null, "note": null},
   "runId": "<uuid per process>",
   "fork": {"id": null, "source": "unspecified", "pid": 1234, "jvmStartedAt": "<process start instant>"},

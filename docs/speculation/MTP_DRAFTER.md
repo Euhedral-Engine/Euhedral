@@ -1,7 +1,7 @@
 # Training the MTP drafter
 
 The MTP layer drafts the tokens that verification checks ([MTP_CONTRACT.md](MTP_CONTRACT.md)). This page covers
-fine-tuning that layer on the target's own answers, the corpus and trainer that do it (quantization/README.md, *MTP
+fine-tuning that layer on the target's own answers, the corpus and trainer that do it (rust/crates/quantize/README.md, *MTP
 drafter corpus* and *MTP drafter training*), and the drafter NVFP4-Trellis-RCO ships. Verification stays exact:
 outputs are the target's whatever the drafter drafts.
 

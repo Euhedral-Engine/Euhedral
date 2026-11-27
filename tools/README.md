@@ -133,8 +133,9 @@ python -m gptq.calibration prompts $C/prompts.jsonl $HOLDOUT/t4_prompts.jsonl
 python -m gptq.calibration generate http://localhost:8080 $C/prompts.jsonl $C/generations.jsonl --parallel 2
 python -m gptq.calibration tokens $CHECKPOINT $C            # writes $C/tokens.npy
 # the codes, one layer at a time on the GPU; then the artifact
-(cd ../rust && cargo run --release -p euhedral-inference-quantize -- calibrate --model $CHECKPOINT --quantization nvfp4 --compressed \
-    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $CODES --act-order)
+cargo run --release --manifest-path ../rust/Cargo.toml -p euhedral-inference-quantize -- calibrate --model $CHECKPOINT --quantization nvfp4 --compressed \
+    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $CODES --act-order \
+    --cuda-library ../build/native/linux-x64/lib/libeuhedral_cuda.so
 python3 convert_checkpoint.py --model $CHECKPOINT --quantization nvfp4 --compressed \
     --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --imatrix imatrix-swift15-v1mix.gguf --codes-from $CODES \
     --out $OUT/qwen3_8_27b_nvfp4_compressed.edrl
@@ -163,8 +164,9 @@ to compare an artifact with the quantization module's own figures, which used an
 default head and convert a second time with `--output-head BF16`; the draft head still needs its codes.
 
 ```bash
-(cd ../rust && cargo run --release -p euhedral-inference-quantize -- calibrate --model $CHECKPOINT --format trellis --bits 3.5 \
-    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $EXL3)
+cargo run --release --manifest-path ../rust/Cargo.toml -p euhedral-inference-quantize -- calibrate --model $CHECKPOINT --format trellis --bits 3.5 \
+    --tokens $C/tokens.npy --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $EXL3 \
+    --cuda-library ../build/native/linux-x64/lib/libeuhedral_cuda.so
 python3 convert_checkpoint.py --model $CHECKPOINT --quantization trellis --trellis-from $EXL3 \
     --codes-from $EXL3/heads --draft-ids-from $OUT/qwen3_8_27b_q3.edrl --out $OUT/qwen3_8_27b_trellis.edrl
 ```

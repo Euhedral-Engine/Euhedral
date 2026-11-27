@@ -5,7 +5,7 @@ This diagram distinguishes host frame routing, mutable-state ownership and devic
 ```mermaid
 flowchart TB
     Request[Request planning and host tasks] --> Lake[lake: hash-selected ingest sinks]
-    Admit[Admit frames ordered by workspace owner.HASH] --> Lake
+    Admit[Admit frames ordered by the workspace owner's hash] --> Lake
     Callback[Driver callbacks and asynchronous completion frames] --> Lake
     Lake --> Fabric[ControlPlaneLattice workers]
     Fabric --> Owner[workspace owner binds graphs one at a time]
@@ -28,7 +28,7 @@ flowchart TB
 |---|---|
 | Process lattice lifecycle | `InferenceEngine` claims exclusive process ownership, starts it and stops it during close. |
 | Sessions and persistent sequence state | Engine tracks sessions; a generation's frame chain serializes its decisions. Sequence commit follows admitted work order. |
-| Workspace access records and pass assembly | Frames ordered on `workspace owner.HASH`; graph binding adds dependencies for buffer reuse. |
+| Workspace access records and pass assembly | Frames ordered on the workspace owner's hash; graph binding adds dependencies for buffer reuse. |
 | Carried sequence state | sequence owner records prior users per key, accessed during workspace-owner admission; separate sequences have separate records. |
 | Device draft tokens and host-KV device region | Carried-state keys order draft token writers/readers and all attention layers reusing a sequence's host-page device region. |
 | Host logits and proposals | Each in-flight quantum must have its own host readback buffer; an unordered proposal requires the sequence to have no other work in flight. |

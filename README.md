@@ -17,9 +17,7 @@ An artifact is a model file ready to serve. To make one from a Hugging Face chec
 **1. Build the server.** [Build requirements](docs/development/BUILDING.md) are listed separately.
 
 ```bash
-cd rust
-cargo xtask native --product linux-x64
-cargo xtask bundle --product linux-x64
+(cd rust && cargo xtask native --product linux-x64 && cargo xtask bundle --product linux-x64)
 ```
 
 The bundle is `build/bundle/euhedral-server-linux-x64/`. To run in a container instead, see

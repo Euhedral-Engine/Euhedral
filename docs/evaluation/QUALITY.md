@@ -1,5 +1,7 @@
 # Measuring quality
 
+> Commands in this document run from the repository root. The engine loads the CUDA library from `build/native/linux-x64/lib/libeuhedral_cuda.so` by default (build it with `cargo xtask native`); pass `--cuda-library FILE` to use another.
+
 Four different quantities are measured, because they answer different questions and add up to no single score.
 
 | Quantity | Question | Tool |
@@ -30,7 +32,7 @@ Each artifact is teacher-forced over the same positions (prefix 1281, 1279 steps
 command of the quantization tool (`rust/crates/quantize`):
 
 ```bash
-cargo run --release -p euhedral-inference-quantize -- score --artifact /models/qwen3_8_27b_q3.edrl --results results.txt \
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- score --artifact /models/qwen3_8_27b_q3.edrl --results results.txt \
     --reference bf16.kld --name q3-t1
 ```
 
@@ -66,7 +68,7 @@ only at release checkpoints, confirms them.
 
 ```bash
 llama-perplexity -m Swift-1.5-BF16.gguf -f t2.txt -c 2560 -b 2560 -ub 2560 --chunks 25 -ngl 0 --kl-divergence-base swift_t2.kld
-cargo run --release -p euhedral-inference-quantize -- score --artifact qwen3_8_27b_nvfp4_compressed.edrl --results results.txt \
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- score --artifact qwen3_8_27b_nvfp4_compressed.edrl --results results.txt \
     --reference swift_t2.kld --name nvfp4c-t2
 ```
 
@@ -149,7 +151,7 @@ serving `nvfp4-compressed`, 64 wikitext-2 and 64 source windows) is retired: on 
 (`nvfp4-compressed`), 0.053 (`nvfp4`), 0.124 (`q3`) and 0.152 (`q3-compressed`). T1-T4 were built the way it was and
 score it lower: they do not choose between calibration sets.
 
-**Calibration** (`quantization/README.md`) runs the sequences through the BF16 checkpoint on the engine's own kernels
+**Calibration** (`rust/crates/quantize/README.md`) runs the sequences through the BF16 checkpoint on the engine's own kernels
 one layer at a time: the Hessians accumulate on the GPU while the sequences pass through the layer, the layer's
 objects are rounded (cuSOLVER for the Cholesky factor, the module's kernels for the column runs), and the sequences
 pass through the rounded layer to give the next layer its inputs. The hidden states stay in pinned host memory. It
@@ -278,8 +280,7 @@ python3 tools/compare_teacher_forced.py nvfp4.bin nvfp4_compressed.bin
 against the first run:
 
 ```bash
-cd rust
-cargo run --release -p euhedral-inference-bench -- drift --artifact /models/qwen3_8_27b_q3.edrl \
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-bench -- drift --artifact /models/qwen3_8_27b_q3.edrl \
     --prefix 512 --steps 512 --candidate host-tier --config host-tier.yaml
 ```
 

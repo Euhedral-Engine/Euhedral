@@ -72,7 +72,7 @@ seal) that runs once.
 
 ## Admission
 
-Admission is a frame on the workspace's owner: its `idHash` is `workspace owner.HASH` and it stays ordered on it,
+Admission is a frame on the workspace's owner: its `idHash` is the workspace owner's hash and it stays ordered on it,
 so admissions run one at a time. A generation's `Admit` admits its quantum itself (Qwen3.8 and Qwen4 alike); only a
 caller outside the owner (tests and tools) publishes the admission as a frame (`publishOnOwner`). Frames keep their publication order when they enter the lattice
 through one source and no queue of more than one partition. The lake's sinks are like GPU streams: each has one
@@ -87,7 +87,7 @@ Admission is small:
 2. prepare quantum-owned resources with the graph's stream selected (the sequence's admission,
    persistent state on first use, the binding of the graph's workspace storage), so any initialization it
    queues precedes every stage;
-3. bind the graph behind the previous users of each workspace buffer it touches (`workspace owner.bind`), then publish
+3. bind the graph behind the previous users of each workspace buffer it touches (the workspace owner's bind), then publish
    the root stages to the lake.
 
 Binding also orders carried sequence state through sequence owner: GDN and KV per layer, draft seeds, device draft tokens, DFlash2 taps/ring and the shared device region for host KV pages. A graph's first users wait on the previous graph's last users of each key for that sequence. Different sequences have separate records.
@@ -489,7 +489,7 @@ represented-NVFP4 tolerance for decode attention.
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous Q3/Q4/Q5 decode, the MXFP8 and
 native FP4 prefill routes, the one-row residual norm, the prefill attention softmax sum, the column-owned GDN recurrence, the
 contiguous and GQA decode attention) is replaced by the exact kernel under exact numerics, and
-the route drift check (`euhedral-bench drift`, [QUALITY.md](../evaluation/QUALITY.md)) compares the two end to end. The Q3 artifact's relaxed numerics measure a hidden-state
+`euhedral-bench drift` ([QUALITY.md](../evaluation/QUALITY.md)) does not compare the two: it runs the artifact on all-GPU settings and then on the host-tier settings (or on the same settings again, which must agree bitwise). A check of exact against relaxed numerics end to end is not automated. The Q3 artifact's relaxed numerics measure a hidden-state
 relative error of 6.0e-2, KL 5.1e-3 and top-1 agreement 0.961 over 8 windows of 48 positions, with no growth by position
 ([PREFILL_MX.md](../kernels/PREFILL_MX.md)); a single one-ulp perturbation (the decode attention merge order) gives about 5.4% and KL 2.6e-3,
 so the combined error stays at the model's sensitivity floor: one-ulp BF16 differences settle at this level in the 64-layer

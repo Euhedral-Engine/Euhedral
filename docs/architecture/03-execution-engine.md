@@ -28,7 +28,7 @@ flowchart TB
 
 `ExecutionPlan.Instruction` names operation kind, weights, input/output buffers and predecessor IDs. The plan borrows weights; it does not own a session's KV/GDN state or the shared workspace. Buffer storage slots allow reuse, with access ordering supplied by the runtime.
 
-`Execution` assembles ready offers into passes constrained by row and part limits. Admission runs in the ordering domain of `workspace owner.HASH`. `EuhedralInferenceRuntime` obtains a graph of the requested shape, prepares its quantum on the home lane and connects workspace accesses to earlier graphs. Stages then publish their own successors; there is no central stage dispatch loop.
+`Execution` assembles ready offers into passes constrained by row and part limits. Admission runs in the ordering domain of the workspace owner's hash. `EuhedralInferenceRuntime` obtains a graph of the requested shape, prepares its quantum on the home lane and connects workspace accesses to earlier graphs. Stages then publish their own successors; there is no central stage dispatch loop.
 
 Binding also connects first users of carried sequence state to its prior users through sequence owner: layer KV/GDN state, draft seed rows, device draft tokens, DFlash2 state and any shared device region for host KV pages. This permits several quanta of one sequence in flight when their host readback buffers are distinct and they do not share an unordered proposal. MTP uses this to admit a step's catch-up and drafts ahead of verification. Sequence conclusions still commit in admission order.
 

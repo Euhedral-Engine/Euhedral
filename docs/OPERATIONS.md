@@ -75,9 +75,10 @@ its weights ([FLASH_NEXT_ARTIFACT.md](flash-next/FLASH_NEXT_ARTIFACT.md#tokenize
 assemble` / `export-drafter` write it. An artifact without one stops the server with the command that adds it, which
 writes only that section and leaves every other byte of the artifact as it is:
 
+From the repository root:
+
 ```bash
-cd rust
-cargo run --release -p euhedral-inference-quantize -- package-tokenizer --artifact ARTIFACT.edrl --tokenizer CHECKPOINT_DIR
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- package-tokenizer --artifact ARTIFACT.edrl --tokenizer CHECKPOINT_DIR
 ```
 
 `--out COPY.edrl` writes a copy with the section and leaves the artifact alone. Running it again replaces the section.

@@ -20,7 +20,7 @@ cargo test --release -p euhedral-inference-engine --test device -- --ignored --n
 
 Settings are looked up in this order: `EUHEDRAL_TEST_<KEY>` in the environment (`euhedral.qwen.rco-artifact` is
 `EUHEDRAL_TEST_QWEN_RCO_ARTIFACT`), then `~/.config/euhedral/test.properties` (or the file named by
-`EUHEDRAL_TEST_CONFIG`). The native library is the product `cargo xtask native` builds.
+`EUHEDRAL_TEST_CONFIG`), then `gradle.properties` in the Gradle user home (`~/.gradle/gradle.properties`), kept as a fallback for existing setups. The native library is named by `euhedral.cuda.library` (`EUHEDRAL_TEST_CUDA_LIBRARY`), normally the `libeuhedral_cuda.so` that `cargo xtask native` builds under `build/native/linux-x64/lib/`.
 
 CI builds the device tests once and runs them in groups with `scripts/ci-device.py` (`pack` writes the archive,
 `run GROUP` runs one group, `check` fails unless every ignored test is in exactly one group). The groups keep the tests
