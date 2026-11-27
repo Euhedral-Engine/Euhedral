@@ -200,6 +200,23 @@ pub fn split_geometry(start: u64, rows: u64, group: u64, fused_from_keys: &[u32;
     u64::from(fused) << 16 | below << 8 | above
 }
 
+/// The split geometry a key names: [`split_geometry`] for a quantum whose attention reads keys of a cache, and 0 for one
+/// with no such attention (the drafter's context and block, a model with no attention layers), whose launches bake no key
+/// count, so its position must not re-key it.
+pub fn keyed_split_geometry(
+    attends_cache: bool,
+    start: u64,
+    rows: u64,
+    group: u64,
+    fused_from_keys: &[u32; FUSED_ROWS],
+) -> u64 {
+    if attends_cache {
+        split_geometry(start, rows, group, fused_from_keys)
+    } else {
+        0
+    }
+}
+
 /// The rows each layer replays, without the trailing layers that replay none.
 pub(crate) fn trimmed(replay: &[u32]) -> Vec<u32> {
     let keep = replay.iter().rposition(|rows| *rows > 0).map_or(0, |last| last + 1);
@@ -427,6 +444,52 @@ mod tests {
         assert_eq!(default_geometry(2044, 5, GROUP), 1 << 16 | 43 << 8 | 64);
         // A group wider than 8 never takes the 32-key spans.
         assert_eq!(default_geometry(5000, 1, 9), 64 << 8);
+    }
+
+    #[test]
+    fn a_quantum_with_no_cache_attention_is_keyed_the_same_at_every_position() {
+        for rows in [1, 8] {
+            let wanted = keyed_split_geometry(false, 0, rows, GROUP, &DEFAULT_FUSED_VERIFY_FROM);
+            for start in [1, 47, 48, 2047, 9000, 131_000] {
+                assert_eq!(
+                    keyed_split_geometry(false, start, rows, GROUP, &DEFAULT_FUSED_VERIFY_FROM),
+                    wanted,
+                    "{rows} rows at {start}"
+                );
+            }
+        }
+        assert_eq!(
+            keyed_split_geometry(true, 100, 1, GROUP, &DEFAULT_FUSED_VERIFY_FROM),
+            default_geometry(100, 1, GROUP)
+        );
+    }
+
+    #[test]
+    fn drafter_quanta_are_keyed_by_their_rows_and_their_buffers() {
+        let mut context = key();
+        context.view = View::Context { rows: 3 };
+        context.kind = QuantumKind::Context;
+        context.rows = 3;
+        let mut wider = context.clone();
+        wider.view = View::Context { rows: 4 };
+        wider.rows = 4;
+        assert_ne!(context.digest(), wider.digest(), "another row count is another launch");
+        let mut block = context.clone();
+        block.view = View::Block;
+        block.kind = QuantumKind::Block;
+        assert_ne!(context.digest(), block.digest());
+        let mut regrown = context.clone();
+        regrown.buffer_generations.push(AllocationId(99));
+        assert_ne!(
+            context.digest(),
+            regrown.digest(),
+            "a reallocated ring is another address"
+        );
+        assert_eq!(
+            context.digest(),
+            context.clone().digest(),
+            "the same step shape shares a graph"
+        );
     }
 
     #[test]

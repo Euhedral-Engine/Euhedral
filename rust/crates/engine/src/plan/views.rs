@@ -75,12 +75,12 @@ impl View {
     }
 
     /// Whether quanta of this view are captured into graphs (when nothing else rules a quantum out): decode,
-    /// verification and draft quanta of at most [`MAX_CAPTURED_ROWS`] rows.
+    /// verification, draft and drafter context quanta of at most [`MAX_CAPTURED_ROWS`] rows, and the drafter's block.
     pub fn capturable(self) -> bool {
         match self {
-            View::PrefillChunk | View::CatchUp { .. } | View::Context { .. } | View::Block => false,
-            View::Decode => true,
-            View::Verify { rows } | View::Draft { rows } => rows <= MAX_CAPTURED_ROWS,
+            View::PrefillChunk | View::CatchUp { .. } => false,
+            View::Decode | View::Block => true,
+            View::Verify { rows } | View::Draft { rows } | View::Context { rows } => rows <= MAX_CAPTURED_ROWS,
         }
     }
 }
@@ -192,12 +192,16 @@ mod tests {
     }
 
     #[test]
-    fn only_decode_verification_and_small_drafts_are_capturable() {
+    fn only_decode_verification_small_drafts_and_the_drafters_views_are_capturable() {
         assert!(View::Decode.capturable());
         assert!(View::Verify { rows: 8 }.capturable());
         assert!(!View::Verify { rows: 9 }.capturable());
         assert!(View::Draft { rows: 1 }.capturable());
         assert!(!View::CatchUp { rows: 9 }.capturable());
+        assert!(View::Context { rows: 1 }.capturable());
+        assert!(View::Context { rows: 8 }.capturable());
+        assert!(!View::Context { rows: 9 }.capturable());
+        assert!(View::Block.capturable());
         assert!(!View::PrefillChunk.capturable());
     }
 }
