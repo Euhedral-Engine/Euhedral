@@ -147,6 +147,7 @@ pub struct Routing {
     layout: DescriptorLayout,
     expert_start: Vec<u32>,
     expert_fill: Vec<u32>,
+    picked: Vec<u32>,
     sorted_row: Vec<u32>,
     sorted_weight: Vec<u32>,
     active: Vec<u32>,
@@ -167,6 +168,7 @@ impl Routing {
             layout,
             expert_start: vec![0; experts + 2],
             expert_fill: vec![0; experts + 1],
+            picked: vec![0; pairs],
             sorted_row: vec![0; pairs],
             sorted_weight: vec![0; pairs],
             active: vec![0; active],
@@ -205,8 +207,12 @@ impl Routing {
         for i in 0..pairs {
             let found = id(i);
             match u32::try_from(found) {
-                Ok(found) if found < experts => self.expert_start[found as usize + 2] += 1,
-                Ok(found) if found == experts => {}
+                Ok(found) if found <= experts => {
+                    self.picked[i] = found;
+                    if found < experts {
+                        self.expert_start[found as usize + 2] += 1;
+                    }
+                }
                 _ => {
                     self.expert_start.fill(0);
                     return Err(FlashError::refused(
@@ -222,7 +228,7 @@ impl Routing {
         }
         self.expert_fill[..experts as usize].copy_from_slice(&self.expert_start[1..=experts as usize]);
         for i in 0..pairs {
-            let found = id(i) as u32;
+            let found = self.picked[i];
             if found == experts {
                 continue;
             }

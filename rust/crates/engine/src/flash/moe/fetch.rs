@@ -10,47 +10,15 @@
 
 use std::fmt::Display;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use euhedral_graph::{Gate, GateRef, Stage, StageCx, StageError, Submitted};
 
-use super::block::BlockPlan;
+use super::host::MoeHost;
 use super::layer::MoeLayer;
 use super::source::Arrived;
 use crate::handoff::Handoff;
 use crate::residency::experts::ExpertId;
-use crate::stages::{Quantum, fatal};
-
-/// What the fetch and expert stages read of the quantum they run for.
-pub trait MoeHost: Send + Sync {
-    /// The experts the quantum's current block names and the leases of those that arrived.
-    fn block_plan(&self) -> Result<&Arc<BlockPlan>, StageError>;
-
-    /// Whether the quantum was stopped, so that its experts are not needed.
-    fn stopped(&self) -> bool;
-
-    /// The flag that ends a request for an expert when the quantum is cancelled, when the quantum has one of its own.
-    fn cancel_flag(&self) -> Option<Arc<AtomicBool>>;
-}
-
-impl MoeHost for Quantum {
-    fn block_plan(&self) -> Result<&Arc<BlockPlan>, StageError> {
-        self.moe_block()
-            .map(|block| block.plan())
-            .ok_or_else(|| fatal("the quantum carries no mixture-of-experts block"))
-    }
-
-    fn stopped(&self) -> bool {
-        self.stop_requested()
-    }
-
-    fn cancel_flag(&self) -> Option<Arc<AtomicBool>> {
-        match self.segments() {
-            [segment] => segment.cancel.clone(),
-            _ => None,
-        }
-    }
-}
+use crate::stages::fatal;
 
 /// The fetch of the `index`-th expert of a layer's block.
 #[derive(Debug)]

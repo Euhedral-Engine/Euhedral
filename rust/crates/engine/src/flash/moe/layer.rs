@@ -9,7 +9,7 @@ use std::sync::Arc;
 use euhedral_inference_cuda::DevicePtr;
 use smallvec::smallvec;
 
-use super::ops::{self, ExpertGeometry, ExpertItems};
+use super::ops::{self, ExpertGeometry, ExpertItems, ROUTER_MAX_EXPERTS, ROUTER_MAX_TOP_K};
 use super::routing::DescriptorLayout;
 use super::source::ExpertSource;
 use crate::flash::buffers::{Carver, FlashRegions, ScratchSizes};
@@ -34,8 +34,18 @@ pub struct MoeShape {
 }
 
 impl MoeShape {
-    /// Refuses a shared expert of no width, and a layout whose routed experts are narrower than the router can pick.
+    /// Refuses a shared expert whose width is not a positive multiple of 16, and a layout the router cannot serve: more
+    /// than [`ROUTER_MAX_EXPERTS`] experts, more than [`ROUTER_MAX_TOP_K`] picks, or more picks than experts.
     pub fn new(layout: DescriptorLayout, geometry: ExpertGeometry, shared_inter: u32) -> Result<Self, FlashError> {
+        let (experts, top_k) = (layout.experts(), layout.top_k());
+        if experts > ROUTER_MAX_EXPERTS || top_k > ROUTER_MAX_TOP_K || top_k > experts {
+            return Err(FlashError::refused(
+                "moe shape",
+                format!(
+                    "{experts} experts with {top_k} picks per row: the router takes at most {ROUTER_MAX_EXPERTS} experts and {ROUTER_MAX_TOP_K} picks, never more than the experts"
+                ),
+            ));
+        }
         if shared_inter == 0 || !shared_inter.is_multiple_of(16) {
             return Err(FlashError::refused(
                 "moe shape",

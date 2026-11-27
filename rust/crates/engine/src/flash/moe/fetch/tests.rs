@@ -1,37 +1,14 @@
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use euhedral_graph::testing::{FakeDevice, GateEvent, StageHarness};
 
 use super::*;
-use crate::flash::moe::testing::{Lease, Log, Source, layer, planned};
-
-/// A quantum as the fetch stages see it.
-struct Host {
-    plan: Option<Arc<BlockPlan>>,
-    stopped: AtomicBool,
-    cancel: Option<Arc<AtomicBool>>,
-}
-
-impl MoeHost for Host {
-    fn block_plan(&self) -> Result<&Arc<BlockPlan>, StageError> {
-        self.plan.as_ref().ok_or_else(|| fatal("no block"))
-    }
-
-    fn stopped(&self) -> bool {
-        self.stopped.load(Ordering::Relaxed)
-    }
-
-    fn cancel_flag(&self) -> Option<Arc<AtomicBool>> {
-        self.cancel.clone()
-    }
-}
+use crate::flash::moe::block::BlockPlan;
+use crate::flash::moe::testing::{Host, Lease, Log, Source, layer, planned};
 
 fn host(plan: Arc<BlockPlan>) -> Host {
-    Host {
-        plan: Some(plan),
-        stopped: AtomicBool::new(false),
-        cancel: None,
-    }
+    Host::new(plan)
 }
 
 /// Experts 1, 3 and 6 are named, by three rows.
@@ -194,11 +171,8 @@ fn a_request_carries_the_flag_of_the_quantums_segment_when_it_has_one_and_the_bl
 #[test]
 fn a_quantum_with_no_block_fails_the_stage_at_its_gate() {
     let rig = rig(Source::default());
-    let host = Host {
-        plan: None,
-        stopped: AtomicBool::new(false),
-        cancel: None,
-    };
+    let mut host = host(block());
+    host.plan = None;
     assert_eq!(pass(&rig, 0, &host), (false, true));
     assert!(matches!(
         rig.harness.gate_events().as_slice(),

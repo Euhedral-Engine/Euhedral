@@ -1539,8 +1539,8 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
     cx: &StageCx<'_>,
 ) -> Result<Submitted, StageError> {
     if stage.idle(quantum) {
-        // An idle stage queues nothing, so there is nothing to mark. A completion edge from it would fire at once; the
-        // plan has only submission edges, which pass the stage's inputs through.
+        // An idle stage queues nothing, so there is nothing to mark. A completion edge from it would fire at once, and
+        // a submission edge passes the stage's inputs through.
         return Ok(Submitted::done());
     }
     quantum.check_prepared()?;

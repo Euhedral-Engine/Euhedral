@@ -6,26 +6,22 @@
 //! anything after it waits in a frame: the edge fires when the copies are done.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use euhedral_graph::{Stage, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::KernelOps;
 
-use super::block::MoeBlock;
+use super::host::{MoeHost, MoeWork, block_of};
 use super::layer::MoeLayer;
 use crate::flash::sequence::{Op, queue_all};
-use crate::stages::{Launch, Quantum, fatal, run_stage};
-
-/// The block hand-over of `quantum`, or the failure of a quantum built without one.
-pub(super) fn block_of(quantum: &Quantum) -> Result<&Arc<MoeBlock>, StageError> {
-    quantum
-        .moe_block()
-        .ok_or_else(|| fatal("the quantum carries no mixture-of-experts block"))
-}
+use crate::stages::{Launch, Quantum, fatal};
 
 /// The rows of `quantum`, within what `layer` routes.
 fn rows_of(quantum: &Quantum, layer: &MoeLayer) -> Result<u32, StageError> {
-    let rows = quantum.rows_u32()?;
+    check_rows(quantum.rows_u32()?, layer)
+}
+
+/// `rows`, when `layer` routes that many.
+pub(super) fn check_rows(rows: u32, layer: &MoeLayer) -> Result<u32, StageError> {
     if rows > layer.max_rows() {
         return Err(fatal(format!(
             "a quantum of {rows} rows exceeds the {} rows layer {} routes",
@@ -55,6 +51,7 @@ impl Launch for MoeRoute {
 
     fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
         let rows = rows_of(quantum, &self.layer)?;
+        quantum.check_staging(self.layer.shape().layout())?;
         let staging = block_of(quantum)?.staging();
         let (ids, weights) = self.layer.router_outputs();
         let top_k = self.layer.shape().layout().top_k() as usize;
@@ -119,47 +116,30 @@ impl MoePlan {
     }
 }
 
-/// The copy of the whole description to the device, as the launches of the plan stage.
-struct DescriptorUpload<'a> {
-    layer: &'a MoeLayer,
-}
-
-impl Launch for DescriptorUpload<'_> {
-    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
-        let staging = block_of(quantum)?.staging();
-        Op::Upload {
-            destination: self.layer.descriptor(),
-            source: staging.descriptor(),
-            offset: 0,
-            bytes: self.layer.shape().layout().bytes(),
-        }
-        .queue(kernels)
-        .map_err(fatal)
-    }
-}
-
-impl Stage<Quantum> for MoePlan {
+impl<Q: MoeHost> Stage<Q> for MoePlan {
     /// Plans the block and publishes it, then queues the copy. The plan is made again when the copy is retried
     /// (nothing was queued), which changes nothing: no expert is fetched before this stage submits.
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let block = block_of(quantum)?;
-        let (plan, staging) = (block.plan(), block.staging());
-        if quantum.rows == 0 {
+    fn run(&self, quantum: &Q, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        let plan = quantum.block_plan()?;
+        if quantum.rows() == 0 {
             plan.publish_none();
             return Ok(Submitted::done());
         }
-        let rows = rows_of(quantum, &self.layer)?;
-        let mut routing = staging.take_routing()?;
-        let planned = routing.plan(rows, |i| staging.id(i), |i| staging.weight(i));
+        let rows = u32::try_from(quantum.rows())
+            .map_err(|_| fatal(format!("{} rows exceed a launch", quantum.rows())))
+            .and_then(|rows| check_rows(rows, &self.layer))?;
+        quantum.check_staging(self.layer.shape().layout())?;
+        let mut routing = quantum.take_routing()?;
+        let planned = routing.plan(rows, |i| quantum.router_pick(i).0, |i| quantum.router_pick(i).1);
         if let Err(error) = planned {
-            staging.give_back(routing);
+            quantum.give_back(routing);
             return Err(fatal(format!("layer {}: {error}", self.layer.index())));
         }
-        let descriptor = staging.descriptor();
-        routing.fill(&mut |word, value| descriptor.word(word).store(value, Ordering::Relaxed));
-        plan.publish(&routing);
-        staging.give_back(routing);
-        run_stage(&DescriptorUpload { layer: &self.layer }, quantum, cx)
+        routing.fill(&mut |word, value| quantum.put_word(word, value));
+        let published = plan.publish(&routing);
+        quantum.give_back(routing);
+        published.map_err(|error| fatal(format!("layer {}: {error}", self.layer.index())))?;
+        quantum.queue(cx, &self.layer, &[], MoeWork::Description)
     }
 }
 
@@ -189,3 +169,6 @@ impl Launch for MoeFinish {
 }
 
 eager!(MoeRoute, MoeShared, MoeFinish);
+
+#[cfg(test)]
+mod tests;

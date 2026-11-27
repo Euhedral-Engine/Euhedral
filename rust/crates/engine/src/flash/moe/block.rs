@@ -32,6 +32,9 @@ pub struct BlockPlan {
     experts: Box<[AtomicU32]>,
     item_starts: Box<[AtomicU32]>,
     held: Box<[Handoff<Box<dyn HeldExpert>>]>,
+    /// The leases of submissions that failed after queueing work: only retirement, when the device has stopped,
+    /// empties them.
+    queued: Box<[Handoff<Box<dyn HeldExpert>>]>,
 }
 
 impl BlockPlan {
@@ -46,6 +49,7 @@ impl BlockPlan {
             experts: (0..width).map(|_| AtomicU32::new(0)).collect(),
             item_starts: (0..=width).map(|_| AtomicU32::new(0)).collect(),
             held: (0..width).map(|_| Handoff::empty()).collect(),
+            queued: (0..width).map(|_| Handoff::empty()).collect(),
         }
     }
 
@@ -55,10 +59,21 @@ impl BlockPlan {
     }
 
     /// Publishes the grouping of a block, and gives back the leases a block before it left behind. A block of no rows
-    /// is published by [`BlockPlan::publish_none`].
-    pub fn publish(&self, routing: &Routing) {
+    /// is published by [`BlockPlan::publish_none`]. A routing that names more experts than the plan holds is refused, and
+    /// the plan then names none.
+    pub fn publish(&self, routing: &Routing) -> Result<(), FlashError> {
         self.release_all();
         let active = routing.active_experts();
+        if active > self.width() {
+            self.publish_none();
+            return Err(FlashError::refused(
+                "moe block",
+                format!(
+                    "a block of {active} experts exceeds the {} its plan holds",
+                    self.width()
+                ),
+            ));
+        }
         for index in 0..active {
             let at = index as usize;
             self.experts[at].store(routing.active_expert(index).unwrap_or(0), Ordering::Relaxed);
@@ -70,6 +85,7 @@ impl BlockPlan {
         self.rows.store(routing.rows(), Ordering::Relaxed);
         self.pairs.store(routing.pair_count(), Ordering::Relaxed);
         self.active.store(active, Ordering::Release);
+        Ok(())
     }
 
     /// Publishes a block that names no expert (a quantum of no rows).
@@ -105,7 +121,9 @@ impl BlockPlan {
             let first = self.item_starts[index as usize].load(Ordering::Relaxed);
             (
                 first,
-                self.item_starts[index as usize + 1].load(Ordering::Relaxed) - first,
+                self.item_starts[index as usize + 1]
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(first),
             )
         })
     }
@@ -128,14 +146,36 @@ impl BlockPlan {
         self.held.get(index as usize)?.take()
     }
 
-    /// Whether the lease of the `index`-th active expert is held.
-    pub fn is_held(&self, index: u32) -> bool {
-        self.held.get(index as usize).is_some_and(Handoff::is_set)
+    /// Keeps the lease of the `index`-th active expert, whose submission failed after it may have queued work that
+    /// reads the slot, until [`BlockPlan::release_queued`]. A lease that cannot be stored is dropped.
+    pub fn hold_queued(&self, index: u32, lease: Box<dyn HeldExpert>) {
+        if let Some(slot) = self.queued.get(index as usize) {
+            slot.send(lease);
+        }
+    }
+
+    /// Drops the lease of the `index`-th active expert that no queued work reads, when the quantum is abandoned.
+    pub fn release_idle(&self, index: u32) {
+        drop(self.take(index));
+    }
+
+    /// Drops every lease of the `index`-th active expert, at the quantum's retirement, when the device has stopped.
+    pub fn release_queued(&self, index: u32) {
+        self.release_idle(index);
+        drop(self.queued.get(index as usize).and_then(Handoff::take));
+    }
+
+    /// Whether the `index`-th active expert's lease is held, in either place.
+    #[cfg(test)]
+    pub(crate) fn is_held(&self, index: u32) -> bool {
+        [&self.held, &self.queued]
+            .iter()
+            .any(|slots| slots.get(index as usize).is_some_and(Handoff::is_set))
     }
 
     /// Drops every lease still held.
     pub fn release_all(&self) {
-        self.held.iter().for_each(|slot| drop(slot.take()));
+        self.held.iter().chain(&self.queued).for_each(|slot| drop(slot.take()));
     }
 }
 
@@ -154,6 +194,7 @@ pub struct MoeStaging {
     weights: PooledPinned,
     descriptor: PooledPinned,
     routing: Handoff<Box<Routing>>,
+    layout: DescriptorLayout,
 }
 
 impl MoeStaging {
@@ -167,7 +208,13 @@ impl MoeStaging {
             weights: pool.acquire((2 * pairs).next_multiple_of(4))?,
             descriptor: pool.acquire(layout.bytes())?,
             routing,
+            layout,
         })
+    }
+
+    /// The extents the staging memory was sized for.
+    pub(crate) fn layout(&self) -> &DescriptorLayout {
+        &self.layout
     }
 
     /// The pinned memory the router's ids are copied into.

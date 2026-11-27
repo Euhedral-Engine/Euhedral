@@ -135,3 +135,19 @@ fn a_shape_refuses_a_shared_width_that_is_not_a_multiple_of_16() {
     );
     assert_eq!(MoeShape::new(layout, geometry, 208).unwrap().padded_width(), 256);
 }
+
+#[test]
+fn a_shape_the_router_cannot_serve_is_refused_naming_the_values_and_the_limits() {
+    let geometry = *shape().geometry();
+    let refused = |experts, top_k| {
+        let layout = DescriptorLayout::new(experts, top_k, 4).unwrap();
+        MoeShape::new(layout, geometry, 192).unwrap_err().to_string()
+    };
+    for (experts, top_k) in [(ROUTER_MAX_EXPERTS + 1, 2), (8, ROUTER_MAX_TOP_K + 1), (2, 3)] {
+        let why = refused(experts, top_k);
+        assert!(why.contains(&format!("{experts} experts with {top_k} picks")), "{why}");
+        assert!(why.contains(&ROUTER_MAX_EXPERTS.to_string()), "{why}");
+    }
+    let limit = DescriptorLayout::new(ROUTER_MAX_EXPERTS, ROUTER_MAX_TOP_K, 4).unwrap();
+    assert!(MoeShape::new(limit, geometry, 192).is_ok());
+}

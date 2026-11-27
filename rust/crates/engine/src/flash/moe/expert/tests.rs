@@ -1,9 +1,13 @@
 use std::time::Duration;
 
-use euhedral_graph::testing::FakeDevice;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use euhedral_graph::testing::{FakeDevice, StageHarness};
+use euhedral_graph::{LaneId, Marker};
 
 use super::*;
-use crate::flash::moe::testing::{Lease, Log, planned};
+use crate::flash::moe::testing::{Host, Lease, Log, Source, layer, planned};
 
 fn marker(value: u64) -> Marker {
     let (_, devices) = FakeDevice::pool(&["lane"]);
@@ -54,4 +58,148 @@ fn the_submission_sees_the_lease_it_must_wait_for() {
         Ok(Submitted::done())
     });
     assert_eq!(seen, Some((0xa000, Some(3))));
+}
+
+/// The expert stage of slot `index`, and a harness to run it in.
+fn rig(index: u32) -> (MoeExpert, StageHarness) {
+    let layer = Arc::new(layer(Arc::new(Source::default()), true));
+    let (lanes, _) = FakeDevice::pool(&["lane"]);
+    (MoeExpert::new(layer, index), StageHarness::new(lanes))
+}
+
+/// Experts 1, 3 and 6 are named, by three rows.
+fn block() -> Arc<BlockPlan> {
+    planned(3, &[6, 1, 6, 3, 1, 6])
+}
+
+#[test]
+fn a_slot_past_the_blocks_experts_does_no_work_and_closes_a_lease_it_was_handed() {
+    let (stage, harness) = rig(3);
+    let (host, log) = (Host::new(block()), Log::default());
+    host.plan.as_ref().unwrap().hold(3, Lease::boxed(0xa000, None, &log));
+    let run = harness.run(&stage as &dyn Stage<Host>, &host);
+    assert!(run.result.is_ok() && run.contract_breach().is_none());
+    assert!(
+        host.log.lines().is_empty(),
+        "no work is queued for a slot the block does not use"
+    );
+    assert_eq!(log.lines(), ["close 0xa000"]);
+}
+
+#[test]
+fn a_stopped_quantum_does_no_work_and_closes_the_lease() {
+    let (stage, harness) = rig(0);
+    let (host, log) = (Host::new(block()), Log::default());
+    host.stopped.store(true, Ordering::Relaxed);
+    host.plan.as_ref().unwrap().hold(0, Lease::boxed(0xa000, None, &log));
+    assert!(harness.run(&stage as &dyn Stage<Host>, &host).result.is_ok());
+    assert!(host.log.lines().is_empty());
+    assert_eq!(log.lines(), ["close 0xa000"]);
+}
+
+#[test]
+fn a_named_expert_that_is_not_held_fails_the_stage() {
+    let (stage, harness) = rig(1);
+    let host = Host::new(block());
+    let run = harness.run(&stage as &dyn Stage<Host>, &host);
+    assert!(matches!(run.result, Err(StageError::Fatal(why)) if why.contains("slot 1") && why.contains("not held")));
+    assert!(host.log.lines().is_empty());
+}
+
+#[test]
+fn a_held_expert_writes_its_slot_words_and_queues_its_work_after_the_lease_is_ready() {
+    let (stage, harness) = rig(2);
+    let (host, log) = (Host::new(block()), Log::default());
+    host.plan
+        .as_ref()
+        .unwrap()
+        .hold(2, Lease::boxed(0x7_0000_a000, Some(marker(3)), &log));
+    let run = harness.run(&stage as &dyn Stage<Host>, &host);
+    assert!(run.result.is_ok());
+    // Slot 2 is words 4 and 5: the address, low then high.
+    assert_eq!((host.word(4), host.word(5)), (0xa000, 7));
+    assert_eq!(
+        host.log.lines(),
+        ["queue Expert { index: 2, first_item: 2, item_count: 1, pairs: 6 } after [3]"]
+    );
+    assert_eq!(
+        log.lines(),
+        ["close 0x70000a000"],
+        "an unmarked submission leaves nothing to fence"
+    );
+}
+
+#[test]
+fn a_lease_is_fenced_behind_the_marker_the_expert_work_was_queued_with() {
+    let (stage, harness) = rig(0);
+    let (host, log) = (Host::new(block()), Log::default());
+    host.plan.as_ref().unwrap().hold(0, Lease::boxed(0xa000, None, &log));
+    let host = host.answering(Ok(Submitted::marker(marker(9))));
+    assert!(harness.run(&stage as &dyn Stage<Host>, &host).result.is_ok());
+    assert_eq!(log.lines(), ["fence 0xa000 behind 9", "close 0xa000"]);
+}
+
+#[test]
+fn a_quantum_abandoned_after_a_partly_queued_expert_keeps_the_lease_until_it_retires() {
+    let (stage, harness) = rig(0);
+    let (host, log) = (Host::new(block()), Log::default());
+    let plan = host.plan.clone().unwrap();
+    plan.hold(0, Lease::boxed(0xa000, None, &log));
+    let host = host.answering(Err(fatal("the second kernel did not launch")));
+    assert!(matches!(
+        harness.run(&stage as &dyn Stage<Host>, &host).result,
+        Err(StageError::Fatal(_))
+    ));
+    harness.abandoned(&stage as &dyn Stage<Host>, &host, LaneId(0));
+    assert!(log.lines().is_empty(), "queued work may still read the slot");
+    assert!(plan.is_held(0));
+    <MoeExpert as Stage<Host>>::retired(&stage, &host, false);
+    assert_eq!(log.lines(), ["close 0xa000"]);
+    assert!(!plan.is_held(0));
+}
+
+#[test]
+fn a_retried_expert_keeps_its_lease_for_the_next_run_and_gives_it_up_when_abandoned() {
+    let (stage, harness) = rig(0);
+    let (host, log) = (Host::new(block()), Log::default());
+    let plan = host.plan.clone().unwrap();
+    plan.hold(0, Lease::boxed(0xa000, None, &log));
+    let host = host.answering(Err(StageError::Retry));
+    assert!(matches!(
+        harness.run(&stage as &dyn Stage<Host>, &host).result,
+        Err(StageError::Retry)
+    ));
+    assert!(plan.is_held(0) && log.lines().is_empty());
+    assert!(
+        harness.run(&stage as &dyn Stage<Host>, &host).result.is_ok(),
+        "the retry finds its lease"
+    );
+    plan.hold(0, Lease::boxed(0xb000, None, &log));
+    harness.abandoned(&stage as &dyn Stage<Host>, &host, LaneId(0));
+    assert_eq!(log.lines().last().map(String::as_str), Some("close 0xb000"));
+    assert!(!plan.is_held(0));
+}
+
+#[test]
+fn a_stage_that_never_ran_releases_what_it_was_given_when_abandoned_and_when_retired() {
+    let (stage, harness) = rig(0);
+    let (host, log) = (Host::new(block()), Log::default());
+    let plan = host.plan.clone().unwrap();
+    plan.hold(0, Lease::boxed(0xa000, None, &log));
+    harness.abandoned(&stage as &dyn Stage<Host>, &host, LaneId(0));
+    assert_eq!(log.lines(), ["close 0xa000"]);
+    plan.hold(0, Lease::boxed(0xb000, None, &log));
+    <MoeExpert as Stage<Host>>::retired(&stage, &host, true);
+    assert_eq!(log.lines(), ["close 0xa000", "close 0xb000"]);
+}
+
+#[test]
+fn a_quantum_with_no_block_fails_the_stage() {
+    let (stage, harness) = rig(0);
+    let mut host = Host::new(block());
+    host.plan = None;
+    assert!(matches!(
+        harness.run(&stage as &dyn Stage<Host>, &host).result,
+        Err(StageError::Fatal(why)) if why.contains("no block")
+    ));
 }

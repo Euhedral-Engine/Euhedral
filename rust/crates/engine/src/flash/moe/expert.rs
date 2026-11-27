@@ -7,26 +7,24 @@
 //! marker, so the cache does not refill the slot before the kernels have read it. A stage past the block's experts, or
 //! of a stopped quantum, completes without work and gives back a lease it was handed.
 //!
-//! A lease is dropped only once nothing queued reads its slot: after the fence, or, when the stage failed after queueing
-//! part of its work, at the quantum's retirement ([`Stage::retired`], [`Stage::abandoned`]), by which the device has
-//! stopped.
+//! A lease is dropped only once nothing queued reads its slot: after the fence, or, when the stage failed after it may
+//! have queued part of its work, at the quantum's retirement ([`Stage::retired`]), by which the device has stopped.
+//! The quantum's abandonment ([`Stage::abandoned`]) comes before that and drops only a lease no queued work reads: one
+//! that was never run, or whose submission asked to retry.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
-use euhedral_graph::{Marker, Stage, StageCx, StageError, Submitted};
-use euhedral_inference_cuda::KernelOps;
+use euhedral_graph::{DeviceQueue, Stage, StageCx, StageError, Submitted};
 
 use super::block::BlockPlan;
+use super::host::{MoeHost, MoeWork};
 use super::layer::MoeLayer;
 use super::source::HeldExpert;
-use super::stages::block_of;
-use crate::flash::sequence::{Op, queue_all};
-use crate::stages::{Launch, Quantum, fatal, run_stage};
+use crate::stages::fatal;
 
 /// Runs `submit` over the expert `lease` of slot `index` and settles the lease by how it ended: fenced behind the
 /// marker of the submission and dropped when it ended with one; kept in its slot when `submit` asked for a retry
-/// (nothing was queued, and the same stage runs again); kept in its slot, to be dropped at retirement, when it failed.
+/// (nothing was queued, and the same stage runs again); kept apart, to be dropped at retirement, when it failed.
 pub(super) fn settle(
     plan: &BlockPlan,
     index: u32,
@@ -40,45 +38,14 @@ pub(super) fn settle(
             }
             Ok(submitted)
         }
-        Err(error) => {
+        Err(StageError::Retry) => {
             plan.hold(index, lease);
+            Err(StageError::Retry)
+        }
+        Err(error) => {
+            plan.hold_queued(index, lease);
             Err(error)
         }
-    }
-}
-
-/// The queued work of one expert: the copy of its slot address and its kernels.
-struct ExpertRun<'a> {
-    layer: &'a MoeLayer,
-    index: u32,
-    ready: Option<Marker>,
-    first_item: u32,
-    item_count: u32,
-    pairs: u32,
-}
-
-impl Launch for ExpertRun<'_> {
-    fn waits(&self, _quantum: &Quantum) -> Vec<Marker> {
-        self.ready.into_iter().collect()
-    }
-
-    fn launch(&self, quantum: &Quantum, kernels: &mut dyn KernelOps) -> Result<(), StageError> {
-        let layout = self.layer.shape().layout();
-        let [gate_up, down] = self
-            .layer
-            .expert_launches(self.first_item, self.item_count, self.pairs)
-            .map_err(fatal)?;
-        let ops = [
-            Op::Upload {
-                destination: self.layer.slot_address(self.index),
-                source: block_of(quantum)?.staging().descriptor(),
-                offset: layout.slot_offset(self.index),
-                bytes: 8,
-            },
-            Op::Launch(gate_up),
-            Op::Launch(down),
-        ];
-        queue_all(&ops, kernels).map_err(fatal)
     }
 }
 
@@ -95,11 +62,10 @@ impl MoeExpert {
     }
 }
 
-impl Stage<Quantum> for MoeExpert {
-    fn run(&self, quantum: &Quantum, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let block = block_of(quantum)?;
-        let plan = block.plan();
-        let Some((first_item, item_count)) = plan.items(self.index).filter(|_| !quantum.stop_requested()) else {
+impl<Q: MoeHost> Stage<Q> for MoeExpert {
+    fn run(&self, quantum: &Q, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+        let plan = quantum.block_plan()?;
+        let Some((first_item, item_count)) = plan.items(self.index).filter(|_| !quantum.stopped()) else {
             drop(plan.take(self.index));
             return Ok(Submitted::done());
         };
@@ -110,44 +76,37 @@ impl Stage<Quantum> for MoeExpert {
                 self.index
             ))
         })?;
+        quantum.check_staging(self.layer.shape().layout())?;
         // The slot's words are the kernels' only view of the expert's address, so they are written before the copy that
         // carries them; writing them again on a retry changes nothing.
-        let descriptor = block.staging().descriptor();
         for (word, value) in self
             .layer
             .shape()
             .layout()
             .slot_words(self.index, lease.device_address())
         {
-            descriptor.word(word).store(value, Ordering::Relaxed);
+            quantum.put_word(word, value);
         }
         settle(plan, self.index, lease, |lease| {
-            let run = ExpertRun {
-                layer: &self.layer,
+            let work = MoeWork::Expert {
                 index: self.index,
-                ready: lease.ready(),
                 first_item,
                 item_count,
                 pairs: plan.pairs(),
             };
-            run_stage(&run, quantum, cx)
+            quantum.queue(cx, &self.layer, &lease.ready().into_iter().collect::<Vec<_>>(), work)
         })
     }
 
-    fn abandoned(&self, quantum: &Quantum, _home: &dyn euhedral_graph::DeviceQueue) {
-        self.release(quantum);
+    fn abandoned(&self, quantum: &Q, _home: &dyn DeviceQueue) {
+        if let Ok(plan) = quantum.block_plan() {
+            plan.release_idle(self.index);
+        }
     }
 
-    fn retired(&self, quantum: &Quantum, _committed: bool) {
-        self.release(quantum);
-    }
-}
-
-impl MoeExpert {
-    /// Gives back the lease this stage still holds, at a time when no queued work of the quantum runs.
-    fn release(&self, quantum: &Quantum) {
-        if let Some(block) = quantum.moe_block() {
-            drop(block.plan().take(self.index));
+    fn retired(&self, quantum: &Q, _committed: bool) {
+        if let Ok(plan) = quantum.block_plan() {
+            plan.release_queued(self.index);
         }
     }
 }

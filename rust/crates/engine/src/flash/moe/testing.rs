@@ -6,10 +6,10 @@
     reason = "test fixture: the fake source's request queue and log are Mutexes, read by one test thread"
 )]
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use euhedral_graph::Marker;
+use euhedral_graph::{Marker, StageCx, StageError, Submitted};
 
 use super::source::{Arrival, Arrived, ExpertSource, HeldExpert};
 use crate::residency::experts::ExpertId;
@@ -205,6 +205,128 @@ pub(crate) fn planned(rows: u32, ids: &[i32]) -> Arc<BlockPlan> {
     let mut routing = Routing::new(layout);
     routing.plan(rows, |i| ids[i], |_| 0x3f80).unwrap();
     let plan = Arc::new(BlockPlan::new(layout.max_active()));
-    plan.publish(&routing);
+    plan.publish(&routing).unwrap();
     plan
+}
+
+use super::host::{MoeHost, MoeWork};
+use crate::handoff::Handoff;
+
+/// A quantum as the MoE stages see it: the plan, the router's picks, the words of the description and the work the
+/// stages queue, which is logged and answered from a script.
+pub(crate) struct Host {
+    pub(crate) plan: Option<Arc<BlockPlan>>,
+    pub(crate) stopped: AtomicBool,
+    pub(crate) cancel: Option<Arc<AtomicBool>>,
+    pub(crate) rows: usize,
+    pub(crate) log: Log,
+    routing: Handoff<Box<Routing>>,
+    picks: Vec<(i32, u16)>,
+    words: Vec<AtomicU32>,
+    outcomes: Mutex<Vec<Result<Submitted, StageError>>>,
+}
+
+impl Host {
+    pub(crate) fn new(plan: Arc<BlockPlan>) -> Self {
+        let layout = *shape().layout();
+        let routing = Handoff::empty();
+        routing.send(Box::new(Routing::new(layout)));
+        Self {
+            plan: Some(plan),
+            stopped: AtomicBool::new(false),
+            cancel: None,
+            rows: 3,
+            log: Log::default(),
+            routing,
+            picks: Vec::new(),
+            words: (0..layout.bytes() / 4).map(|_| AtomicU32::new(0)).collect(),
+            outcomes: Mutex::default(),
+        }
+    }
+
+    /// The router's choice for the next plan, `(expert id, BF16 weight bits)` per pair.
+    pub(crate) fn picking(mut self, picks: &[(i32, u16)], rows: usize) -> Self {
+        self.picks = picks.to_vec();
+        self.rows = rows;
+        self
+    }
+
+    /// The answer of the next queued work (in order); work past the script succeeds with no marker.
+    pub(crate) fn answering(self, outcome: Result<Submitted, StageError>) -> Self {
+        self.outcomes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(0, outcome);
+        self
+    }
+
+    pub(crate) fn word(&self, index: usize) -> u32 {
+        self.words[index].load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn routing_is_home(&self) -> bool {
+        self.routing.is_set()
+    }
+}
+
+impl MoeHost for Host {
+    fn block_plan(&self) -> Result<&Arc<BlockPlan>, StageError> {
+        self.plan
+            .as_ref()
+            .ok_or_else(|| StageError::Fatal("no block".to_owned()))
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    fn cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.cancel.clone()
+    }
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn check_staging(&self, layout: &DescriptorLayout) -> Result<(), StageError> {
+        if layout == shape().layout() {
+            Ok(())
+        } else {
+            Err(StageError::Fatal("staging does not fit".to_owned()))
+        }
+    }
+
+    fn take_routing(&self) -> Result<Box<Routing>, StageError> {
+        self.routing
+            .take()
+            .ok_or_else(|| StageError::Fatal("the routing scratch is in use".to_owned()))
+    }
+
+    fn give_back(&self, routing: Box<Routing>) {
+        self.routing.send(routing);
+    }
+
+    fn router_pick(&self, i: usize) -> (i32, u16) {
+        self.picks[i]
+    }
+
+    fn put_word(&self, word: usize, value: u32) {
+        self.words[word].store(value, Ordering::Relaxed);
+    }
+
+    fn queue(
+        &self,
+        _cx: &StageCx<'_>,
+        _layer: &MoeLayer,
+        waits: &[Marker],
+        work: MoeWork,
+    ) -> Result<Submitted, StageError> {
+        let waits: Vec<u64> = waits.iter().map(|marker| marker.value).collect();
+        self.log.push(format!("queue {work:?} after {waits:?}"));
+        self.outcomes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+            .unwrap_or_else(|| Ok(Submitted::done()))
+    }
 }

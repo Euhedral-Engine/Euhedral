@@ -12,6 +12,7 @@
 pub mod block;
 pub mod expert;
 pub mod fetch;
+pub mod host;
 pub mod layer;
 pub mod ops;
 pub mod routing;
