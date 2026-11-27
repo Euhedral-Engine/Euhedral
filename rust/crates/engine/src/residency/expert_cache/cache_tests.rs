@@ -474,8 +474,8 @@ impl Rig {
             bytes: artifact.clone(),
             held: Mutex::new(VecDeque::new()),
         });
-        let source = FileRecordSource::new(Arc::clone(&layout), Arc::clone(&port) as Arc<dyn PartPort>, 1, true)
-            .expect("a source");
+        let source =
+            FileRecordSource::new(Arc::clone(&layout), Arc::clone(&port) as Arc<dyn PartPort>, 1).expect("a source");
         let staging = HostArena::new(settings.staging_slots as usize, layout.slot_bytes()).expect("an arena");
         let (memory, tier) = match settings.tier_slots {
             Some(slots) => {

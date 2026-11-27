@@ -807,7 +807,7 @@ fn build_cache(
         let piece = planned.piece;
         let port: Arc<dyn PartPort> = Arc::new(FilePartPort::new(Arc::clone(&core.io), Arc::new(file), piece));
         let split = core.settings.memory.weight_streaming.read_split as usize;
-        let source = FileRecordSource::new(Arc::clone(&layout), port, split, true).map_err(expert_failed)?;
+        let source = FileRecordSource::new(Arc::clone(&layout), port, split).map_err(expert_failed)?;
         let (memory, shards) = match plan.expert_store {
             ExpertStoreMode::RamCached => {
                 let (memory, shards) = RamTier::new(Arc::clone(&layout), plan.host.expert_ram_slots, 1)
