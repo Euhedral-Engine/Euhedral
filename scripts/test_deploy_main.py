@@ -162,6 +162,7 @@ class DeploymentTests(unittest.TestCase):
         run = next(event for event in self.events if event[:2] == ("docker", "run"))
         self.assertNotIn("--env-file", run)
         self.assertIn("--gpus", run)
+        self.assertEqual("seccomp=unconfined", run[run.index("--security-opt") + 1])
         self.assertIn("EUHEDRAL_SERVER_PORT=18081", run)
         self.assertIn("EUHEDRAL_MODEL_ARTIFACT=/models/model.edrl", run)
         self.assertIn("127.0.0.1:18081:18081", run)
@@ -182,6 +183,21 @@ class DeploymentTests(unittest.TestCase):
         with MODULE.build_context(SCRIPT.parents[1]) as context:
             self.assertTrue((context / "Dockerfile").is_file())
             self.assertFalse((context / "benchmark-results").exists())
+
+    def test_the_rust_image_is_built_from_its_own_dockerfile(self):
+        self.deploy(lambda port: "qwen3.8-27b-nvfp4-compressed")
+        build = next(event for event in self.events if event[:2] == ("docker", "build"))
+        self.assertEqual(str(self.root / "rust" / "Dockerfile"), build[build.index("-f") + 1])
+
+    def test_a_closed_engine_does_not_qualify(self):
+        def response(url, data=None):
+            if url.endswith("/health"):
+                return {"status": "up", "engine": "closed", "model": "qwen"}
+            return {"data": [{"id": "qwen"}]}
+
+        with patch.object(MODULE, "command", return_value="healthy"), patch.object(MODULE, "get_json", side_effect=response), patch.object(MODULE.time, "monotonic", side_effect=[0, 1, 301]), patch.object(MODULE.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                MODULE.verify_ready(18080)
 
     def test_zero_token_chat_response_does_not_qualify(self):
         def response(url, data=None):
