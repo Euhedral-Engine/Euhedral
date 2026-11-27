@@ -309,3 +309,56 @@ fn a_spent_window_frees_nothing_and_an_open_one_frees() {
         "a kept model is never freed by an open window"
     );
 }
+
+/// What a fake model did at the end of its shutdown.
+#[derive(Default)]
+struct Fate {
+    freed: bool,
+    kept: bool,
+}
+
+fn concluded(decided: Release, window: Duration) -> (Result<(), EngineError>, Fate) {
+    let mut fate = Fate::default();
+    let result = conclude(
+        decided,
+        Instant::now(),
+        window,
+        64,
+        &mut fate,
+        |fate| fate.freed = true,
+        |fate| fate.kept = true,
+    );
+    (result, fate)
+}
+
+#[test]
+fn a_spent_window_keeps_the_model_and_says_it_did_not_finish() {
+    let (result, fate) = concluded(Release::Free, Duration::ZERO);
+    assert!(!fate.freed && fate.kept, "a model was freed after its window was spent");
+    assert!(matches!(result, Err(EngineError::Unfinished { .. })), "{result:?}");
+}
+
+#[test]
+fn an_open_window_frees_the_model() {
+    let (result, fate) = concluded(Release::Free, Duration::MAX);
+    assert!(fate.freed && !fate.kept);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn a_model_the_decision_keeps_is_kept_whatever_the_window() {
+    let (result, fate) = concluded(Release::Keep("a reason"), Duration::MAX);
+    assert!(!fate.freed && fate.kept);
+    assert!(
+        matches!(result, Err(EngineError::Unfinished { left, .. }) if left.contains("a reason") && left.contains("64"))
+    );
+}
+
+#[test]
+fn a_kept_model_counts_its_bytes_again_and_a_freed_one_stays_at_zero() {
+    let bytes = AtomicU64::new(0);
+    counted(&Ok(()), &bytes, 64);
+    assert_eq!(bytes.load(Ordering::Acquire), 0);
+    counted(&Err(EngineError::Runtime("kept".to_owned())), &bytes, 64);
+    assert_eq!(bytes.load(Ordering::Acquire), 64);
+}

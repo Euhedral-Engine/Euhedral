@@ -100,7 +100,7 @@ impl FlashRuntime {
 
     /// Stops the engine within `window`, as the dense engine's `shutdown_within` does: cancels the running request,
     /// closes the sequence, closes the lattice through `owner` and frees the model's memory. When the window is spent
-    /// before the lattice has closed, a request did not end, or another handle to the runtime is alive, nothing is
+    /// before the sequence closes or before the lattice has closed, a request did not end, or another handle to the runtime is alive, nothing is
     /// freed (the device memory stays allocated until the process exits, and the bytes are logged) and the refusal is
     /// returned. A free that has begun is not interrupted. Call it on the thread that started the engine.
     pub fn shutdown(runtime: Arc<FlashRuntime>, owner: RuntimeOwner, window: Duration) -> Result<(), EngineError> {
@@ -117,9 +117,30 @@ impl FlashRuntime {
             ));
         };
         let FlashRuntime { model, engine } = runtime;
-        let ended = engine.close();
-        model.shutdown_within(owner, ended, window.saturating_sub(begun.elapsed()))
+        // The engine's close frees the sequence and may wait: it does not begin once the window is spent.
+        close_within(begun, window, engine, FlashEngine::close, mem::forget, |ended, left| {
+            model.shutdown_within(owner, ended, left)
+        })
     }
+}
+
+/// Closes the `engine` unless the `window` that began at `begun` is spent, then hands the model's shutdown whether the
+/// engine ended and what is left of the window. A spent window forgets the engine (its memory stays allocated) and
+/// tells the model it did not end, so the model is kept too.
+fn close_within<E>(
+    begun: Instant,
+    window: Duration,
+    engine: E,
+    close: impl FnOnce(E) -> bool,
+    forget: impl FnOnce(E),
+    model: impl FnOnce(bool, Duration) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    if begun.elapsed() >= window {
+        forget(engine);
+        return model(false, Duration::ZERO);
+    }
+    let ended = close(engine);
+    model(ended, window.saturating_sub(begun.elapsed()))
 }
 
 /// The runtime and the owner back when no other handle to the runtime is alive. Otherwise the owner is closed through
@@ -156,6 +177,7 @@ fn summary(model: &FlashModel) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::sync::atomic::AtomicU32;
 
     use super::*;
@@ -167,6 +189,71 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    #[test]
+    fn a_spent_window_forgets_the_engine_without_closing_it_and_keeps_the_model() {
+        let order = RefCell::new(Vec::new());
+        let told = RefCell::new(None);
+        let result = close_within(
+            Instant::now(),
+            Duration::ZERO,
+            (),
+            |()| {
+                order.borrow_mut().push("close");
+                true
+            },
+            |()| order.borrow_mut().push("forget"),
+            |ended, left| {
+                told.replace(Some((ended, left)));
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            *order.borrow(),
+            ["forget"],
+            "the engine was closed after the window was spent"
+        );
+        assert_eq!(told.take(), Some((false, Duration::ZERO)));
+    }
+
+    #[test]
+    fn an_open_window_closes_the_engine_and_passes_on_what_is_left_of_it() {
+        let told = RefCell::new(None);
+        let window = Duration::from_secs(3600);
+        let result = close_within(
+            Instant::now(),
+            window,
+            (),
+            |()| true,
+            |()| panic!("the engine was forgotten inside an open window"),
+            |ended, left| {
+                told.replace(Some((ended, left)));
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        let (ended, left) = told.take().expect("the model was told");
+        assert!(ended);
+        assert!(left <= window && left > Duration::ZERO, "{left:?}");
+    }
+
+    #[test]
+    fn an_engine_that_did_not_end_tells_the_model_so() {
+        let told = RefCell::new(None);
+        let _ = close_within(
+            Instant::now(),
+            Duration::MAX,
+            (),
+            |()| false,
+            |()| {},
+            |ended, _| {
+                told.replace(Some(ended));
+                Ok(())
+            },
+        );
+        assert_eq!(told.take(), Some(false));
     }
 
     #[test]

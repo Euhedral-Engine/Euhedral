@@ -19,7 +19,7 @@ use std::mem::{self, ManuallyDrop};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
@@ -170,29 +170,20 @@ impl FlashModel {
         });
         let allocated = self.core.teardown.device_bytes.load(Ordering::Acquire);
         let teardown = Arc::clone(&self.core.teardown);
-        let release = owner.shutdown_with(move || {
-            // The lattice has closed by now: the window is checked against it, and a spent one frees nothing.
-            let release = decided.within(begun, window);
-            match release {
-                Release::Free => self.release(),
-                Release::Keep(why) => {
-                    log::error!("{why}: {allocated} bytes of device memory stay allocated until the process exits");
-                    mem::forget(self);
-                }
-            }
-            release
+        // The lattice closes first; `conclude` then frees the model or keeps it, by the window.
+        let result = owner.shutdown_with(move || {
+            conclude(
+                decided,
+                begun,
+                window,
+                allocated,
+                self,
+                FlashModel::release,
+                mem::forget,
+            )
         });
-        match release {
-            Release::Free => Ok(()),
-            Release::Keep(why) => {
-                // Nothing was freed: the bytes still count as allocated.
-                teardown.device_bytes.store(allocated, Ordering::Release);
-                Err(EngineError::Unfinished {
-                    window,
-                    left: format!("{why}; {allocated} bytes of device memory stay allocated until the process exits"),
-                })
-            }
-        }
+        counted(&result, &teardown.device_bytes, allocated);
+        result
     }
 
     #[allow(
@@ -257,6 +248,41 @@ impl Release {
 )]
 fn wait_closed(cache: &ExpertCache, bound: Duration) -> bool {
     cache.close().wait(bound).is_ok()
+}
+
+/// The end of a model's shutdown, once the lattice has closed: `free` when `decided` frees and the `window` that began
+/// at `begun` is not spent, else `keep` (the model is forgotten: its `allocated` bytes stay until the process exits)
+/// and [`EngineError::Unfinished`] says why.
+fn conclude<M>(
+    decided: Release,
+    begun: Instant,
+    window: Duration,
+    allocated: u64,
+    model: M,
+    free: impl FnOnce(M),
+    keep: impl FnOnce(M),
+) -> Result<(), EngineError> {
+    match decided.within(begun, window) {
+        Release::Free => {
+            free(model);
+            Ok(())
+        }
+        Release::Keep(why) => {
+            log::error!("{why}: {allocated} bytes of device memory stay allocated until the process exits");
+            keep(model);
+            Err(EngineError::Unfinished {
+                window,
+                left: format!("{why}; {allocated} bytes of device memory stay allocated until the process exits"),
+            })
+        }
+    }
+}
+
+/// Counts a kept model's `allocated` bytes again: the owner's shutdown counted them as freed.
+fn counted(result: &Result<(), EngineError>, device_bytes: &AtomicU64, allocated: u64) {
+    if result.is_err() {
+        device_bytes.store(allocated, Ordering::Release);
+    }
 }
 
 /// Starts the Flash-Next engine of `settings` on the CUDA library at `library`, and returns at once: the rest runs as
