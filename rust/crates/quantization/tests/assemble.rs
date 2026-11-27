@@ -18,7 +18,7 @@ use std::time::Duration;
 use checkpoint_support::World;
 use euhedral_inference_edrl::tiny::{DRAFTER_PROJECTION, PROJECTIONS, TOKENIZER, TinyArtifact};
 use euhedral_inference_edrl::{MAX_DRAFT_DEPTH, TokenizerTexts};
-use euhedral_inference_engine::{ArtifactGuard, Handoff};
+use euhedral_inference_engine::{ArtifactGuard, GuardError, Handoff};
 use euhedral_inference_quantization::assemble::{
     ArtifactFile, AssembleError, Done, Request, SourceSet, View, run, view, write,
 };
@@ -305,6 +305,38 @@ fn an_output_that_a_running_engine_holds_is_refused_by_path_and_not_touched() {
     assert!(!fixture.dir.path().join("served.edrl.part").exists());
     drop(guard);
     fixture.write(&composite, &out, 1 << 20).unwrap();
+    fixture.world.finish();
+}
+
+#[test]
+fn a_write_keeps_its_claim_on_the_output_until_it_ends() {
+    // On Windows a claim holds nothing (the engine's guard stops a write at its open), so only the Unix lock shows.
+    if cfg!(windows) {
+        return;
+    }
+    let fixture = Fixture::new();
+    let sources = fixture.open(&fixture.two()).unwrap();
+    let composite = view(&sources, &allocation(&[]), None).unwrap();
+    let out = fixture.dir.path().join("served.edrl");
+    fs::write(&out, b"served").unwrap();
+    // A world whose I/O only the test drives: the write is in flight, at its first step, until the test runs it.
+    let driven = World::driven();
+    let ended = Handoff::new();
+    let sender = Arc::clone(&ended);
+    write(
+        &driven.io,
+        &driven.host,
+        &composite,
+        &out,
+        1 << 20,
+        Arc::new(move |result| sender.send(result)),
+    )
+    .unwrap();
+    let refusal = ArtifactGuard::hold(&out).unwrap_err();
+    assert!(matches!(refusal, GuardError::Held { .. }), "{refusal}");
+    driven.drive_until(&ended).unwrap();
+    drop(ArtifactGuard::hold(&out).unwrap());
+    driven.finish();
     fixture.world.finish();
 }
 

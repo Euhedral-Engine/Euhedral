@@ -35,6 +35,7 @@ use euhedral_inference_settings::Settings;
 use euhedral_io::{IoBuf, IoDone, OpenSpec, OwnedFile};
 use euhedral_memory::Claim;
 
+use crate::artifact_guard::GuardError;
 use crate::composite::{Composed, Composite, compose, composed_depth, refuse_replaced_on_disk};
 use crate::error::{EngineError, PlanError};
 use crate::frames::{Kind, step};
@@ -393,6 +394,12 @@ pub(crate) fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
     (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))
 }
 
+/// Checks that `file`, opened by `path`, is the file the engine holds, and gives the file back.
+fn admitted(core: &Core, path: &Path, file: OwnedFile) -> (Result<(), GuardError>, OwnedFile) {
+    let file = File::from(file);
+    (core.admit_file(path, &file), OwnedFile::from(file))
+}
+
 /// Reads the header and the footer, then the metadata and the table they locate.
 fn indexed(
     startup: Startup,
@@ -401,6 +408,11 @@ fn indexed(
     with_metadata: bool,
     next: impl FnOnce(Startup, Indexed) + Send + 'static,
 ) {
+    // The open went by the name: it must have found the file the engine holds.
+    let (admitted, file) = admitted(&startup.core, &path, file);
+    if let Err(error) = admitted {
+        return startup.fail(error.into());
+    }
     let (length, file) = file_len(file);
     let length = match length {
         Ok(length) => length,
@@ -973,8 +985,8 @@ fn disk_tier(
     let buffer = Arc::new(PinnedBuffer::alloc(&core.library, size)?);
     let window = DiskWindow::new(Arc::clone(&buffer), geometry)
         .map_err(|error| EngineError::Runtime(format!("the disk window: {error}")))?;
-    let file =
-        ArtifactFile::open(path).map_err(|error| EngineError::io(format!("opening {}", path.display()), error))?;
+    let file = ArtifactFile::open_admitted(path, |opened| core.admit_file(path, opened).map_err(io::Error::other))
+        .map_err(|error| EngineError::io(format!("opening {}", path.display()), error))?;
     let piece = DiskReadPiece::from_setting(core.settings.memory.disk_read_piece).map_err(EngineError::Runtime)?;
     let port = FilePort::new(Arc::clone(&core.io), Arc::new(file), window, piece);
     let reader = DiskReader::new(Arc::new(port), geometry, Generation::spawner(core));

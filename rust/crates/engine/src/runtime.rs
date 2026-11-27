@@ -7,6 +7,8 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::fs::File;
+use std::io;
 use std::iter;
 use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -29,7 +31,7 @@ use euhedral_inference_edrl::TensorTable;
 use euhedral_inference_settings::{Auto, BatchingSettings, Settings};
 use euhedral_io::{AsyncIo, OwnedFile, RawFile};
 
-use crate::artifact_guard::ArtifactGuard;
+use crate::artifact_guard::{ArtifactGuard, GuardError};
 use crate::composite::Composite;
 use crate::error::{EngineError, PlanError};
 use crate::flash::start::host_budget;
@@ -222,7 +224,7 @@ pub(crate) struct Core {
     /// What stops the lattice and its lakes, shared with the owner.
     pub(crate) teardown: Arc<Teardown>,
     /// The hold on each artifact file served (the base and the composite's sources), until the core is dropped.
-    _guards: Vec<ArtifactGuard>,
+    guards: Vec<ArtifactGuard>,
 }
 
 impl fmt::Debug for Core {
@@ -256,6 +258,19 @@ pub(crate) struct Units {
 }
 
 impl Core {
+    /// Admits `opened`, the engine's own open of the artifact file at `path`, when it is the file the engine holds. A
+    /// path that now names another file, or that the engine does not hold, is refused with the path: the engine reads
+    /// only the file it holds.
+    pub(crate) fn admit_file(&self, path: &Path, opened: &File) -> Result<(), GuardError> {
+        match self.guards.iter().find(|guard| guard.path() == path) {
+            Some(guard) => guard.admit(opened),
+            None => Err(GuardError::Lock {
+                path: path.to_path_buf(),
+                source: io::Error::other("the engine does not hold this file"),
+            }),
+        }
+    }
+
     fn device_lanes(&self) -> &DeviceLanes {
         self.device_lanes
             .get()
@@ -1305,6 +1320,21 @@ pub fn open_lane_set<G: Gpu>(
     })
 }
 
+/// The hold on `base` and on the source of each replacement of `composite`: every file the engine serves. Refuses with
+/// the path of the first that cannot be held (missing, held by a writer, replaced meanwhile, or on a file system
+/// without locks); the holds taken before it are released.
+pub(crate) fn hold_artifacts(base: &Path, composite: &Composite) -> Result<Vec<ArtifactGuard>, GuardError> {
+    iter::once(base)
+        .chain(
+            composite
+                .replacements
+                .iter()
+                .map(|replacement| replacement.source.as_path()),
+        )
+        .map(ArtifactGuard::hold)
+        .collect()
+}
+
 /// Builds the lattice, the lakes, the device with its kernels and the pools of a startup, on the calling thread. The
 /// lanes are not opened here: their rings depend on the sequences the plan resolves ([`Core::open_lanes`]).
 pub(crate) fn build(
@@ -1323,11 +1353,9 @@ fn build_composite(
     composite: &Composite,
 ) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
-    // First, before any open of the artifact: the engine holds every file it serves against change for its life.
-    let guards = iter::once(&settings.model.artifact)
-        .chain(composite.replacements.iter().map(|replacement| &replacement.source))
-        .map(|path| ArtifactGuard::hold(path))
-        .collect::<Result<Vec<_>, _>>()?;
+    // First, before the engine's own opens of the artifact: it holds every file it serves for its life, and each later
+    // open of one is checked against the hold ([`Core::admit_file`]).
+    let guards = hold_artifacts(&settings.model.artifact, composite)?;
     // Before anything is opened: a stated count the passes cannot hold is refused.
     check_stated_sequences(&settings.batching)?;
     let library = CudaLibrary::load(library_path)?;
@@ -1392,7 +1420,7 @@ fn build_composite(
         pool_bytes,
         started,
         teardown,
-        _guards: guards,
+        guards,
     }))
 }
 
@@ -1404,7 +1432,9 @@ fn build_composite(
 )]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
     use std::io;
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Mutex;
     use std::thread;
@@ -1412,8 +1442,75 @@ mod tests {
     use euhedral_inference_settings::ModelSettings;
 
     use super::*;
+    use crate::artifact_guard::WriteClaim;
+    use crate::composite::Replacement;
     use crate::residency::disk::{DiskUse, ReadDone, ReadPort, ReadSpec};
     use crate::residency::offload::WindowGeometry;
+
+    fn composite_of(sources: &[&Path]) -> Composite {
+        Composite {
+            replacements: sources
+                .iter()
+                .map(|source| Replacement {
+                    source: source.to_path_buf(),
+                    objects: Vec::new(),
+                })
+                .collect(),
+            ..Composite::default()
+        }
+    }
+
+    fn file_in(directory: &tempfile::TempDir, name: &str) -> PathBuf {
+        let path = directory.path().join(name);
+        fs::write(&path, b"bytes").unwrap();
+        path
+    }
+
+    #[test]
+    fn the_base_and_every_source_of_a_composite_are_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let (base, first, second) = (
+            file_in(&directory, "base.edrl"),
+            file_in(&directory, "first.edrl"),
+            file_in(&directory, "second.edrl"),
+        );
+        let held = hold_artifacts(&base, &composite_of(&[&first, &second])).unwrap();
+        for path in [&base, &first, &second] {
+            assert!(
+                matches!(WriteClaim::take(path), Err(GuardError::Held { .. })),
+                "{} is held",
+                path.display()
+            );
+        }
+        drop(held);
+        for path in [&base, &first, &second] {
+            WriteClaim::take(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_composite_without_replacements_holds_the_base_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let (base, other) = (file_in(&directory, "base.edrl"), file_in(&directory, "other.edrl"));
+        let held = hold_artifacts(&base, &Composite::default()).unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(WriteClaim::take(&base).is_err());
+        WriteClaim::take(&other).unwrap();
+    }
+
+    #[test]
+    fn a_missing_source_refuses_the_start_by_path_and_releases_the_holds_taken_before_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (base, first) = (file_in(&directory, "base.edrl"), file_in(&directory, "first.edrl"));
+        let missing = directory.path().join("missing.edrl");
+        let refusal = hold_artifacts(&base, &composite_of(&[&first, &missing])).unwrap_err();
+        assert!(
+            refusal.to_string().contains(&missing.display().to_string()),
+            "{refusal}"
+        );
+        WriteClaim::take(&base).unwrap();
+        WriteClaim::take(&first).unwrap();
+    }
 
     #[test]
     fn the_stage_ring_holds_the_quanta_in_flight_in_a_power_of_two() {

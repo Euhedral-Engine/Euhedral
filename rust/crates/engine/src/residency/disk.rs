@@ -328,21 +328,35 @@ pub struct ArtifactFile {
 impl ArtifactFile {
     /// Opens `path` for the reads of the window. Blocking: call it at startup, outside any frame.
     pub fn open(path: &Path) -> io::Result<ArtifactFile> {
-        Self::open_with(path, open_direct)
+        Self::open_checked(path, open_direct, |_| Ok(()))
     }
 
-    /// As [`open`](Self::open) with `direct` as the page-cache-bypassing open (tests force it to fail). A file system
-    /// that refuses the direct open (tmpfs does) leaves every read buffered.
+    /// As [`open`](Self::open), with each handle it opens (the buffered one and the direct one) shown to `admit` first:
+    /// an `Err` from it fails the open. The engine passes the check that the handle is the file it holds.
+    pub fn open_admitted(path: &Path, admit: impl Fn(&File) -> io::Result<()>) -> io::Result<ArtifactFile> {
+        Self::open_checked(path, open_direct, admit)
+    }
+
+    /// As [`open_admitted`](Self::open_admitted) with `direct` as the page-cache-bypassing open (tests force it to
+    /// fail). A file system that refuses the direct open (tmpfs does) leaves every read buffered.
     #[allow(
         clippy::disallowed_methods,
         reason = "no-wait, blocking I/O: one fstat at startup, before any frame runs"
     )]
-    pub(crate) fn open_with(path: &Path, direct: impl FnOnce(&Path) -> io::Result<File>) -> io::Result<ArtifactFile> {
+    fn open_checked(
+        path: &Path,
+        direct: impl FnOnce(&Path) -> io::Result<File>,
+        admit: impl Fn(&File) -> io::Result<()>,
+    ) -> io::Result<ArtifactFile> {
         let buffered = open_buffered(path)?;
+        admit(&buffered)?;
         let len = buffered.metadata()?.len();
         let direct = direct(path)
             .map_err(|refused| log::info!("the artifact is read through the page cache: {refused}"))
             .ok();
+        if let Some(direct) = &direct {
+            admit(direct)?;
+        }
         Ok(ArtifactFile {
             buffered: buffered.into(),
             direct: direct.map(OwnedFile::from),

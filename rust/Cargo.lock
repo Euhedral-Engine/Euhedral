@@ -563,6 +563,7 @@ dependencies = [
  "euhedral-io",
  "euhedral-memory",
  "log",
+ "same-file",
  "sha2",
  "smallvec",
  "tempfile",

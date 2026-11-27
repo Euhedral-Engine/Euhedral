@@ -24,6 +24,7 @@ euhedral-inference-cuda = { path = "../cuda" }
 euhedral-inference-edrl = { path = "../edrl" }
 euhedral-inference-settings = { path = "../settings" }
 log.workspace = true
+same-file.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
 
