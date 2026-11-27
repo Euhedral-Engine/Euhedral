@@ -293,6 +293,7 @@ fn two_sequences_capture_and_restore_their_own_bytes_at_once() {
         CacheSpec {
             library: &world.library,
             config: &world.config,
+            drafter: None,
             format,
             settings: PrefixCacheSettings {
                 size: ByteSize(granted),

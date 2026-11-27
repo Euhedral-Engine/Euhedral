@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::model::dflash2::Dflash2Config;
 use crate::model::{LayerKind, ModelConfig};
 use euhedral_memory::{LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope, SlotArena};
 
@@ -62,4 +63,27 @@ pub fn compact() -> ModelConfig {
         })
         .collect();
     config(kinds, 2, 4, 8)
+}
+
+/// A drafter of `layers` layers whose rings hold `window` rows of 64 values (BF16): a ring is `128 * window` bytes.
+pub fn drafter(layers: usize, window: usize) -> Dflash2Config {
+    Dflash2Config {
+        layers,
+        hidden: 64,
+        intermediate: 64,
+        heads: 1,
+        kv_heads: 4,
+        head_dim: 16,
+        block_size: 8,
+        mask_token: 0,
+        conv_kernel: 2,
+        conv_group: 16,
+        selector_top_k: 16,
+        selector_rank: 16,
+        sliding_window: window,
+        vocab: 1024,
+        eps: 1e-6,
+        theta: 1e7,
+        taps: vec![1, 3],
+    }
 }

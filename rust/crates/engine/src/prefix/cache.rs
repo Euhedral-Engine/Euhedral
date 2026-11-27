@@ -100,6 +100,12 @@ pub enum OpenError {
     SlotBytes { arena: u64, layout: u64 },
     #[error("the checkpoint interval must be a positive multiple of the chunk")]
     Interval,
+    #[error("a chunk's checkpoint that holds {kind:?} state takes {needed} slots and the arena has {slots}")]
+    Capacity {
+        kind: Speculation,
+        needed: usize,
+        slots: u32,
+    },
 }
 
 /// A match the cache pinned: the position it restores, and the pins until it is restored or dropped.
@@ -262,6 +268,17 @@ impl PrefixCache {
         }
         if interval == 0 || chunk == 0 || !interval.is_multiple_of(chunk) {
             return Err(OpenError::Interval);
+        }
+        // The drafter's rings are a fixed share of every checkpoint, which an arena too small for the first chunk's
+        // could never store: refuse it here, not by skipping every capture.
+        let kind = Speculation::Dflash2;
+        let needed = layout.slots(0, chunk, Some(kind));
+        if layout.has_speculation(kind) && needed > arena.capacity() as usize {
+            return Err(OpenError::Capacity {
+                kind,
+                needed,
+                slots: arena.capacity(),
+            });
         }
         let tree = PrefixTree::new(Arc::clone(&arena));
         let root = tree.root();

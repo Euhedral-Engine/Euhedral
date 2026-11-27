@@ -18,7 +18,10 @@ pub const POSITION_GRANULE: u32 = PAGE_TOKENS as u32;
 /// The kind of speculative decoding state a node holds beside the base state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Speculation {
+    /// The MTP layer: its cache's pages and the base hidden row of the last position.
     Mtp,
+    /// The DFlash2 drafter: each layer's ring of keys and values of the last window of positions.
+    Dflash2,
 }
 
 /// A node of one tree. Ids of evicted or aborted nodes are never reused for another node.

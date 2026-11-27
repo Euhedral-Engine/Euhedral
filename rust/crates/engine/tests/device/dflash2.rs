@@ -33,10 +33,14 @@ use euhedral_inference_engine::generation::{
     FinishReason, GenerationListener, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation, Verification,
 };
 use euhedral_inference_engine::sampling::SamplingConfig;
+use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff};
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
+
+/// Graphs each captured view keeps.
+const CAPTURES: u32 = 8;
 
 /// Tokens each generation asks for.
 const GENERATED: u32 = 128;
@@ -59,7 +63,8 @@ fn machine() -> Option<Machine> {
     Some(Machine { artifact, library })
 }
 
-fn start(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
+/// An engine that keeps `captures_per_view` graphs of each captured view (0: every quantum runs stage by stage).
+fn start(machine: &Machine, captures_per_view: u32) -> (Card, Arc<EngineRuntime>) {
     let mut settings = Settings::with_model(ModelSettings {
         artifact: machine.artifact.clone(),
         name: "test".to_string(),
@@ -67,17 +72,20 @@ fn start(machine: &Machine) -> (Card, Arc<EngineRuntime>) {
     settings.context.max_tokens = 4096;
     // A prefix cache hit would restore the prompt of the first run into the second.
     settings.prefix_cache.size = ByteSize(0);
+    settings.kernels.graphs.captures_per_view = captures_per_view;
     common::engine(&settings, &machine.library)
 }
 
 struct Recording {
     tokens: Vec<u32>,
+    events: Vec<QuantumEvent>,
     verifications: Vec<Verification>,
     outcome: GenerationOutcome,
 }
 
 struct Recorder {
     tokens: Vec<u32>,
+    events: Vec<QuantumEvent>,
     verifications: Vec<Verification>,
     done: Option<Arc<Handoff<Recording>>>,
 }
@@ -89,7 +97,9 @@ impl GenerationListener for Recorder {
         self.tokens.push(id);
     }
 
-    fn quantum(&mut self, _event: QuantumEvent) {}
+    fn quantum(&mut self, event: QuantumEvent) {
+        self.events.push(event);
+    }
 
     fn verification(&mut self, event: Verification) {
         self.verifications.push(event);
@@ -99,6 +109,7 @@ impl GenerationListener for Recorder {
         let done = self.done.take().expect("a generation finishes once");
         done.send(Recording {
             tokens: mem::take(&mut self.tokens),
+            events: mem::take(&mut self.events),
             verifications: mem::take(&mut self.verifications),
             outcome,
         });
@@ -111,6 +122,7 @@ impl Drop for Recorder {
         if let Some(done) = self.done.take() {
             done.send(Recording {
                 tokens: mem::take(&mut self.tokens),
+                events: mem::take(&mut self.events),
                 verifications: mem::take(&mut self.verifications),
                 outcome: GenerationOutcome {
                     reason: FinishReason::Failed("the listener was dropped before the generation finished".to_string()),
@@ -137,6 +149,7 @@ fn generate(runtime: &EngineRuntime, prompt: &[u32], speculation: Speculation) -
             constraint: None,
             listener: Box::new(Recorder {
                 tokens: Vec::new(),
+                events: Vec::new(),
                 verifications: Vec::new(),
                 done: Some(done),
             }),
@@ -172,7 +185,7 @@ fn mean_accepted(counts: &[u64]) -> f64 {
 fn dflash2_output_equals_greedy() {
     let Some(machine) = machine() else { return };
     let prompt = CHAT_PROMPT.to_vec();
-    let (_card, runtime) = start(&machine);
+    let (_card, runtime) = start(&machine, CAPTURES);
     let depth = runtime.plan().draft_depth;
     assert!(depth > 0, "the artifact drafts");
 
@@ -229,4 +242,50 @@ fn dflash2_output_equals_greedy() {
             drafted.tokens.len()
         );
     }
+}
+
+/// The drafted decode of an engine that records and replays the drafter's graphs equals that of an engine that runs
+/// every quantum stage by stage, and the context and block quanta replay their graphs more than once.
+#[test]
+#[ignore = "needs a GPU, the native library and the DFlash2 artifact"]
+fn dflash2_replayed_drafter_graphs_equal_the_eager_run() {
+    let Some(machine) = machine() else { return };
+    let prompt = CHAT_PROMPT.to_vec();
+    let eager = {
+        let (_card, runtime) = start(&machine, 0);
+        generate(&runtime, &prompt, Speculation::Artifact)
+    };
+    assert_eq!(eager.tokens.len(), GENERATED as usize);
+    let (_card, runtime) = start(&machine, CAPTURES);
+    let graphed = generate(&runtime, &prompt, Speculation::Artifact);
+    for kind in [QuantumKind::Context, QuantumKind::Block] {
+        let of_kind: Vec<&QuantumEvent> = graphed.events.iter().filter(|event| event.kind == kind).collect();
+        let replayed = of_kind.iter().filter(|event| event.replayed).count();
+        println!(
+            "{kind:?}: {} quanta, {} recorded, {replayed} replayed",
+            of_kind.len(),
+            of_kind.iter().filter(|event| event.recorded).count()
+        );
+        assert!(
+            replayed > 1,
+            "{kind:?} quanta replay a graph more than once, saw {replayed}"
+        );
+    }
+    assert_eq!(
+        graphed
+            .verifications
+            .iter()
+            .map(|v| (v.accepted, v.drafted))
+            .collect::<Vec<_>>(),
+        eager
+            .verifications
+            .iter()
+            .map(|v| (v.accepted, v.drafted))
+            .collect::<Vec<_>>(),
+        "the acceptance of every verification is the eager run's"
+    );
+    assert_eq!(
+        graphed.tokens, eager.tokens,
+        "the replayed drafter drafts as the eager one"
+    );
 }

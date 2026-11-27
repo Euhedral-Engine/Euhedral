@@ -44,7 +44,7 @@ use euhedral_inference_cuda::launch::ops::RusteeOps;
 use euhedral_inference_cuda::{AllocationId, CudaError, KernelOps, PinnedPool, SubmitMode};
 use thiserror::Error;
 
-pub use capture_key::{CaptureKey, split_geometry};
+pub use capture_key::{CaptureKey, keyed_split_geometry, split_geometry};
 pub use input_record::{
     encode as encode_input_record, encode_into as encode_input_record_into,
     encode_positions as encode_input_record_positions,
@@ -368,7 +368,13 @@ impl Quantum {
             token_from: self.token_from.as_ref().map(|selection| selection.generation()),
             row_exact: self.mode.row_exact,
             programmatic: self.mode.pdl,
-            split_geometry: split_geometry(start, rows, group, &self.lanes.kernels().dispatch().fused_verify_from),
+            split_geometry: keyed_split_geometry(
+                source.is_some(),
+                start,
+                rows,
+                group,
+                &self.lanes.kernels().dispatch().fused_verify_from,
+            ),
             reserved_host_pages: keyed_host_pages(source, host_pages(KvSource::Base), host_pages(KvSource::Mtp)),
             replay_rows: capture_key::trimmed(self.segment().refs.replay_layers()),
             buffer_generations: self.buffer_generations(),

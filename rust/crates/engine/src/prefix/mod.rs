@@ -21,7 +21,7 @@ pub use cache::{CacheParts, Hit, OpenError, PrefixCacheHandle, PrefixCacheStats,
 pub(crate) use copier::FIRST_COPY_SERIAL;
 pub use copier::{Copier, PinnedArena, SequenceAddresses};
 pub use copy::{CopyJob, Direction, Ended, HostArena, Piece, Resolve};
-pub use layout::{Buffer, CheckpointLayout, SlotCopy};
+pub use layout::{Buffer, CheckpointLayout, LayoutError, SlotCopy};
 pub use open::{CacheSpec, open_prefix_cache, open_prefix_cache_claimed};
 pub use prompt::{PromptCheckpoints, Restored};
 pub use tree::{Match, NodeId, POSITION_GRANULE, PrefixNode, PrefixTree, ReserveError, Speculation};
