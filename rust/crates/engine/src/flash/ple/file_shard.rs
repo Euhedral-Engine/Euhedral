@@ -1,37 +1,50 @@
 //! A shard of the n-gram table read in place from the artifact file: the file is not mapped (no dependency maps files
-//! on every platform the engine builds for); each row is a positional read of the file's own pages.
+//! on every platform the engine builds for); each row is one read through RustEE's asynchronous I/O, which a worker
+//! of the lattice never waits for (the I/O engine of each platform makes the read, and its end is a frame).
 
-use std::fs::File;
-use std::io;
+use std::fmt;
+use std::sync::Arc;
 
-use euhedral_io::OwnedFile;
+use euhedral_io::{AsyncIo, IoDoneOwned, OwnedFile};
 
-use super::ShardBytes;
+use super::{RowRead, ShardBytes};
+use crate::runtime::raw_file;
 
-/// The `len` bytes at `base` of a file, read by position. It owns a duplicate of the handle, so the file it was made
-/// from may close, and it keeps no cursor, so reads from many threads need no lock.
-#[derive(Debug)]
+/// The `len` bytes at `base` of a file, read by position. It holds the file open, and keeps no cursor, so reads from
+/// many threads need no lock.
 pub struct FileShard {
-    file: File,
+    io: Arc<AsyncIo>,
+    file: Arc<OwnedFile>,
     base: u64,
     len: u64,
 }
 
+impl fmt::Debug for FileShard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileShard")
+            .field("base", &self.base)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FileShard {
-    /// The shard of `len` bytes at `base` of `file`. Refuses a range that overflows 64 bits and a handle that cannot
-    /// be duplicated.
-    pub fn over(file: &OwnedFile, base: u64, len: u64) -> io::Result<FileShard> {
+    /// The shard of `len` bytes at `base` of `file`, read through `io`. Refuses a range that overflows 64 bits.
+    pub fn over(io: Arc<AsyncIo>, file: Arc<OwnedFile>, base: u64, len: u64) -> Result<FileShard, String> {
         if base.checked_add(len).is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{len} bytes at {base} overflow 64 bits"),
-            ));
+            return Err(format!("{len} bytes at {base} overflow 64 bits"));
         }
-        Ok(FileShard {
-            file: File::from(file.try_clone()?),
-            base,
-            len,
-        })
+        Ok(FileShard { io, file, base, len })
+    }
+
+    /// Where in the file `len` bytes at `offset` of the shard are. Refuses an empty range and one past the shard.
+    fn locate(&self, offset: u64, len: usize) -> Result<u64, String> {
+        let end = offset.checked_add(len as u64).filter(|end| *end <= self.len);
+        if len == 0 || end.is_none() {
+            return Err(format!("{len} bytes at {offset} of a shard of {}", self.len));
+        }
+        // The sum is at most `base + len`, which `over` proved fits.
+        Ok(self.base + offset)
     }
 }
 
@@ -40,43 +53,27 @@ impl ShardBytes for FileShard {
         self.len
     }
 
-    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
-        let end = offset.checked_add(out.len() as u64).filter(|end| *end <= self.len);
-        if end.is_none() {
-            return Err(format!("{} bytes at {offset} of a shard of {}", out.len(), self.len));
-        }
-        // The sum is at most `base + len`, which `over` proved fits.
-        read_exact_at(&self.file, out, self.base + offset).map_err(|error| {
-            format!(
-                "reading {} bytes at {} of the file: {error}",
-                out.len(),
-                self.base + offset
-            )
-        })
+    fn start(&self, offset: u64, len: usize, then: RowRead) -> Result<(), String> {
+        let at = self.locate(offset, len)?;
+        let ended: euhedral_io::Continuation<IoDoneOwned<Vec<u8>>> =
+            Box::new(move |done| then(read_result(done, len, at)));
+        self.io
+            .read_into(raw_file(&self.file), at, vec![0u8; len], ended)
+            .map_err(|error| format!("starting the read of {len} bytes at {at} of the file: {error}"))
     }
 }
 
-#[cfg(unix)]
-fn read_exact_at(file: &File, out: &mut [u8], at: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-
-    file.read_exact_at(out, at)
-}
-
-#[cfg(windows)]
-fn read_exact_at(file: &File, mut out: &mut [u8], mut at: u64) -> io::Result<()> {
-    use std::os::windows::fs::FileExt;
-
-    while !out.is_empty() {
-        match file.seek_read(out, at)? {
-            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
-            read => {
-                out = &mut out[read..];
-                at += read as u64;
-            }
-        }
+/// The bytes a read of `len` bytes at `at` of the file brought, or what went wrong.
+fn read_result(done: IoDoneOwned<Vec<u8>>, len: usize, at: u64) -> Result<Vec<u8>, String> {
+    let IoDoneOwned { buf, result, .. } = done;
+    match (buf, result) {
+        (Some(bytes), Ok(read)) if read == len => Ok(bytes),
+        (Some(_), Ok(read)) => Err(format!("{read} of {len} bytes at {at} of the file")),
+        (_, Err(error)) => Err(format!("reading {len} bytes at {at} of the file: {error}")),
+        (None, Ok(_)) => Err(format!(
+            "reading {len} bytes at {at} of the file: the ring kept the memory"
+        )),
     }
-    Ok(())
 }
 
 #[cfg(test)]
