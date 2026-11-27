@@ -30,7 +30,7 @@ struct Fill {
 }
 
 /// Starts reading `items` (a record and the tier slot it goes to) into `arena` with `readers` chains. Refuses no
-/// reader; with no items `done` is called at once with 0.
+/// reader at all (0); with no items `done` is called at once with 0.
 pub fn preload(
     source: Arc<FileRecordSource>,
     arena: Arc<HostArena>,
@@ -38,7 +38,10 @@ pub fn preload(
     readers: usize,
     done: PreloadDone,
 ) -> Result<(), ExpertError> {
-    let chains = readers.clamp(1, items.len().max(1));
+    if readers == 0 {
+        return Err(ExpertError::NoReaders { readers });
+    }
+    let chains = readers.min(items.len().max(1));
     if items.is_empty() {
         done(Ok(0));
         return Ok(());
@@ -82,7 +85,7 @@ fn advance(fill: &Arc<Fill>) {
                     ReadOutcome::Failed(error) => {
                         let _ = chained.failure.set(error);
                     }
-                    ReadOutcome::Cancelled | ReadOutcome::Lost => {
+                    ReadOutcome::Cancelled { .. } | ReadOutcome::Lost => {
                         let _ = chained.failure.set(ExpertError::Unfinished {
                             bank: chained.source.layout().bank_name(id.bank).to_owned(),
                             expert: id.expert,

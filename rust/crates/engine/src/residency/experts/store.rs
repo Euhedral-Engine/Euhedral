@@ -47,9 +47,9 @@ impl TierDirective {
         match *self {
             TierDirective::Hit { slot } => Some(TierSettle::Used(slot)),
             TierDirective::Fill { slot } => Some(match outcome {
-                ReadOutcome::Complete => TierSettle::Filled(slot),
+                ReadOutcome::Complete | ReadOutcome::Cancelled { filled: true } => TierSettle::Filled(slot),
                 ReadOutcome::Lost => TierSettle::Lost(slot),
-                ReadOutcome::Cancelled | ReadOutcome::Failed(_) => TierSettle::Abandoned(slot),
+                ReadOutcome::Cancelled { filled: false } | ReadOutcome::Failed(_) => TierSettle::Abandoned(slot),
             }),
             TierDirective::Bypass => None,
         }
@@ -57,7 +57,7 @@ impl TierDirective {
 
     /// The settle of a load that planned this directive and was refused before it started.
     pub fn settle_unstarted(&self) -> Option<TierSettle> {
-        self.settle(&ReadOutcome::Cancelled)
+        self.settle(&ReadOutcome::Cancelled { filled: false })
     }
 }
 
@@ -123,7 +123,7 @@ impl ExpertStore {
                 // The copy is the one frame; `chain` orders the copies of one tier slot.
                 Ok(Started::Frame(step(Kind::ExpertCopy, slot, move || {
                     let outcome = if cancel.load(Ordering::Acquire) {
-                        ReadOutcome::Cancelled
+                        ReadOutcome::Cancelled { filled: false }
                     } else {
                         match to.bytes_mut() {
                             Some(to_bytes) => {

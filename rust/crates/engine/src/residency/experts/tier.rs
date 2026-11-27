@@ -562,7 +562,8 @@ impl RamTier {
         let mut list = Vec::with_capacity(shards);
         for (index, &size) in sizes.iter().enumerate() {
             let mut shard = RamTierShard::new(Arc::clone(&layout), index, shards, first, size);
-            if resident {
+            // A shard whose slots hold all its records is resident whatever the whole tier is.
+            if shard.holds_all() {
                 shard.assign_resident()?;
             }
             list.push(shard);

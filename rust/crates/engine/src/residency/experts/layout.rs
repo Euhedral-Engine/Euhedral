@@ -47,6 +47,8 @@ pub enum ExpertError {
     SlotNotPaged { bytes: usize, block: u64 },
     #[error("an arena of {slots} slots of {bytes} bytes does not fit in memory")]
     ArenaSize { slots: usize, bytes: usize },
+    #[error("preload with {readers} readers: it needs at least 1")]
+    NoReaders { readers: usize },
     #[error("read_split is {split}: it must be at least 1")]
     BadSplit { split: usize },
     #[error("a tier of {slots} slots cannot serve {shards} shards: each shard needs one")]

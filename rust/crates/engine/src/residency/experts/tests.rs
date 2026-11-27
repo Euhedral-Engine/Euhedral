@@ -11,10 +11,9 @@
 
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
-use std::fs::{File, write};
+use std::fs::write;
 use std::io;
 use std::mem::forget;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -142,7 +141,8 @@ struct Started1 {
 }
 
 struct FakePort {
-    file: File,
+    /// The artifact's bytes, which the reads copy from.
+    bytes: Vec<u8>,
     direct: bool,
     held: Mutex<VecDeque<Held>>,
     starts: Mutex<Vec<Started1>>,
@@ -159,7 +159,7 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl FakePort {
     fn new(rig: &Rig, direct: bool) -> Arc<FakePort> {
         Arc::new(FakePort {
-            file: File::open(&rig.path).expect("the artifact opens"),
+            bytes: rig.bytes.clone(),
             direct,
             held: Mutex::new(VecDeque::new()),
             starts: Mutex::new(Vec::new()),
@@ -195,16 +195,14 @@ impl FakePort {
                 return frame.execute().expect("the frame runs");
             }
             Fault::Short(moved) => {
-                self.file
-                    .read_exact_at(&mut memory.bytes_mut()[..moved], offset)
-                    .expect("the file reads");
+                memory.bytes_mut()[..moved].copy_from_slice(&self.bytes[offset as usize..][..moved]);
                 Ok(moved)
             }
             Fault::None => {
                 let len = memory.len();
-                self.file
-                    .read_exact_at(memory.bytes_mut(), offset)
-                    .expect("the file reads");
+                memory
+                    .bytes_mut()
+                    .copy_from_slice(&self.bytes[offset as usize..][..len]);
                 Ok(len)
             }
         };
@@ -287,6 +285,7 @@ impl Probe {
 }
 
 use super::source::Done;
+use crate::residency::offload::HOST_ALIGNMENT;
 
 fn source(rig: &Rig, port: &Arc<FakePort>, split: usize, verify: bool) -> FileRecordSource {
     FileRecordSource::new(rig.layout(), Arc::clone(port) as Arc<dyn PartPort>, split, verify).expect("a source")
@@ -584,6 +583,13 @@ fn a_short_read_fails_the_load_naming_the_record_and_the_bytes() {
     ));
 }
 
+/// What the platform answers a direct read it cannot align (what `refuses_alignment` checks): EINVAL, or
+/// ERROR_INVALID_PARAMETER.
+#[cfg(windows)]
+const ALIGNMENT_ERRNO: i32 = 87;
+#[cfg(not(windows))]
+const ALIGNMENT_ERRNO: i32 = 22;
+
 #[test]
 fn a_direct_read_the_file_system_cannot_align_is_made_again_buffered_once() {
     let rig = Rig::new();
@@ -593,7 +599,7 @@ fn a_direct_read_the_file_system_cannot_align_is_made_again_buffered_once() {
     let probe = Arc::new(Probe::default());
     read(&source, &memory, 0, id(0, 3), None, &no_cancel(), &probe).expect("started");
     assert!(port.starts()[0].direct);
-    port.release(0, Fault::Os(22));
+    port.release(0, Fault::Os(ALIGNMENT_ERRNO));
     assert_eq!(probe.calls(), 0, "the retry is out");
     let starts = port.starts();
     assert_eq!(starts.len(), 2);
@@ -704,7 +710,7 @@ fn a_bypass_cancelled_before_it_starts_submits_nothing_and_ends_cancelled() {
     };
     assert!(port.starts().is_empty());
     frame.execute().expect("the frame runs");
-    assert_eq!(probe.outcome.get(), Some(&ReadOutcome::Cancelled));
+    assert_eq!(probe.outcome.get(), Some(&ReadOutcome::Cancelled { filled: false }));
     assert!(!memory.is_leased(0));
 }
 
@@ -722,12 +728,12 @@ fn a_cancel_that_arrives_between_two_submissions_stops_the_rest_and_the_reads_ou
     assert_eq!(probe.calls(), 0);
     assert!(memory.is_leased(0), "the read that is out may still write the slot");
     port.release_all();
-    assert_eq!(probe.outcome.get(), Some(&ReadOutcome::Cancelled));
+    assert_eq!(probe.outcome.get(), Some(&ReadOutcome::Cancelled { filled: false }));
     assert!(!memory.is_leased(0), "the slot is free once the read returned");
 }
 
 #[test]
-fn a_fill_that_is_cancelled_reads_on_into_the_tier_and_skips_only_the_copy_to_staging() {
+fn a_fill_that_is_cancelled_before_any_copy_reads_on_into_the_tier_and_ends_cancelled_not_complete() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
     let source = source(&rig, &port, 2, true);
@@ -739,13 +745,39 @@ fn a_fill_that_is_cancelled_reads_on_into_the_tier_and_skips_only_the_copy_to_st
     port.release_all();
     assert_eq!(
         probe.outcome.get(),
-        Some(&ReadOutcome::Complete),
-        "the record reached the tier"
+        Some(&ReadOutcome::Cancelled { filled: true }),
+        "the record reached the tier, not staging"
     );
     assert_eq!(slot_prefix(&tier, 0, 10000), rig.record(id(0, 0)));
     assert!(
         slot_prefix(&staging, 0, 10000).iter().all(|&byte| byte == 0),
         "staging was not written"
+    );
+}
+
+#[test]
+fn a_fill_that_is_cancelled_between_two_copies_ends_cancelled_though_staging_holds_a_part() {
+    let rig = Rig::new();
+    let port = FakePort::new(&rig, true);
+    let source = source(&rig, &port, 2, true);
+    let (tier, staging) = (arena(&rig, 1), arena(&rig, 1));
+    let probe = Arc::new(Probe::default());
+    let cancel = no_cancel();
+    read(&source, &tier, 0, id(0, 0), Some((&staging, 0)), &cancel, &probe).expect("started");
+    port.release(0, Fault::None);
+    cancel.store(true, Ordering::Release);
+    port.release_all();
+    assert_eq!(probe.outcome.get(), Some(&ReadOutcome::Cancelled { filled: true }));
+    assert_eq!(slot_prefix(&tier, 0, 10000), rig.record(id(0, 0)));
+    let staged = slot_prefix(&staging, 0, 10000);
+    assert_eq!(
+        staged[..PAGE as usize],
+        rig.record(id(0, 0))[..PAGE as usize],
+        "the first part was copied"
+    );
+    assert!(
+        staged[10000 - 100..].iter().all(|&byte| byte == 0),
+        "the last part was not"
     );
 }
 
@@ -1150,7 +1182,11 @@ fn the_store_fills_then_hits_then_bypasses_and_the_owner_applies_each_settle_in_
     );
     owner
         .shard
-        .apply(first.settle(&ReadOutcome::Cancelled).expect("a settle"))
+        .apply(
+            first
+                .settle(&ReadOutcome::Cancelled { filled: false })
+                .expect("a settle"),
+        )
         .expect("abandoned");
     let (_, probe) = owner.load(other, 2, &cancel);
     assert!(matches!(owner.settle(&probe).settle, Some(TierSettle::Filled(_))));
@@ -1231,7 +1267,7 @@ fn a_hit_that_was_cancelled_skips_the_copy_and_still_settles_used() {
     let (directive, probe) = owner.load(id(0, 0), 1, &cancel);
     assert!(matches!(directive, TierDirective::Hit { .. }));
     let end = owner.settle(&probe);
-    assert_eq!(end.outcome, ReadOutcome::Cancelled);
+    assert_eq!(end.outcome, ReadOutcome::Cancelled { filled: false });
     assert!(matches!(end.settle, Some(TierSettle::Used(_))));
     assert!(slot_prefix(&owner.staging, 1, 10000).iter().all(|&byte| byte == 0));
     assert_eq!(owner.shard.pinned_slots(), 0);
@@ -1393,4 +1429,81 @@ fn where_the_ring_is_positional_the_same_reads_end_the_same_way() {
         positional_io: true,
         ..AsyncIoOptions::default()
     });
+}
+
+// ---------------------------------------------------------------- refusals
+
+#[test]
+fn an_arena_refuses_a_slot_that_is_not_whole_pages_and_one_that_cannot_exist_naming_the_values() {
+    assert_eq!(
+        HostArena::new(2, 100).expect_err("not paged"),
+        ExpertError::SlotNotPaged {
+            bytes: 100,
+            block: HOST_ALIGNMENT
+        }
+    );
+    assert!(matches!(
+        HostArena::new(2, 0).expect_err("empty slots"),
+        ExpertError::SlotNotPaged { bytes: 0, .. }
+    ));
+    assert_eq!(
+        HostArena::new(0, 4096).expect_err("no slot"),
+        ExpertError::ArenaSize { slots: 0, bytes: 4096 }
+    );
+    assert_eq!(
+        HostArena::new(usize::MAX, 4096).expect_err("overflow"),
+        ExpertError::ArenaSize {
+            slots: usize::MAX,
+            bytes: 4096
+        }
+    );
+}
+
+#[test]
+fn a_preload_with_no_readers_is_refused_before_anything_is_read() {
+    let rig = Rig::new();
+    let port = FakePort::new(&rig, true);
+    let source = Arc::new(source(&rig, &port, 1, true));
+    let (memory, shards) = tier_over(&rig, 8, 1);
+    let error = preload::preload(
+        source,
+        memory,
+        shards[0].assigned(),
+        0,
+        Box::new(|_| panic!("a refused preload tells nothing")),
+    )
+    .expect_err("no readers");
+    assert_eq!(error, ExpertError::NoReaders { readers: 0 });
+    assert!(port.starts().is_empty());
+}
+
+#[test]
+fn a_shard_whose_slots_hold_all_its_records_is_assigned_them_whatever_the_whole_tier_is() {
+    let rig = Rig::new();
+    let layout = rig.layout();
+    assert_eq!(layout.keys(), 8);
+    // 7 slots over 2 shards: the tier cannot hold every record, yet a shard with a slot for each of its own can.
+    let (_, mut shards) = tier_over(&rig, 7, 2);
+    let mut held = 0;
+    for (index, shard) in shards.iter_mut().enumerate() {
+        let owned: Vec<usize> = (0..layout.keys()).filter(|&key| shard_of(key, 2) == index).collect();
+        if !shard.holds_all() {
+            continue;
+        }
+        held += 1;
+        assert_eq!(
+            shard.assigned().len(),
+            owned.len(),
+            "every record of the shard has its slot"
+        );
+        for key in owned {
+            let directive = shard.plan(layout.id_of(key), false).expect("a plan");
+            assert!(
+                matches!(directive, TierDirective::Hit { .. }),
+                "key {key}: {directive:?}"
+            );
+        }
+        shard.check_invariants();
+    }
+    assert!(held > 0, "the case has a shard that holds all its records");
 }

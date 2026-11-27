@@ -13,7 +13,8 @@
 //! The artifact's ring cannot cancel a file read, so a read that is out runs to its end and its memory stays leased
 //! until it does. A cancelled load that reads into staging alone (a bypass) submits no part it has not submitted and
 //! ends as [`ReadOutcome::Cancelled`]. A load that fills a tier slot reads on (the record is worth keeping) and skips
-//! only the copy to staging.
+//! only the copy to staging; it then ends as `Cancelled { filled: true }`, so `Complete` always means staging holds the
+//! record.
 
 use std::fmt::{self, Formatter};
 use std::io;
@@ -94,10 +95,11 @@ fn raw_file_of(file: &ArtifactFile, direct: bool) -> euhedral_io::RawFile {
 /// How a load ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadOutcome {
-    /// Every byte of the record is in the destination (and in staging, unless the load was cancelled).
+    /// Every byte of the record is in the destination and, when there is a copy, in staging.
     Complete,
-    /// The load was cancelled before every part was submitted; the destination holds no usable record.
-    Cancelled,
+    /// The load was cancelled: staging does not hold the record. `filled` says the destination, a tier slot the load
+    /// read on into, holds the whole record, checked; otherwise the destination holds no usable record.
+    Cancelled { filled: bool },
     /// A part failed, or the record is damaged; the destination holds no usable record.
     Failed(ExpertError),
     /// A read's memory was leaked by the ring (it broke): the destination slot is out of use for good.
@@ -225,6 +227,7 @@ impl FileRecordSource {
             pending: AtomicUsize::new(count + 1),
             leaked: AtomicBool::new(false),
             skipped: AtomicBool::new(false),
+            uncopied: AtomicBool::new(false),
             failure: OnceLock::new(),
             layout: Arc::clone(&self.layout),
             port: Arc::clone(&self.port),
@@ -276,6 +279,8 @@ struct Shared {
     leaked: AtomicBool,
     /// Some part was not read because the load was cancelled.
     skipped: AtomicBool,
+    /// Some part was read but not copied to staging because the load was cancelled.
+    uncopied: AtomicBool,
     /// The first part's failure.
     failure: OnceLock<ExpertError>,
     layout: Arc<ExpertLayout>,
@@ -318,6 +323,15 @@ impl Shared {
         }
     }
 
+    /// The outcome of a load whose destination holds the whole record: complete unless staging missed a copy.
+    fn complete(&self) -> ReadOutcome {
+        if self.uncopied.load(Ordering::Acquire) {
+            ReadOutcome::Cancelled { filled: true }
+        } else {
+            ReadOutcome::Complete
+        }
+    }
+
     /// One part ended (its memory already dropped): the last one finishes the load.
     fn tick(&self) {
         if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -344,7 +358,7 @@ impl Shared {
         let outcome = if self.leaked.load(Ordering::Acquire) {
             ReadOutcome::Lost
         } else if self.skipped.load(Ordering::Acquire) {
-            ReadOutcome::Cancelled
+            ReadOutcome::Cancelled { filled: false }
         } else if let Some(error) = self.failure.get() {
             ReadOutcome::Failed(error.clone())
         } else if let Some(expected) = crc32 {
@@ -352,7 +366,7 @@ impl Shared {
                 Some(all) => {
                     let found = crc32fast::hash(&all[..bytes]);
                     if found == expected {
-                        ReadOutcome::Complete
+                        self.complete()
                     } else {
                         ReadOutcome::Failed(ExpertError::Damaged {
                             bank: self.layout.bank_name(self.id.bank).to_owned(),
@@ -366,7 +380,7 @@ impl Shared {
                 None => ReadOutcome::Lost,
             }
         } else {
-            ReadOutcome::Complete
+            self.complete()
         };
         drop((destination, copy_to));
         done(outcome);
@@ -439,10 +453,12 @@ fn arrived(shared: &Arc<Shared>, end: PartEnd, done: IoDoneOwned<WritePart>) {
     };
     match result {
         Ok(moved) if moved == wanted => {
-            if let Some(copy) = copy.as_mut()
-                && !shared.cancel.load(Ordering::Acquire)
-            {
-                copy.bytes_mut().copy_from_slice(&memory.bytes()[..len]);
+            if let Some(copy) = copy.as_mut() {
+                if shared.cancel.load(Ordering::Acquire) {
+                    shared.uncopied.store(true, Ordering::Release);
+                } else {
+                    copy.bytes_mut().copy_from_slice(&memory.bytes()[..len]);
+                }
             }
         }
         Ok(moved) => shared.fail(ExpertError::Short {
