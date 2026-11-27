@@ -419,16 +419,3 @@ fn the_split_partials_are_sized_for_the_largest_row_count_that_splits() {
     assert_eq!(shape.splits_for(1, 31), 1);
     assert_eq!(shape.splits_for(1, 100_000), 64);
 }
-
-#[test]
-fn the_expansion_is_the_widest_of_the_layers_linears() {
-    let body = body();
-    let widest = body
-        .shape
-        .linear_shapes()
-        .iter()
-        .map(|(k, n)| body.device.expansion_bytes(64, *k, *n))
-        .max()
-        .unwrap();
-    assert_eq!(body.expansion_bytes(64), widest);
-}

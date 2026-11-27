@@ -210,8 +210,9 @@ impl Launch for BlockStage {
 
 impl BlockStage {
     /// Where the quantum's rows lie: the segment's start and, for a layer that reads the cache, its page tables from
-    /// the view the quantum took at admission. The tail slot is the committed one (0): a sequence with chunks of
-    /// several quanta in flight supplies its own through [`BlockStage::ops_at`].
+    /// the view the quantum took at admission. A launch knows no tail slot: the cache layer's stage runs only the
+    /// first chunk of a sequence (slot 0), and refuses a later one, because a stale tail would write wrong block keys.
+    /// A sequence with later chunks supplies its slot through [`BlockStage::ops_at`].
     fn chunk_of(&self, quantum: &Quantum) -> Result<ChunkAt, StageError> {
         let segment = quantum.segment();
         let start = u32::try_from(segment.start_position)
@@ -233,8 +234,19 @@ impl BlockStage {
             start,
             key_table: table(view.key_table(layer), "K")?,
             value_table: table(view.value_table(layer), "V")?,
-            tail_slot: 0,
+            tail_slot: unsupplied_tail_slot(start).map_err(fatal)?,
         })
+    }
+}
+
+/// The tail slot of a launch that is told none: only a sequence's first chunk has a known one.
+fn unsupplied_tail_slot(start: u32) -> Result<u32, String> {
+    if start == 0 {
+        Ok(0)
+    } else {
+        Err(format!(
+            "a launch at position {start} does not know the raw tail's slot: the sequence's owner supplies it"
+        ))
     }
 }
 

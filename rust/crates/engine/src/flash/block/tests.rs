@@ -236,3 +236,9 @@ fn the_chunk_a_caller_names_reaches_the_body_and_the_default_is_a_first_chunk_wi
 fn regions_output(stage: &BlockStage) -> DevicePtr {
     stage.regions.block_output
 }
+
+#[test]
+fn a_launch_knows_the_tail_slot_of_a_first_chunk_only() {
+    assert_eq!(unsupplied_tail_slot(0), Ok(0));
+    assert!(unsupplied_tail_slot(4).unwrap_err().contains("position 4"));
+}
