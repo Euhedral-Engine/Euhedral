@@ -181,7 +181,7 @@ class DeploymentTests(unittest.TestCase):
 
     def test_build_context_contains_only_committed_source(self):
         with MODULE.build_context(SCRIPT.parents[1]) as context:
-            self.assertTrue((context / "Dockerfile").is_file())
+            self.assertTrue((context / "rust" / "Dockerfile").is_file())
             self.assertFalse((context / "benchmark-results").exists())
 
     def test_the_rust_image_is_built_from_its_own_dockerfile(self):

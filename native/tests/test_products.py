@@ -6,7 +6,6 @@ import pathlib
 import struct
 import sys
 import unittest
-import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "native" / "native-products.json"
@@ -86,23 +85,6 @@ def pe_imports(data):
 
 
 class NativeProductsTest(unittest.TestCase):
-    def test_server_jars_carry_their_platform_layout(self):
-        jars = {product["id"]: ROOT / "api" / "build" / "libs" / f"euhedral-inference-{product['id']}.jar"
-                for product in json.loads(MANIFEST.read_text(encoding="utf-8"))["products"]}
-        built = {product: jar for product, jar in jars.items() if jar.is_file()}
-        self.assertTrue(built, "no server jar built")
-        for product, jar in built.items():
-            with self.subTest(product=product), zipfile.ZipFile(jar) as packaged:
-                prefix = f"META-INF/euhedral-native/{product}/"
-                members = {name[len(prefix):] for name in packaged.namelist()
-                           if name.startswith(prefix) and not name.endswith("/")}
-                hashes = packaged.read(prefix + "files.sha256").decode("utf-8").splitlines()
-                listed = {line.split("  ", 1)[1] for line in hashes if line}
-                self.assertEqual(members - {"files.sha256"}, listed)
-                other = {name for name in packaged.namelist() if name.startswith("META-INF/euhedral-native/")
-                         and not name.startswith(prefix) and name != "META-INF/euhedral-native/"}
-                self.assertEqual(set(), other)
-
     def test_product_layout_lists_every_file_with_its_hash(self):
         for product in json.loads(MANIFEST.read_text(encoding="utf-8"))["products"]:
             prefix = OUTPUT / product["id"]

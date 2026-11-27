@@ -4,9 +4,8 @@ rust/target
 .claude
 # The euhedral_build copy is taken through local_path_override, not as packages of this module.
 bazel
-# Gradle and Zig output.
+# Zig output.
 build
-.gradle
 native/.zig-cache
 native/.zig-global-cache
 native/zig-out
