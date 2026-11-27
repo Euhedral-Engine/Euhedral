@@ -44,14 +44,12 @@ cache:
 
 The records it brings in evict as many as it saves: not built.
 
-## The host budget under the server's heap
+## The host budget and the process's own memory
 
-The planner reserved the JVM heap's whole room to grow. A server started without `-Xmx` (the container's command, the
-benchmark) may grow its heap to a quarter of the machine, 14.7 GiB here, though the engine's heap holds under 1 GiB; the
-expert tier lost a third. The test JVM's heap (512 MiB) hid it. `-Peuhedral.test.heap=15752m` runs the screens with the
-server's heap.
+The planner reserved too little room for the process's own growth and for the page cache of the memory-mapped n-gram rows, and
+the expert tier lost a third.
 
-The reserve is now at most 2 GiB for the heap, 1 GiB native, and 6 GiB for the page cache the memory-mapped n-gram rows
+The reserve is now at most 2 GiB for growth, 1 GiB native, and 6 GiB for the page cache the memory-mapped n-gram rows
 settle at (5.1-6.1 GiB after a run); the machine keeps room for that cache, which the budget did not count before.
 
 Paired screens, 3 forks alternating, no cgroup (the lowest `MemAvailable` seen was 12 GiB):

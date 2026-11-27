@@ -84,7 +84,7 @@ The entries, in order: `tokenizer.json`, `tokenizer_config.json`, `chat_template
 `pad_token_id` of `generation_config.json`, as JSON without spaces). The header's `fileSize` is where the content ends, before
 the section. Because the section follows everything else and the footer is written last, an artifact gains or replaces it
 without any other byte moving: `package-tokenizer` ([OPERATIONS.md](../OPERATIONS.md#artifacts-and-their-tokenizer)) truncates the
-file to its content and appends the section. `TokenizerSection` (Java) and `tools/euhedral_artifacts/tokenizer_section.py`
+file to its content and appends the section. `rust/crates/edrl/src/tokenizer_section.rs` and `tools/euhedral_artifacts/tokenizer_section.py`
 write the same bytes.
 
 ### Objects
@@ -158,4 +158,4 @@ CRC-32, and with `--checkpoint` every byte of every object against the checkpoin
 Layout counts: 1,118 contiguous BF16, 311 row-split NVFP4, 128 interleaved NVFP4 shards, 25,088 expert records. Conversion on
 this machine (checkpoint on exFAT, artifact on ext4, 4 workers) takes about 75 seconds of writing; `verify --checkpoint`
 confirmed all 104,913,171,900 payload bytes equal the checkpoint's, and `Validator.verifyChecksums` checks every CRC-32
-in the Java reader.
+in the Rust reader.

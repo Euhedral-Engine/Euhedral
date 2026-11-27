@@ -154,8 +154,7 @@ compares the artifacts on the same tokens:
 KL is a fifth of Q3's. Greedy generation answers the factual prompt identically (" Paris.").
 
 ```bash
-./gradlew :core:cudaIntegrationTest --tests '*TeacherForcedQualityCudaIntegrationTest' --rerun \
-    -Peuhedral.quality.report=/tmp/sd4.bin -Peuhedral.quality.artifact=ARTIFACT -Peuhedral.quality.host-mib=512
+(cd rust && cargo run --release -p euhedral-inference-bench -- dump --artifact ARTIFACT --prefix N --steps N --out /tmp/sd4.bin)
 python3 tools/compare_teacher_forced.py /tmp/nvfp4.bin /tmp/sd4.bin
 ```
 

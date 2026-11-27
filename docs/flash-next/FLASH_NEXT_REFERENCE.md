@@ -2,7 +2,7 @@
 
 Deterministic fixtures for the Flash-Next (`Qwen/Qwen3.8-Flash-Next`, HF `model_type` `qwen4_exp`) text model, produced by
 the **unmodified** upstream transformers implementation over the weights of the NVFP4 EDRL v3 artifact
-(`docs/flash-next/FLASH_NEXT_ARTIFACT.md`). The Java engine and the CUDA operators compare against them; the tensor names, dtypes and
+(`docs/flash-next/FLASH_NEXT_ARTIFACT.md`). The Rust engine and the CUDA operators compare against them; the tensor names, dtypes and
 shapes below are the contract.
 
 * Upstream: transformers `qwen4_exp` at revision `f5ab85619d989359ef47b5efed8a91a15045627b` (source copy in
@@ -76,7 +76,7 @@ what the fixtures use. The GPU must be free for a model case (6.5 GiB peak); eac
 
 Emulates the engine's NVFP4 KV cache by applying the codec to `key_states`/`value_states` (after `k_norm` and RoPE,
 `[1, 2, rows, 256]`) before they enter the cache, so attention sees `H^T dequant(quant(H k))`. Ported from
-`native/src/attention/nvfp4_kv.cuh` (the device codec) with the semantics of `Nvfp4KvReference.java`:
+`native/src/attention/nvfp4_kv.cuh` (the device codec) with the semantics of the Python reference in `tools/flash_next_reference/kvcodec.py`:
 
 * a row is one head: 256 BF16 values; rotation by the normalized Sylvester H256 (entries +-1/16) in FP32 with the device's
   butterfly (five stages over index bits 0..4 with `lane&stride ? peer-v : v+peer`, three stages over bits 5..7, `* 0.0625`);

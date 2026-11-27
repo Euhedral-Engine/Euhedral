@@ -67,7 +67,7 @@ converter's) and BF16 norms; the base artifact's tokenizer is carried.
 NVFP4-Trellis-RCO with the trained drafter, MTP depth 4, greedy, 256 tokens per prompt
 (`MtpDraftLengthScreenCudaIntegrationTest`).
 
-24 drafting prompts (`tools/mtp_draft_prompts.py`, about 1K to 5K tokens):
+24 drafting prompts (a retired prompt-set tool, about 1K to 5K tokens):
 
 | Category | Tokens per verification | tok/s |
 |---|---|---|

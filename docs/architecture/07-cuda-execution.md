@@ -8,7 +8,7 @@ flowchart TB
     Format --> NV[Nvfp4Format: plain or SD4]
     Format --> TR[TrellisFormat: EXL3 payload and companions]
     Format --> Other[Grouped Q3/Q4/Q5, P2E2 or BF16]
-    NV --> Binding[CudaGpuMemory dispatch with row-exact selection]
+    NV --> Binding[CUDA launch table with row-exact selection]
     TR --> TRoute{Row count and numerical mode}
     TRoute -->|Row-exact or small rows| TMMA[Rotations, FP16 operands with FP32 sums, epilogue]
     TRoute -->|Whole-K prefill within tensor-core threshold| TFP8[Block-scaled FP8 when available, otherwise FP16 accumulation]
@@ -18,9 +18,9 @@ flowchart TB
     TBF --> Table
     Other --> Binding
     Table --> Binding
-    Binding --> ABI[Java FFM to euhedral_cuda C ABI]
+    Binding --> ABI[Rust cuda crate to euhedral_cuda C ABI]
     ABI --> Native[Native route selection and CUDA launches]
-    Lane[StageFrame selects a LanePool stream] --> Binding
+    Lane[stage frame selects a lane pool stream] --> Binding
     Pred[Predecessor markers] --> Wait[Cross-stream event waits]
     Wait --> Lane
     Native --> Marker[Record submission marker]
@@ -28,7 +28,7 @@ flowchart TB
     Native --> Completion[Asynchronous completion and retirement]
 ```
 
-`CudaGpuMemory` binds the stable C ABI through Java's Foreign Function and Memory API. Device addresses are opaque longs. Kernel launches use the stream selected for the calling stage; direct operations without a selected stream are synchronous diagnostic paths.
+The `cuda` crate binds the stable C ABI. Device addresses are opaque longs. Kernel launches use the stream selected for the calling stage; direct operations without a selected stream are synchronous diagnostic paths.
 
 NVFP4 dispatch distinguishes its plain and compressed scale layouts and selects compatible kernels. Production multi-row prefill can use accelerated numerical routes; verification requires row-exact execution. Optional native routes can report unavailable so a supported fallback can run. Row-exact verification and diagnostic scalar exact numerics are distinct contracts.
 
@@ -38,9 +38,9 @@ A stage first awaits predecessor markers from other streams, then submits work a
 
 ## Implementation anchors
 
-- [LinearFormats](../../core/src/main/java/io/euhedral_execution/inference/core/artifact/format/LinearFormats.java), [Nvfp4Format](../../core/src/main/java/io/euhedral_execution/inference/core/artifact/format/Nvfp4Format.java), [TrellisFormat](../../core/src/main/java/io/euhedral_execution/inference/core/artifact/format/TrellisFormat.java) and [TrellisSettings](../../core/src/main/java/io/euhedral_execution/inference/core/artifact/format/TrellisSettings.java).
-- [CudaGpuMemory](../../core/src/main/java/io/euhedral_execution/inference/core/gpu/CudaGpuMemory.java), [KernelTable](../../core/src/main/java/io/euhedral_execution/inference/core/gpu/KernelTable.java) and [C ABI](../../native/include/euhedral_cuda.h).
+- [formats](../../rust/crates/engine/src/formats/mod.rs): the [NVFP4](../../rust/crates/engine/src/formats/nvfp4.rs), [trellis](../../rust/crates/engine/src/formats/trellis.rs) and [Q3](../../rust/crates/engine/src/formats/q3.rs) linear formats.
+- [cuda crate](../../rust/crates/cuda/src/lib.rs), [launch table](../../rust/crates/cuda/src/launch/table.rs) and the [C ABI](../../native/include/euhedral_cuda.h).
 - [Native implementations](../../native/src), especially `trellis`, `nvfp4`, `nvfp4_native`, `q3` and `reference`.
-- [StageFrame](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/StageFrame.java), [LanePool](../../core/src/main/java/io/euhedral_execution/inference/core/runtime/graph/LanePool.java) and [CUDA graphs](../kernels/CUDA_GRAPHS.md).
+- [frames](../../rust/crates/engine/src/frames.rs), [runtime lanes](../../rust/crates/engine/src/runtime.rs) and [CUDA graphs](../kernels/CUDA_GRAPHS.md).
 
 This is a dispatch map rather than an exhaustive kernel catalog. It omits block geometry, tuning measurements and native build steps.

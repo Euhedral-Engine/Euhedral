@@ -42,7 +42,7 @@ If the full cache and weights do not fit, the planner first tries spilling atten
 
 `WeightStaging` currently defines four aligned device slots. Transfers follow each slot's last reader, including readers in previously admitted graphs. A consumer follows its transfer. Disk-backed transfers also wait for the corresponding window payload to become ready. These dependencies protect reuse while allowing copies ahead of compute.
 
-Every payload read resolves its file per object through `Artifact.pathOf`: a plain `.edrl` reads everything from itself, while an artifact assembled from several calibrated sources (the quantization module's `assemble`) names a source file for each object it took elsewhere. Loading, segment validation, host-backed staging and `DiskReader` all read through it; `DiskReader` opens each named file once.
+Every payload read resolves its file per object through the artifact's per-object source path: a plain `.edrl` reads everything from itself, while an artifact assembled from several calibrated sources (the quantization `assemble` command) names a source file for each object it took elsewhere. Loading, segment validation, host-backed staging and the disk reader all read through it; the disk reader opens each named file once.
 
 The embedding is a gather and can be read from mapped host storage. The output head is too large for ordinary staging slots and can be mapped as a last resort when the other offloadable weights have left the device. The draft head stays resident. These mapped accesses differ from ordinary host-backed projections copied into staging.
 
@@ -52,10 +52,9 @@ With host KV pages, prefix checkpoints stop at the device-resident page frontier
 
 ## Implementation anchors
 
-- [Artifact](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/artifact/Artifact.java): per-object source files.
-- [ResidencyPlanner](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/loader/ResidencyPlanner.java), [HostWeightSelection](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/loader/HostWeightSelection.java) and [WeightLoader](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/loader/WeightLoader.java).
-- [WeightStaging](../../core/src/main/java/io/euhedral_execution/inference/core/artifact/WeightStaging.java), [DiskWindow](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/offload/DiskWindow.java) and [DiskReader](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/offload/DiskReader.java).
-- [Sequence](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/Sequence.java), [AttentionKvState](../../core/src/main/java/io/euhedral_execution/inference/core/state/AttentionKvState.java) and [PrefixCache](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/prefix/PrefixCache.java).
-- [KvHostPages](../../core/src/main/java/io/euhedral_execution/inference/core/state/KvHostPages.java), [Shape carried-state keys](../../core/src/main/java/io/euhedral_execution/inference/core/model/qwen38/Shape.java) and [memory settings](../../core/src/main/java/io/euhedral_execution/inference/core/settings/MemorySettings.java).
+- [residency planner](../../rust/crates/engine/src/residency/planner.rs), [loader](../../rust/crates/engine/src/residency/loader.rs) and [budget](../../rust/crates/engine/src/residency/budget.rs): where each weight lives.
+- [disk window](../../rust/crates/engine/src/residency/disk.rs) and [offload](../../rust/crates/engine/src/residency/offload.rs): weight staging from host and disk.
+- [state](../../rust/crates/engine/src/state/mod.rs), [KV state](../../rust/crates/engine/src/state/kv.rs) and [prefix cache](../../rust/crates/engine/src/prefix/cache.rs): sequence state and prefix reuse.
+- [memory settings](../../rust/crates/settings/src/model.rs): the memory settings and their sizes ([sizes](../../rust/crates/settings/src/sizes.rs)).
 
 This diagram shows ownership and data movement, not a fixed allocation size or a performance prediction. Actual byte budgets depend on the artifact and configured context.

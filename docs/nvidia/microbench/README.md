@@ -10,7 +10,7 @@ This is a small C harness that produced every measured number in `docs/nvidia/`.
 ## Build and run
 
 ```bash
-bash docs/nvidia/microbench/build.sh            # needs build/cuda-dev (from ./gradlew nativeBuild) and zig
+bash docs/nvidia/microbench/build.sh            # needs the native build (`cd rust && cargo xtask native`, then CUDA_DEV at its output) and zig
 export CUDA_INCLUDE_DIR=$PWD/build/cuda-dev/linux-x64/include
 export LD_LIBRARY_PATH=$PWD/build/cuda-dev/linux-x64/runtime   # NVRTC builtins
 export MB_ROOT=$PWD/docs/nvidia/microbench
