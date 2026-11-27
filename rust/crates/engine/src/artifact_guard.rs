@@ -26,6 +26,9 @@ pub enum GuardError {
     /// A running engine holds the file (or, for a guard, a writer has it).
     #[error("{} is held by a running engine or a running writer: stop it before using this file", path.display())]
     Held { path: PathBuf },
+    /// The engine holds no file of this path: it was asked to admit an open of a file it never held.
+    #[error("{} is not a file the engine holds", path.display())]
+    NotHeld { path: PathBuf },
     /// The path names another file than the one held: it was renamed over or replaced.
     #[error("{} is not the file the engine holds: it was renamed or replaced while the engine started", path.display())]
     Replaced { path: PathBuf },
@@ -122,6 +125,17 @@ impl ArtifactGuard {
                 path: self.path.clone(),
             }),
         }
+    }
+}
+
+/// Admits `opened`, the engine's open of `path`, against the guard of `path` among `guards`: it must be the file held. A
+/// path no guard holds is refused as [`GuardError::NotHeld`].
+pub(crate) fn admit_held(guards: &[ArtifactGuard], path: &Path, opened: &File) -> Result<(), GuardError> {
+    match guards.iter().find(|guard| guard.path() == path) {
+        Some(guard) => guard.admit(opened),
+        None => Err(GuardError::NotHeld {
+            path: path.to_path_buf(),
+        }),
     }
 }
 
@@ -273,6 +287,7 @@ mod tests {
     fn a_name_renamed_over_between_the_open_and_the_lock_is_refused_by_path() {
         let (directory, path) = artifact();
         let opened = File::open(&path).unwrap();
+        let original = File::open(&path).unwrap();
         // A writer replaces the file and releases its claim: the open above is of the old file.
         let replacement = directory.path().join("replacement.edrl");
         fs::write(&replacement, b"other").unwrap();
@@ -280,7 +295,8 @@ mod tests {
         let refusal = ArtifactGuard::lock_opened(&path, opened).unwrap_err();
         assert!(matches!(refusal, GuardError::Replaced { .. }));
         assert!(refusal.to_string().contains(&path.display().to_string()));
-        WriteClaim::take(&path).unwrap();
+        // The lock on the original file, not on the replacement, was released.
+        original.try_lock().unwrap();
     }
 
     #[cfg(unix)]
@@ -325,8 +341,32 @@ mod tests {
 
         let (_directory, path) = artifact();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        // A user who may write it anyway (root) never takes the fallback.
+        if OpenOptions::new().write(true).open(&path).is_ok() {
+            return;
+        }
         let _claim = WriteClaim::take(&path).unwrap();
         assert!(matches!(ArtifactGuard::hold(&path), Err(GuardError::Held { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_output_is_claimed_through_the_read_only_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let claim = WriteClaim::take(directory.path()).unwrap();
+        assert!(claim._file.is_some());
+    }
+
+    #[test]
+    fn an_open_of_a_path_no_guard_holds_is_refused_by_path() {
+        let (directory, path) = artifact();
+        let other = directory.path().join("other.edrl");
+        fs::write(&other, b"bytes").unwrap();
+        let guards = [ArtifactGuard::hold(&path).unwrap()];
+        admit_held(&guards, &path, &File::open(&path).unwrap()).unwrap();
+        let refusal = admit_held(&guards, &other, &File::open(&other).unwrap()).unwrap_err();
+        assert!(matches!(refusal, GuardError::NotHeld { .. }));
+        assert!(refusal.to_string().contains(&other.display().to_string()));
     }
 
     #[cfg(unix)]

@@ -7,8 +7,6 @@
 
 use std::cell::Cell;
 use std::fmt;
-use std::fs::File;
-use std::io;
 use std::iter;
 use std::mem::{self, ManuallyDrop};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -224,7 +222,7 @@ pub(crate) struct Core {
     /// What stops the lattice and its lakes, shared with the owner.
     pub(crate) teardown: Arc<Teardown>,
     /// The hold on each artifact file served (the base and the composite's sources), until the core is dropped.
-    guards: Vec<ArtifactGuard>,
+    pub(crate) guards: Vec<ArtifactGuard>,
 }
 
 impl fmt::Debug for Core {
@@ -258,19 +256,6 @@ pub(crate) struct Units {
 }
 
 impl Core {
-    /// Admits `opened`, the engine's own open of the artifact file at `path`, when it is the file the engine holds. A
-    /// path that now names another file, or that the engine does not hold, is refused with the path: the engine reads
-    /// only the file it holds.
-    pub(crate) fn admit_file(&self, path: &Path, opened: &File) -> Result<(), GuardError> {
-        match self.guards.iter().find(|guard| guard.path() == path) {
-            Some(guard) => guard.admit(opened),
-            None => Err(GuardError::Lock {
-                path: path.to_path_buf(),
-                source: io::Error::other("the engine does not hold this file"),
-            }),
-        }
-    }
-
     fn device_lanes(&self) -> &DeviceLanes {
         self.device_lanes
             .get()
@@ -1354,7 +1339,7 @@ fn build_composite(
 ) -> Result<Arc<Core>, EngineError> {
     let started = Instant::now();
     // First, before the engine's own opens of the artifact: it holds every file it serves for its life, and each later
-    // open of one is checked against the hold ([`Core::admit_file`]).
+    // open of one is checked against the hold (`artifact_guard::admit_held`).
     let guards = hold_artifacts(&settings.model.artifact, composite)?;
     // Before anything is opened: a stated count the passes cannot hold is refused.
     check_stated_sequences(&settings.batching)?;

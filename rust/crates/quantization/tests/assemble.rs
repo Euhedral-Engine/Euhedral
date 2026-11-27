@@ -334,6 +334,13 @@ fn a_write_keeps_its_claim_on_the_output_until_it_ends() {
     .unwrap();
     let refusal = ArtifactGuard::hold(&out).unwrap_err();
     assert!(matches!(refusal, GuardError::Held { .. }), "{refusal}");
+    // After the step that opens the `.part` file the chain has gone on and still waits for the next one.
+    driven.drive_step();
+    let refusal = ArtifactGuard::hold(&out).unwrap_err();
+    assert!(
+        matches!(refusal, GuardError::Held { .. }),
+        "after the first step: {refusal}"
+    );
     driven.drive_until(&ended).unwrap();
     drop(ArtifactGuard::hold(&out).unwrap());
     driven.finish();

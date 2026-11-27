@@ -191,7 +191,27 @@ impl World {
         World { lattice, io, host }
     }
 
-    /// Runs the steps of the hand-driven `io`, where this thread stands, until `ended` has its value.
+    /// Runs the next step of the hand-driven `io`, where this thread stands: waits until a frame is ready, runs the
+    /// frames that are, and returns. Nothing else of the call's chain runs until the next step.
+    pub fn drive_step(&self) {
+        let begun = Instant::now();
+        loop {
+            assert!(begun.elapsed() < LONGEST, "no step of the call became ready");
+            self.io.reap();
+            let mut frames = Vec::new();
+            self.io.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+            if frames.is_empty() {
+                continue;
+            }
+            for mut frame in frames {
+                let _ = frame.execute();
+                frame.do_finally();
+            }
+            return;
+        }
+    }
+
+    /// Runs the steps of the hand-driven `io` until `ended` has its value.
     pub fn drive_until<T>(&self, ended: &Arc<Handoff<T>>) -> T {
         let begun = Instant::now();
         loop {

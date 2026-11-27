@@ -164,6 +164,29 @@ impl Run {
         receiver.recv_timeout(Duration::from_secs(60)).expect("the run reports")
     }
 
+    /// Runs the next step of the hand-driven `io`, where this thread stands: waits until a frame is ready and runs the
+    /// frames that are. The run goes no further until the next step.
+    fn drive_step(&self) {
+        let begun = Instant::now();
+        loop {
+            assert!(
+                begun.elapsed() < Duration::from_secs(60),
+                "no step of the run became ready"
+            );
+            self.io.reap();
+            let mut frames = Vec::new();
+            self.io.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+            if frames.is_empty() {
+                continue;
+            }
+            for mut frame in frames {
+                let _ = frame.execute();
+                frame.do_finally();
+            }
+            return;
+        }
+    }
+
     /// Runs the steps of the hand-driven `io`, where this thread stands, until the run reports.
     fn drive(&self, receiver: &Receiver<Result<Packaged, PackageError>>) -> Result<Packaged, PackageError> {
         let begun = Instant::now();
@@ -486,6 +509,13 @@ fn a_run_keeps_its_claim_on_the_file_it_writes_until_it_reports() {
         // In flight: the run reads through the hand-driven I/O, which has not stepped.
         let refusal = ArtifactGuard::hold(&written).unwrap_err();
         assert!(matches!(refusal, GuardError::Held { .. }), "{refusal}");
+        // After its first step the run has gone on and still waits for the next one.
+        run.drive_step();
+        let refusal = ArtifactGuard::hold(&written).unwrap_err();
+        assert!(
+            matches!(refusal, GuardError::Held { .. }),
+            "after the first step: {refusal}"
+        );
         run.drive(&receiver).unwrap();
         drop(ArtifactGuard::hold(&written).unwrap());
     }
