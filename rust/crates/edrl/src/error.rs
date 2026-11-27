@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::flash::inventory::{InventoryProblem, describe};
+
 /// Why a region of an artifact was refused.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum EdrlError {
@@ -12,6 +14,12 @@ pub enum EdrlError {
     /// Only container version 2 (tensor descriptors carry a persistent weight layout) is supported.
     #[error("unsupported artifact version {found}: only compact version 2 artifacts are supported")]
     UnsupportedVersion { found: u32 },
+    /// A version 3 file names an architecture other than `qwen4_exp`.
+    #[error("unsupported artifact architecture {found}: only qwen4_exp (1) is supported")]
+    UnsupportedArchitecture { found: u32 },
+    /// The tables do not hold the inventory the configuration implies.
+    #[error("{}", describe(problems))]
+    Inventory { problems: Vec<InventoryProblem> },
     /// A region is malformed: `what` is the first violated rule.
     #[error("{what}")]
     Invalid { what: String },
