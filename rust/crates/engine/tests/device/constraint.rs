@@ -34,8 +34,9 @@ use euhedral_inference_engine::stages::QuantumKind;
 use euhedral_inference_engine::{EngineRuntime, Handoff};
 use euhedral_inference_settings::{ModelSettings, Settings};
 
-/// The longest a test waits for a generation of a few tokens: a request that hangs fails the test inside the grant.
-const GENERATION_WAIT: Duration = Duration::from_secs(60);
+/// The hang guard for a generation of a few tokens, as long as the other device tests' guard: on a card shared with
+/// other jobs a healthy run can take minutes, so only a request that never reports fails the test.
+const GENERATION_WAIT: Duration = Duration::from_secs(20 * 60);
 
 /// The prompt: any ids inside the vocabulary will do.
 const PROMPT: [u32; 6] = [3000, 1500, 2200, 800, 4100, 1200];
@@ -261,7 +262,7 @@ fn run_opening(
             }),
         })
         .expect("the request is admitted");
-    done.wait(GENERATION_WAIT).expect("the generation reports")
+    done.wait(GENERATION_WAIT).expect("the generation never reported its outcome within the hang guard")
 }
 
 /// Quanta in flight, selections and row readbacks leased after a generation: all free.
