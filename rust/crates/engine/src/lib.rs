@@ -3,6 +3,7 @@
 
 pub mod composite;
 pub mod error;
+pub mod flash;
 pub mod formats;
 mod frames;
 pub mod generation;

@@ -39,6 +39,11 @@ impl KernelArguments {
         Self(self.0.u32(value))
     }
 
+    /// A 32-bit float, carried as its bits.
+    pub fn float32(self, value: f32) -> Self {
+        Self(self.0.f32(value))
+    }
+
     /// A 64-bit value (a byte offset the kernel adds to a pointer).
     pub fn int64(self, value: u64) -> Self {
         Self(self.0.u64(value))
