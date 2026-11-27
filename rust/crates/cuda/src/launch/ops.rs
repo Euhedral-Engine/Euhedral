@@ -28,7 +28,7 @@ use crate::launch::elementwise::{
     check_zero_device_memory, plan_argmax, plan_argmax_logprob, plan_residual_add, plan_residual_rms_norm,
     plan_rms_norm_unit_offset_sliced, plan_selected_token, plan_swiglu,
 };
-use crate::launch::embedding::{EmbedShape, plan_embed_q3, plan_embed_q3_p2e2};
+use crate::launch::embedding::{EmbedShape, plan_embed_bf16, plan_embed_q3, plan_embed_q3_p2e2};
 use crate::launch::gdn::{
     ConvolutionShape, GatedRmsNormShape, ProjectControlShape, RecurrenceShape, plan_convolution, plan_gated_rms_norm,
     plan_project_control, plan_recurrence,
@@ -328,6 +328,30 @@ where
         };
         self.planned("euhedral_cuda_embed_q3", |sink| {
             plan_embed_q3(&shape, &mut |launch| sink(launch))
+        })
+    }
+
+    fn embed_bf16(
+        &mut self,
+        token_ids: DevicePtr,
+        embedding: DevicePtr,
+        hidden: DevicePtr,
+        token_count: u32,
+        vocabulary_size: u32,
+        hidden_size: u32,
+        embedding_bytes: u64,
+    ) -> Result<(), CudaError> {
+        let shape = EmbedShape {
+            token_ids,
+            embedding,
+            hidden,
+            token_count,
+            vocabulary_size,
+            hidden_size,
+            embedding_bytes,
+        };
+        self.planned("euhedral_cuda_embed_bf16", |sink| {
+            plan_embed_bf16(&shape, &mut |launch| sink(launch))
         })
     }
 

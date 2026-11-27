@@ -1,13 +1,16 @@
 //! The linear formats: how one weight multiplies a block of rows.
 //!
 //! [`LinearFormat`] is the contract the stages consume. [`TrellisLinear`] and [`Nvfp4Linear`] implement it with the
-//! kernel choice, grid and K split of the Java formats, [`Q3Linear`] runs the grouped Q3, Q4 and Q5 tensors and the
-//! P2E2 compressed Q3, and [`TokenEmbedding`] looks up token rows of a Q3 table.
+//! kernel choice, grid and K split of the Java formats, [`Bf16Linear`] runs the unquantized projections on the row-exact
+//! BF16 GEMMs, [`Q3Linear`] runs the grouped Q3, Q4 and Q5 tensors and the
+//! P2E2 compressed Q3, and [`TokenEmbedding`] looks up token rows of a Q3, NVFP4 or BF16 table.
 //! [`ShapeRecorder`] lists the launches a format queued, for the tests that compare them with Java's.
 
+mod bf16;
 mod embedding;
 mod nvfp4;
 mod q3;
+mod row_exact;
 pub mod shapes;
 mod trellis;
 
@@ -15,11 +18,13 @@ use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps};
 
 use crate::model::WeightRef;
 
+pub use bf16::Bf16Linear;
 pub use embedding::TokenEmbedding;
 pub use nvfp4::{Nvfp4Linear, Nvfp4Route, nvfp4_native_scratch_bytes};
 pub use q3::{GATE_UP_MIN_ROWS, Q3Linear};
+pub use row_exact::ROW_EXACT_KERNELS;
 pub use shapes::{KernelArguments, Launch, LinearKernel, ShapeRecorder, Table};
-pub use trellis::{ROW_EXACT_KERNELS, TrellisLinear, TrellisOperands, TrellisShape};
+pub use trellis::{TrellisLinear, TrellisOperands, TrellisShape};
 
 /// A region of the workspace's expansion scratch a linear takes for one launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

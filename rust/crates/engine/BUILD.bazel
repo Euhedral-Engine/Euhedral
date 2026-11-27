@@ -768,6 +768,68 @@ rust_test(
 )
 
 rust_test(
+    name = "plan_bf16_test",
+    compile_data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ),
+    crate_features = ["test-oracles"],
+    crate_name = "plan_bf16",
+    crate_root = "tests/plan_bf16.rs",
+    data = glob(
+        [
+            "tests/**",
+            "src/**",
+            "Cargo.toml",
+            "README.md",
+        ],
+        exclude = ["tests/**/*.rs", "src/**/*.rs"],
+        allow_empty = True,
+    ),
+    deps = [
+        ":euhedral_inference_engine",
+        "//rust/crates/bench:euhedral_inference_bench",
+        "//rust/crates/cuda:euhedral_inference_cuda",
+        "//rust/crates/edrl:euhedral_inference_edrl",
+        "//rust/crates/settings:euhedral_inference_settings",
+        "//rust/crates/test-support:test_support",
+        "//rust/crates/tokenizer:euhedral_inference_tokenizer",
+        "@euhedral_crates//:log",
+        "@euhedral_crates//:sha2",
+        "@euhedral_crates//:smallvec",
+        "@euhedral_crates//:tempfile",
+        "@euhedral_crates//:thiserror",
+        "@euhedral_rustee//euhedral-core:euhedral_core_cuda_testing",
+        "@euhedral_rustee//euhedral-data-structures:euhedral_data_structures_cuda_testing",
+        "@euhedral_rustee//euhedral-gpu:euhedral_gpu_cuda_testing",
+        "@euhedral_rustee//euhedral-graph:euhedral_graph_cuda_testing",
+        "@euhedral_rustee//euhedral-hardware-utils:euhedral_hardware_utils_cuda_testing",
+        "@euhedral_rustee//euhedral-hashing:euhedral_hashing_cuda_testing",
+        "@euhedral_rustee//euhedral-io:euhedral_io_cuda_testing",
+        "@euhedral_rustee//euhedral-memory:euhedral_memory_cuda_testing",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "rust/crates/engine",
+        "CARGO_TARGET_TMPDIR": "unused-under-bazel",
+    },
+    srcs = glob(
+        [
+            "tests/plan_bf16.rs",
+            "tests/*/**/*.rs",
+        ],
+        allow_empty = True,
+    ),
+    version = "0.1.0",
+)
+
+rust_test(
     name = "plan_q3_test",
     compile_data = glob(
         [
