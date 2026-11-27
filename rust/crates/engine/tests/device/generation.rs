@@ -45,7 +45,7 @@ use euhedral_inference_engine::{EngineRuntime, Handoff};
 
 /// The longest a device test waits for one hand-off; past it the test fails.
 const WAIT: Duration = Duration::from_secs(20 * 60);
-use euhedral_inference_settings::{Auto, ByteSize, ModelSettings, Settings, SpeculationMode};
+use euhedral_inference_settings::{Auto, ByteSize, KvFormat, ModelSettings, Settings, SpeculationMode};
 use euhedral_inference_tokenizer::Tokenizer;
 
 struct Machine {
@@ -1851,6 +1851,9 @@ fn proof_run_the_bf16_artifact_generates_the_java_greedy_tokens() {
     settings.speculation.mode = SpeculationMode::None;
     settings.memory.gpu_limit = Auto::Value(ByteSize::gib(28));
     settings.memory.host_limit = Auto::Value(ByteSize::mib(24_000));
+    // The Java reference keeps its caches in NVFP4 unless told otherwise, while the BF16 artifact's default is a BF16
+    // cache; the golden is the NVFP4 one.
+    settings.context.kv_cache_format = Auto::Value(KvFormat::Nvfp4);
     let (_card, runtime) = common::engine(&settings, Path::new(&library));
     let recording = generate(&runtime, &prompt, 128, &[]);
     let first = recording.token_times[0];
