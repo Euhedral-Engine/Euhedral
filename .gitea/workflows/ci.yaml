@@ -1,17 +1,30 @@
-# CI for Linux (ARM and the Intel SDE step stay on GitHub, which runs them for the main pushes that forge-mirror sends;
-# the Windows build of a pull request runs there too, dispatched by the `windows` job below). One workflow, so
-# `rollover promote` finds one run per commit (require_run = ["ci.yaml"]).
+# CI for Linux, once per pull request: when the label `land` is added to it (the land step of the orchestrate scripts, `pr-land`:
+# merge the target into the branch, add the label, wait for this run on that exact head, merge if green). A push to a pull
+# request starts nothing. Any other label event, a label removal included (Gitea maps both to `labeled`), does start a run, with
+# every job skipped (the `if:` of each job) except `land-guard`, which fails there; a skipped job counts as passing for a required
+# check, so `land-guard` (required) is what keeps such a run from showing the pull request green. Gitea's `pull_request`
+# payload carries no `label` object: the label added is in `github.event.changes.added_labels` (an array). The concurrency
+# group tells a land run from another label's run, so a label added during a land run cannot cancel it. No path filter: the
+# jobs are required checks, and a filtered pull request would never post its context; the job `changes` decides which groups
+# run, and the required jobs still report (a group that did not change is skipped, which passes).
+# The land run tests the head that is merged: the target is already in it, so the merge commit has the head's tree.
+# A push to an integration branch (rust/next*) therefore runs no tests; it runs `landed`, which checks that the pushed commit is
+# the merge of a pull request head that had a green land run and has that head's tree. That run is what `rollover promote`
+# needs (require_run = ["ci.yaml"] in .gitea/rollover.toml: the latest run with event push, on the integration branch, for
+# the promoted commit, must be a success; a dispatched run does not count). A push to main starts nothing: promotion
+# moves main to a commit that already passed. ARM and the Intel SDE step stay on GitHub, which runs them for the main pushes
+# that forge-mirror sends; the Windows build of a land run runs there too, dispatched by the `windows` job below.
+# By hand (workflow_dispatch) every group runs.
+# Sentinels for `pr-land --require-success`: `changes` and `land-guard`. The rules of the triggers are pinned by
+# scripts/lint-ci-triggers.py.
 #
 # It fails fast: the first job that fails cancels the whole run (the last step of each job, `.gitea/actions/fail-fast`;
 # the two Bazel jobs are reusable workflows with no steps of ours, so `gate-failed` and `windows-failed` do it for them).
-# A cancelled run is never green: the checks to require are `rust`, `native-package`, `device`, `gate-ok` and `windows`,
-# and the last four are cancelled with it.
+# A cancelled run is never green: the checks to require are `changes`, `land-guard`, `rust`, `native-package`, `device`,
+# `gate-ok` and `windows`, and the others are cancelled with it.
 #
 # The runner labels are listed below with the jobs that use them.
-# Runs for a pull request that touches a path below, for a push to main or to an integration branch (rust/next*), and by hand.
-# A push to any other branch starts nothing: the runner is shared, and the branch's pull request runs the same jobs.
-# On an integration branch the jobs run whenever anything since main touched their paths, so a later push that touches none
-# of them cannot hide a failed earlier one. A push to a rust/next* branch that is not vars.INTEGRATION_BRANCH fails at once.
+# A push to an integration branch that is not vars.INTEGRATION_BRANCH fails at once.
 #
 # Job labels are the runner's (arbiter-docker for the cheap job, arbiter-docker-unconfined for the heavy ones, which need
 # seccomp off, arbiter-gpu for the device test jobs, which get the card; the device build runs unconfined without it). No docker job sets timeout-minutes: the arbiter's hold limit (ARBITER_EST + 60 s from the grant) is its limit.
@@ -22,24 +35,9 @@ name: ci
 
 on:
   pull_request:
-    paths:
-      - "rust/**"
-      - "native/**"
-      - "mise.toml"
-      - ".gitea/workflows/**"
-      - "scripts/lint-workflows.py"
-      - "scripts/test_lint_workflows.py"
-      - "MODULE.bazel"
-      - "MODULE.bazel.lock"
-      - ".bazelrc"
-      - ".bazelversion"
-      - ".bazelignore"
-      - "BUILD.bazel"
-      - "bazel/**"
-      - ".gitattributes"
-      - ".github/workflows/ci.yml"
+    types: [labeled]
   push:
-    branches: [main, "rust/next*"]
+    branches: ["rust/next*"]
   workflow_dispatch:
 
 # `actions: write` is for the cancel call of the fail-fast step, and nothing else.
@@ -48,11 +46,11 @@ permissions:
   actions: write
 
 # The event is part of the group, so a manual run on the integration branch never cancels the push run that
-# `rollover promote` requires for that commit. Each push to main has its own group (its sha), so no main run is
-# cancelled or replaced by a newer one: each main run diffs against the previous push.
+# `rollover promote` requires for that commit, and a push run is per commit. A pull request's land run and another label's run
+# are in different groups.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}-${{ contains(github.event.changes.added_labels.*.name, 'land') && 'land' || 'other' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -62,6 +60,7 @@ jobs:
   changes:
     name: changes
     runs-on: arbiter-docker
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land'))
     env:
       ARBITER_ARGS: "--mem 1G"
       ARBITER_EST: "60"
@@ -77,17 +76,18 @@ jobs:
         run: python3 -m unittest scripts/test_lint_workflows.py
       - name: Lint the memory asked by the workflows
         run: python3 scripts/lint-workflows.py .gitea/workflows
+      - name: Test the trigger lint and the landed check
+        run: python3 -m unittest scripts/test_lint_ci_triggers.py scripts/test_ci_landed.py
+      - name: Lint the triggers
+        run: python3 scripts/lint-ci-triggers.py .gitea/workflows/ci.yaml
       - name: Decide which groups changed
         id: diff
         env:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
-          BASE_REF: ${{ github.base_ref }}
-          BEFORE: ${{ github.event.before }}
           INTEGRATION_BRANCH: ${{ vars.INTEGRATION_BRANCH }}
         run: |
           set -euo pipefail
-          zero=0000000000000000000000000000000000000000
 
           # The path groups of each job. mise.toml and rust/** are in every group.
           rust_paths=(
@@ -121,26 +121,17 @@ jobs:
           fi
 
           # Base: what the groups are compared with.
-          #   pull request       the merge base with the target branch
-          #   integration branch the merge base with main, so a later push cannot hide an earlier failure
-          #   main               the previous push; everything when it is unknown (new branch, forced push)
-          #   dispatch           everything
+          #   pull request  the merge base with main, whatever the target: a commit that reached the integration branch
+          #                 untested cannot be hidden by a later pull request that touches no group
+          #   push          nothing: an integration branch push runs no tests, `landed` checks it
+          #   dispatch      everything
           all=false
           range=
           case "$EVENT" in
             pull_request)
-              range="origin/${BASE_REF#refs/heads/}...HEAD"
+              range="origin/main...HEAD"
               ;;
             push)
-              if [ "$REF_NAME" = main ]; then
-                if [ -z "$BEFORE" ] || [ "$BEFORE" = "$zero" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-                  all=true
-                else
-                  range="$BEFORE..HEAD"
-                fi
-              else
-                range="origin/main...HEAD"
-              fi
               ;;
             *)
               all=true
@@ -151,6 +142,7 @@ jobs:
           changed() {
             local rc=0
             if [ "$all" = true ]; then echo true; return; fi
+            if [ -z "$range" ]; then echo false; return; fi
             git diff --quiet "$range" -- "$@" || rc=$?
             case "$rc" in
               0) echo false ;;
@@ -170,10 +162,36 @@ jobs:
         if: failure()
         uses: ./.gitea/actions/fail-fast
 
+  # A push to an integration branch: the commit must be the merge of a pull request head that had a green land run, with
+  # that head's tree (or already be on main, as the branch `rollover promote` starts at main). This is the push run that
+  # `rollover promote` requires.
+  landed:
+    name: landed
+    needs: changes
+    if: github.event_name == 'push' && (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land'))
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--mem 1G"
+      ARBITER_EST: "60"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The commit is a landed pull request
+        env:
+          GITEA_TOKEN: ${{ github.token }}
+          API_URL: ${{ github.server_url }}/api/v1
+          REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/ci-landed.py "$GITHUB_SHA"
+      # Last step: the first failed job cancels the run (see the action).
+      - name: Cancel the run
+        if: failure()
+        uses: ./.gitea/actions/fail-fast
+
   rust:
     name: rust
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.rust == 'true'
     runs-on: arbiter-docker-unconfined
     env:
       ARBITER_ARGS: "--mem 12G"
@@ -245,7 +263,7 @@ jobs:
   device-build:
     name: device-build
     needs: changes
-    if: needs.changes.outputs.native == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.native == 'true'
     runs-on: arbiter-docker-unconfined
     env:
       ARBITER_ARGS: "--mem 16G"
@@ -300,7 +318,7 @@ jobs:
   device-kernels:
     name: device-kernels
     needs: [changes, device-build]
-    if: needs.changes.outputs.native == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
       # The engine sizes its host memory from the container headroom, so a learned cap starves it: limit to the full ask.
@@ -348,7 +366,7 @@ jobs:
   device-servers:
     name: device-servers
     needs: [changes, device-build]
-    if: needs.changes.outputs.native == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
       # Measured: 12.7 GB on the card (one engine at a time), 5.4 GB of host memory; 185 s alone on the card, and past
@@ -396,7 +414,7 @@ jobs:
   device-engine-rig:
     name: device-engine-rig
     needs: [changes, device-build]
-    if: needs.changes.outputs.native == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
       # Measured: 5.4 GB on the card (a reduced model), 12.2 GB of host memory, 140 s.
@@ -443,7 +461,7 @@ jobs:
   device-engine-small:
     name: device-engine-small
     needs: [changes, device-build]
-    if: needs.changes.outputs.native == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
       # Measured: 13.1 GB on the card (a 512 and an 8192 token engine), 2.6 GB of host memory, 57 to 141 s.
@@ -490,7 +508,7 @@ jobs:
   device-engine-big:
     name: device-engine-big
     needs: [changes, device-build]
-    if: needs.changes.outputs.native == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.native == 'true'
     runs-on: arbiter-gpu
     env:
       # Measured: 22.1 GB on the card, 23.4 GB of host memory, 53 model loads, 582 s; the disk-tier and forced-row
@@ -539,7 +557,7 @@ jobs:
   device:
     name: device
     needs: [changes, device-build, device-kernels, device-servers, device-engine-rig, device-engine-small, device-engine-big]
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land'))
     runs-on: arbiter-docker
     steps:
       - name: Every device group passed
@@ -563,7 +581,7 @@ jobs:
   native-package:
     name: native-package
     needs: changes
-    if: needs.changes.outputs.native == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.native == 'true'
     runs-on: arbiter-docker-unconfined
     env:
       ARBITER_ARGS: "--mem 12G"
@@ -625,7 +643,7 @@ jobs:
   # staleness check, and forge's repo check. The reusable workflows are pinned by the protected tag, by its full ref.
   gate:
     needs: changes
-    if: needs.changes.outputs.bazel == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.bazel == 'true'
     uses: euhedral/ci/.gitea/workflows/bazel-gate.yml@refs/tags/v10
     with:
       stale-build: gazelle
@@ -638,7 +656,7 @@ jobs:
   # The same test on the Windows platform: GitHub runs it, dispatched by the proxy, for a pull request only.
   windows:
     needs: changes
-    if: needs.changes.outputs.bazel == 'true'
+    if: (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.changes.outputs.bazel == 'true'
     uses: euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v10
     with:
       repo: Euhedral-Engine/Euhedral
@@ -652,7 +670,7 @@ jobs:
   gate-failed:
     name: gate-failed
     needs: gate
-    if: always() && needs.gate.result == 'failure'
+    if: always() && (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.gate.result == 'failure'
     runs-on: arbiter-docker
     env:
       ARBITER_ARGS: "--mem 1G"
@@ -664,7 +682,7 @@ jobs:
   windows-failed:
     name: windows-failed
     needs: windows
-    if: always() && needs.windows.result == 'failure'
+    if: always() && (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land')) && needs.windows.result == 'failure'
     runs-on: arbiter-docker
     env:
       ARBITER_ARGS: "--mem 1G"
@@ -679,7 +697,7 @@ jobs:
   gate-ok:
     name: gate-ok
     needs: [changes, gate, windows]
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land'))
     runs-on: arbiter-docker
     steps:
       # The image's PATH starts with directories an earlier job can write: a planted `bash` could pass this step.
@@ -703,3 +721,25 @@ jobs:
           else
             test "$WINDOWS" = success -o "$WINDOWS" = skipped
           fi
+
+  # The guard of the land rule. Gitea starts this workflow for every `labeled` event of a pull request, and a label removal counts
+  # as one (the removal of `land` after a land included): the jobs above are skipped for it, and a skipped job counts as passing
+  # for a required check, so a run for another label would show the pull request green. This job runs on every run and fails
+  # unless a pull request run is a land run (the label `land` is among the labels the event added); its context is required, so
+  # a run for another label is red here, and a later land run on the same head posts a newer success. `pr-land` requires it, and
+  # `changes`, to be `success`.
+  land-guard:
+    name: land-guard
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--mem 1G"
+      ARBITER_EST: "60"
+      EVENT: ${{ github.event_name }}
+      LAND_ADDED: ${{ contains(github.event.changes.added_labels.*.name, 'land') }}
+    steps:
+      - name: Fail unless a pull request run is a land run
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        env:
+          PATH: /usr/bin:/bin
+        run: |
+          [ "$EVENT" != pull_request ] || [ "$LAND_ADDED" = true ] || { echo "not a land run: the label land was not added by this event"; exit 1; }
