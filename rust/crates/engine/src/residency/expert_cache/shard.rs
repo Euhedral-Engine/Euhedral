@@ -148,14 +148,6 @@ impl Shard {
         })
     }
 
-    pub(super) fn slots(&self) -> usize {
-        self.slots
-    }
-
-    pub(super) fn keys(&self) -> usize {
-        self.directory.len()
-    }
-
     /// Asks for the expert of `key`, whose record is `bytes` long. A resident one is a lease at once. An absent one is a
     /// miss when `blocked` is `None` and a slot is free or evictable; otherwise the answer is to wait, and nothing has
     /// changed.
@@ -224,8 +216,8 @@ impl Shard {
         Ok(())
     }
 
-    /// The copy of `slot` retired: the expert is resident once nobody holds it.
-    pub(super) fn retired(&mut self, slot: u32, generation: u64) -> Result<(), CacheError> {
+    /// The copy of `slot` retired: the expert is resident once nobody holds it. Whether the slot became evictable.
+    pub(super) fn retired(&mut self, slot: u32, generation: u64) -> Result<bool, CacheError> {
         let index = self.loading_slot(slot, generation, "retired")?;
         if self.ready[index].is_none() {
             return Err(CacheError::BadLoad {
@@ -236,13 +228,14 @@ impl Shard {
         self.loading -= 1;
         self.ready[index] = None;
         self.waits[index].clear();
-        if self.pins[index] > 0 {
-            self.state[index] = State::InUse;
-        } else {
+        let evictable = self.pins[index] == 0;
+        if evictable {
             self.make_evictable(index);
+        } else {
+            self.state[index] = State::InUse;
         }
         self.stats.transferred(self.bytes[index]);
-        Ok(())
+        Ok(evictable)
     }
 
     /// Ends the load of `slot` that never submitted a copy (it was refused, its read failed, or it was cancelled): the
@@ -271,11 +264,11 @@ impl Shard {
     }
 
     /// A lease on `slot` was let go; `fence` is the device work that read it, if any. A lease of an earlier life of the
-    /// slot (the shard closed with it open) is ignored.
-    pub(super) fn release(&mut self, slot: u32, generation: u64, fence: Option<Marker>) {
+    /// slot (the shard closed with it open) is ignored. Whether the slot became evictable.
+    pub(super) fn release(&mut self, slot: u32, generation: u64, fence: Option<Marker>) -> bool {
         let index = slot as usize;
         if self.closed || self.generation.get(index) != Some(&generation) || self.pins[index] == 0 {
-            return;
+            return false;
         }
         self.leases_open -= 1;
         if let Some(fence) = fence {
@@ -286,7 +279,9 @@ impl Shard {
         // wait behind the copy's marker), but the copy is still writing.
         if self.pins[index] == 0 && self.state[index] != State::Loading {
             self.make_evictable(index);
+            return true;
         }
+        false
     }
 
     /// Ends the shard: every lease still open is forced shut, and the fences pending are dropped. Refuses while a load
@@ -309,32 +304,21 @@ impl Shard {
         Ok(forced)
     }
 
-    pub(super) fn is_closed(&self) -> bool {
-        self.closed
-    }
-
-    pub(super) fn loading(&self) -> usize {
-        self.loading
-    }
-
+    #[cfg(test)]
     pub(super) fn leases_open(&self) -> u64 {
         self.leases_open
     }
 
     /// Slots holding a loaded expert that no lease pins: what a miss may evict.
+    #[cfg(test)]
     pub(super) fn evictable(&self) -> usize {
         self.used_in_queues()
     }
 
     /// Whether the expert of `key` has a slot, resident, leased or loading.
+    #[cfg(test)]
     pub(super) fn holds(&self, key: usize) -> bool {
         self.directory.get(key).is_some_and(|&slot| slot != NONE)
-    }
-
-    /// The slot of the expert of `key`, when it is loaded and not loading.
-    pub(super) fn resident_slot(&self, key: usize) -> Option<u32> {
-        let slot = *self.directory.get(key)?;
-        (slot != NONE && self.state[slot as usize] != State::Loading).then_some(slot)
     }
 
     /// The fences the load of `slot` waits behind: the device work that read its previous expert.
@@ -474,6 +458,7 @@ impl Shard {
         self.next[slot] = NONE;
     }
 
+    #[cfg(test)]
     fn used_in_queues(&self) -> usize {
         let mut count = 0;
         for head in self.head {
@@ -488,6 +473,7 @@ impl Shard {
 
     /// Verifies the bookkeeping, which holds between any two calls: the directory and the slots agree, and every slot is
     /// in exactly the list its state says. Names the first inconsistency.
+    #[cfg(test)]
     pub(super) fn check_invariants(&self) -> Result<(), String> {
         let mut free = 0;
         let mut slot = self.free_head;

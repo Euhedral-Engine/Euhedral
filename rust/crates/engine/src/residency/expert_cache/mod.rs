@@ -4,12 +4,22 @@
 //! - [`stats`]: the counters the engine's metrics read.
 //! - `shard`: the bookkeeping of the device slots (S3-FIFO over slots that leases pin).
 
+mod cache;
+mod host;
+mod lease;
+mod owner;
 mod shard;
 pub mod stats;
 
 #[cfg(test)]
+mod cache_tests;
+#[cfg(test)]
 mod shard_tests;
 
+pub use cache::{CacheConfig, ExpertCache};
+pub use host::{CopyJob, CopyLane, DeviceSlots, Frames, SubmitFailure};
+pub use lease::ExpertLease;
+pub use owner::{Listener, Outcome};
 pub use stats::{CacheSnapshot, CacheStats, Cause};
 
 /// Why the cache refused, or could not do, what it was asked.
@@ -25,6 +35,24 @@ pub enum CacheError {
     Key { key: usize, keys: usize },
     #[error("slot {slot} has no load that {what}")]
     BadLoad { slot: u32, what: &'static str },
+    #[error("the device pool has {free} free slots: the cache asked for {wanted}")]
+    PoolTooSmall { wanted: usize, free: usize },
+    #[error("the {what} slots are {slot_bytes} bytes: a record needs {record}")]
+    SlotTooSmall {
+        what: &'static str,
+        slot_bytes: u64,
+        record: u64,
+    },
+    #[error(
+        "the staging free list has {free_list} slots over an arena of {arena}: it needs at least one and at most the arena's"
+    )]
+    StagingSlots { free_list: usize, arena: usize },
+    #[error("{reads} concurrent reads: the cache needs at least one")]
+    Reads { reads: usize },
+    #[error("the cache was abandoned: {why}")]
+    Abandoned { why: String },
+    #[error("loading expert {expert} of bank {bank} failed: {why}")]
+    Transfer { bank: String, expert: u32, why: String },
     #[error("{loads} expert transfers are still in flight")]
     LoadsInFlight { loads: usize },
 }
