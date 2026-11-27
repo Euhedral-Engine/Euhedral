@@ -101,8 +101,8 @@ def require(path: Path) -> bytes:
     """As `read`, failing with the command that adds a section to an artifact without one."""
     section = read(path)
     if section is None:
-        raise SectionError(f"{path} carries no tokenizer; add the checkpoint's with: ./gradlew :quantization:run "
-                           f"--args=\"package-tokenizer --artifact {path} --tokenizer CHECKPOINT_DIR\"")
+        raise SectionError(f"{path} carries no tokenizer; add the checkpoint's with: cargo run --release -p "
+                           f"euhedral-inference-quantize -- package-tokenizer --artifact {path} --tokenizer CHECKPOINT_DIR")
     return section
 
 

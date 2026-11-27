@@ -100,8 +100,8 @@ fn sample_row(speculative: Option<Speculative>) -> Row {
     }
 }
 
-/// The fields `tools/rust_gate.py` reads from a row, each with the kind of value it takes there. A row written without
-/// one of them, or with it of another kind, breaks the comparison.
+/// The fields a reader of result rows takes from a row, each with the kind of value it takes there. A row written
+/// without one of them, or with it of another kind, breaks the reader.
 #[test]
 fn a_row_carries_every_field_the_comparison_tool_reads() {
     let speculative = Speculative {

@@ -146,7 +146,7 @@ def nearest_even(values, representable):
     return np.argmin(np.where(distance == minimum, rank, 2), axis=-1)
 
 
-def java_reference_row(row: np.ndarray) -> np.ndarray:
+def reference_row(row: np.ndarray) -> np.ndarray:
     """core/.../Nvfp4KvReference.represented: H from its definition, float64 rotation, nearest-even choices."""
     rotated = H256 @ row.astype(np.float64)
     for base in range(0, 256, 16):
@@ -187,13 +187,13 @@ class KvCodecTest(unittest.TestCase):
         represented = kvcodec.dequantize_rows(codes, scales)
         self.assertEqual(represented[0].abs().sum().item(), 0)
 
-    def test_roundtrip_matches_the_java_reference_semantics(self):
+    def test_roundtrip_matches_the_reference_semantics(self):
         rng = np.random.default_rng(7)
         scale = rng.choice([0.01, 1.0, 30.0], size=(64, 1))
         rows = (rng.standard_normal((64, 256)) * scale).astype(np.float32)
         rows = torch.from_numpy(rows).to(torch.bfloat16).float().numpy()
         ours = kvcodec.roundtrip(torch.from_numpy(rows)).numpy()
-        reference = np.stack([java_reference_row(r) for r in rows])
+        reference = np.stack([reference_row(r) for r in rows])
         # the device butterfly is float32 and the reference float64: they only disagree on (rare) exact ties
         close = np.abs(ours - reference) <= 1e-4 * np.abs(rows).max(axis=1, keepdims=True)
         self.assertGreater(close.mean(), 0.995)
