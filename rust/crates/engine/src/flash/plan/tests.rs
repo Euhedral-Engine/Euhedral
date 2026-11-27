@@ -7,11 +7,17 @@ fn kinds(plan: &DensePlan) -> Vec<NodeKind> {
 }
 
 #[test]
-fn the_tiny_model_has_the_embedding_its_n_gram_roots_both_layers_and_the_final_mix() {
+fn the_tiny_model_has_the_embedding_its_n_gram_roots_both_layers_the_final_mix_and_the_head() {
     let plan = DensePlan::from_config(&tiny_config()).unwrap();
     let mut expected = vec![NodeKind::Embed, NodeKind::Block(0), NodeKind::End(0), NodeKind::PleIds];
     expected.extend((0..PARTS).map(NodeKind::PleGather));
-    expected.extend([NodeKind::Ple, NodeKind::Block(1), NodeKind::End(1), NodeKind::FinalMix]);
+    expected.extend([
+        NodeKind::Ple,
+        NodeKind::Block(1),
+        NodeKind::End(1),
+        NodeKind::FinalMix,
+        NodeKind::Head,
+    ]);
     assert_eq!(kinds(&plan), expected);
 }
 
@@ -43,6 +49,8 @@ fn each_layer_runs_its_block_then_its_end_injection_then_the_next_layer() {
     assert_eq!(plan.nodes()[at(NodeKind::Block(0))].after, [at(NodeKind::Embed)]);
     assert_eq!(plan.nodes()[at(NodeKind::End(0))].after, [at(NodeKind::Block(0))]);
     assert_eq!(plan.nodes()[at(NodeKind::FinalMix)].after, [at(NodeKind::End(1))]);
+    assert_eq!(plan.nodes()[at(NodeKind::Head)].after, [at(NodeKind::FinalMix)]);
+    assert_eq!(at(NodeKind::Head), plan.nodes().len() - 1, "the head is the last node");
 }
 
 #[test]
@@ -58,7 +66,8 @@ fn a_model_without_the_n_gram_layer_has_no_host_roots() {
             NodeKind::End(0),
             NodeKind::Block(1),
             NodeKind::End(1),
-            NodeKind::FinalMix
+            NodeKind::FinalMix,
+            NodeKind::Head
         ]
     );
 }
@@ -155,4 +164,31 @@ fn the_moe_graph_validates_with_experts_on_one_lane_and_on_several_and_the_fetch
 #[test]
 fn a_moe_plan_of_no_experts_is_refused() {
     assert!(DensePlan::with_moe(&tiny_config(), 0).is_err());
+}
+
+#[test]
+fn a_plan_with_more_nodes_than_a_graph_holds_is_refused_naming_its_count_before_any_node_is_built() {
+    let config = tiny_config();
+    let ok = DensePlan::with_moe(&config, 15_000).unwrap();
+    assert!(ok.nodes().len() <= MAX_NODES);
+    // Two layers of 2 * 40000 + 6 nodes, and the rest: the count the refusal names.
+    let message = DensePlan::with_moe(&config, 40_000).unwrap_err().to_string();
+    assert!(
+        message.contains("160") && message.contains(&MAX_NODES.to_string()),
+        "{message}"
+    );
+    assert!(DensePlan::with_moe(&config, u32::MAX).is_err());
+}
+
+#[test]
+fn a_plan_is_admitted_up_to_the_stages_a_graph_holds_and_refused_one_node_pair_past_them() {
+    // Without the n-gram layer a plan has 2 * layers + 3 nodes, always odd, so a plan of exactly `MAX_NODES` cannot
+    // exist: these are the last count below the limit and the first above it.
+    let mut config = tiny_config();
+    config.ple.layers.clear();
+    config.text.num_layers = (MAX_NODES as u32 - 3) / 2;
+    assert_eq!(DensePlan::from_config(&config).unwrap().nodes().len(), MAX_NODES - 1);
+    config.text.num_layers += 1;
+    let message = DensePlan::from_config(&config).unwrap_err().to_string();
+    assert!(message.contains(&(MAX_NODES + 1).to_string()), "{message}");
 }

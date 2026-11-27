@@ -1,6 +1,6 @@
 //! The nodes and edges of the dense part of a Flash-Next quantum (`ExecutionPlan`'s stage list for the non-diagnostic
 //! shape): the embedding, the n-gram embedding's host roots and its device stage at the layer that holds it, and for
-//! each layer the block, the layer's mixture of experts and the end injection, then the final mix.
+//! each layer the block, the layer's mixture of experts and the end injection, then the final mix and the head.
 //!
 //! The nodes are what a session builds a stage for; [`DensePlan::spec`] is the RustEE graph over them. A plan made
 //! with [`DensePlan::with_moe`] puts a layer's MoE nodes between its block and its end injection (the shape of
@@ -15,6 +15,10 @@ use euhedral_inference_edrl::FlashConfig;
 
 use super::FlashError;
 use super::ple::PARTS;
+
+/// The most nodes a plan may have: the stages a RustEE graph holds, whose ids are 16 bits. This limit is RustEE's, not
+/// the engine's, and goes once RustEE lifts it.
+pub const MAX_NODES: usize = 1 << 16;
 
 /// What a node of the dense part does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +37,8 @@ pub enum NodeKind {
     End(usize),
     /// The final mixer over the last row.
     FinalMix,
+    /// The logits of the last row and the copy of what the host reads of them.
+    Head,
     /// The router of layer `n`'s MoE block, and the copy of its choice to the host.
     MoeRoute(usize),
     /// The shared expert of layer `n`.
@@ -63,6 +69,7 @@ impl NodeKind {
             NodeKind::Block(_) => "flash block",
             NodeKind::End(_) => "flash end inject",
             NodeKind::FinalMix => "flash final mix",
+            NodeKind::Head => "flash head",
             NodeKind::MoeRoute(_) => "flash moe route",
             NodeKind::MoeShared(_) => "flash moe shared",
             NodeKind::MoePlan(_) => "flash moe plan",
@@ -136,6 +143,16 @@ impl DensePlan {
                 ));
             }
         };
+        // The embedding, the final mix and the head; per layer a block and an end injection, and the MoE nodes.
+        let moe = moe_width.map_or(0, |width| 4 + 2 * u64::from(width));
+        let ple = if ple_layer.is_some() { PARTS as u64 + 2 } else { 0 };
+        let count = (layers as u64).saturating_mul(2 + moe).saturating_add(3 + ple);
+        if count > MAX_NODES as u64 {
+            return Err(FlashError::refused(
+                "dense plan",
+                format!("a plan of {count} nodes exceeds the {MAX_NODES} stages a graph holds (RustEE's limit)"),
+            ));
+        }
         let mut nodes = vec![Node::new(NodeKind::Embed, vec![])];
         let mut last = 0;
         for layer in 0..layers {
@@ -162,6 +179,7 @@ impl DensePlan {
             last = nodes.len() - 1;
         }
         nodes.push(Node::new(NodeKind::FinalMix, vec![last]));
+        nodes.push(Node::new(NodeKind::Head, vec![nodes.len() - 1]));
         Ok(Self { nodes })
     }
 

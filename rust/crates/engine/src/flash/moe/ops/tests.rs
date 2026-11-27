@@ -108,3 +108,22 @@ fn a_geometry_refuses_extents_and_offsets_the_kernels_cannot_read() {
         ExpertGeometry::flash_next()
     );
 }
+
+#[test]
+fn the_nvfp4_padding_launches_javas_arguments_and_refuses_widths_the_kernel_cannot_take() {
+    let line = nvfp4_pad_k(at(A), at(B), 2560, 640, 768).unwrap().line();
+    assert_eq!(
+        line,
+        "euhedral_q4_nvfp4_pad_k grid=2561,1,1 block=128,1,1 smem=0 args=p1000,p2000,i2560,i640,i768"
+    );
+    assert!(refused(nvfp4_pad_k(at(A), at(B), 2560, 640, 640 - 128)).contains("640"));
+    assert!(refused(nvfp4_pad_k(at(A), at(B), 2560, 100, 128)).contains("100"));
+    assert!(refused(nvfp4_pad_k(at(A), at(B), 2560, 640, 700)).contains("700"));
+    assert!(refused(nvfp4_pad_k(at(A), at(B), 0, 640, 768)).contains("rows"));
+}
+
+#[test]
+fn a_plain_nvfp4_tensor_is_its_codes_its_aligned_scales_and_one_global() {
+    // 4 rows of 128 values: 256 code bytes, 32 scale bytes aligned to 256, then the four-byte global.
+    assert_eq!(nvfp4_bytes(4, 128), 256 + 256 + 4);
+}

@@ -1,3 +1,9 @@
+#[allow(
+    clippy::disallowed_types,
+    reason = "the test thread, not a worker, holds the pending reads"
+)]
+use std::sync::Mutex;
+
 use super::*;
 
 fn ids(eos: i32) -> NgramIds {
@@ -68,7 +74,7 @@ fn the_parts_of_every_gather_cover_its_rows_once_in_order() {
     assert!(part_range(100, 1).is_empty(), "a part past the count is empty");
 }
 
-fn shard(rows: u64, tag: u8, scale: f32) -> Arc<dyn ShardBytes> {
+fn shard_bytes(rows: u64, tag: u8) -> Vec<u8> {
     let layout = NgramLayout::new(rows, 32).unwrap();
     let mut bytes = vec![0u8; layout.byte_size() as usize];
     for row in 0..rows as usize {
@@ -76,27 +82,29 @@ fn shard(rows: u64, tag: u8, scale: f32) -> Arc<dyn ShardBytes> {
             bytes[row * 18 + byte] = tag + (row * 10 + byte) as u8 % 100;
         }
     }
-    let at = layout.trailer_offset() as usize;
-    bytes[at..at + 4].copy_from_slice(&scale.to_le_bytes());
-    Arc::new(bytes)
+    bytes
 }
 
-fn table() -> NgramRows {
-    NgramRows::new(vec![shard(5, 100, 2.0), shard(3, 0, 0.5)], 5, 8, 32).unwrap()
+fn shard(rows: u64, tag: u8) -> Arc<dyn ShardBytes> {
+    Arc::new(MemoryShard(shard_bytes(rows, tag)))
+}
+
+fn table() -> Arc<NgramRows> {
+    Arc::new(NgramRows::new(vec![shard(5, 100), shard(3, 0)], 5, 8, 32, vec![2.0, 0.5]).unwrap())
+}
+
+fn record(tag: u8, row: usize, scale: f32) -> Vec<u8> {
+    let mut record: Vec<u8> = (0..18).map(|byte| tag + (row * 10 + byte) as u8 % 100).collect();
+    record.extend([0, 0]);
+    record.extend(scale.to_le_bytes());
+    record
 }
 
 #[test]
 fn a_record_is_the_packed_row_zero_padding_and_the_shards_scale() {
     let table = table();
     assert_eq!(table.record_bytes(), 24);
-    let mut out = vec![0xAA; 3 * 24];
-    table.gather(&[7, 0, 4, 5], 1..4, &mut out).unwrap();
-    let record = |tag: u8, row: usize, scale: f32| {
-        let mut record: Vec<u8> = (0..18).map(|byte| tag + (row * 10 + byte) as u8 % 100).collect();
-        record.extend([0, 0]);
-        record.extend(scale.to_le_bytes());
-        record
-    };
+    let out = table.gather_in_memory(&[7, 0, 4, 5], 1..4).unwrap();
     assert_eq!(out[..24], record(100, 0, 2.0)[..]);
     assert_eq!(out[24..48], record(100, 4, 2.0)[..]);
     assert_eq!(out[48..], record(0, 0, 0.5)[..]);
@@ -106,33 +114,180 @@ fn a_record_is_the_packed_row_zero_padding_and_the_shards_scale() {
 fn a_range_gathers_the_same_records_as_the_whole() {
     let table = table();
     let ids = [7, 0, 4, 5, 2, 6];
-    let mut whole = vec![0; 6 * 24];
-    table.gather(&ids, 0..6, &mut whole).unwrap();
-    let mut pieces = vec![0; 6 * 24];
-    for (part, chunk) in [0..2, 2..3, 3..6].into_iter().enumerate() {
-        let _ = part;
-        let (from, to) = (chunk.start * 24, chunk.end * 24);
-        table.gather(&ids, chunk, &mut pieces[from..to]).unwrap();
-    }
+    let whole = table.gather_in_memory(&ids, 0..6).unwrap();
+    let pieces: Vec<u8> = [0..2, 2..3, 3..6]
+        .into_iter()
+        .flat_map(|chunk| table.gather_in_memory(&ids, chunk).unwrap())
+        .collect();
     assert_eq!(whole, pieces);
 }
 
 #[test]
-fn a_gather_the_table_cannot_serve_is_refused_with_the_row() {
+fn a_gather_the_table_cannot_serve_is_refused_with_the_row_and_starts_nothing() {
     let table = table();
-    let mut out = vec![0; 24];
-    let error = table.gather(&[8], 0..1, &mut out).unwrap_err().to_string();
+    let error = table.gather_in_memory(&[8], 0..1).unwrap_err().to_string();
     assert!(error.contains("row 8 of 8"), "{error}");
-    assert!(table.gather(&[1], 0..1, &mut [0; 23]).is_err());
-    assert!(table.gather(&[1], 0..2, &mut [0; 48]).is_err());
+    assert!(table.gather_in_memory(&[1], 0..2).is_err());
+    assert_eq!(
+        table.gather_in_memory(&[1], 1..1).unwrap(),
+        Vec::<u8>::new(),
+        "no rows end at once"
+    );
 }
 
 #[test]
 fn a_table_whose_shards_do_not_hold_its_rows_is_refused() {
-    assert!(NgramRows::new(vec![shard(5, 0, 1.0)], 5, 8, 32).is_err());
-    let short: Arc<dyn ShardBytes> = Arc::new(vec![0u8; 100]);
-    assert!(NgramRows::new(vec![short, shard(3, 0, 1.0)], 5, 8, 32).is_err());
-    assert!(NgramRows::new(vec![shard(5, 0, 1.0)], 5, 5, 24).is_err());
+    assert!(
+        NgramRows::new(vec![shard(5, 0)], 5, 8, 32, vec![1.0]).is_err(),
+        "one shard of two"
+    );
+    let short: Arc<dyn ShardBytes> = Arc::new(MemoryShard(vec![0u8; 100]));
+    assert!(NgramRows::new(vec![short, shard(3, 0)], 5, 8, 32, vec![1.0; 2]).is_err());
+    assert!(NgramRows::new(vec![shard(5, 0)], 5, 5, 24, vec![1.0]).is_err());
+    let scales = NgramRows::new(vec![shard(5, 0)], 5, 5, 32, vec![])
+        .unwrap_err()
+        .to_string();
+    assert!(scales.contains("0 scales for 1 shards"), "{scales}");
+}
+
+#[test]
+fn the_extent_of_a_shard_is_its_size_and_where_its_scale_is() {
+    let layout = NgramLayout::new(3, 32).unwrap();
+    let (size, scale_at) = NgramRows::shard_extent(1, 5, 8, 32).unwrap();
+    assert_eq!((size, scale_at), (layout.byte_size(), layout.trailer_offset()));
+    assert!(NgramRows::shard_extent(2, 5, 8, 32).is_err(), "past the table");
+}
+
+/// A shard whose reads end when the test says so, in the order it says.
+#[derive(Default)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "the test thread, not a worker, holds the pending reads"
+)]
+struct Deferred {
+    bytes: Vec<u8>,
+    refuse: bool,
+    pending: Mutex<Vec<(u64, usize, RowRead)>>,
+}
+
+impl fmt::Debug for Deferred {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Deferred").finish_non_exhaustive()
+    }
+}
+
+impl ShardBytes for Deferred {
+    fn size(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn start(&self, offset: u64, len: usize, then: RowRead) -> Result<(), String> {
+        if self.refuse {
+            return Err("the read was refused".to_owned());
+        }
+        self.pending.lock().unwrap().push((offset, len, then));
+        Ok(())
+    }
+}
+
+impl Deferred {
+    fn holding(bytes: Vec<u8>) -> Arc<Deferred> {
+        Arc::new(Deferred {
+            bytes,
+            ..Deferred::default()
+        })
+    }
+
+    fn pending(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Ends the `index`-th pending read (counted as they were started) with the shard's bytes, or with `failure`.
+    fn end(&self, index: usize, failure: Option<&str>) {
+        let (offset, len, then) = self.pending.lock().unwrap().remove(index);
+        let result = match failure {
+            Some(why) => Err(why.to_owned()),
+            None => Ok(self.bytes[offset as usize..offset as usize + len].to_vec()),
+        };
+        then(result).execute().unwrap();
+    }
+}
+
+/// What a gather told, once.
+#[derive(Default)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "the test thread reads what the end of the gather wrote"
+)]
+struct Told(Mutex<Vec<Result<Vec<u8>, FlashError>>>);
+
+impl Told {
+    fn done(self: &Arc<Self>) -> GatherDone {
+        let told = Arc::clone(self);
+        Box::new(move |result| told.0.lock().unwrap().push(result))
+    }
+
+    fn count(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+}
+
+#[test]
+fn a_gather_ends_once_when_the_last_row_ends_whatever_the_order_and_keeps_the_rows_in_order() {
+    for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2], [1, 2, 0]] {
+        let held = Deferred::holding(shard_bytes(5, 100));
+        let table =
+            Arc::new(NgramRows::new(vec![Arc::clone(&held) as Arc<dyn ShardBytes>], 5, 5, 32, vec![2.0]).unwrap());
+        let told = Arc::new(Told::default());
+        table.gather(&[4, 0, 2], 0..3, told.done()).unwrap();
+        assert_eq!(held.pending(), 3, "every row is started before any ends");
+        assert_eq!(told.count(), 0);
+        // `order` names the started reads by their place in the queue as it shrinks.
+        let mut left = vec![0, 1, 2];
+        for (step, place) in order.into_iter().enumerate() {
+            let at = left.iter().position(|row| *row == place).unwrap();
+            left.remove(at);
+            assert_eq!(told.count(), 0, "{order:?} step {step}");
+            held.end(at, None);
+        }
+        assert_eq!(told.count(), 1, "{order:?}");
+        let out = told.0.lock().unwrap().remove(0).unwrap();
+        let expected: Vec<u8> = [4, 0, 2].into_iter().flat_map(|row| record(100, row, 2.0)).collect();
+        assert_eq!(out, expected, "{order:?}");
+    }
+}
+
+#[test]
+fn a_row_that_fails_fails_the_gather_after_the_others_have_ended_and_names_the_row_and_the_cause() {
+    let held = Deferred::holding(shard_bytes(5, 100));
+    let table = Arc::new(NgramRows::new(vec![Arc::clone(&held) as Arc<dyn ShardBytes>], 5, 5, 32, vec![2.0]).unwrap());
+    let told = Arc::new(Told::default());
+    table.gather(&[1, 2, 3], 0..3, told.done()).unwrap();
+    held.end(1, Some("the disk went away"));
+    held.end(0, None);
+    assert_eq!(told.count(), 0, "a row is still out");
+    held.end(0, None);
+    assert_eq!(told.count(), 1);
+    let error = told.0.lock().unwrap().remove(0).unwrap_err().to_string();
+    assert!(
+        error.contains("row 1") && error.contains("the disk went away"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_row_that_cannot_start_fails_the_gather_once_and_ends_it_in_the_call() {
+    let refusing = Arc::new(Deferred {
+        bytes: shard_bytes(5, 0),
+        refuse: true,
+        ..Deferred::default()
+    });
+    let table = Arc::new(NgramRows::new(vec![refusing as Arc<dyn ShardBytes>], 5, 5, 32, vec![1.0]).unwrap());
+    let told = Arc::new(Told::default());
+    table.gather(&[0, 1], 0..2, told.done()).unwrap();
+    assert_eq!(told.count(), 1, "nothing was started, so nothing is out");
+    let error = told.0.lock().unwrap().remove(0).unwrap_err().to_string();
+    assert!(error.contains("the read was refused"), "{error}");
 }
 
 #[test]

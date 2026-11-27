@@ -135,27 +135,21 @@ pub struct FileRecordSource {
     layout: Arc<ExpertLayout>,
     port: Arc<dyn PartPort>,
     split: usize,
-    verify: bool,
 }
 
 impl FileRecordSource {
-    /// A source of the records of `layout`, each read as up to `split` parts. With `verify` a record's CRC-32 is checked
-    /// when its last part has arrived, and a record that does not match is refused by name. Refuses a split of 0.
+    /// A source of the records of `layout`, each read as up to `split` parts. The records are trusted as the artifact holds
+    /// them: nothing checks a record as it is read while serving. Keeping the file from being changed while the
+    /// engine runs is a guard of its own, not this source's; the bytes are trusted. Refuses a split of 0.
     pub fn new(
         layout: Arc<ExpertLayout>,
         port: Arc<dyn PartPort>,
         split: usize,
-        verify: bool,
     ) -> Result<FileRecordSource, ExpertError> {
         if split == 0 {
             return Err(ExpertError::BadSplit { split });
         }
-        Ok(FileRecordSource {
-            layout,
-            port,
-            split,
-            verify,
-        })
+        Ok(FileRecordSource { layout, port, split })
     }
 
     pub fn layout(&self) -> &Arc<ExpertLayout> {
@@ -237,8 +231,6 @@ impl FileRecordSource {
             finish: ClaimCell::new(Some(Finish {
                 destination,
                 copy_to,
-                crc32: self.verify.then_some(record.crc32),
-                bytes,
                 done,
             })),
         });
@@ -297,9 +289,6 @@ struct Shared {
 struct Finish {
     destination: SlotWrite,
     copy_to: Option<SlotWrite>,
-    /// The record's CRC-32 to check, when verifying.
-    crc32: Option<u32>,
-    bytes: usize,
     done: Done,
 }
 
@@ -345,10 +334,8 @@ impl Shared {
             return;
         };
         let Some(Finish {
-            mut destination,
+            destination,
             copy_to,
-            crc32,
-            bytes,
             done,
         }) = claim.take()
         else {
@@ -361,24 +348,6 @@ impl Shared {
             ReadOutcome::Cancelled { filled: false }
         } else if let Some(error) = self.failure.get() {
             ReadOutcome::Failed(error.clone())
-        } else if let Some(expected) = crc32 {
-            match destination.bytes_mut() {
-                Some(all) => {
-                    let found = crc32fast::hash(&all[..bytes]);
-                    if found == expected {
-                        self.complete()
-                    } else {
-                        ReadOutcome::Failed(ExpertError::Damaged {
-                            bank: self.layout.bank_name(self.id.bank).to_owned(),
-                            expert: self.id.expert,
-                            expected,
-                            found,
-                        })
-                    }
-                }
-                // A part is still held: it was leaked.
-                None => ReadOutcome::Lost,
-            }
         } else {
             self.complete()
         };

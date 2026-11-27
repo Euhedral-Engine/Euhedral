@@ -21,7 +21,7 @@
     reason = "small synthetic shapes"
 )]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, KernelOps, PinnedPool};
 use euhedral_inference_edrl::{NgramLayout, TensorDataType, WeightFormat, WeightLayout};
@@ -34,7 +34,7 @@ use euhedral_inference_engine::flash::ops::{
     conv_history, gdn_control, gdn_conv, gdn_gated_norm, ngram_expand, ple_conv, ple_gate,
 };
 use euhedral_inference_engine::flash::ple::{
-    NgramIds, NgramRows, PARTS, PleGatherStage, PleIdsStage, PleRows, ShardBytes,
+    MemoryShard, NgramIds, NgramRows, PARTS, PleGatherStage, PleIdsStage, PleRows, ShardBytes,
 };
 use euhedral_inference_engine::flash::sequence::{Op, queue_all};
 use euhedral_inference_engine::formats::{LinearMode, Nvfp4Linear};
@@ -281,12 +281,11 @@ fn ple_expand_gate_and_conv_match_the_host_reference() {
     }
     let trailer = layout.trailer_offset() as usize;
     shard[trailer..trailer + 4].copy_from_slice(&global.to_le_bytes());
-    let source: Arc<dyn ShardBytes> = Arc::new(shard.clone());
-    let table = NgramRows::new(vec![source], 4, 4, width as u32).unwrap();
+    let source: Arc<dyn ShardBytes> = Arc::new(MemoryShard(shard.clone()));
+    let table = Arc::new(NgramRows::new(vec![source], 4, 4, width as u32, vec![global]).unwrap());
     let record_bytes = table.record_bytes() as usize;
     let ids = [2u64, 0, 3];
-    let mut records = vec![0u8; rows * record_bytes];
-    table.gather(&ids, 0..rows, &mut records).unwrap();
+    let records = table.gather_in_memory(&ids, 0..rows).unwrap();
     let mut expanded = Vec::new();
     for id in ids {
         let row = &shard[id as usize * row_bytes..(id as usize + 1) * row_bytes];
@@ -672,15 +671,26 @@ fn ple_gather_refuses_a_missing_part_a_run_before_the_ids_and_a_second_publicati
     let _card = common::card();
     let Some(rig) = rig() else { return };
     let layout = NgramLayout::new(16, 32).unwrap();
-    let shard: Arc<dyn ShardBytes> = Arc::new(vec![0u8; layout.byte_size() as usize]);
-    let table = Arc::new(NgramRows::new(vec![shard], 16, 16, 32).unwrap());
+    let shard: Arc<dyn ShardBytes> = Arc::new(MemoryShard(vec![0u8; layout.byte_size() as usize]));
+    let table = Arc::new(NgramRows::new(vec![shard], 16, 16, 32, vec![1.0]).unwrap());
     let ids = Arc::new(NgramIds::new(2, 1, &[3, 5], &[10], &[0], -1).unwrap());
     let pool = PinnedPool::new(&rig.library, 1 << 20);
     assert!(PleGatherStage::new(PARTS, Arc::clone(&table), Arc::clone(&pool)).is_err());
     let stage = PleGatherStage::new(0, table, pool).unwrap();
-    let rows = PleRows::new(ids.fresh_context());
-    assert!(stage.gather(&rows).is_err(), "before the ids");
+    let rows = Arc::new(PleRows::new(ids.fresh_context()));
+    let gather = |stage: &PleGatherStage| {
+        let ended = Arc::new(OnceLock::new());
+        let told = Arc::clone(&ended);
+        let started = stage.start(
+            Arc::clone(&rows),
+            Box::new(move |result| {
+                let _ = told.set(result);
+            }),
+        );
+        started.map(|()| ended.get().cloned().expect("an in-memory part ends in the call"))
+    };
+    assert!(gather(&stage).is_err(), "before the ids");
     PleIdsStage::new(ids).hash(&rows, &[1; 12], 12).unwrap();
-    stage.gather(&rows).unwrap();
-    assert!(stage.gather(&rows).is_err(), "the part was published already");
+    gather(&stage).unwrap().unwrap();
+    assert!(gather(&stage).unwrap().is_err(), "the part was published already");
 }

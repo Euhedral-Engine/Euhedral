@@ -287,8 +287,8 @@ impl Probe {
 use super::source::Done;
 use crate::residency::offload::HOST_ALIGNMENT;
 
-fn source(rig: &Rig, port: &Arc<FakePort>, split: usize, verify: bool) -> FileRecordSource {
-    FileRecordSource::new(rig.layout(), Arc::clone(port) as Arc<dyn PartPort>, split, verify).expect("a source")
+fn source(rig: &Rig, port: &Arc<FakePort>, split: usize) -> FileRecordSource {
+    FileRecordSource::new(rig.layout(), Arc::clone(port) as Arc<dyn PartPort>, split).expect("a source")
 }
 
 fn arena(rig: &Rig, slots: usize) -> Arc<HostArena> {
@@ -416,7 +416,7 @@ fn parts_are_cut_in_order_without_overlap_and_never_past_the_slot() {
 fn a_record_is_read_in_page_aligned_parts_that_join_into_one_end() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 3, true);
+    let source = source(&rig, &port, 3);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     let started = read(&source, &memory, 0, id(0, 1), None, &no_cancel(), &probe).expect("started");
@@ -460,7 +460,7 @@ fn a_record_is_read_in_page_aligned_parts_that_join_into_one_end() {
 fn a_record_whose_bytes_do_not_end_on_a_page_is_read_buffered_where_a_whole_page_would_pass_the_file() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 1, true);
+    let source = source(&rig, &port, 1);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     read(&source, &memory, 0, id(2, 0), None, &no_cancel(), &probe).expect("started");
@@ -476,7 +476,7 @@ fn a_record_whose_bytes_do_not_end_on_a_page_is_read_buffered_where_a_whole_page
 fn without_a_direct_handle_every_part_is_buffered() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, false);
-    let source = source(&rig, &port, 2, true);
+    let source = source(&rig, &port, 2);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     read(&source, &memory, 0, id(0, 0), None, &no_cancel(), &probe).expect("started");
@@ -489,7 +489,7 @@ fn without_a_direct_handle_every_part_is_buffered() {
 fn a_fill_copies_each_part_to_staging_as_it_arrives() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 3, true);
+    let source = source(&rig, &port, 3);
     let (tier, staging) = (arena(&rig, 1), arena(&rig, 1));
     let probe = Arc::new(Probe::default());
     read(&source, &tier, 0, id(0, 2), Some((&staging, 0)), &no_cancel(), &probe).expect("started");
@@ -512,7 +512,7 @@ fn a_part_refused_by_the_ring_fails_the_load_once_after_the_parts_out_have_ended
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
     port.refuse_from.store(1, Ordering::Release);
-    let source = source(&rig, &port, 3, true);
+    let source = source(&rig, &port, 3);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     let started = read(&source, &memory, 0, id(0, 0), None, &no_cancel(), &probe).expect("started");
@@ -534,7 +534,7 @@ fn when_every_part_ends_before_the_start_returns_the_start_hands_back_the_frame_
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
     port.refuse_from.store(0, Ordering::Release);
-    let source = source(&rig, &port, 2, true);
+    let source = source(&rig, &port, 2);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     let started = read(&source, &memory, 0, id(0, 0), None, &no_cancel(), &probe).expect("started");
@@ -554,7 +554,7 @@ fn when_every_part_ends_before_the_start_returns_the_start_hands_back_the_frame_
 fn a_leaked_read_makes_the_load_lost_and_keeps_the_slot_leased_for_good() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 2, true);
+    let source = source(&rig, &port, 2);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     read(&source, &memory, 0, id(0, 0), None, &no_cancel(), &probe).expect("started");
@@ -569,7 +569,7 @@ fn a_leaked_read_makes_the_load_lost_and_keeps_the_slot_leased_for_good() {
 fn a_short_read_fails_the_load_naming_the_record_and_the_bytes() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 1, true);
+    let source = source(&rig, &port, 1);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     read(&source, &memory, 0, id(1, 2), None, &no_cancel(), &probe).expect("started");
@@ -594,7 +594,7 @@ const ALIGNMENT_ERRNO: i32 = 22;
 fn a_direct_read_the_file_system_cannot_align_is_made_again_buffered_once() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 1, true);
+    let source = source(&rig, &port, 1);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     read(&source, &memory, 0, id(0, 3), None, &no_cancel(), &probe).expect("started");
@@ -614,7 +614,7 @@ fn a_direct_read_the_file_system_cannot_align_is_made_again_buffered_once() {
 fn any_other_error_fails_the_load_without_a_retry() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 1, true);
+    let source = source(&rig, &port, 1);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     read(&source, &memory, 0, id(0, 0), None, &no_cancel(), &probe).expect("started");
@@ -626,51 +626,13 @@ fn any_other_error_fails_the_load_without_a_retry() {
     ));
 }
 
-// ---------------------------------------------------------------- a damaged record
-
-#[test]
-fn a_damaged_record_is_refused_naming_its_bank_expert_and_both_checksums() {
-    let mut rig = Rig::new();
-    let record = rig.layout().record(id(0, 2)).expect("a record");
-    let expected = record.crc32;
-    rig.bytes[record.offset as usize + 7000] ^= 0x40;
-    write(&rig.path, &rig.bytes).expect("the artifact is damaged");
-    let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 2, true);
-    let memory = arena(&rig, 1);
-    let probe = Arc::new(Probe::default());
-    read(&source, &memory, 0, id(0, 2), None, &no_cancel(), &probe).expect("started");
-    port.release_all();
-    let Some(ReadOutcome::Failed(ExpertError::Damaged {
-        bank,
-        expert,
-        expected: wanted,
-        found,
-    })) = probe.outcome.get()
-    else {
-        panic!("a damaged record was not refused: {:?}", probe.outcome.get());
-    };
-    assert_eq!((bank.as_str(), *expert, *wanted), ("bank0", 2, expected));
-    assert_ne!(*found, expected);
-    // Its neighbour reads clean, and without verification the damage is not looked for.
-    let probe = Arc::new(Probe::default());
-    read(&source, &memory, 0, id(0, 1), None, &no_cancel(), &probe).expect("started");
-    port.release_all();
-    assert_eq!(probe.outcome.get(), Some(&ReadOutcome::Complete));
-    let lax = FileRecordSource::new(rig.layout(), Arc::clone(&port) as Arc<dyn PartPort>, 2, false).expect("a source");
-    let probe = Arc::new(Probe::default());
-    read(&lax, &memory, 0, id(0, 2), None, &no_cancel(), &probe).expect("started");
-    port.release_all();
-    assert_eq!(probe.outcome.get(), Some(&ReadOutcome::Complete));
-}
-
 // ---------------------------------------------------------------- refusals and cancellation
 
 #[test]
 fn an_unknown_expert_a_slot_too_small_and_a_zero_split_are_refused_before_anything_starts() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 2, true);
+    let source = source(&rig, &port, 2);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     let refused = read(&source, &memory, 0, id(0, 9), None, &no_cancel(), &probe);
@@ -691,7 +653,7 @@ fn an_unknown_expert_a_slot_too_small_and_a_zero_split_are_refused_before_anythi
         !memory.is_leased(0) && !small.is_leased(0),
         "a refused load keeps no lease"
     );
-    let error = FileRecordSource::new(rig.layout(), port as Arc<dyn PartPort>, 0, true).expect_err("a zero split");
+    let error = FileRecordSource::new(rig.layout(), port as Arc<dyn PartPort>, 0).expect_err("a zero split");
     assert_eq!(error, ExpertError::BadSplit { split: 0 });
 }
 
@@ -699,7 +661,7 @@ fn an_unknown_expert_a_slot_too_small_and_a_zero_split_are_refused_before_anythi
 fn a_bypass_cancelled_before_it_starts_submits_nothing_and_ends_cancelled() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 3, true);
+    let source = source(&rig, &port, 3);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     let cancel = no_cancel();
@@ -720,7 +682,7 @@ fn a_cancel_that_arrives_between_two_submissions_stops_the_rest_and_the_reads_ou
     let port = FakePort::new(&rig, true);
     let cancel = no_cancel();
     *locked(&port.cancel_on_start) = Some(Arc::clone(&cancel));
-    let source = source(&rig, &port, 3, true);
+    let source = source(&rig, &port, 3);
     let memory = arena(&rig, 1);
     let probe = Arc::new(Probe::default());
     read(&source, &memory, 0, id(0, 0), None, &cancel, &probe).expect("started");
@@ -736,7 +698,7 @@ fn a_cancel_that_arrives_between_two_submissions_stops_the_rest_and_the_reads_ou
 fn a_fill_that_is_cancelled_before_any_copy_reads_on_into_the_tier_and_ends_cancelled_not_complete() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 2, true);
+    let source = source(&rig, &port, 2);
     let (tier, staging) = (arena(&rig, 1), arena(&rig, 1));
     let probe = Arc::new(Probe::default());
     let cancel = no_cancel();
@@ -759,7 +721,7 @@ fn a_fill_that_is_cancelled_before_any_copy_reads_on_into_the_tier_and_ends_canc
 fn a_fill_that_is_cancelled_between_two_copies_ends_cancelled_though_staging_holds_a_part() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = source(&rig, &port, 2, true);
+    let source = source(&rig, &port, 2);
     let (tier, staging) = (arena(&rig, 1), arena(&rig, 1));
     let probe = Arc::new(Probe::default());
     let cancel = no_cancel();
@@ -1100,7 +1062,7 @@ impl Owner {
     fn new(rig: &Rig, tier_slots: usize, split: usize) -> Owner {
         let port = FakePort::new(rig, true);
         let source =
-            FileRecordSource::new(rig.layout(), Arc::clone(&port) as Arc<dyn PartPort>, split, true).expect("a source");
+            FileRecordSource::new(rig.layout(), Arc::clone(&port) as Arc<dyn PartPort>, split).expect("a source");
         let (memory, mut shards) = tier_over(rig, tier_slots, 1);
         let staging = arena(rig, 4);
         Owner {
@@ -1301,7 +1263,7 @@ fn a_load_refused_at_the_start_leaves_its_directive_to_be_settled_unstarted() {
 fn the_preload_reads_every_assigned_record_into_its_slot_with_several_chains() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = Arc::new(source(&rig, &port, 2, true));
+    let source = Arc::new(source(&rig, &port, 2));
     let (memory, shards) = tier_over(&rig, 8, 1);
     let items = shards[0].assigned();
     assert_eq!(items.len(), 8);
@@ -1338,13 +1300,10 @@ fn the_preload_reads_every_assigned_record_into_its_slot_with_several_chains() {
 }
 
 #[test]
-fn a_preload_that_meets_a_damaged_record_ends_with_its_name_and_reads_no_more() {
-    let mut rig = Rig::new();
-    let record = rig.layout().record(id(0, 0)).expect("a record");
-    rig.bytes[record.offset as usize + 1] ^= 1;
-    write(&rig.path, &rig.bytes).expect("damaged");
+fn a_preload_that_meets_a_failed_read_ends_with_its_name_and_reads_no_more() {
+    let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = Arc::new(source(&rig, &port, 1, true));
+    let source = Arc::new(source(&rig, &port, 1));
     let (memory, shards) = tier_over(&rig, 8, 1);
     let items = shards[0].assigned();
     let told = Arc::new(OnceLock::new());
@@ -1361,9 +1320,9 @@ fn a_preload_that_meets_a_damaged_record_ends_with_its_name_and_reads_no_more() 
     .expect("started");
     while told.get().is_none() {
         assert!(port.held() > 0, "the preload stalled with no read out");
-        port.release(0, Fault::None);
+        port.release(0, Fault::Os(5));
     }
-    assert!(matches!(told.get(), Some(Err(ExpertError::Damaged { bank, expert: 0, .. })) if bank == "bank0"));
+    assert!(matches!(told.get(), Some(Err(ExpertError::Read { bank, expert: 0, .. })) if bank == "bank0"));
     assert!(port.starts().len() < 8, "the chain went on after the failure");
 }
 
@@ -1398,7 +1357,7 @@ fn read_through_the_ring(options: AsyncIoOptions) -> bool {
         DiskReadPiece::from_setting(Auto::Auto).expect("a piece"),
     ));
     println!("has_direct = {direct}");
-    let source = FileRecordSource::new(rig.layout(), port, 3, true).expect("a source");
+    let source = FileRecordSource::new(rig.layout(), port, 3).expect("a source");
     let memory = arena(&rig, 1);
     for target in (0..rig.layout().keys()).map(|key| rig.layout().id_of(key)) {
         let probe = Arc::new(Probe::default());
@@ -1463,7 +1422,7 @@ fn an_arena_refuses_a_slot_that_is_not_whole_pages_and_one_that_cannot_exist_nam
 fn a_preload_with_no_readers_is_refused_before_anything_is_read() {
     let rig = Rig::new();
     let port = FakePort::new(&rig, true);
-    let source = Arc::new(source(&rig, &port, 1, true));
+    let source = Arc::new(source(&rig, &port, 1));
     let (memory, shards) = tier_over(&rig, 8, 1);
     let error = preload::preload(
         source,

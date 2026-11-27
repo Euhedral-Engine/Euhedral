@@ -15,10 +15,11 @@ use std::sync::Arc;
 
 use euhedral_memory::{
     Claim, LeakReport, LocationId, LocationKind, LocationSpec, OwnerId, OwnerSpec, Placed, PlanItem, PlanRequest,
-    Planner, Priority, Reservation, Scope,
+    Planner, Priority, Reservation, Scope, TierPool,
 };
 
 use crate::error::{EngineError, PlanError};
+use crate::residency::flash::FlashPlan;
 use crate::residency::planner::{CAPACITY_CAP, LocationBytes, ResidencyPlan};
 
 /// What the plan sets memory aside for.
@@ -186,7 +187,22 @@ impl MemoryAccount {
     /// against, and the host account's). The decision was made when the plan was; this reserves it, and refuses when
     /// the two disagree.
     pub fn admit(&self, plan: &ResidencyPlan) -> Result<PlanReservation, PlanError> {
-        let consumers = plan.consumers();
+        self.admit_consumers(plan.consumers(), plan.host_budget_bytes, plan.budget_bytes)
+    }
+
+    /// Admits a Flash-Next `plan`: the consumers it lists, against the device bytes it was made against. It was made
+    /// within the host budget, which the account holds the host to as it does a dense plan of an unknown one: the
+    /// bytes it asks for.
+    pub fn admit_flash(&self, plan: &FlashPlan) -> Result<PlanReservation, PlanError> {
+        self.admit_consumers(plan.consumers(), None, plan.device.free)
+    }
+
+    fn admit_consumers(
+        &self,
+        consumers: Vec<ConsumerBytes>,
+        host_budget_bytes: Option<u64>,
+        budget_bytes: u64,
+    ) -> Result<PlanReservation, PlanError> {
         let (mut host_bytes, mut device_bytes) = (0u64, 0u64);
         for asked in &consumers {
             let total = if asked.host { &mut host_bytes } else { &mut device_bytes };
@@ -194,11 +210,11 @@ impl MemoryAccount {
         }
         // An unknown host budget allowed no spill: the host holds what the plan admits there (the prefix arena and
         // any host pages), no more.
-        let host_budget = plan.host_budget_bytes.unwrap_or(host_bytes);
+        let host_budget = host_budget_bytes.unwrap_or(host_bytes);
         self.planner
             .set_capacity(self.host, host_budget.min(CAPACITY_CAP.max(host_bytes)));
         self.planner
-            .set_capacity(self.device, plan.budget_bytes.min(CAPACITY_CAP.max(device_bytes)));
+            .set_capacity(self.device, budget_bytes.min(CAPACITY_CAP.max(device_bytes)));
         let request = PlanRequest {
             owner: self.owner,
             items: plan_items(&consumers, self.host, self.device),
@@ -231,6 +247,33 @@ impl MemoryAccount {
             left: consumers,
             admitted,
         })
+    }
+
+    /// The pool of `count` slots of `slot_bytes` at the device address `base`, for the expert cache: the plan's
+    /// expert-cache bytes are taken from `reservation` and given back at once, as the pool claims its slots itself
+    /// (elastically, so the planner can order free ones back). Refuses a pool the plan admitted fewer bytes for, and
+    /// one the planner has not the budget for.
+    pub fn expert_pool(
+        &self,
+        reservation: &mut PlanReservation,
+        base: u64,
+        slot_bytes: u64,
+        count: u32,
+    ) -> Result<Arc<TierPool>, EngineError> {
+        let bytes = slot_bytes.checked_mul(u64::from(count)).ok_or_else(|| {
+            EngineError::Runtime(format!("{count} expert slots of {slot_bytes} bytes overflow 64 bits"))
+        })?;
+        drop(reservation.claim(Consumer::ExpertCache, bytes)?);
+        TierPool::new(&self.planner, self.holders, self.device, base, slot_bytes, count).ok_or_else(|| {
+            EngineError::Runtime(format!(
+                "the planner has no budget for {count} expert slots of {slot_bytes} bytes on the device"
+            ))
+        })
+    }
+
+    /// The owner of the claims the allocations hold: what the expert cache leases its slots for.
+    pub fn holders(&self) -> OwnerId {
+        self.holders
     }
 
     /// Ends the account: the claims still held by the allocations are leaks. Whatever the reservation still holds is
