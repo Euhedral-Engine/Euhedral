@@ -46,6 +46,7 @@ use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 
 use crate::error::EngineError;
+use crate::flash::moe::block::MoeBlock;
 use crate::flash::ple::PleRows;
 use crate::model::ModelConfig;
 use crate::quantum::Capture;
@@ -803,6 +804,8 @@ pub struct Quantum {
     pub(crate) disk: Option<Arc<transfer::DiskLedger>>,
     /// What the Flash-Next n-gram embedding's stages hand to one another for this quantum ([`Quantum::with_ple_rows`]).
     pub(crate) ple: Option<Arc<PleRows>>,
+    /// What the Flash-Next mixture-of-experts stages hand to one another for this quantum ([`Quantum::with_moe_block`]).
+    pub(crate) moe: Option<Arc<MoeBlock>>,
 }
 
 /// The next quantum's id.
@@ -892,6 +895,7 @@ impl Quantum {
             capture: None,
             disk: None,
             ple: None,
+            moe: None,
         })
     }
 
@@ -980,6 +984,7 @@ impl Quantum {
             capture: None,
             disk: None,
             ple: None,
+            moe: None,
         })
     }
 
@@ -1373,6 +1378,18 @@ impl Quantum {
         self
     }
 
+    /// The hand-over of the Flash-Next mixture-of-experts stages for this quantum: the experts its blocks name and the
+    /// pinned memory the router's choice and the block's description pass through.
+    pub fn with_moe_block(mut self, block: Arc<MoeBlock>) -> Self {
+        self.moe = Some(block);
+        self
+    }
+
+    /// The hand-over of the mixture-of-experts stages, if the quantum carries one.
+    pub fn moe_block(&self) -> Option<&Arc<MoeBlock>> {
+        self.moe.as_ref()
+    }
+
     /// The hand-over of the n-gram embedding, if the quantum carries one.
     pub fn ple_rows(&self) -> Option<&Arc<PleRows>> {
         self.ple.as_ref()
@@ -1522,8 +1539,8 @@ pub fn run_stage<L: StageLaunch + ?Sized>(
     cx: &StageCx<'_>,
 ) -> Result<Submitted, StageError> {
     if stage.idle(quantum) {
-        // An idle stage queues nothing, so there is nothing to mark. A completion edge from it would fire at once; the
-        // plan has only submission edges, which pass the stage's inputs through.
+        // An idle stage queues nothing, so there is nothing to mark. A completion edge from it would fire at once, and
+        // a submission edge passes the stage's inputs through.
         return Ok(Submitted::done());
     }
     quantum.check_prepared()?;

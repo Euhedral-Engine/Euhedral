@@ -2,7 +2,7 @@
 //!
 //! Most are launches of the Flash-Next table ([`ops`](super::ops)); the NVFP4 linears, the GDN recurrence and the
 //! residual add are the shared kernels Java reaches through `ExecutionGpu`, and the staging copy is the upload of the
-//! gathered n-gram records.
+//! gathered n-gram records. The routing's readback and the zero fill of a block no expert computed are the other two.
 
 use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps, PinnedBuffer};
 use smallvec::SmallVec;
@@ -61,6 +61,15 @@ pub enum Op<'a> {
         offset: usize,
         bytes: usize,
     },
+    /// The copy of `bytes` device bytes at `source` into a pinned buffer, at `offset`.
+    Readback {
+        destination: &'a PinnedBuffer,
+        offset: usize,
+        source: DevicePtr,
+        bytes: usize,
+    },
+    /// The zero fill of `bytes` device bytes at `address`.
+    Zero { address: DevicePtr, bytes: u64 },
 }
 
 /// The operations of one stage, in the order they are queued.
@@ -150,6 +159,17 @@ impl Op<'_> {
                 // after the quantum's work retired, and does not write it again.
                 unsafe { kernels.copy_upload_to_device(destination, source, offset, bytes) }
             }
+            Op::Readback {
+                destination,
+                offset,
+                source,
+                bytes,
+            } => {
+                // SAFETY: the stage that built the operation keeps the buffer in the quantum, and the host reads the
+                // bytes only after the work up to this copy has retired (a completion edge), or through atomics.
+                unsafe { kernels.copy_device_to_readback_shared(destination, offset, source, bytes) }
+            }
+            Op::Zero { address, bytes } => kernels.zero_device_memory(address, bytes),
         }
     }
 
@@ -213,6 +233,10 @@ impl Op<'_> {
                 bytes,
                 ..
             } => format!("upload {} offset={offset} bytes={bytes}", address(destination)),
+            Op::Readback {
+                offset, source, bytes, ..
+            } => format!("readback {} offset={offset} bytes={bytes}", address(source)),
+            Op::Zero { address: target, bytes } => format!("zero {} bytes={bytes}", address(target)),
         }
     }
 }

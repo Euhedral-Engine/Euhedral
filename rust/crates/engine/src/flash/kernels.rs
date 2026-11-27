@@ -1,5 +1,5 @@
-//! The kernels of the Flash-Next table (`euhedral_cuda_qwen4_launch`, native/src/host/qwen4_ops.c) the dense part and
-//! the sparse attention launch. The discriminant is the kernel's index in the table, which is its ABI; a test compares
+//! The kernels of the Flash-Next table (`euhedral_cuda_qwen4_launch`, native/src/host/qwen4_ops.c) the dense part, the
+//! sparse attention and the mixture of experts launch. The discriminant is the kernel's index in the table, which is its ABI; a test compares
 //! every name with the catalog's.
 
 use euhedral_inference_cuda::launch::catalog::qwen4_table;
@@ -31,7 +31,14 @@ pub enum Qwen4Kernel {
     QsaAttention = 18,
     QsaMerge = 19,
     QsaKvAppend = 20,
+    Router = 21,
+    Swiglu = 22,
+    MoeFinish = 23,
     Embedding = 24,
+    ExpertGateUpSwiglu = 25,
+    ExpertDown = 26,
+    ExpertCombine = 27,
+    SwigluPadded = 28,
     LinearTc = 30,
     LinearTcSplit = 31,
     LinearTcRows = 32,
@@ -41,8 +48,8 @@ pub enum Qwen4Kernel {
 }
 
 impl Qwen4Kernel {
-    /// Every kernel the dense part launches.
-    pub const ALL: [Qwen4Kernel; 28] = [
+    /// Every kernel the engine launches from the table.
+    pub const ALL: [Qwen4Kernel; 35] = [
         Qwen4Kernel::LinearBf16,
         Qwen4Kernel::GroupedRmsNorm,
         Qwen4Kernel::ScaledSilu,
@@ -64,7 +71,14 @@ impl Qwen4Kernel {
         Qwen4Kernel::QsaAttention,
         Qwen4Kernel::QsaMerge,
         Qwen4Kernel::QsaKvAppend,
+        Qwen4Kernel::Router,
+        Qwen4Kernel::Swiglu,
+        Qwen4Kernel::MoeFinish,
         Qwen4Kernel::Embedding,
+        Qwen4Kernel::ExpertGateUpSwiglu,
+        Qwen4Kernel::ExpertDown,
+        Qwen4Kernel::ExpertCombine,
+        Qwen4Kernel::SwigluPadded,
         Qwen4Kernel::LinearTc,
         Qwen4Kernel::LinearTcSplit,
         Qwen4Kernel::LinearTcRows,
@@ -102,7 +116,14 @@ impl Qwen4Kernel {
             Qwen4Kernel::QsaAttention => "euhedral_q4_qsa_attention",
             Qwen4Kernel::QsaMerge => "euhedral_q4_qsa_merge",
             Qwen4Kernel::QsaKvAppend => "euhedral_q4_qsa_kv_append",
+            Qwen4Kernel::Router => "euhedral_q4_router_bf16",
+            Qwen4Kernel::Swiglu => "euhedral_q4_swiglu_bf16",
+            Qwen4Kernel::MoeFinish => "euhedral_q4_moe_finish_bf16",
             Qwen4Kernel::Embedding => "euhedral_q4_embedding_bf16",
+            Qwen4Kernel::ExpertGateUpSwiglu => "euhedral_q4_expert_gate_up_swiglu_bf16",
+            Qwen4Kernel::ExpertDown => "euhedral_q4_expert_down_bf16",
+            Qwen4Kernel::ExpertCombine => "euhedral_q4_expert_combine_bf16",
+            Qwen4Kernel::SwigluPadded => "euhedral_q4_swiglu_padded_bf16",
             Qwen4Kernel::LinearTc => "euhedral_q4_linear_tc_bf16",
             Qwen4Kernel::LinearTcSplit => "euhedral_q4_linear_tc_split_bf16",
             Qwen4Kernel::LinearTcRows => "euhedral_q4_linear_tc_rows_bf16",
