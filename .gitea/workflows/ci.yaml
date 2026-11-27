@@ -250,7 +250,6 @@ jobs:
   # EUHEDRAL_NVRTC_DIR (the directory holding libnvrtc) is required. The optional ones are passed to the tests only when set,
   # and a test whose data is missing prints a skip line and passes (each group lists them at its end):
   #   EUHEDRAL_TEST_QWEN_RCO_ARTIFACT              the model artifact
-  #   EUHEDRAL_TEST_RUST_GOLDENS                   the goldens directory
   #   EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES    the directory with the CUDA math libraries
   # The card holds one engine of the model at a time per process; the arbiter runs groups side by side when their asks fit.
   device-build:
@@ -343,7 +342,6 @@ jobs:
         env:
           EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
           EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
-          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
           EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
         run: |
           set -euo pipefail
@@ -392,7 +390,6 @@ jobs:
         env:
           EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
           EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
-          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
           EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
         run: |
           set -euo pipefail
@@ -440,7 +437,6 @@ jobs:
         env:
           EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
           EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
-          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
           EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
         run: |
           set -euo pipefail
@@ -488,7 +484,6 @@ jobs:
         env:
           EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
           EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
-          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
           EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
         run: |
           set -euo pipefail
@@ -537,7 +532,6 @@ jobs:
         env:
           EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
           EUHEDRAL_TEST_QWEN_RCO_ARTIFACT: ${{ vars.EUHEDRAL_TEST_QWEN_RCO_ARTIFACT }}
-          EUHEDRAL_TEST_RUST_GOLDENS: ${{ vars.EUHEDRAL_TEST_RUST_GOLDENS }}
           EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES: ${{ vars.EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES }}
         run: |
           set -euo pipefail
