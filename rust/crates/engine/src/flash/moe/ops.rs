@@ -182,6 +182,44 @@ pub fn swiglu_padded(
     ))
 }
 
+/// The bytes of a plain NVFP4 tensor of `rows` rows of `k` values: the codes, the scales aligned to 256 bytes and the
+/// FP32 global (`MoeOps.nvfp4Bytes`).
+pub fn nvfp4_bytes(rows: u32, k: u32) -> u64 {
+    let align = |value: u64| (value + 255) & !255;
+    let (rows, k) = (u64::from(rows), u64::from(k));
+    let scales = align(rows * k / 2);
+    align(scales + rows * k / 16) + 4
+}
+
+/// The plain NVFP4 tensor `source` of `rows` rows of `k` values copied to `target` in rows of `padded` values: the
+/// added columns are zero codes with zero scales (`MoeOps.nvfp4PadK`). `target` holds [`nvfp4_bytes`] of `padded`.
+pub fn nvfp4_pad_k(
+    source: DevicePtr,
+    target: DevicePtr,
+    rows: u32,
+    k: u32,
+    padded: u32,
+) -> Result<Launch, FlashError> {
+    const OP: &str = "nvfp4 pad";
+    positive(OP, &[("rows", rows), ("k", k)])?;
+    if !k.is_multiple_of(128) || !padded.is_multiple_of(128) || padded < k {
+        return Err(FlashError::refused(
+            OP,
+            format!("padding {k} values to {padded}: both must be multiples of 128, the padded no less than the width"),
+        ));
+    }
+    Ok(Qwen4Kernel::Nvfp4PadK.launch(
+        [rows + 1, 1, 1],
+        [128, 1, 1],
+        KernelArguments::new()
+            .pointer(source)
+            .pointer(target)
+            .int32(rows)
+            .int32(k)
+            .int32(padded),
+    ))
+}
+
 /// `output = routed + sigmoid(gate) * shared` per row, in BF16 (`MoeOps.finish`).
 pub fn moe_finish(
     routed: DevicePtr,
