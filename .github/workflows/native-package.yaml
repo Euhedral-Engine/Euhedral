@@ -4,31 +4,13 @@ on:
   push:
     branches: [main]
     paths:
-      - "api/**"
-      - "core/**"
-      - "benchmark/**"
-      - "gradle/**"
-      - "settings.gradle.kts"
-      - "gradle.properties"
       - "native/**"
-      - "native.gradle.kts"
-      - "build.gradle.kts"
-      - "api/build.gradle.kts"
       - "mise.toml"
       - "rust/**"
       - ".github/workflows/native-package.yaml"
   pull_request:
     paths:
-      - "api/**"
-      - "core/**"
-      - "benchmark/**"
-      - "gradle/**"
-      - "settings.gradle.kts"
-      - "gradle.properties"
       - "native/**"
-      - "native.gradle.kts"
-      - "build.gradle.kts"
-      - "api/build.gradle.kts"
       - "mise.toml"
       - "rust/**"
       - ".github/workflows/native-package.yaml"
@@ -57,9 +39,6 @@ jobs:
         with:
           install: true
           cache: true
-      - uses: gradle/actions/setup-gradle@v6.4.0
-        with:
-          cache-provider: basic
       - name: Cache Zig
         uses: actions/cache@v6.1.0
         with:
@@ -72,24 +51,13 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
-      - name: Build both CUDA products and package Spring Boot
-        run: mise exec -- gradle nativeVerify :api:bootJar build
-      - uses: actions/upload-artifact@v7.0.1
-        if: failure()
-        with:
-          name: failed-tests-${{ matrix.os }}
-          path: |
-            api/build/test-results/test/*.xml
-            core/build/test-results/test/*.xml
-            benchmark/build/test-results/test/*.xml
+      - name: Build and verify both CUDA products
+        working-directory: rust
+        run: |
+          mise exec -- cargo xtask native
+          mise exec -- cargo xtask native-verify
       - name: Check ELF/PE targets, imports, and installed CUDA sources
         run: python -m unittest discover -s native/tests -v
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: cuda-native-${{ matrix.os }}
-          if-no-files-found: error
-          retention-days: 2
-          path: api/build/libs/euhedral-inference-*.jar
       - name: Bundle the Rust server (linux-x64)
         if: runner.os == 'Linux'
         working-directory: rust
