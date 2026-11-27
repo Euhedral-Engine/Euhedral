@@ -118,7 +118,7 @@ fn scratch_buffers_are_disjoint_and_sized_for_the_rows() {
 
 #[test]
 fn a_shape_the_kernels_cannot_serve_is_refused() {
-    for (streams, hidden, lowrank) in [(1, 64, 8), (0, 64, 8), (4, 0, 8), (4, 64, 0)] {
+    for (streams, hidden, lowrank) in [(1, 64, 8), (0, 64, 8), (4, 0, 8), (4, 64, 0), (4, 64, 4), (3, 4, 8)] {
         let error = HyperShape::new(streams, hidden, lowrank, 1e-6).unwrap_err().to_string();
         assert!(
             error.contains(&format!("{streams} streams of {hidden} values at rank {lowrank}")),

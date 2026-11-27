@@ -21,7 +21,10 @@
     reason = "small synthetic shapes"
 )]
 
+use std::sync::Arc;
+
 use euhedral_inference_cuda::{DeviceBuffer, DevicePtr, KernelOps};
+use euhedral_inference_edrl::NgramLayout;
 use euhedral_inference_engine::flash::Weight;
 use euhedral_inference_engine::flash::buffers::{FlashRegions, StreamShape};
 use euhedral_inference_engine::flash::embed::EmbedStreams;
@@ -29,6 +32,7 @@ use euhedral_inference_engine::flash::hyper::{HyperShape, HyperWeights};
 use euhedral_inference_engine::flash::ops::{
     conv_history, gdn_control, gdn_conv, gdn_gated_norm, ngram_expand, ple_conv, ple_gate,
 };
+use euhedral_inference_engine::flash::ple::{NgramRows, ShardBytes};
 use euhedral_inference_engine::flash::sequence::{Op, queue_all};
 use linear_gpu::{Random, Rig, assert_close, bf16, bf16_value, empty, rig, upload};
 
@@ -245,28 +249,40 @@ fn ple_expand_gate_and_conv_match_the_host_reference() {
     let (rows, streams, width, taps, dilation) = (3usize, 2usize, 32usize, 3usize, 2usize);
     let channels = width;
     let history_rows = (taps - 1) * dilation;
-    let record_bytes = (width / 2 + width / 16 + 4).next_multiple_of(4);
     let mut random = Random::new(31);
 
-    // Records: codes, E4M3 block scales (kept in a sane range), zero padding, the shard's scale last.
-    let mut records = vec![0u8; rows * record_bytes];
-    let mut expanded = Vec::new();
-    for row in 0..rows {
-        let record = &mut records[row * record_bytes..(row + 1) * record_bytes];
-        for byte in record.iter_mut().take(width / 2) {
+    // A shard of four rows as the store lays it out (codes, then E4M3 block scales, per row; the global scale in the
+    // trailer), gathered into records by the stage's own table: what the gather writes is what the kernel reads.
+    let layout = NgramLayout::new(4, width as u64).unwrap();
+    let row_bytes = width / 2 + width / 16;
+    let global = 0.25 + random.uniform();
+    let mut shard = vec![0u8; layout.byte_size() as usize];
+    for row in 0..4 {
+        let at = row * row_bytes;
+        for byte in &mut shard[at..at + width / 2] {
             *byte = random.next_u64() as u8;
         }
-        for scale in 0..width / 16 {
-            record[width / 2 + scale] = 0x30 + (random.next_u64() % 16) as u8;
+        for scale in &mut shard[at + width / 2..at + row_bytes] {
+            *scale = 0x30 + (random.next_u64() % 16) as u8;
         }
-        let global = 0.25 + random.uniform();
-        record[record_bytes - 4..].copy_from_slice(&global.to_le_bytes());
+    }
+    let trailer = layout.trailer_offset() as usize;
+    shard[trailer..trailer + 4].copy_from_slice(&global.to_le_bytes());
+    let source: Arc<dyn ShardBytes> = Arc::new(shard.clone());
+    let table = NgramRows::new(vec![source], 4, 4, width as u32).unwrap();
+    let record_bytes = table.record_bytes() as usize;
+    let ids = [2u64, 0, 3];
+    let mut records = vec![0u8; rows * record_bytes];
+    table.gather(&ids, 0..rows, &mut records).unwrap();
+    let mut expanded = Vec::new();
+    for id in ids {
+        let row = &shard[id as usize * row_bytes..(id as usize + 1) * row_bytes];
         for i in 0..width {
-            let byte = record[i / 2];
+            let byte = row[i / 2];
             let nibble = if i % 2 == 1 { byte >> 4 } else { byte & 15 };
             let magnitude = E2M1[usize::from(nibble & 7)];
             let value = if nibble & 8 != 0 { -magnitude } else { magnitude };
-            expanded.push(round(value * (e4m3(record[width / 2 + i / 16]) * global)));
+            expanded.push(round(value * (e4m3(row[width / 2 + i / 16]) * global)));
         }
     }
     let records_d = upload(&rig.library, &records);

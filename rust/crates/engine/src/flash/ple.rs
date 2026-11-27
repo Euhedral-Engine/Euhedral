@@ -183,11 +183,19 @@ impl PleShape {
         }
         let state_ok = hidden > 0 && streams > 0 && u64::from(hidden) * u64::from(streams) <= u64::from(u32::MAX);
         let history = u64::from(taps.saturating_sub(1)) * u64::from(dilation);
-        if !state_ok || taps == 0 || dilation == 0 || history > 32 || record_bytes == 0 || !epsilon.is_finite() {
+        if !state_ok
+            || taps == 0
+            || dilation == 0
+            || history > 32
+            || !row_width.is_multiple_of(16)
+            || !record_bytes.is_multiple_of(4)
+            || u64::from(record_bytes) < u64::from(row_width / 2 + row_width / 16 + 4)
+            || !epsilon.is_finite()
+        {
             return Err(FlashError::refused(
                 OP,
                 format!(
-                    "hidden {hidden}, streams {streams}, taps {taps}, dilation {dilation} (history {history} of at most 32), record {record_bytes}, epsilon {epsilon}"
+                    "hidden {hidden}, streams {streams}, taps {taps}, dilation {dilation} (history {history} of at most 32), record {record_bytes} for rows of {row_width} (a multiple of 16, the codes, scales and global in a multiple of 4 bytes), epsilon {epsilon}"
                 ),
             ));
         }

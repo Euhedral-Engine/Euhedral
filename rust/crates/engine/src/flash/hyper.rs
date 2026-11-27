@@ -29,6 +29,8 @@ impl HyperShape {
         if streams <= 1
             || hidden == 0
             || lowrank == 0
+            || !lowrank.is_multiple_of(8)
+            || !state_width.is_multiple_of(8)
             || state_width > u64::from(u32::MAX)
             || !epsilon.is_finite()
             || epsilon < 0.0
@@ -37,7 +39,7 @@ impl HyperShape {
                 "hyper-connection",
                 format!(
                     "{streams} streams of {hidden} values at rank {lowrank} with epsilon {epsilon}: \
-                     more than one stream, positive extents and a finite epsilon"
+                     more than one stream, a rank and a stream width that are positive multiples of 8 (the BF16 linears' K) and a finite epsilon"
                 ),
             ));
         }

@@ -133,4 +133,8 @@ fn a_shape_the_table_and_the_streams_cannot_serve_is_refused() {
     assert!(PleShape::new(64, 2, 128, 4, 32, 24, 3, 17, 1e-6).is_err());
     assert!(PleShape::new(64, 2, 128, 4, 32, 24, 0, 2, 1e-6).is_err());
     assert!(PleShape::new(64, 0, 128, 4, 32, 24, 3, 2, 1e-6).is_err());
+    // A record the expand kernel cannot read: not a multiple of four bytes, too small for its row, a row of partial blocks.
+    assert!(PleShape::new(64, 2, 128, 4, 32, 22, 3, 2, 1e-6).is_err());
+    assert!(PleShape::new(64, 2, 128, 4, 32, 20, 3, 2, 1e-6).is_err());
+    assert!(PleShape::new(64, 2, 120, 4, 30, 24, 3, 2, 1e-6).is_err());
 }
