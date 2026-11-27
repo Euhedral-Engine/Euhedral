@@ -1,6 +1,6 @@
 # Benchmarking
 
-> Commands in this document run from the repository root. The engine loads the CUDA library from `build/native/linux-x64/lib/libeuhedral_cuda.so` by default (build it with `cargo xtask native`); pass `--cuda-library FILE` to use another.
+> Commands in this document run from the repository root. The engine loads the CUDA library named by the config's `cudaLibrary` (the shipped configs use `build/native/linux-x64/lib/libeuhedral_cuda.so`; build it with `(cd rust && cargo xtask native --product linux-x64)`). `run` takes only `--validate-only` and `--fork-id`.
 
 `euhedral-bench` (crate `euhedral-inference-bench`, in `rust/`) is an end-to-end harness. It loads the engine, creates a fresh
 session for every iteration, and runs the real tokenizer -> lattice -> CUDA path. The `run` command writes

@@ -1,6 +1,6 @@
 # NVFP4 at 64K: compressed scales and host-mapped embedding
 
-> Commands in this document run from the repository root. The engine loads the CUDA library from `build/native/linux-x64/lib/libeuhedral_cuda.so` by default (build it with `cargo xtask native`); pass `--cuda-library FILE` to use another.
+> Commands in this document run from the repository root. The engine loads the CUDA library from `build/native/linux-x64/lib/libeuhedral_cuda.so` by default (build it with `(cd rust && cargo xtask native --product linux-x64)`); pass `--cuda-library FILE` to use another.
 
 The `nvfp4-compressed` artifact makes NVFP4 usable at 64K context on the 16 GB card. Two mechanisms cover the 1.9 GiB that 64K
 needs beyond the free device memory; staging covers the rest ([NVFP4_RESIDENCY.md](NVFP4_RESIDENCY.md)):

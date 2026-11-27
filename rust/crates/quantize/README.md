@@ -1,6 +1,6 @@
 # Quantization tools
 
-Every command below runs from the repository root as `cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- COMMAND [FLAGS]` (or `rust/target/release/quantization COMMAND [FLAGS]` once built). Run with no command to list them. The CUDA library defaults to `build/native/linux-x64/lib/libeuhedral_cuda.so` (build it with `cargo xtask native`); `--cuda-library FILE` (alias `--library`) names another. `--config YAML` takes the engine settings. Commands: `calibrate`, `score`, `generate`, `train-drafter`, `export-drafter`, `assemble`, `cost`, `allocate`, `reference` and `package-tokenizer`.
+Every command below runs from the repository root as `cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- COMMAND [FLAGS]` (or `rust/target/release/quantization COMMAND [FLAGS]` once built). Run with no command to list them. The CUDA library defaults to `build/native/linux-x64/lib/libeuhedral_cuda.so` (build it with `(cd rust && cargo xtask native --product linux-x64)`); `--cuda-library FILE` (alias `--library`) names another. `--config YAML` takes the engine settings. Commands: `calibrate`, `score`, `generate`, `train-drafter`, `export-drafter`, `assemble`, `cost`, `allocate`, `reference` and `package-tokenizer`.
 
 The quantization commands (`rust/crates/quantize`, binary `quantization`; the work is in `rust/crates/quantization`) run on the engine's CUDA kernels through the Euhedral lattice. They write pre-rounded codes
 for the converter (`tools/convert_checkpoint.py --codes-from`); nothing here is part of the engine or the API.
@@ -41,7 +41,7 @@ Options: `--act-order` (columns by decreasing diag H), `--damp` (0.01), `--batch
 ## Trellis calibration
 
 ```bash
-cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- calibrate --format trellis --bits 3.5 --model /path/to/checkpoint \
+cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantize -- calibrate --quantization trellis --format trellis --bits 3.5 --model /path/to/checkpoint \
     --tokens tokens.npy --draft-ids-from artifact.edrl --out exl3/
 ```
 
@@ -72,8 +72,7 @@ Resource flags:
 - `--write-buffer-mib N` (16): the buffer each output file is copied through.
 - `--batch`, `--sequences`, `--layers`, `--cuda-library` as above.
 
-The GPTQ-only flags (`--skip-mtp`, `--act-order`, `--damp`, `--quantization`, `--compressed`, `--nvfp4-above`,
-`--nvfp4-scale-max`) are rejected with `--format trellis`. `--bits` and every
+`--format trellis` needs `--quantization trellis` (and `--quantization trellis` needs `--format trellis`) and `--bits`. It refuses `--skip-mtp`, because the checkpoint carries the MTP block, and `--compressed`, which the recipe rejects for trellis. The trellis options (`--bits`, `--viterbi-scratch-mib`, `--write-buffer-mib`) are refused without `--format trellis`. `--bits` and every
 allocated rate are validated before any GPU work.
 
 Resuming: the hidden states are checkpointed every 8 layers into one `hidden.bin` (overwritten in place) and a run with the same tokens, shape and `--bits` resumes after the last checkpoint; the layer files already
@@ -107,7 +106,7 @@ cargo run --release --manifest-path rust/Cargo.toml -p euhedral-inference-quanti
 ```
 
 Answers chat prompts (`{"id", "messages", "tools"?}` per line; `tools/gptq/calibration.py prompts ... --chat N`) with the
-artifact's own greedy decode and keeps what the MTP drafter learns from: every token, and the post-final-norm hidden
+artifact's own greedy decode for the share `--greedy-fraction` of the prompts (default 0.25; the rest are sampled, and their labels are the greedy choices the sampled path passed over) and keeps what the MTP drafter learns from: every token, and the post-final-norm hidden
 of every row the base model ran, which is what seeds the drafter (docs/speculation/MTP_CONTRACT.md §2). Prompts are rendered by
 the checkpoint's chat template with thinking on and prefilled in the engine's 512-row chunks, as the server does; then
 up to `--batch` sequences (at most 32) decode together, one row each per batched verification, so every row is bit
@@ -146,7 +145,7 @@ base model's token, on answer tokens; token embeddings are the artifact's Q3 row
 whose drafts all have targets, the leading drafts equal to the base model's tokens, the drafts a verification
 accepts. `out/best.bin` keeps the best evaluation's parameters; a run resumes from `out/resume.bin`.
 
-The Rust command saves each file to a sibling `.part` file and renames it over the target once whole, so a stop leaves
+`train-drafter` saves each file to a sibling `.part` file and renames it over the target once whole, so a stop leaves
 the old file or the new one (a leftover `.part` is overwritten by the next save). A start refuses, naming what differs,
 when `out` holds a state of another corpus (a content digest, not a path), model, artifact or settings, a state that
 was torn, or `best.bin` without a state; `--fresh` starts over and replaces them. `--poison-memory` fills memory
@@ -164,4 +163,4 @@ one, from the checkpoint's MTP weights.
 
 ## Tests
 
-The tests of the quantization crate are in `rust/crates/quantization`: CPU tests run with `mise run rust-test`; the device tests (`kernels_gpu`, `generate_gpu`, `assemble_score_gpu`, `drafter_gpu`) are `#[ignore]` tests that need a GPU, the checkpoint and the fixtures, and run with `cargo test --release -p euhedral-inference-quantization --test <name> -- --ignored` ([testing](../../../docs/evaluation/TESTING.md)).
+The tests of the quantization crate are in `rust/crates/quantization`: CPU tests run with `mise run rust-test`; the device tests (`kernels_gpu`, `generate_gpu`, `assemble_score_gpu`, `drafter_gpu`) are `#[ignore]` tests that need a GPU, the checkpoint and the fixtures, and run with `cargo test --release --manifest-path rust/Cargo.toml -p euhedral-inference-quantization --test <name> -- --ignored` ([testing](../../../docs/evaluation/TESTING.md)).

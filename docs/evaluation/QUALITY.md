@@ -1,6 +1,6 @@
 # Measuring quality
 
-> Commands in this document run from the repository root. The engine loads the CUDA library from `build/native/linux-x64/lib/libeuhedral_cuda.so` by default (build it with `cargo xtask native`); pass `--cuda-library FILE` to use another.
+> Commands in this document run from the repository root. The engine loads the CUDA library from `build/native/linux-x64/lib/libeuhedral_cuda.so` by default (build it with `(cd rust && cargo xtask native --product linux-x64)`); pass `--cuda-library FILE` to use another.
 
 Four different quantities are measured, because they answer different questions and add up to no single score.
 
