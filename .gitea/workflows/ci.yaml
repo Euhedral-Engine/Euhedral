@@ -85,11 +85,9 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
-          BASE_REF: ${{ github.base_ref }}
           INTEGRATION_BRANCH: ${{ vars.INTEGRATION_BRANCH }}
         run: |
           set -euo pipefail
-          zero=0000000000000000000000000000000000000000
 
           # The path groups of each job. mise.toml and rust/** are in every group.
           rust_paths=(
@@ -123,14 +121,15 @@ jobs:
           fi
 
           # Base: what the groups are compared with.
-          #   pull request  the merge base with the target branch (a land run)
+          #   pull request  the merge base with main, whatever the target: a commit that reached the integration branch
+          #                 untested cannot be hidden by a later pull request that touches no group
           #   push          nothing: an integration branch push runs no tests, `landed` checks it
           #   dispatch      everything
           all=false
           range=
           case "$EVENT" in
             pull_request)
-              range="origin/${BASE_REF#refs/heads/}...HEAD"
+              range="origin/main...HEAD"
               ;;
             push)
               ;;

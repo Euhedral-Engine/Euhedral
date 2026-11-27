@@ -64,6 +64,10 @@ class LintCiTriggersTest(unittest.TestCase):
     def test_a_missing_guard_fails(self):
         self.assertEqual(len(broken("  land-guard:\n    runs-on: x\n", "")), 1)
 
+    def test_a_guard_with_needs_or_if_fails(self):
+        self.assertEqual(len(broken("  land-guard:\n    runs-on: x\n", "  land-guard:\n    needs: changes\n    runs-on: x\n")), 1)
+        self.assertEqual(len(broken("  land-guard:\n    runs-on: x\n", "  land-guard:\n    if: always()\n    runs-on: x\n")), 1)
+
     def test_a_concurrency_group_that_cannot_tell_a_land_run_fails(self):
         self.assertEqual(len(broken(" && 'land' || 'other' }}", " }}")), 1)
 

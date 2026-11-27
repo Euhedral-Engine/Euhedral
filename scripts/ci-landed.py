@@ -47,30 +47,23 @@ def verdict(sha, on_main, parents, trees, runs_of):
     return None
 
 
-def git(*args):
-    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
+PAGE = 50
 
 
-def main(argv):
-    if len(argv) != 1:
-        print(__doc__, file=sys.stderr)
-        return 2
-    sha = argv[0]
+def check(sha, is_on_main, parents_of, tree_of, runs_page):
+    """Exit code for `sha`: 0 landed, 1 not landed, 2 the check could not be made (a ValueError from a collaborator, or an
+    Actions reply that has no `workflow_runs` or is a full page, which may hide the run)."""
+    def runs_of(commit):
+        reply = runs_page(commit, PAGE)
+        if not isinstance(reply, dict) or not isinstance(reply.get("workflow_runs"), list):
+            raise ValueError(f"the Actions reply for {commit} has no workflow_runs")
+        if len(reply["workflow_runs"]) >= PAGE:
+            raise ValueError(f"{commit} has {PAGE} runs or more: the list may be cut off")
+        return reply["workflow_runs"]
+
     try:
-        token, api, repository = (os.environ[name] for name in ("GITEA_TOKEN", "API_URL", "REPOSITORY"))
-
-        def runs_of(commit):
-            request = urllib.request.Request(
-                f"{api}/repos/{repository}/actions/runs?head_sha={commit}&limit=50",
-                headers={"Authorization": f"token {token}"},
-            )
-            with urllib.request.urlopen(request, timeout=60) as response:
-                return json.load(response).get("workflow_runs") or []
-
-        on_main = subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"]).returncode == 0
-        parents = git("rev-list", "--parents", "-n", "1", sha).split()[1:]
-        reason = verdict(sha, on_main, parents, lambda commit: git("rev-parse", f"{commit}^{{tree}}"), runs_of)
-    except (KeyError, OSError, ValueError, subprocess.CalledProcessError) as error:
+        reason = verdict(sha, is_on_main(sha), parents_of(sha), tree_of, runs_of)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"::error::the check could not be made: {error}", file=sys.stderr)
         return 2
     if reason:
@@ -78,6 +71,44 @@ def main(argv):
         return 1
     print(f"{sha} is on main or the merge of a pull request head with a green land run")
     return 0
+
+
+def git(*args):
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def is_on_main(sha):
+    """Whether `sha` is an ancestor of origin/main; git's exit 128 (an unknown commit or ref) is an error, not a no."""
+    code = subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], capture_output=True).returncode
+    if code not in (0, 1):
+        raise ValueError(f"git merge-base failed ({code})")
+    return code == 0
+
+
+def main(argv):
+    if len(argv) != 1:
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        token, api, repository = (os.environ[name] for name in ("GITEA_TOKEN", "API_URL", "REPOSITORY"))
+    except KeyError as error:
+        print(f"::error::the check could not be made: {error} is not set", file=sys.stderr)
+        return 2
+
+    def runs_page(commit, limit):
+        request = urllib.request.Request(
+            f"{api}/repos/{repository}/actions/runs?head_sha={commit}&limit={limit}", headers={"Authorization": f"token {token}"}
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.load(response)
+
+    return check(
+        argv[0],
+        is_on_main,
+        lambda sha: git("rev-list", "--parents", "-n", "1", sha).split()[1:],
+        lambda commit: git("rev-parse", f"{commit}^{{tree}}"),
+        runs_page,
+    )
 
 
 if __name__ == "__main__":

@@ -69,7 +69,10 @@ def lint(text):
     for name in names:
         block = sub_block(jobs, name)
         condition = next((line for line in block if line.startswith("    if:")), "")
-        if name != GUARD and LAND not in condition:
+        if name == GUARD:
+            if condition or any(line.startswith("    needs:") for line in block):
+                problems.append(f"{GUARD} must have no `needs:` and no `if:`: it runs on every run")
+        elif LAND not in condition:
             problems.append(f"job {name} has no `if:` on the added label land")
     group = "\n".join(top_block(lines, "concurrency") or [])
     if "'land'" not in group or "'other'" not in group:

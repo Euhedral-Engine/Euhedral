@@ -50,5 +50,28 @@ class LandedTest(unittest.TestCase):
         self.assertIsNone(check([run(conclusion="failure"), run()]))
 
 
+class CheckTest(unittest.TestCase):
+    def run_check(self, reply, on_main=lambda sha: False):
+        trees = {MERGE: "t", HEAD: "t"}
+        return ci_landed.check(MERGE, on_main, lambda sha: [BASE, HEAD], trees.__getitem__, lambda commit, limit: reply)
+
+    def test_exit_codes(self):
+        self.assertEqual(self.run_check({"workflow_runs": [run()]}), 0)
+        self.assertEqual(self.run_check({"workflow_runs": []}), 1)
+
+    def test_a_reply_without_the_list_cannot_be_checked(self):
+        self.assertEqual(self.run_check({"message": "denied"}), 2)
+        self.assertEqual(self.run_check({"workflow_runs": None}), 2)
+
+    def test_a_full_page_cannot_be_checked(self):
+        self.assertEqual(self.run_check({"workflow_runs": [run(conclusion="failure")] * ci_landed.PAGE}), 2)
+
+    def test_a_failing_git_cannot_be_checked(self):
+        def broken(sha):
+            raise ValueError("git merge-base failed (128)")
+
+        self.assertEqual(self.run_check({"workflow_runs": [run()]}, on_main=broken), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
