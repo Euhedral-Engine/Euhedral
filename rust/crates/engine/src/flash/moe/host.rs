@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use euhedral_graph::{Marker, StageCx, StageError, Submitted};
+use euhedral_graph::{DeviceQueue, Marker, StageCx, StageError, Submitted};
 use euhedral_inference_cuda::KernelOps;
 
 use super::block::{BlockPlan, MoeBlock};
@@ -60,7 +60,11 @@ pub trait MoeHost: Send + Sync {
     /// Stores one word of the block's description, in the memory the device copies it from.
     fn put_word(&self, word: usize, value: u32);
 
-    /// Queues `work` of `layer` behind the markers `waits`.
+    /// Orders `home`, the lane the quantum retires on, behind the work that failed after it was queued on any lane.
+    fn await_unmarked(&self, home: &dyn DeviceQueue);
+
+    /// Queues `work` of `layer` behind the markers `waits`. `Err(Retry)` means that nothing was queued: the expert stage
+    /// keeps the lease in its slot for the retry, and any other error that work may have been queued.
     fn queue(
         &self,
         cx: &StageCx<'_>,
@@ -176,6 +180,11 @@ impl MoeHost for Quantum {
         if let Some(block) = self.moe_block() {
             block.staging().descriptor().word(word).store(value, Ordering::Relaxed);
         }
+    }
+
+    fn await_unmarked(&self, home: &dyn DeviceQueue) {
+        self.unmarked
+            .await_on(home, |lane| self.lanes.get(lane).map(|queue| queue.id()));
     }
 
     fn queue(

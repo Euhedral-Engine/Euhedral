@@ -28,10 +28,22 @@ use crate::stages::fatal;
 pub(super) fn settle(
     plan: &BlockPlan,
     index: u32,
-    mut lease: Box<dyn HeldExpert>,
+    lease: Box<dyn HeldExpert>,
     submit: impl FnOnce(&dyn HeldExpert) -> Result<Submitted, StageError>,
 ) -> Result<Submitted, StageError> {
-    match submit(&*lease) {
+    let mut unsettled = Unsettled {
+        plan,
+        index,
+        lease: Some(lease),
+    };
+    let outcome = match unsettled.lease.as_deref() {
+        Some(lease) => submit(lease),
+        None => return Err(fatal("the expert's lease was lost before its submission")),
+    };
+    let Some(mut lease) = unsettled.lease.take() else {
+        return Err(fatal("the expert's lease was lost during its submission"));
+    };
+    match outcome {
         Ok(submitted) => {
             if let Some(marker) = submitted.marker {
                 lease.fence_after(marker);
@@ -45,6 +57,22 @@ pub(super) fn settle(
         Err(error) => {
             plan.hold_queued(index, lease);
             Err(error)
+        }
+    }
+}
+
+/// A lease whose submission is running: when the submission unwinds, the lease goes to the leases queued work may read,
+/// as for a failed submission, instead of being dropped unfenced.
+struct Unsettled<'a> {
+    plan: &'a BlockPlan,
+    index: u32,
+    lease: Option<Box<dyn HeldExpert>>,
+}
+
+impl Drop for Unsettled<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.plan.hold_queued(self.index, lease);
         }
     }
 }
@@ -98,7 +126,10 @@ impl<Q: MoeHost> Stage<Q> for MoeExpert {
         })
     }
 
-    fn abandoned(&self, quantum: &Q, _home: &dyn DeviceQueue) {
+    fn abandoned(&self, quantum: &Q, home: &dyn DeviceQueue) {
+        // The home lane retires behind work that failed after it was queued on another lane, so that the device has
+        // stopped reading the leases kept for retirement.
+        quantum.await_unmarked(home);
         if let Ok(plan) = quantum.block_plan() {
             plan.release_idle(self.index);
         }

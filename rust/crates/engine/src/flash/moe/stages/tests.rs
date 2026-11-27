@@ -112,6 +112,19 @@ fn a_plan_stage_that_finds_the_scratch_in_use_fails_the_quantum() {
 }
 
 #[test]
+fn a_quantum_whose_staging_does_not_fit_the_layer_fails_the_plan_stage_and_takes_no_scratch() {
+    let (stage, harness) = rig();
+    let mut host = host(&[6, 1, 6, 3, 1, 6], 3);
+    host.fits = false;
+    assert!(matches!(
+        run(&stage, &harness, &host),
+        Err(StageError::Fatal(why)) if why.contains("staging")
+    ));
+    assert!(host.routing_is_home());
+    assert!(host.log.lines().is_empty());
+}
+
+#[test]
 fn a_quantum_with_no_block_fails_the_plan_stage() {
     let (stage, harness) = rig();
     let mut host = host(&[], 0);

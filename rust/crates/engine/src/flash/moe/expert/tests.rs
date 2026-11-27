@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -150,7 +151,13 @@ fn a_quantum_abandoned_after_a_partly_queued_expert_keeps_the_lease_until_it_ret
         harness.run(&stage as &dyn Stage<Host>, &host).result,
         Err(StageError::Fatal(_))
     ));
+    assert!(host.log.lines().iter().all(|line| line != "await unmarked"));
     harness.abandoned(&stage as &dyn Stage<Host>, &host, LaneId(0));
+    assert_eq!(
+        host.log.lines().last().map(String::as_str),
+        Some("await unmarked"),
+        "home retires behind the work that failed on another lane"
+    );
     assert!(log.lines().is_empty(), "queued work may still read the slot");
     assert!(plan.is_held(0));
     <MoeExpert as Stage<Host>>::retired(&stage, &host, false);
@@ -202,4 +209,32 @@ fn a_quantum_with_no_block_fails_the_stage() {
         harness.run(&stage as &dyn Stage<Host>, &host).result,
         Err(StageError::Fatal(why)) if why.contains("no block")
     ));
+}
+
+#[test]
+fn a_submission_that_unwinds_leaves_its_lease_kept_for_retirement() {
+    let (plan, log) = (block(), Log::default());
+    let lease = Lease::boxed(0xa000, None, &log);
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        let _ = settle(&plan, 0, lease, |_| panic!("the launch panicked"));
+    }));
+    assert!(unwound.is_err());
+    assert!(log.lines().is_empty(), "the lease is not dropped unfenced");
+    assert!(plan.is_held(0));
+    plan.release_queued(0);
+    assert_eq!(log.lines(), ["close 0xa000"]);
+}
+
+#[test]
+fn a_quantum_whose_staging_does_not_fit_the_layer_fails_the_expert_stage_before_any_write() {
+    let (stage, harness) = rig(0);
+    let (mut host, log) = (Host::new(block()), Log::default());
+    host.fits = false;
+    host.plan.as_ref().unwrap().hold(0, Lease::boxed(0xa000, None, &log));
+    assert!(matches!(
+        harness.run(&stage as &dyn Stage<Host>, &host).result,
+        Err(StageError::Fatal(why)) if why.contains("staging")
+    ));
+    assert_eq!(host.word(0), 0);
+    assert!(host.log.lines().is_empty());
 }

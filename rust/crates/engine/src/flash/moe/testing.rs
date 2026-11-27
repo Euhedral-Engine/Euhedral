@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use euhedral_graph::{Marker, StageCx, StageError, Submitted};
+use euhedral_graph::{DeviceQueue, Marker, StageCx, StageError, Submitted};
 
 use super::source::{Arrival, Arrived, ExpertSource, HeldExpert};
 use crate::residency::experts::ExpertId;
@@ -218,6 +218,7 @@ pub(crate) struct Host {
     pub(crate) plan: Option<Arc<BlockPlan>>,
     pub(crate) stopped: AtomicBool,
     pub(crate) cancel: Option<Arc<AtomicBool>>,
+    pub(crate) fits: bool,
     pub(crate) rows: usize,
     pub(crate) log: Log,
     routing: Handoff<Box<Routing>>,
@@ -235,6 +236,7 @@ impl Host {
             plan: Some(plan),
             stopped: AtomicBool::new(false),
             cancel: None,
+            fits: true,
             rows: 3,
             log: Log::default(),
             routing,
@@ -289,7 +291,7 @@ impl MoeHost for Host {
     }
 
     fn check_staging(&self, layout: &DescriptorLayout) -> Result<(), StageError> {
-        if layout == shape().layout() {
+        if self.fits && layout == shape().layout() {
             Ok(())
         } else {
             Err(StageError::Fatal("staging does not fit".to_owned()))
@@ -312,6 +314,10 @@ impl MoeHost for Host {
 
     fn put_word(&self, word: usize, value: u32) {
         self.words[word].store(value, Ordering::Relaxed);
+    }
+
+    fn await_unmarked(&self, _home: &dyn DeviceQueue) {
+        self.log.push("await unmarked".to_owned());
     }
 
     fn queue(
