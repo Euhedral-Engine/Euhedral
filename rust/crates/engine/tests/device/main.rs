@@ -27,6 +27,7 @@ mod capture_fault;
 mod composite;
 mod constraint;
 mod dflash2;
+mod flash;
 mod formats;
 mod formats_oracle;
 mod generation;

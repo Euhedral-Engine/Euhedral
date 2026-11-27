@@ -23,7 +23,7 @@ use crate::formats::{LinearFormat, LinearMode, ScratchRegion};
 use crate::model::WeightRef;
 
 /// The library's status for a route that declines a launch (`EUHEDRAL_CUDA_ROUTE_UNAVAILABLE`).
-const ROUTE_UNAVAILABLE: i32 = -5;
+pub(crate) const ROUTE_UNAVAILABLE: i32 = -5;
 
 /// The NVFP4 linears of a device.
 #[derive(Debug)]

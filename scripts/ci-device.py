@@ -33,7 +33,8 @@ ENGINE = ("engine", "device")
 # The tests of the engine binary that use the card without an engine of the model (the rig tests, with a reduced model),
 # and the modules that start engines, by the settings they start with.
 RIG_MODULES = [
-    "batched", "capture", "capture_exact", "formats", "formats_oracle", "prefix_copy", "retire", "stages", "state",
+    "batched", "capture", "capture_exact", "flash", "formats", "formats_oracle", "prefix_copy", "retire", "stages",
+    "state",
 ]
 SMALL_ENGINE_MODULES = ["constraint", "hidden", "reserve", "sampled_mtp"]
 BIG_ENGINE_MODULES = [
