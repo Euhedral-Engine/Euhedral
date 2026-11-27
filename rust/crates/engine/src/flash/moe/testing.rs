@@ -1,6 +1,11 @@
 //! Fakes of the cache's side of the stages: an expert source whose arrivals a test orders, and leases that say how they
 //! were closed.
 
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixture: the fake source's request queue and log are Mutexes, read by one test thread"
+)]
+
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
 

@@ -8,6 +8,7 @@
 //! graph then runs the stage, which has nothing left to do. A failed arrival fails the gate, and the quantum, with the
 //! layer and expert named.
 
+use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -63,7 +64,7 @@ impl MoeFetch {
         Self { layer, index }
     }
 
-    fn named(&self, expert: u32, why: impl std::fmt::Display) -> StageError {
+    fn named(&self, expert: u32, why: impl Display) -> StageError {
         fatal(format!("layer {} expert {expert}: {why}", self.layer.index()))
     }
 }
@@ -110,10 +111,10 @@ impl<Q: MoeHost> Stage<Q> for MoeFetch {
             bank: self.layer.bank(),
             expert,
         };
-        if let Err(why) = self.layer.source().fetch(id, plan.rows() > 1, cancel, arrival) {
-            if let Some(gate) = held.take() {
-                gate.fail(self.named(expert, why));
-            }
+        if let Err(why) = self.layer.source().fetch(id, plan.rows() > 1, cancel, arrival)
+            && let Some(gate) = held.take()
+        {
+            gate.fail(self.named(expert, why));
         }
         false
     }

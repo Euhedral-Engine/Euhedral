@@ -1,4 +1,9 @@
+use std::array::from_fn;
+
 use super::*;
+
+/// The active experts, the work items, the (row, weight) pairs and each row's pair indices.
+type Expected = (Vec<u32>, Vec<[u32; 4]>, Vec<(u32, u32)>, Vec<Vec<u32>>);
 
 /// A deterministic stream of values (xorshift).
 struct Stream(u64);
@@ -53,7 +58,7 @@ fn decode(routing: &Routing, words: &[u32], items: usize, pairs: usize) -> Decod
     let at = |offset: usize| offset / 4;
     Decoded {
         items: (0..items)
-            .map(|i| std::array::from_fn(|f| words[at(layout.items_offset() + 16 * i) + f]))
+            .map(|i| from_fn(|f| words[at(layout.items_offset() + 16 * i) + f]))
             .collect(),
         pairs: (0..pairs)
             .map(|p| {
@@ -72,13 +77,7 @@ fn decode(routing: &Routing, words: &[u32], items: usize, pairs: usize) -> Decod
 
 /// The grouping by sorting: pairs by expert, stably (so ascending row, then position), the items of 16, and each row's
 /// list of pair indices.
-fn reference(
-    rows: u32,
-    experts: u32,
-    top_k: u32,
-    ids: &[i32],
-    weights: &[u16],
-) -> (Vec<u32>, Vec<[u32; 4]>, Vec<(u32, u32)>, Vec<Vec<u32>>) {
+fn reference(rows: u32, experts: u32, top_k: u32, ids: &[i32], weights: &[u16]) -> Expected {
     let mut sorted: Vec<(u32, u32, u32)> = (0..(rows * top_k) as usize)
         .filter(|&i| ids[i] as u32 != experts)
         .map(|i| (ids[i] as u32, i as u32 / top_k, u32::from(weights[i])))

@@ -3,6 +3,7 @@
 //! The steps are pure: given the rows and the plan of a block they list the launches and copies a stage queues, so a
 //! test reads them as lines and the stages ([`super::stages`], [`super::expert`]) only choose when to queue them.
 
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
 
 use euhedral_inference_cuda::DevicePtr;
@@ -147,8 +148,8 @@ pub struct MoeLayer {
     source: Arc<dyn ExpertSource>,
 }
 
-impl std::fmt::Debug for MoeLayer {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for MoeLayer {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter
             .debug_struct("MoeLayer")
             .field("layer", &self.index)

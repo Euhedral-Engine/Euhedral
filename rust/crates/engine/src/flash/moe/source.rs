@@ -5,6 +5,7 @@
 //! exists because a lease can be made by the cache alone, so that the stages' unit tests (an expert that arrives late,
 //! out of order or never) drive them through a source of their own.
 
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -51,8 +52,8 @@ pub enum Arrived {
     Cancelled,
 }
 
-impl std::fmt::Debug for Arrived {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Arrived {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Held(lease) => write!(formatter, "Held({:#x})", lease.device_address()),
             Self::Failed(why) => write!(formatter, "Failed({why})"),
