@@ -1186,10 +1186,12 @@ mod tests {
     #[test]
     fn a_length_step_the_io_refuses_calls_its_continuation_once_with_the_error() {
         let io = AsyncIo::open().unwrap();
+        // A file that exists in a sandboxed run too, so the open is accepted and the length is what is refused.
+        let present = tempfile::NamedTempFile::new().unwrap();
         let (sender, receiver) = mpsc::channel();
         read_all(
             &io,
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+            present.path(),
             Box::new(move |result| sender.send(result).unwrap()),
         );
         io.complete();
@@ -1253,7 +1255,8 @@ mod tests {
     fn a_step_the_io_refuses_calls_its_continuation_once_with_the_error() {
         let io = AsyncIo::open().unwrap();
         io.complete();
-        let file = Arc::new(File::open(env!("CARGO_MANIFEST_DIR").to_owned() + "/Cargo.toml").unwrap());
+        // An anonymous temporary file: a path under the crate is not there in a sandboxed test run.
+        let file = Arc::new(tempfile::tempfile().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         fn counted<T: 'static>(calls: &Arc<AtomicUsize>) -> Then<T> {
             let calls = Arc::clone(calls);
