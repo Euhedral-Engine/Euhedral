@@ -1,9 +1,13 @@
 //! The cache's one owner: its device slots' bookkeeping and the host tier's, and the loads in flight.
 //!
-//! Requests, lease releases, read completions, copy submissions and copy retirements are records posted to it; the one
-//! worker that holds its claim applies them in order, with no lock and no wait. A request that cannot be served (every
-//! slot is loading or leased, every staging buffer or read is in use) stays here with the cause, and is asked again
-//! when that cause has changed, once per change.
+//! Requests, lease releases, read completions, copy submissions and copy retirements are records posted to it (see
+//! `source`); the one worker that runs its turn applies them in order, with no lock and no wait. A request that cannot
+//! be served (every slot is loading or leased, every staging buffer or read is in use) stays here with the cause, and is
+//! asked again when that cause has changed, once per change.
+//!
+//! A record whose application panics poisons the owner: the loads and waiting requests are ended with the error that
+//! names it, new requests are refused with it, and the records that give things back (reads, copies, leases) are still
+//! applied, so that every load ends and a close completes.
 //!
 //! A load is: the owner reserves a device slot, a staging slot and a read, and begins the store's load; the store's
 //! frames read the record; its end posts [`Message::Read`]; the owner offers the copy's frame, which a worker submits on
@@ -11,9 +15,11 @@
 //! the marker's retirement runs a frame that posts [`Message::Retired`], which frees the staging slot and ends the load.
 //! The load holds one unit of the lake from its start to its retirement, so closing waits for it.
 
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::mem::{self, forget};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,11 +30,11 @@ use euhedral_memory::{SlotArena, SlotLease};
 
 use super::CacheError;
 use super::host::{CopyJob, CopyLane, DeviceSlots, Frames, SubmitFailure};
-use super::lease::ExpertLease;
+use super::lease::{ExpertLease, Home};
 use super::shard::{Claimed, Reserved, Shard};
+use super::source::Inbox;
 use super::stats::{CacheStats, Cause};
 use crate::frames::{Kind, step};
-use crate::generation::{Address, Turn};
 use crate::handoff::Handoff;
 use crate::residency::experts::{
     ExpertError, ExpertId, ExpertLayout, ExpertStore, HostArena, LoadEnd, RamTierShard, ReadOutcome, Started,
@@ -40,14 +46,47 @@ use crate::residency::experts::{
 pub enum Outcome {
     /// The expert is leased.
     Leased(ExpertLease),
-    /// The expert could not be had; the error names it.
+    /// The expert could not be had; the error names why: the expert's own failure, a closed cache, a poisoned owner.
     Failed(CacheError),
-    /// The request was cancelled, or the cache closed, before a lease was made.
+    /// The request's own cancel flag was set before a lease was made.
     Cancelled,
 }
 
 /// Told once with a request's outcome, on a worker, once the owner's claim is free. It must not wait.
 pub type Listener = Box<dyn FnOnce(Outcome) + Send>;
+
+/// A request's listener, which is told exactly once: a reply dropped untold (the record that held it panicked, or the
+/// owner was dropped) tells it that the request was abandoned.
+pub(crate) struct Reply(Option<Listener>);
+
+impl Reply {
+    pub(super) fn new(listener: Listener) -> Reply {
+        Reply(Some(listener))
+    }
+
+    fn tell(mut self, outcome: Outcome) {
+        if let Some(listener) = self.0.take() {
+            listener(outcome);
+        }
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        let Some(listener) = self.0.take() else {
+            return;
+        };
+        let why = "the request was dropped before it was answered".to_owned();
+        // A drop may run while a panic unwinds: a listener that panics must not escape it.
+        if catch_unwind(AssertUnwindSafe(|| {
+            listener(Outcome::Failed(CacheError::Abandoned { why }))
+        }))
+        .is_err()
+        {
+            log::error!("a listener of the expert cache panicked while told its request was dropped");
+        }
+    }
+}
 
 /// One request for an expert.
 pub(crate) struct Request {
@@ -57,7 +96,7 @@ pub(crate) struct Request {
     /// Whether the load is a prefill scan's, which the host tier may refuse to keep.
     pub scan: bool,
     pub cancel: Arc<AtomicBool>,
-    pub listener: Listener,
+    pub reply: Reply,
 }
 
 /// What is posted to the owner.
@@ -80,21 +119,54 @@ pub(crate) enum Message {
     Retired {
         id: ExpertId,
     },
+    /// The copy that may have read staging slot `staging` has retired: the slot is free to be written again.
+    Unquarantined {
+        staging: u32,
+    },
+    /// No marker will say when the copy that may have read staging slot `staging` ends: the slot is never used again.
+    Lost {
+        staging: u32,
+    },
     /// Some request was cancelled: those waiting here end.
     Sweep,
+    /// The cache is closing: `done` is sent when nothing is in flight.
+    Close(Arc<Handoff<()>>),
 }
 
 /// Why a copy was not submitted, and whether the device may still read its staging slot.
 pub(crate) struct Unsubmitted {
     why: String,
-    /// The copy may be queued: the staging slot is never reused.
-    leaked: bool,
+    /// The copy may be queued: the staging slot waits for a later marker (see [`Message::Unquarantined`]).
+    quarantined: bool,
+}
+
+impl Unsubmitted {
+    pub(super) fn refused(why: String) -> Unsubmitted {
+        Unsubmitted {
+            why,
+            quarantined: false,
+        }
+    }
+
+    pub(super) fn uncertain(why: String) -> Unsubmitted {
+        Unsubmitted { why, quarantined: true }
+    }
 }
 
 /// An outcome to tell, or the end of a shutdown.
 pub(crate) enum Finished {
-    Told(Listener, Outcome),
+    Told(Reply, Outcome),
     Idle(Arc<Handoff<()>>),
+}
+
+impl Finished {
+    /// Tells the outcome, or the end of the shutdown.
+    pub(super) fn deliver(self) {
+        match self {
+            Finished::Told(reply, outcome) => reply.tell(outcome),
+            Finished::Idle(closed) => closed.send(()),
+        }
+    }
 }
 
 /// The load of one expert, from the reservation of its slots to the retirement of its copy.
@@ -106,6 +178,8 @@ struct Load {
     fences: Vec<Marker>,
     staging: SlotLease,
     cancel: Arc<AtomicBool>,
+    /// The frame that submits the copy was offered: from then on a record of the copy's retirement is to come.
+    copy_offered: bool,
     /// The lake unit the load holds until its copy retires.
     _unit: Box<dyn Send>,
 }
@@ -132,12 +206,14 @@ pub(super) struct Parts {
 }
 
 pub(crate) struct Owner {
-    inbox: Consumer<Message, Single>,
-    address: Arc<Address<Owner>>,
+    records: Consumer<Message, Single>,
+    /// Where the leases, the store's ends and the copy frames post.
+    inbox: Arc<Inbox>,
     layout: Arc<ExpertLayout>,
     store: Arc<ExpertStore>,
     tier: Vec<RamTierShard>,
-    device: DeviceSlots,
+    /// Shared with the leases, so the pool's slots stay leased while any lease is out.
+    device: Arc<DeviceSlots>,
     shard: Shard,
     staging: Arc<HostArena>,
     staging_slots: Arc<SlotArena>,
@@ -148,17 +224,23 @@ pub(crate) struct Owner {
     stats: Arc<CacheStats>,
     loads: HashMap<ExpertId, Load>,
     blocked: VecDeque<Waiting>,
+    /// Staging slots a copy may still read, by slot index, with the lease that keeps them from the free list.
+    quarantined: HashMap<u32, SlotLease>,
+    /// Staging slots that are never used again.
+    lost: u32,
     /// How many times each cause (by [`Cause`] order) has changed.
     epochs: [u64; 4],
     told: Vec<Finished>,
     closed: bool,
+    /// Why the owner can no longer serve, once a record panicked.
+    poisoned: Option<String>,
     closing: Vec<Arc<Handoff<()>>>,
 }
 
 impl Owner {
     pub(super) fn new(
-        inbox: Consumer<Message, Single>,
-        address: Arc<Address<Owner>>,
+        records: Consumer<Message, Single>,
+        inbox: Arc<Inbox>,
         parts: Parts,
     ) -> Result<Owner, CacheError> {
         let Parts {
@@ -199,12 +281,12 @@ impl Owner {
         }
         let shard = Shard::new(layout.keys(), device.len(), Arc::clone(&stats))?;
         Ok(Owner {
+            records,
             inbox,
-            address,
             layout,
             store,
             tier,
-            device,
+            device: Arc::new(device),
             shard,
             staging,
             staging_slots,
@@ -215,11 +297,72 @@ impl Owner {
             stats,
             loads: HashMap::new(),
             blocked: VecDeque::new(),
+            quarantined: HashMap::new(),
+            lost: 0,
             epochs: [0; 4],
             told: Vec::new(),
             closed: false,
+            poisoned: None,
             closing: Vec::new(),
         })
+    }
+
+    /// Applies every record posted, in order, then asks again the requests whose cause changed, and returns what is to be
+    /// told. A record that panics poisons the owner and the records after it are still applied.
+    pub(super) fn turn(&mut self) -> Vec<Finished> {
+        while let Some(message) = self.records.poll() {
+            let read = match &message {
+                Message::Read(end) => Some(end.id),
+                _ => None,
+            };
+            if self.guarded(|owner| owner.handle(message))
+                && let Some(id) = read
+            {
+                self.end_stranded(id);
+            }
+        }
+        self.guarded(Owner::ask_changed);
+        self.guarded(Owner::signal_closed);
+        mem::take(&mut self.told)
+    }
+
+    /// Runs `step`; a panic in it poisons the owner instead of leaving it. Whether it panicked.
+    fn guarded(&mut self, step: impl FnOnce(&mut Owner)) -> bool {
+        let Err(panic) = catch_unwind(AssertUnwindSafe(|| step(self))) else {
+            return false;
+        };
+        self.poison(&panic_text(&*panic));
+        true
+    }
+
+    /// Ends the load of `id` whose read ended in a record that panicked, if no copy was offered for it: no record of it
+    /// is to come, so it would hold the close for ever.
+    fn end_stranded(&mut self, id: ExpertId) {
+        if self.loads.get(&id).is_some_and(|load| !load.copy_offered) {
+            self.guarded(|owner| owner.end_load(id, None, Outcome::Cancelled));
+        }
+    }
+
+    /// Ends what is waiting or loading with the error that names the panic, and refuses requests from now on. What is
+    /// in flight is still given back by the records that end it, so a close completes.
+    fn poison(&mut self, why: &str) {
+        log::error!("the expert cache owner panicked and is poisoned: {why}");
+        if self.poisoned.is_some() {
+            return;
+        }
+        self.poisoned = Some(why.to_owned());
+        for load in self.loads.values_mut() {
+            load.cancel.store(true, Ordering::Release);
+            if let Some(request) = load.request.take() {
+                let error = CacheError::Poisoned { why: why.to_owned() };
+                self.told.push(Finished::Told(request.reply, Outcome::Failed(error)));
+            }
+        }
+        for waiting in mem::take(&mut self.blocked) {
+            let error = CacheError::Poisoned { why: why.to_owned() };
+            self.told
+                .push(Finished::Told(waiting.request.reply, Outcome::Failed(error)));
+        }
     }
 
     fn handle(&mut self, message: Message) {
@@ -237,7 +380,10 @@ impl Owner {
             Message::Read(end) => self.read_ended(end),
             Message::Submitted { id, result } => self.submitted(id, result),
             Message::Retired { id } => self.retired(id),
+            Message::Unquarantined { staging } => self.unquarantined(staging),
+            Message::Lost { staging } => self.lost_slot(staging),
             Message::Sweep => self.sweep(),
+            Message::Close(done) => self.shut(done),
         }
     }
 
@@ -258,21 +404,25 @@ impl Owner {
 
     /// Serves `request`: a lease now, a load started, or a place in the waiting list. `again` says it was asked before.
     fn ask(&mut self, request: Request, again: bool) {
-        if self.closed || request.cancel.load(Ordering::Acquire) {
-            self.told.push(Finished::Told(request.listener, Outcome::Cancelled));
+        if request.cancel.load(Ordering::Acquire) {
+            self.told.push(Finished::Told(request.reply, Outcome::Cancelled));
+            return;
+        }
+        if let Some(refusal) = self.refusal() {
+            self.told.push(Finished::Told(request.reply, Outcome::Failed(refusal)));
             return;
         }
         let claimed = match self.shard.claim(request.key, request.bytes, self.blocked_by()) {
             Ok(claimed) => claimed,
             Err(error) => {
-                self.told.push(Finished::Told(request.listener, Outcome::Failed(error)));
+                self.told.push(Finished::Told(request.reply, Outcome::Failed(error)));
                 return;
             }
         };
         match claimed {
             Claimed::Resident { slot, generation } => {
                 let lease = self.lease(request.id, slot, generation, request.bytes, None);
-                self.told.push(Finished::Told(request.listener, Outcome::Leased(lease)));
+                self.told.push(Finished::Told(request.reply, Outcome::Leased(lease)));
             }
             Claimed::Joined {
                 slot,
@@ -280,9 +430,13 @@ impl Owner {
                 ready,
             } => {
                 let lease = self.lease(request.id, slot, generation, request.bytes, Some(ready));
-                self.told.push(Finished::Told(request.listener, Outcome::Leased(lease)));
+                self.told.push(Finished::Told(request.reply, Outcome::Leased(lease)));
             }
             Claimed::Miss(reserved) => self.begin(request, reserved),
+            Claimed::Wait(Cause::Staging) if self.staging_gone() => {
+                let error = CacheError::StagingLost { lost: self.lost };
+                self.told.push(Finished::Told(request.reply, Outcome::Failed(error)));
+            }
             Claimed::Wait(cause) => {
                 if !again {
                     self.stats.waited(cause);
@@ -293,9 +447,28 @@ impl Owner {
         }
     }
 
+    /// Why no request is served now, if so: the owner is poisoned, or closed.
+    fn refusal(&self) -> Option<CacheError> {
+        if let Some(why) = &self.poisoned {
+            Some(CacheError::Poisoned { why: why.clone() })
+        } else if self.closed {
+            Some(CacheError::Closed)
+        } else {
+            None
+        }
+    }
+
+    /// Whether every staging slot is lost, so that no load can start again.
+    fn staging_gone(&self) -> bool {
+        self.lost >= self.staging_slots.capacity()
+    }
+
     fn lease(&self, id: ExpertId, slot: u32, generation: u64, bytes: u64, ready: Option<Marker>) -> ExpertLease {
         ExpertLease::new(
-            Arc::clone(&self.address),
+            Home {
+                inbox: Arc::clone(&self.inbox),
+                _slots: Arc::clone(&self.device),
+            },
             id,
             slot,
             generation,
@@ -307,7 +480,11 @@ impl Owner {
 
     /// Asks again each waiting request whose cause has changed since it waited, in the order they came.
     fn ask_changed(&mut self) {
-        for waiting in mem::take(&mut self.blocked) {
+        // One pass over the requests waiting now; what is not asked stays in the list, so a panic poisons it with them.
+        for _ in 0..self.blocked.len() {
+            let Some(waiting) = self.blocked.pop_front() else {
+                break;
+            };
             if self.epochs[waiting.cause as usize] == waiting.epoch {
                 self.blocked.push_back(waiting);
             } else {
@@ -322,7 +499,7 @@ impl Owner {
         for waiting in mem::take(&mut self.blocked) {
             if waiting.request.cancel.load(Ordering::Acquire) {
                 self.told
-                    .push(Finished::Told(waiting.request.listener, Outcome::Cancelled));
+                    .push(Finished::Told(waiting.request.reply, Outcome::Cancelled));
             } else {
                 self.blocked.push_back(waiting);
             }
@@ -370,13 +547,13 @@ impl Owner {
             }
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        let address = Arc::clone(&self.address);
+        let inbox = Arc::clone(&self.inbox);
         let load = StoreLoad {
             id,
             directive,
             staging_slot: staging.index() as usize,
             cancel: Arc::clone(&cancel),
-            done: Box::new(move |end| address.post(Message::Read(end))),
+            done: Box::new(move |end| inbox.post(Message::Read(end))),
         };
         let started = match self.store.begin(load) {
             Ok(started) => started,
@@ -396,6 +573,7 @@ impl Owner {
                 fences,
                 staging,
                 cancel,
+                copy_offered: false,
                 _unit: unit,
             },
         );
@@ -405,6 +583,7 @@ impl Owner {
         {
             // The frame carried the load's end and is gone with its lease: the load can only be ended here.
             self.reads -= 1;
+            self.changed(Cause::Reads);
             let error = self.failure(id, "the lake took no frame");
             self.end_load(id, directive.settle_unstarted(), Outcome::Failed(error));
         }
@@ -436,7 +615,17 @@ impl Owner {
         self.stats.failed_transfer();
         self.changed(Cause::Slots);
         self.changed(Cause::Copying);
-        self.told.push(Finished::Told(request.listener, outcome));
+        // The staging slot and the read the request held are free again with the caller's locals.
+        self.changed(Cause::Staging);
+        self.told.push(Finished::Told(request.reply, outcome));
+    }
+
+    /// Applies `settle` to the tier shard of `id`'s key; an id the layout does not hold is logged and settles nothing.
+    fn settle_of(&mut self, id: ExpertId, settle: TierSettle) {
+        match self.layout.key(id) {
+            Ok(key) => self.settle(key, settle),
+            Err(error) => log::error!("a tier settle for an expert the layout does not hold was dropped: {error}"),
+        }
     }
 
     fn settle(&mut self, key: usize, settle: TierSettle) {
@@ -454,15 +643,15 @@ impl Owner {
         self.reads = self.reads.saturating_sub(1);
         self.changed(Cause::Reads);
         let id = end.id;
-        let key = self.layout.key(id).unwrap_or(0);
         if let Some(settle) = end.settle {
-            self.settle(key, settle);
+            self.settle_of(id, settle);
         }
         let Some(load) = self.loads.get(&id) else {
             log::error!("a read ended for an expert with no load: {id:?}");
             return;
         };
         let cancelled = self.closed
+            || self.poisoned.is_some()
             || load.cancel.load(Ordering::Acquire)
             || load
                 .request
@@ -470,7 +659,10 @@ impl Owner {
                 .is_some_and(|request| request.cancel.load(Ordering::Acquire));
         match end.outcome {
             ReadOutcome::Complete if !cancelled => self.submit(id),
-            ReadOutcome::Complete | ReadOutcome::Cancelled { .. } => self.end_load(id, None, Outcome::Cancelled),
+            ReadOutcome::Complete | ReadOutcome::Cancelled { .. } => {
+                let outcome = self.ended_by(id);
+                self.end_load(id, None, outcome);
+            }
             ReadOutcome::Failed(error) => {
                 let failure = self.failure(id, error);
                 self.end_load(id, None, Outcome::Failed(failure));
@@ -505,14 +697,33 @@ impl Owner {
         let frame = copy_frame(
             Arc::clone(&self.copier),
             Arc::clone(&self.frames),
-            Arc::clone(&self.address),
-            id,
-            slot as usize,
+            Arc::clone(&self.inbox),
+            Copy {
+                id,
+                chain: slot as usize,
+                staging: staging_slot as u32,
+            },
             job,
         );
         if self.frames.offer(frame).is_err() {
             let failure = self.failure(id, "the lake took no frame");
             self.end_load(id, None, Outcome::Failed(failure));
+        } else if let Some(load) = self.loads.get_mut(&id) {
+            load.copy_offered = true;
+        }
+    }
+
+    /// What a request is told when its load ends before the copy was made and no failure ended it: its own cancel flag,
+    /// else the close or the poison that ended it.
+    fn ended_by(&self, id: ExpertId) -> Outcome {
+        let asked = self
+            .loads
+            .get(&id)
+            .and_then(|load| load.request.as_ref())
+            .is_some_and(|request| request.cancel.load(Ordering::Acquire));
+        match self.refusal() {
+            Some(refusal) if !asked => Outcome::Failed(refusal),
+            _ => Outcome::Cancelled,
         }
     }
 
@@ -523,13 +734,18 @@ impl Owner {
         };
         let (slot, generation, bytes) = (load.slot, load.generation, load.bytes);
         match result {
-            Err(Unsubmitted { why, leaked }) => {
+            Err(Unsubmitted { why, quarantined }) => {
                 let failure = self.failure(id, why);
-                self.finish_load(id, None, Outcome::Failed(failure), leaked);
+                self.finish_load(id, None, Outcome::Failed(failure), quarantined);
             }
             Ok(marker) => {
                 if let Err(error) = self.shard.submitted(slot, generation, marker) {
+                    // The copy is queued and will retire: the load stays for that, and its request is told.
                     log::error!("{error}");
+                    let failure = self.failure(id, error);
+                    if let Some(request) = self.loads.get_mut(&id).and_then(|load| load.request.take()) {
+                        self.told.push(Finished::Told(request.reply, Outcome::Failed(failure)));
+                    }
                     return;
                 }
                 self.changed(Cause::Copying);
@@ -537,15 +753,19 @@ impl Owner {
                 let Some(request) = self.loads.get_mut(&id).and_then(|load| load.request.take()) else {
                     return;
                 };
-                let outcome = if self.closed || request.cancel.load(Ordering::Acquire) {
-                    // The lease is dropped here: it posts its own release, and the slot is unpinned in this turn.
+                let outcome = if request.cancel.load(Ordering::Acquire) {
+                    // The lease is dropped here: it posts its own release, and the slot is unpinned in a later turn.
                     drop(lease);
                     self.stats.cancelled_miss();
                     Outcome::Cancelled
+                } else if let Some(refusal) = self.refusal() {
+                    drop(lease);
+                    self.stats.cancelled_miss();
+                    Outcome::Failed(refusal)
                 } else {
                     Outcome::Leased(lease)
                 };
-                self.told.push(Finished::Told(request.listener, outcome));
+                self.told.push(Finished::Told(request.reply, outcome));
             }
         }
     }
@@ -570,35 +790,81 @@ impl Owner {
         self.finish_load(id, settle, outcome, false);
     }
 
-    /// As [`end_load`](Owner::end_load); with `leaked` the staging slot is never given back, as the device may still
-    /// read it.
-    fn finish_load(&mut self, id: ExpertId, settle: Option<TierSettle>, outcome: Outcome, leaked: bool) {
+    /// As [`end_load`](Owner::end_load); with `quarantined` the staging slot is held out of the free list, as the device
+    /// may still read it, until [`Message::Unquarantined`] or [`Message::Lost`] says what became of the copy.
+    fn finish_load(&mut self, id: ExpertId, settle: Option<TierSettle>, outcome: Outcome, quarantined: bool) {
         let Some(mut load) = self.loads.remove(&id) else {
             return;
         };
-        if let Some(settle) = settle
-            && let Ok(key) = self.layout.key(id)
-        {
-            self.settle(key, settle);
+        if let Some(settle) = settle {
+            self.settle_of(id, settle);
         }
         if let Err(error) = self.shard.abandon(load.slot, load.generation) {
             log::error!("{error}");
         }
         match &outcome {
-            Outcome::Cancelled => self.stats.cancelled_miss(),
-            _ => self.stats.failed_transfer(),
+            Outcome::Failed(CacheError::Transfer { .. } | CacheError::Abandoned { .. }) => self.stats.failed_transfer(),
+            _ => self.stats.cancelled_miss(),
         }
         if let Some(request) = load.request.take() {
-            self.told.push(Finished::Told(request.listener, outcome));
+            self.told.push(Finished::Told(request.reply, outcome));
         }
-        if leaked {
-            forget(load.staging);
+        if quarantined {
+            self.quarantined.insert(load.staging.index(), load.staging);
         } else {
             drop(load);
         }
         self.changed(Cause::Slots);
         self.changed(Cause::Copying);
         self.changed(Cause::Staging);
+    }
+
+    /// A copy that may have read staging slot `staging` has retired: the slot is free again.
+    fn unquarantined(&mut self, staging: u32) {
+        if self.quarantined.remove(&staging).is_none() {
+            log::error!("staging slot {staging} was released from a quarantine it was not in");
+            return;
+        }
+        self.changed(Cause::Staging);
+    }
+
+    /// Staging slot `staging` can never be said free: its lease is forgotten, so it never returns to the free list. When
+    /// every slot is gone, the requests that wait for one are told so: nothing would ever end their wait.
+    fn lost_slot(&mut self, staging: u32) {
+        let Some(lease) = self.quarantined.remove(&staging) else {
+            log::error!("staging slot {staging} was lost from a quarantine it was not in");
+            return;
+        };
+        forget(lease);
+        self.lost += 1;
+        if !self.staging_gone() {
+            return;
+        }
+        let error = CacheError::StagingLost { lost: self.lost };
+        for waiting in mem::take(&mut self.blocked) {
+            if waiting.cause == Cause::Staging {
+                self.told
+                    .push(Finished::Told(waiting.request.reply, Outcome::Failed(error.clone())));
+            } else {
+                self.blocked.push_back(waiting);
+            }
+        }
+    }
+
+    /// Closes: requests waiting and loads in flight are ended with [`CacheError::Closed`]; `done` is sent when nothing
+    /// is in flight.
+    fn shut(&mut self, done: Arc<Handoff<()>>) {
+        self.closed = true;
+        self.closing.push(done);
+        for load in self.loads.values_mut() {
+            load.cancel.store(true, Ordering::Release);
+        }
+        for waiting in mem::take(&mut self.blocked) {
+            self.told.push(Finished::Told(
+                waiting.request.reply,
+                Outcome::Failed(CacheError::Closed),
+            ));
+        }
     }
 
     /// Tells the handoffs of a close once nothing is in flight, and forces the leases still out shut.
@@ -615,19 +881,40 @@ impl Owner {
     }
 }
 
+/// The text of a caught panic's payload.
+fn panic_text(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a panic with no text".to_owned()
+    }
+}
+
+/// What a copy frame knows of its load.
+#[derive(Clone, Copy)]
+struct Copy {
+    id: ExpertId,
+    /// The copy lane's chain: the load's device slot.
+    chain: usize,
+    /// The load's staging slot.
+    staging: u32,
+}
+
 /// The frame that submits `job` on the copy lane and tells the owner. A lane with no room hands the job to a frame
-/// that runs once there is; nothing waits.
+/// that runs once there is; nothing waits. It only posts: every outcome is applied by the owner's turn.
 fn copy_frame(
     copier: Arc<dyn CopyLane>,
     frames: Arc<dyn Frames>,
-    owner: Arc<Address<Owner>>,
-    id: ExpertId,
-    chain: usize,
+    owner: Arc<Inbox>,
+    copy: Copy,
     job: CopyJob,
 ) -> Box<dyn Frame> {
+    let Copy { id, chain, .. } = copy;
     step(Kind::ExpertSubmit, chain, move || match copier.submit(&job) {
         Ok(marker) => {
-            // The owner hears of the submission before the retirement can be: the message is in its inbox before the
+            // The owner hears of the submission before the retirement can be: the record is in its inbox before the
             // frame that posts the retirement is registered.
             owner.post(Message::Submitted { id, result: Ok(marker) });
             let retired = Arc::clone(&owner);
@@ -641,90 +928,89 @@ fn copy_frame(
             );
         }
         Err(SubmitFailure::Busy) => {
-            let again = copy_frame(Arc::clone(&copier), frames, owner, id, chain, job);
+            let again = copy_frame(Arc::clone(&copier), frames, owner, copy, job);
             copier.when_room(again);
         }
         Err(SubmitFailure::Refused(why)) => owner.post(Message::Submitted {
             id,
-            result: Err(Unsubmitted { why, leaked: false }),
+            result: Err(Unsubmitted::refused(why)),
         }),
         Err(SubmitFailure::Uncertain(why)) => {
-            // The copy may still read the staging slot: it is never reused.
-            mem::forget(job);
+            // The copy may be queued and has no marker: the owner keeps its staging slot out of the free list, and the
+            // next marker of the lane gives it back.
             owner.post(Message::Submitted {
                 id,
-                result: Err(Unsubmitted { why, leaked: true }),
+                result: Err(Unsubmitted::uncertain(why)),
             });
+            Quarantine {
+                copier,
+                frames,
+                owner,
+                copy,
+                job,
+            }
+            .run();
         }
     })
 }
 
-impl Turn for Owner {
-    type Message = Message;
-    type Finished = Finished;
+/// A copy that may be queued with no marker of its own, waiting for one behind it.
+///
+/// The lane runs its work in order, so the marker of work submitted after the copy retires only after the copy has run
+/// (or been dropped by the lane): once it has, the device no longer reads the staging slot, and the job (the slot's read
+/// lease) can go. The marker is taken with no work behind it, as the lane's own mark. When the lane cannot mark either,
+/// nothing will say when the copy ran: the slot is lost, and the owner is told.
+struct Quarantine {
+    copier: Arc<dyn CopyLane>,
+    frames: Arc<dyn Frames>,
+    owner: Arc<Inbox>,
+    copy: Copy,
+    job: CopyJob,
+}
 
-    fn turn(&mut self) {
-        while let Some(message) = self.inbox.poll() {
-            self.handle(message);
-        }
-        self.ask_changed();
-        self.signal_closed();
-    }
-
-    fn take_finished(&mut self) -> Vec<Finished> {
-        mem::take(&mut self.told)
-    }
-
-    fn abandon(&mut self, why: &str) -> Vec<Finished> {
-        self.closed = true;
-        let loads: Vec<ExpertId> = self.loads.keys().copied().collect();
-        for id in loads {
-            if let Some(load) = self.loads.get_mut(&id) {
-                load.cancel.store(true, Ordering::Release);
-                if let Some(request) = load.request.take() {
-                    let error = CacheError::Abandoned { why: why.to_owned() };
-                    self.told.push(Finished::Told(request.listener, Outcome::Failed(error)));
-                }
+impl Quarantine {
+    /// Takes the marker and registers the release of the slot behind it; with the lane full, tries again when it has
+    /// room.
+    fn run(self) {
+        let Quarantine {
+            copier,
+            frames,
+            owner,
+            copy,
+            job,
+        } = self;
+        match copier.mark() {
+            Ok(marker) => {
+                let Copy { chain, staging, .. } = copy;
+                frames.after_marker(
+                    marker,
+                    step(Kind::ExpertRetire, chain, move || {
+                        drop(job);
+                        owner.post(Message::Unquarantined { staging });
+                    }),
+                );
+            }
+            Err(SubmitFailure::Busy) => {
+                let again = Arc::clone(&copier);
+                let frame = step(Kind::ExpertSubmit, copy.chain, move || {
+                    Quarantine {
+                        copier,
+                        frames,
+                        owner,
+                        copy,
+                        job,
+                    }
+                    .run();
+                });
+                again.when_room(frame);
+            }
+            Err(SubmitFailure::Refused(why) | SubmitFailure::Uncertain(why)) => {
+                log::error!("a staging slot is lost: no marker can say when its copy ran: {why}");
+                // The owner forgets the slot's own lease, so nothing writes the slot again: the job's read lease can go.
+                owner.post(Message::Lost { staging: copy.staging });
+                drop(job);
             }
         }
-        for waiting in mem::take(&mut self.blocked) {
-            let error = CacheError::Abandoned { why: why.to_owned() };
-            self.told
-                .push(Finished::Told(waiting.request.listener, Outcome::Failed(error)));
-        }
-        self.signal_closed();
-        mem::take(&mut self.told)
-    }
-
-    fn deliver(finished: Finished) {
-        match finished {
-            Finished::Told(listener, outcome) => listener(outcome),
-            Finished::Idle(closed) => closed.send(()),
-        }
-    }
-
-    fn shut(&mut self, idle: Arc<Handoff<()>>) {
-        self.closed = true;
-        self.closing.push(idle);
-        for load in self.loads.values() {
-            load.cancel.store(true, Ordering::Release);
-        }
-        for waiting in mem::take(&mut self.blocked) {
-            self.told
-                .push(Finished::Told(waiting.request.listener, Outcome::Cancelled));
-        }
-        self.signal_closed();
-    }
-
-    fn into_barrier(finished: Finished) -> Result<Arc<Handoff<()>>, Finished> {
-        match finished {
-            Finished::Idle(closed) => Ok(closed),
-            told => Err(told),
-        }
-    }
-
-    fn idle(&self) -> bool {
-        self.loads.is_empty() && self.blocked.is_empty()
     }
 }
 

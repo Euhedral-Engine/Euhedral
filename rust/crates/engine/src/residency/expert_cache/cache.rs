@@ -1,21 +1,23 @@
-//! The cache's public face: built from the plan's memory and the store, asked for experts, closed.
+//! The cache's public face: built from the plan's memory and the store, asked for experts, closed. Every call posts a
+//! record to the owner and returns; the owner is a source of the lattice (see `source`) and a worker applies the records.
 
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use euhedral_core::generics::LatticeSource;
 use euhedral_data_structures::queues::MpscQueue;
 use euhedral_memory::SlotArena;
 
 use super::CacheError;
 use super::host::{CopyLane, DeviceSlots, Frames};
-use super::owner::{Listener, Message, Owner, Parts, Request};
+use super::owner::{Listener, Message, Owner, Parts, Reply, Request};
+use super::source::{Inbox, OwnerSource};
 use super::stats::{CacheSnapshot, CacheStats};
-use crate::generation::{Address, Mailbox, Spawn};
 use crate::handoff::Handoff;
 use crate::residency::experts::{ExpertError, ExpertId, ExpertStore, RamTierShard};
 
-/// Slots in a chunk of the owner's inbox.
+/// Slots in a chunk of the owner's record queue.
 const INBOX_CHUNK: usize = 64;
 
 /// What a cache is built from.
@@ -46,8 +48,7 @@ impl fmt::Debug for CacheConfig {
 
 /// The device cache of routed experts.
 pub struct ExpertCache {
-    pub(super) mailbox: Arc<Mailbox<Owner>>,
-    address: Arc<Address<Owner>>,
+    source: Arc<OwnerSource>,
     store: Arc<ExpertStore>,
     stats: Arc<CacheStats>,
 }
@@ -59,9 +60,10 @@ impl fmt::Debug for ExpertCache {
 }
 
 impl ExpertCache {
-    /// A cache over `config`; its hand-offs to a worker go through `spawn`. Refuses a device slot smaller than the
-    /// largest record, a staging free list larger than the staging memory, and no device slot or no read.
-    pub fn new(config: CacheConfig, spawn: Spawn) -> Result<ExpertCache, CacheError> {
+    /// A cache over `config`. Its owner does nothing until the lattice polls [`source`](ExpertCache::source). Refuses a
+    /// device slot smaller than the largest record, a staging free list larger than the staging memory, and no device
+    /// slot or no read.
+    pub fn new(config: CacheConfig) -> Result<ExpertCache, CacheError> {
         let CacheConfig {
             store,
             tier,
@@ -73,8 +75,8 @@ impl ExpertCache {
         } = config;
         let stats = Arc::new(CacheStats::default());
         let queue = MpscQueue::<Message>::new(INBOX_CHUNK);
-        let (producer, inbox) = (queue.producer(), queue.consumer());
-        let address = Address::new();
+        let (producer, records) = (queue.producer(), queue.consumer());
+        let inbox = Arc::new(Inbox::new(producer));
         let parts = Parts {
             layout: Arc::clone(store.layout()),
             store: Arc::clone(&store),
@@ -87,15 +89,17 @@ impl ExpertCache {
             copier,
             stats: Arc::clone(&stats),
         };
-        let owner = Owner::new(inbox, Arc::clone(&address), parts)?;
-        let mailbox = Arc::new(Mailbox::new(owner, producer, spawn));
-        address.set(&mailbox);
+        let owner = Owner::new(records, Arc::clone(&inbox), parts)?;
         Ok(ExpertCache {
-            mailbox,
-            address,
+            source: OwnerSource::new(inbox, owner),
             store,
             stats,
         })
+    }
+
+    /// The owner as a source of the lattice: attach it with `add_upstream`, and a worker applies the records posted.
+    pub fn source(&self) -> Arc<dyn LatticeSource> {
+        Arc::clone(&self.source) as Arc<dyn LatticeSource>
     }
 
     /// Asks for `id`'s expert: `listener` is told, on a worker, with a lease (at once when the expert is resident), the
@@ -112,13 +116,13 @@ impl ExpertCache {
         let layout = self.store.layout();
         let key = layout.key(id)?;
         let bytes = layout.record(id)?.bytes;
-        self.address.post(Message::Request(Request {
+        self.source.post(Message::Request(Request {
             id,
             key,
             bytes,
             scan,
             cancel,
-            listener,
+            reply: Reply::new(listener),
         }));
         Ok(())
     }
@@ -126,13 +130,15 @@ impl ExpertCache {
     /// Sets `cancel` and has the owner end the requests that wait on it.
     pub fn cancel(&self, cancel: &AtomicBool) {
         cancel.store(true, Ordering::Release);
-        self.address.post(Message::Sweep);
+        self.source.post(Message::Sweep);
     }
 
-    /// Closes the cache: waiting requests are cancelled, loads in flight are cancelled and awaited, and the handoff
-    /// is sent when none is left. `None` when the caller holds the owner's claim (a listener).
-    pub fn close(&self) -> Option<Arc<Handoff<()>>> {
-        self.mailbox.stopping()
+    /// Closes the cache: requests waiting and loads in flight are ended with [`CacheError::Closed`], the loads are awaited,
+    /// and the handoff is sent when none is left. Requests after it are refused with the same error.
+    pub fn close(&self) -> Arc<Handoff<()>> {
+        let done = Handoff::new();
+        self.source.post(Message::Close(Arc::clone(&done)));
+        done
     }
 
     /// The counters, read now.

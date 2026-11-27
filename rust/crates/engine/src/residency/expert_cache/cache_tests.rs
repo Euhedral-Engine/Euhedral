@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
-use euhedral_core::frames::Frame;
+use euhedral_core::frames::{Failure, Frame};
+use euhedral_core::generics::{LatticeReceiver, LatticeSource, LatticeTerminal};
 use euhedral_graph::{LaneId, Marker, QueueId};
 use euhedral_inference_edrl::{
     ComponentGroup, ExpertBank, ExpertProjection, ExpertRecord, TensorDataType, WeightFormat, WeightLayout,
@@ -25,9 +26,7 @@ use euhedral_io::{Continuation, IoDoneOwned};
 use euhedral_memory::{LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope, SlotArena, TierPool};
 
 use super::host::{CopyJob, CopyLane, DeviceSlots, Frames, SubmitFailure};
-use super::owner::Owner;
-use super::{CacheConfig, CacheError, ExpertCache, ExpertLease, Outcome};
-use crate::generation::Turn;
+use super::{CacheConfig, CacheError, ExpertCache, ExpertLease, Listener, Outcome};
 use crate::residency::experts::{
     ExpertError, ExpertId, ExpertLayout, ExpertStore, FileRecordSource, HostArena, PartPort, WritePart,
 };
@@ -150,6 +149,17 @@ struct LaneState {
     busy: usize,
     refuse: bool,
     refuse_admit: bool,
+    /// How many of the next submissions queue the copy and then fail with no marker.
+    uncertain: usize,
+    /// How many of the next marks find the lane full.
+    mark_busy: usize,
+    /// Whether the lane refuses every mark.
+    mark_refuse: bool,
+    /// The values of the markers the lane has made.
+    issued: u64,
+    /// Whether the lake's hand-off of a frame, or the admission of a unit, panics.
+    panic_offer: bool,
+    panic_admit: bool,
 }
 
 struct Unit(Arc<AtomicUsize>);
@@ -193,7 +203,13 @@ impl FakeLane {
 
 impl Frames for FakeLane {
     fn offer(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
-        locked(&self.state).offered.push_back(frame);
+        let mut state = locked(&self.state);
+        if state.panic_offer {
+            drop(state);
+            drop(frame);
+            panic!("the lake's hand-off of a frame panicked");
+        }
+        state.offered.push_back(frame);
         Ok(())
     }
 
@@ -202,6 +218,9 @@ impl Frames for FakeLane {
     }
 
     fn admit(&self) -> Result<Box<dyn Send>, String> {
+        if locked(&self.state).panic_admit {
+            panic!("the lake's admission of a unit panicked");
+        }
         if locked(&self.state).refuse_admit {
             return Err("the lake is closed".to_owned());
         }
@@ -225,12 +244,64 @@ impl CopyLane for FakeLane {
             bytes: job.staging.bytes()[..job.bytes].to_vec(),
             waits: job.waits.clone(),
         });
-        Ok(Marker::new(self.queue, LaneId(0), state.submitted.len() as u64))
+        state.issued += 1;
+        if state.uncertain > 0 {
+            state.uncertain -= 1;
+            return Err(SubmitFailure::Uncertain(
+                "the lane failed after the copy was queued".to_owned(),
+            ));
+        }
+        Ok(Marker::new(self.queue, LaneId(0), state.issued))
+    }
+
+    fn mark(&self) -> Result<Marker, SubmitFailure> {
+        let mut state = locked(&self.state);
+        if state.mark_busy > 0 {
+            state.mark_busy -= 1;
+            return Err(SubmitFailure::Busy);
+        }
+        if state.mark_refuse {
+            return Err(SubmitFailure::Refused("the lane takes no marker".to_owned()));
+        }
+        state.issued += 1;
+        Ok(Marker::new(self.queue, LaneId(0), state.issued))
     }
 
     fn when_room(&self, frame: Box<dyn Frame>) {
         locked(&self.state).room.push_back(frame);
     }
+}
+
+// ---------------------------------------------------------------- the fake worker
+
+/// The downstream of the owner's source: it keeps the frames the source pushes, and the test runs them as a worker would.
+#[derive(Default)]
+struct FakeReceiver {
+    pushed: Mutex<VecDeque<Box<dyn Frame>>>,
+}
+
+impl FakeReceiver {
+    fn waiting(&self) -> usize {
+        locked(&self.pushed).len()
+    }
+
+    fn take(&self) -> Option<Box<dyn Frame>> {
+        locked(&self.pushed).pop_front()
+    }
+}
+
+impl LatticeTerminal for FakeReceiver {
+    fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+}
+
+impl LatticeReceiver for FakeReceiver {
+    fn push(&self, frame: Box<dyn Frame>) {
+        locked(&self.pushed).push_back(frame);
+    }
+
+    fn on_complete(&self) {}
+
+    fn on_error(&self, _error: Failure) {}
 }
 
 // ---------------------------------------------------------------- the rig
@@ -265,6 +336,8 @@ struct Rig {
     cache: ExpertCache,
     port: Arc<FakePort>,
     lane: Arc<FakeLane>,
+    worker: Arc<FakeReceiver>,
+    source: Arc<dyn LatticeSource>,
     artifact: Vec<u8>,
 }
 
@@ -405,40 +478,56 @@ impl Rig {
             frames: Arc::clone(&lane) as Arc<dyn Frames>,
             copier: Arc::clone(&lane) as Arc<dyn CopyLane>,
         };
-        let cache = ExpertCache::new(
-            config,
-            Box::new(|work| {
-                work();
-                true
-            }),
-        )?;
+        let cache = ExpertCache::new(config)?;
+        let worker = Arc::new(FakeReceiver::default());
+        let source = cache.source();
+        Arc::clone(&source).add_downstream(Arc::clone(&worker) as Arc<dyn LatticeReceiver>);
         Ok(Rig {
             _dir: dir,
             cache,
             port,
             lane,
+            worker,
+            source,
             artifact,
         })
     }
 
+    /// A worker's visits: the source is requested, and the frames it pushes run, until it pushes none. Nothing runs
+    /// unless a worker visits, so a record posted is not applied before this.
+    fn poll(&self) {
+        for _ in 0..1000 {
+            self.source.request(1);
+            let Some(mut frame) = self.worker.take() else {
+                return;
+            };
+            frame.execute().expect("the frame runs");
+        }
+        panic!("the owner's turns never ran out: a turn keeps posting a record for the next");
+    }
+
+    /// Posts a request for `expert` and returns what it will be told, without a worker visiting.
+    fn ask(&self, expert: u32, listener: Listener) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cache
+            .fetch(id(expert), false, Arc::clone(&cancel), listener)
+            .expect("the request is accepted");
+        cancel
+    }
+
+    /// Posts a request for `expert` and has a worker visit.
     fn fetch(&self, expert: u32) -> (Told, Arc<AtomicBool>) {
         let told = Told::default();
-        let cancel = Arc::new(AtomicBool::new(false));
         let sink = told.clone();
-        self.cache
-            .fetch(
-                id(expert),
-                false,
-                Arc::clone(&cancel),
-                Box::new(move |outcome| *locked(&sink.0) = Some(outcome)),
-            )
-            .expect("the request is accepted");
+        let cancel = self.ask(expert, Box::new(move |outcome| *locked(&sink.0) = Some(outcome)));
+        self.poll();
         (told, cancel)
     }
 
     /// Moves every read, submission and retirement along until nothing is held.
     fn settle(&self) {
         for _ in 0..1000 {
+            self.poll();
             let reads = self.port.held();
             let offered = self.lane.next(|state| Some(!state.offered.is_empty())).unwrap_or(false);
             let after = self.lane.next(|state| Some(!state.after.is_empty())).unwrap_or(false);
@@ -498,9 +587,17 @@ fn a_request_for_an_expert_being_loaded_joins_its_load() {
     let (second, _) = rig.fetch(1);
     assert!(!second.is_told());
     assert_eq!(rig.port.held(), 1, "one read serves both");
-    rig.settle();
+    rig.port.release_all();
+    rig.poll();
+    rig.lane.run_offered();
+    rig.poll();
     let (a, b) = (first.lease(), second.lease());
     assert_eq!(a.device_address(), b.device_address());
+    assert!(
+        b.ready().is_some(),
+        "the joined lease waits for the copy that is still writing the slot"
+    );
+    rig.settle();
     let stats = rig.cache.stats();
     assert_eq!((stats.misses, stats.coalesced), (1, 1));
 }
@@ -532,6 +629,13 @@ fn a_request_with_every_slot_leased_is_asked_again_after_a_release_and_not_befor
     drop(other.lease());
     assert_eq!(rig.cache.stats().asked_again, 0);
     drop(held);
+    assert_eq!(
+        rig.cache.stats().asked_again,
+        0,
+        "a release only posts: nothing runs until the owner's turn"
+    );
+    assert_eq!(rig.port.held(), 0);
+    rig.poll();
     assert_eq!(rig.cache.stats().asked_again, 1, "the release asked it once");
     assert_eq!(rig.port.held(), 1, "and it began its load");
     rig.settle();
@@ -567,6 +671,7 @@ fn a_read_that_fails_fails_the_request_with_the_experts_name_and_frees_what_it_h
     });
     let (told, _) = rig.fetch(4);
     rig.port.release(true);
+    rig.poll();
     match told.failure() {
         CacheError::Transfer { bank, expert, .. } => assert_eq!((bank.as_str(), expert), ("experts", 4)),
         other => panic!("expected a transfer failure, got {other:?}"),
@@ -577,8 +682,11 @@ fn a_read_that_fails_fails_the_request_with_the_experts_name_and_frees_what_it_h
 }
 
 #[test]
-fn a_copy_the_lane_refuses_fails_the_request_with_the_experts_name() {
-    let rig = Rig::new(Settings::default());
+fn a_copy_the_lane_refuses_fails_the_request_with_the_experts_name_and_gives_its_staging_slot_back() {
+    let rig = Rig::new(Settings {
+        staging_slots: 1,
+        ..Settings::default()
+    });
     locked(&rig.lane.state).refuse = true;
     let (told, _) = rig.fetch(5);
     rig.settle();
@@ -599,12 +707,12 @@ fn a_lane_with_no_room_gets_the_copy_again_when_it_has_room() {
     locked(&rig.lane.state).busy = 1;
     let (told, _) = rig.fetch(0);
     rig.port.release_all();
+    rig.poll();
     rig.lane.run_offered();
     assert_eq!(rig.lane.submitted(), 0);
     assert!(!told.is_told());
     rig.lane.run_room();
-    rig.lane.run_offered();
-    rig.lane.retire_all();
+    rig.settle();
     drop(told.lease());
     assert_eq!(rig.lane.submitted(), 1);
 }
@@ -618,8 +726,10 @@ fn a_request_cancelled_while_waiting_is_ended_and_leaves_nothing_held() {
     let held = rig.lease(0);
     let (waiting, cancel) = rig.fetch(1);
     rig.cache.cancel(&cancel);
+    rig.poll();
     assert!(waiting.cancelled());
     drop(held);
+    rig.poll();
     assert_eq!(rig.port.held(), 0, "the cancelled request never began its load");
     assert_eq!(rig.cache.stats().asked_again, 0);
 }
@@ -646,13 +756,16 @@ fn a_request_cancelled_between_its_read_and_its_copy_gets_no_lease_and_its_slot_
     });
     let (told, cancel) = rig.fetch(0);
     rig.port.release_all();
+    rig.poll();
     cancel.store(true, Ordering::Release);
     rig.lane.run_offered();
+    rig.poll();
     assert!(
         told.cancelled(),
-        "a request cancelled before its read ended is not leased"
+        "a request cancelled after its read ended is not leased"
     );
     rig.lane.retire_all();
+    rig.poll();
     assert_eq!(rig.cache.stats().cancelled_misses, 1);
     drop(rig.lease(1));
 }
@@ -666,6 +779,7 @@ fn a_request_cancelled_before_its_read_ends_has_no_copy_made() {
     let (told, cancel) = rig.fetch(0);
     cancel.store(true, Ordering::Release);
     rig.port.release_all();
+    rig.poll();
     assert!(told.cancelled(), "the read ended for a request that was cancelled");
     assert_eq!(rig.lane.submitted(), 0, "no copy was made for it");
     drop(rig.lease(1));
@@ -684,6 +798,7 @@ fn reads_in_flight_are_limited_and_the_next_miss_is_asked_again_when_one_ends() 
     assert_eq!(rig.port.held(), 1, "one read at a time");
     assert_eq!(rig.cache.stats().waits[3], 1);
     rig.port.release(false);
+    rig.poll();
     assert_eq!(rig.cache.stats().asked_again, 1);
     assert_eq!(rig.port.held(), 1, "the second began when the first ended");
     rig.settle();
@@ -703,9 +818,12 @@ fn staging_buffers_in_use_hold_the_next_miss_until_a_copy_retires() {
     assert_eq!(rig.port.held(), 1);
     assert_eq!(rig.cache.stats().waits[2], 1);
     rig.port.release_all();
+    rig.poll();
     rig.lane.run_offered();
+    rig.poll();
     assert_eq!(rig.port.held(), 0, "the staging buffer is held until the copy retires");
     rig.lane.retire_all();
+    rig.poll();
     assert_eq!(rig.port.held(), 1);
     rig.settle();
     drop((first.lease(), second.lease()));
@@ -716,11 +834,15 @@ fn closing_waits_for_the_load_in_flight_and_its_unit_ends_with_the_copy() {
     let rig = Rig::new(Settings::default());
     let (told, _) = rig.fetch(0);
     rig.port.release_all();
+    rig.poll();
     rig.lane.run_offered();
-    let closed = rig.cache.close().expect("the owner is free");
+    rig.poll();
+    let closed = rig.cache.close();
+    rig.poll();
     assert!(!closed.is_set(), "the copy has not retired");
     assert_eq!(rig.lane.units.load(Ordering::SeqCst), 1);
     rig.lane.retire_all();
+    rig.poll();
     assert!(
         closed.wait(HANG).is_ok(),
         "the close was never told after the copy retired"
@@ -733,7 +855,8 @@ fn closing_waits_for_the_load_in_flight_and_its_unit_ends_with_the_copy() {
 fn a_lease_that_is_never_dropped_does_not_hang_the_close_and_is_counted() {
     let rig = Rig::new(Settings::default());
     forget(rig.lease(0));
-    let closed = rig.cache.close().expect("the owner is free");
+    let closed = rig.cache.close();
+    rig.poll();
     assert!(
         closed.wait(HANG).is_ok(),
         "the close hung on a lease that was never dropped"
@@ -758,11 +881,16 @@ fn a_dropped_lease_frees_its_slot_for_the_next_request() {
 fn a_lease_dropped_after_the_close_is_harmless() {
     let rig = Rig::new(Settings::default());
     let lease = rig.lease(0);
-    let closed = rig.cache.close().expect("the owner is free");
+    let closed = rig.cache.close();
+    rig.poll();
     assert!(closed.wait(HANG).is_ok(), "the close was never told");
     drop(lease);
     let (late, _) = rig.fetch(1);
-    assert!(late.cancelled(), "a request after the close is cancelled");
+    assert_eq!(
+        late.failure(),
+        CacheError::Closed,
+        "a request after the close is refused with the error that names it"
+    );
 }
 
 #[test]
@@ -837,23 +965,193 @@ fn a_lake_that_admits_no_unit_fails_the_request_with_the_experts_name_and_frees_
 }
 
 #[test]
-fn requests_in_loads_are_told_when_the_owner_is_abandoned() {
+fn a_posted_record_is_applied_by_the_next_visit_of_a_worker_and_not_by_the_poster() {
     let rig = Rig::new(Settings::default());
-    let (told, _) = rig.fetch(0);
-    let (waiting, _) = rig.fetch(1);
-    let (third, _) = rig.fetch(2);
-    let finished = rig
-        .cache
-        .mailbox
-        .with(|owner| owner.abandon("the turn panicked"))
-        .expect("the claim is free");
-    assert_eq!(finished.len(), 3);
-    for one in finished {
-        Owner::deliver(one);
+    rig.source.request(1);
+    assert_eq!(rig.worker.waiting(), 0, "no record waits: no turn frame is pushed");
+    rig.ask(0, Box::new(|_| {}));
+    assert_eq!(
+        rig.port.held(),
+        0,
+        "a request posted is not applied on the posting thread"
+    );
+    assert_eq!(
+        rig.worker.waiting(),
+        0,
+        "posting pushes nothing: only a worker's request does"
+    );
+    rig.source.request(1);
+    assert_eq!(
+        rig.worker.waiting(),
+        1,
+        "the request found a record and pushed the turn frame"
+    );
+    rig.source.request(1);
+    assert_eq!(rig.worker.waiting(), 1, "one turn frame is out at a time");
+    rig.poll();
+    assert_eq!(rig.port.held(), 1, "the turn applied the request and began its load");
+}
+
+#[test]
+fn a_copy_that_may_be_queued_holds_its_staging_slot_until_a_later_marker_retires() {
+    let rig = Rig::new(Settings {
+        staging_slots: 1,
+        ..Settings::default()
+    });
+    locked(&rig.lane.state).uncertain = 1;
+    let (first, _) = rig.fetch(0);
+    let (second, _) = rig.fetch(1);
+    rig.port.release_all();
+    rig.poll();
+    rig.lane.run_offered();
+    rig.poll();
+    match first.failure() {
+        CacheError::Transfer { expert, .. } => assert_eq!(expert, 0),
+        other => panic!("expected a transfer failure, got {other:?}"),
     }
+    assert!(!second.is_told());
+    assert_eq!(
+        rig.port.held(),
+        0,
+        "the staging slot is not reused while the copy may still read it"
+    );
+    rig.settle();
+    drop(second.lease());
+    assert_eq!(rig.cache.stats().failed_transfers, 1);
+}
+
+#[test]
+fn a_marker_the_lane_has_no_room_for_is_taken_again_when_it_has_room() {
+    let rig = Rig::new(Settings {
+        staging_slots: 1,
+        ..Settings::default()
+    });
+    {
+        let mut state = locked(&rig.lane.state);
+        state.uncertain = 1;
+        state.mark_busy = 1;
+    }
+    let (first, _) = rig.fetch(0);
+    let (second, _) = rig.fetch(1);
+    rig.port.release_all();
+    rig.poll();
+    rig.lane.run_offered();
+    rig.poll();
+    first.failure();
+    assert_eq!(locked(&rig.lane.state).room.len(), 1, "the mark waits for room");
+    assert!(!second.is_told());
+    rig.lane.run_room();
+    rig.settle();
+    drop(second.lease());
+}
+
+#[test]
+fn when_every_staging_slot_is_lost_the_waiting_requests_are_told_so() {
+    let rig = Rig::new(Settings {
+        staging_slots: 1,
+        ..Settings::default()
+    });
+    {
+        let mut state = locked(&rig.lane.state);
+        state.uncertain = 1;
+        state.mark_refuse = true;
+    }
+    let (first, _) = rig.fetch(0);
+    let (second, _) = rig.fetch(1);
+    rig.port.release_all();
+    rig.poll();
+    rig.lane.run_offered();
+    rig.poll();
+    first.failure();
+    assert_eq!(
+        second.failure(),
+        CacheError::StagingLost { lost: 1 },
+        "the request that waited for the lost slot was never told"
+    );
+}
+
+#[test]
+fn when_every_staging_slot_is_lost_a_miss_is_refused_and_a_resident_expert_is_still_served() {
+    let rig = Rig::new(Settings {
+        staging_slots: 1,
+        ..Settings::default()
+    });
+    drop(rig.lease(3));
+    {
+        let mut state = locked(&rig.lane.state);
+        state.uncertain = 1;
+        state.mark_refuse = true;
+    }
+    let (first, _) = rig.fetch(0);
+    rig.port.release_all();
+    rig.poll();
+    rig.lane.run_offered();
+    rig.poll();
+    first.failure();
+    let (miss, _) = rig.fetch(1);
+    assert_eq!(miss.failure(), CacheError::StagingLost { lost: 1 });
+    let (hit, _) = rig.fetch(3);
+    assert_eq!(hit.lease().id(), id(3));
+}
+
+#[test]
+fn a_panic_applying_a_record_poisons_the_owner_and_every_request_is_told_the_error() {
+    let rig = Rig::new(Settings {
+        device_slots: 1,
+        ..Settings::default()
+    });
+    let (loading, _) = rig.fetch(0);
+    let (waiting, _) = rig.fetch(1);
+    locked(&rig.lane.state).panic_offer = true;
+    rig.port.release_all();
+    rig.poll();
+    assert!(matches!(loading.failure(), CacheError::Poisoned { .. }));
+    assert!(matches!(waiting.failure(), CacheError::Poisoned { .. }));
+    let (late, _) = rig.fetch(2);
+    match late.failure() {
+        CacheError::Poisoned { why } => assert!(why.contains("hand-off"), "the panic's text is kept: {why}"),
+        other => panic!("expected a poisoned owner, got {other:?}"),
+    }
+    locked(&rig.lane.state).panic_offer = false;
+    let closed = rig.cache.close();
+    rig.poll();
+    assert!(
+        closed.wait(HANG).is_ok(),
+        "the close never ended after a panic poisoned the owner"
+    );
+    assert_eq!(rig.lane.units.load(Ordering::SeqCst), 0, "the load's unit never ended");
+}
+
+#[test]
+fn a_request_in_the_record_that_panicked_is_told_it_was_abandoned() {
+    let rig = Rig::new(Settings::default());
+    locked(&rig.lane.state).panic_admit = true;
+    let (told, _) = rig.fetch(0);
     assert!(matches!(told.failure(), CacheError::Abandoned { .. }));
-    assert!(matches!(waiting.failure(), CacheError::Abandoned { .. }));
-    assert!(matches!(third.failure(), CacheError::Abandoned { .. }));
+    let (late, _) = rig.fetch(1);
+    assert!(matches!(late.failure(), CacheError::Poisoned { .. }));
+}
+
+#[test]
+fn a_listener_that_panics_does_not_stop_the_load_from_retiring_or_the_close_or_the_listeners_after_it() {
+    let rig = Rig::new(Settings::default());
+    rig.ask(0, Box::new(|_| panic!("the listener of the first request panicked")));
+    let (second, _) = rig.fetch(1);
+    rig.settle();
+    drop(second.lease());
+    let closed = rig.cache.close();
+    rig.poll();
+    assert!(
+        closed.wait(HANG).is_ok(),
+        "the close never ended after a listener panicked while a copy was submitted"
+    );
+    assert_eq!(rig.lane.units.load(Ordering::SeqCst), 0, "the load's unit never ended");
+    let (late, _) = rig.fetch(2);
+    assert_eq!(
+        late.failure(),
+        CacheError::Closed,
+        "a listener's panic poisoned the owner"
+    );
 }
 
 #[test]

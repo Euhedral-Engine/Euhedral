@@ -54,8 +54,8 @@ pub enum SubmitFailure {
     Busy,
     /// Nothing was queued and the lane cannot take it.
     Refused(String),
-    /// The copy may be queued: the lane failed after it was taken. The job's staging bytes must not be reused, so the
-    /// job is leaked with the failure.
+    /// The copy may be queued without a marker: the lane failed after the work was taken. The job's staging bytes stay
+    /// as they are until a later [`CopyLane::mark`] retires.
     Uncertain(String),
 }
 
@@ -64,6 +64,11 @@ pub trait CopyLane: Send + Sync {
     /// Queues `job` behind its waits and returns the marker its retirement is told by. The caller keeps the job (and so
     /// its staging lease) until that retirement. Never waits.
     fn submit(&self, job: &CopyJob) -> Result<Marker, SubmitFailure>;
+
+    /// A marker behind everything submitted on the lane so far, with no work of its own: its retirement says that every
+    /// copy submitted before it, a copy that failed with [`SubmitFailure::Uncertain`] included, has run. `Busy` when the
+    /// lane has no room for a marker.
+    fn mark(&self) -> Result<Marker, SubmitFailure>;
 
     /// Runs `frame` once the lane has room again (a copy was refused as `Busy`). Never waits.
     fn when_room(&self, frame: Box<dyn Frame>);

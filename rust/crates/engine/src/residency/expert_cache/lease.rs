@@ -5,12 +5,20 @@ use std::sync::Arc;
 
 use euhedral_graph::Marker;
 
-use super::owner::{Message, Owner};
-use crate::generation::Address;
+use super::host::DeviceSlots;
+use super::owner::Message;
+use super::source::Inbox;
 use crate::residency::experts::ExpertId;
 
-/// A leased expert. Dropping it tells the cache's owner, which unpins the slot: nothing waits, and a lease dropped on
-/// any thread is let go in the owner's own turn.
+/// What a lease holds of the cache: where it posts its release, and the pool's slots, which stay leased while any lease is
+/// out, whatever became of the cache.
+pub(super) struct Home {
+    pub inbox: Arc<Inbox>,
+    pub _slots: Arc<DeviceSlots>,
+}
+
+/// A leased expert. Dropping it posts to the cache's owner, which unpins the slot in its next turn: nothing waits and
+/// nothing runs on the dropping thread.
 pub struct ExpertLease {
     id: ExpertId,
     slot: u32,
@@ -19,12 +27,12 @@ pub struct ExpertLease {
     bytes: u64,
     ready: Option<Marker>,
     fence: Option<Marker>,
-    owner: Arc<Address<Owner>>,
+    home: Home,
 }
 
 impl ExpertLease {
     pub(super) fn new(
-        owner: Arc<Address<Owner>>,
+        home: Home,
         id: ExpertId,
         slot: u32,
         generation: u64,
@@ -40,7 +48,7 @@ impl ExpertLease {
             bytes,
             ready,
             fence: None,
-            owner,
+            home,
         }
     }
 
@@ -73,7 +81,7 @@ impl ExpertLease {
 
 impl Drop for ExpertLease {
     fn drop(&mut self) {
-        self.owner.post(Message::Release {
+        self.home.inbox.post(Message::Release {
             slot: self.slot,
             generation: self.generation,
             fence: self.fence,

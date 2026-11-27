@@ -1,6 +1,7 @@
 //! The engine's implementations of the cache's two interfaces: the frames go to the `stages` lake and the copies run on
 //! one transfer lane of the runtime, retiring through its completions.
 
+use std::cell::Cell;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
@@ -90,23 +91,47 @@ impl CopyLane for RuntimeLanes {
         // SAFETY: the device address is the slot of a pool the cache leased; the cache never leases a slot out for
         // anything else while this load is out.
         let destination = unsafe { DevicePtr::from_raw(job.device) };
+        let copied = Cell::new(false);
         let queued = self.core.lane_table().submit_ops(lane, false, |ops| {
             // SAFETY: the job, which holds the staging slot's read lease, is kept by the caller until the marker this
             // submission returns has completed, so the bytes stay alive and unmodified until the copy has run.
-            unsafe { ops.copy_upload_to_device(destination, buffer, offset, job.bytes) }
+            let result = unsafe { ops.copy_upload_to_device(destination, buffer, offset, job.bytes) };
+            copied.set(result.is_ok());
+            result
         });
         match queued {
             Ok(((), marker)) => Ok(marker),
             Err(SubmitError::Busy) => Err(SubmitFailure::Busy),
-            // The work's own refusal included: the copy call may have queued part of itself before it failed.
-            Err(error) => Err(SubmitFailure::Uncertain(error.to_string())),
+            // The work's own refusal (validation, or the copy call failing): the lane queued nothing of it.
+            Err(SubmitError::Work(why)) => Err(SubmitFailure::Refused(why)),
+            // The copy was queued and the lane failed after it (the marker, the claim): it may still run, with no
+            // marker to say when. A failure before the copy was made queued nothing.
+            Err(SubmitError::Lane(error)) if copied.get() => Err(SubmitFailure::Uncertain(error.to_string())),
+            Err(SubmitError::Lane(error)) => Err(SubmitFailure::Refused(error.to_string())),
+        }
+    }
+
+    fn mark(&self) -> Result<Marker, SubmitFailure> {
+        match self
+            .core
+            .lane_table()
+            .submit_ops(self.lane(), false, |_| Ok::<(), String>(()))
+        {
+            Ok(((), marker)) => Ok(marker),
+            Err(SubmitError::Busy) => Err(SubmitFailure::Busy),
+            Err(error) => Err(SubmitFailure::Refused(error.to_string())),
         }
     }
 
     fn when_room(&self, frame: Box<dyn Frame>) {
         let stages = Arc::clone(&self.core.stages);
         retry_or_offer(&**self.lane(), self.core.completions(), frame, |frame| {
-            let _ = stages.offer(frame);
+            // The lake took none (it is closed): the frame runs here, so the load it carries ends rather than hangs.
+            if let Err(mut refused) = stages.offer(frame)
+                && let Err(error) = refused.execute()
+            {
+                log::error!("a retried expert copy failed on the calling thread: {error:?}");
+            }
         });
     }
 }

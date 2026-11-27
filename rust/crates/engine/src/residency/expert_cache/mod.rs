@@ -1,8 +1,13 @@
 //! The device cache of routed experts under the Flash-Next MoE layer: resident experts are leased at once, misses are
 //! loaded from the host expert store, and nothing waits on a lock.
 //!
-//! - [`stats`]: the counters the engine's metrics read.
+//! - `cache`: the public face, [`ExpertCache`]: it posts requests to the owner and closes.
+//! - `source`: the owner as a source of the lattice, and the inbox every record is posted to.
+//! - `owner`: the bookkeeping that applies the records: loads, waiting requests, staging and the tier.
 //! - `shard`: the bookkeeping of the device slots (S3-FIFO over slots that leases pin).
+//! - `lease`: the right to use one slot.
+//! - `host`: the interfaces to the lake and the copy lane; `lanes` is the engine's implementation of them.
+//! - [`stats`]: the counters the engine's metrics read.
 
 mod cache;
 mod host;
@@ -10,6 +15,7 @@ mod lanes;
 mod lease;
 mod owner;
 mod shard;
+mod source;
 pub mod stats;
 
 #[cfg(test)]
@@ -52,6 +58,10 @@ pub enum CacheError {
     Reads { reads: usize },
     #[error("the cache was abandoned: {why}")]
     Abandoned { why: String },
+    #[error("the cache's owner panicked and serves no more: {why}")]
+    Poisoned { why: String },
+    #[error("every one of the {lost} staging slots is lost to a failed copy: no load can start")]
+    StagingLost { lost: u32 },
     #[error("loading expert {expert} of bank {bank} failed: {why}")]
     Transfer { bank: String, expert: u32, why: String },
     #[error("{loads} expert transfers are still in flight")]
