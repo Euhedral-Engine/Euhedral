@@ -181,6 +181,54 @@ impl World {
         World { lattice, io, host }
     }
 
+    /// A world whose `AsyncIo` no lattice drives: a call that reads or writes through it goes no further than the
+    /// steps [`World::drive_until`] runs, so a test holds the call in flight at a step and looks at what it holds.
+    pub fn driven() -> World {
+        let settings = Settings::with_model(ModelSettings::default());
+        let lattice = ControlPlaneLattice::new(lattice_config(&settings)).unwrap();
+        let io = AsyncIo::open().unwrap();
+        let host = Lake::new(Arc::clone(&lattice), NonZeroUsize::new(2).unwrap(), LONGEST);
+        World { lattice, io, host }
+    }
+
+    /// Runs the next step of the hand-driven `io`, where this thread stands: waits until a frame is ready, runs the
+    /// frames that are, and returns. Nothing else of the call's chain runs until the next step.
+    pub fn drive_step(&self) {
+        let begun = Instant::now();
+        loop {
+            assert!(begun.elapsed() < LONGEST, "no step of the call became ready");
+            self.io.reap();
+            let mut frames = Vec::new();
+            self.io.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+            if frames.is_empty() {
+                continue;
+            }
+            for mut frame in frames {
+                let _ = frame.execute();
+                frame.do_finally();
+            }
+            return;
+        }
+    }
+
+    /// Runs the steps of the hand-driven `io` until `ended` has its value.
+    pub fn drive_until<T>(&self, ended: &Arc<Handoff<T>>) -> T {
+        let begun = Instant::now();
+        loop {
+            if let Some(value) = ended.take() {
+                return value;
+            }
+            assert!(begun.elapsed() < LONGEST, "the call never ended");
+            self.io.reap();
+            let mut frames = Vec::new();
+            self.io.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+            for mut frame in frames {
+                let _ = frame.execute();
+                frame.do_finally();
+            }
+        }
+    }
+
     /// Starts a call and waits, outside the lattice, for the value its callback is given.
     pub fn call<T: Send + 'static>(
         &self,

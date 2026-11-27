@@ -35,6 +35,7 @@ use euhedral_inference_settings::Settings;
 use euhedral_io::{IoBuf, IoDone, OpenSpec, OwnedFile};
 use euhedral_memory::Claim;
 
+use crate::artifact_guard::{ArtifactGuard, GuardError, admit_held};
 use crate::composite::{Composed, Composite, compose, composed_depth, refuse_replaced_on_disk};
 use crate::error::{EngineError, PlanError};
 use crate::frames::{Kind, step};
@@ -393,6 +394,20 @@ pub(crate) fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
     (file.metadata().map(|metadata| metadata.len()), OwnedFile::from(file))
 }
 
+/// Checks that `file`, opened by `path`, is the file the engine holds, and gives the file back.
+fn admitted(guards: &[ArtifactGuard], path: &Path, file: OwnedFile) -> (Result<(), GuardError>, OwnedFile) {
+    let file = File::from(file);
+    (admit_held(guards, path, &file), OwnedFile::from(file))
+}
+
+/// Opens the artifact at `path` for the disk tier's reads, refusing a handle that is not the file the engine holds.
+fn open_artifact(guards: &[ArtifactGuard], path: &Path) -> Result<ArtifactFile, EngineError> {
+    ArtifactFile::open_admitted(path, |opened| {
+        admit_held(guards, path, opened).map_err(io::Error::other)
+    })
+    .map_err(|error| EngineError::io(format!("opening {}", path.display()), error))
+}
+
 /// Reads the header and the footer, then the metadata and the table they locate.
 fn indexed(
     startup: Startup,
@@ -401,6 +416,11 @@ fn indexed(
     with_metadata: bool,
     next: impl FnOnce(Startup, Indexed) + Send + 'static,
 ) {
+    // The open went by the name: it must have found the file the engine holds.
+    let (admitted, file) = admitted(&startup.core.guards, &path, file);
+    if let Err(error) = admitted {
+        return startup.fail(error.into());
+    }
     let (length, file) = file_len(file);
     let length = match length {
         Ok(length) => length,
@@ -973,8 +993,7 @@ fn disk_tier(
     let buffer = Arc::new(PinnedBuffer::alloc(&core.library, size)?);
     let window = DiskWindow::new(Arc::clone(&buffer), geometry)
         .map_err(|error| EngineError::Runtime(format!("the disk window: {error}")))?;
-    let file =
-        ArtifactFile::open(path).map_err(|error| EngineError::io(format!("opening {}", path.display()), error))?;
+    let file = open_artifact(&core.guards, path)?;
     let piece = DiskReadPiece::from_setting(core.settings.memory.disk_read_piece).map_err(EngineError::Runtime)?;
     let port = FilePort::new(Arc::clone(&core.io), Arc::new(file), window, piece);
     let reader = DiskReader::new(Arc::new(port), geometry, Generation::spawner(core));
@@ -1469,6 +1488,7 @@ fn tensors(
     reason = "the tests start threads to race senders, and join them"
 )]
 mod tests {
+    use std::fs;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration;
@@ -1477,6 +1497,51 @@ mod tests {
 
     use super::*;
     use crate::residency::offload::{StagingGeometry, WindowGeometry};
+
+    /// A held file, and the same name after another file was renamed over it.
+    #[cfg(unix)]
+    fn held_then_replaced() -> (tempfile::TempDir, PathBuf, Vec<ArtifactGuard>) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.edrl");
+        fs::write(&path, b"held").unwrap();
+        let guards = vec![ArtifactGuard::hold(&path).unwrap()];
+        let replacement = directory.path().join("replacement.edrl");
+        fs::write(&replacement, b"other").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        (directory, path, guards)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_index_open_that_found_another_file_is_refused_by_path_and_the_held_one_is_admitted() {
+        let (_directory, path, guards) = held_then_replaced();
+        let (refusal, _file) = admitted(&guards, &path, OwnedFile::from(File::open(&path).unwrap()));
+        let refusal = refusal.unwrap_err();
+        assert!(matches!(refusal, GuardError::Replaced { .. }));
+        assert!(refusal.to_string().contains(&path.display().to_string()));
+        let held = guards[0].path().to_path_buf();
+        assert_eq!(held, path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_disk_tier_open_that_found_another_file_is_refused_by_path() {
+        let (_directory, path, guards) = held_then_replaced();
+        let refusal = open_artifact(&guards, &path).unwrap_err().to_string();
+        assert!(refusal.contains(&path.display().to_string()), "{refusal}");
+        assert!(refusal.contains("not the file the engine holds"), "{refusal}");
+    }
+
+    #[test]
+    fn a_disk_tier_open_of_the_held_file_is_admitted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.edrl");
+        fs::write(&path, b"held").unwrap();
+        let guards = vec![ArtifactGuard::hold(&path).unwrap()];
+        assert_eq!(open_artifact(&guards, &path).unwrap().len(), 4);
+        let (admitted, _file) = admitted(&guards, &path, OwnedFile::from(File::open(&path).unwrap()));
+        admitted.unwrap();
+    }
 
     #[test]
     fn the_transfer_lane_cap_follows_the_librarys_lane_limit() {

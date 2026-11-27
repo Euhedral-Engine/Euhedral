@@ -21,15 +21,15 @@ use std::num::NonZeroUsize;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
 use euhedral_graph::Lake;
 use euhedral_inference_edrl::tiny::TinyArtifact;
 use euhedral_inference_edrl::{FOOTER_BYTES, TokenizerFooter, TokenizerSection};
-use euhedral_inference_engine::lattice_config;
+use euhedral_inference_engine::{ArtifactGuard, GuardError, lattice_config};
 use euhedral_inference_quantization::package_error::PackageError;
 use euhedral_inference_quantization::package_tokenizer::{PackageRequest, Packaged, package_tokenizer};
 use euhedral_inference_quantization::tokenizer_files::TokenizerFiles;
@@ -125,12 +125,19 @@ struct Run {
 
 impl Run {
     fn start() -> Run {
+        let run = Run::driven();
+        run.lattice
+            .add_upstream(Arc::clone(&run.io) as Arc<dyn LatticeSource>)
+            .expect("the lattice takes the I/O");
+        run
+    }
+
+    /// A run whose `AsyncIo` no lattice drives: it goes no further than the steps `drive` runs, so a test holds it in
+    /// flight and looks at what it holds.
+    fn driven() -> Run {
         let settings = Settings::with_model(ModelSettings::default());
         let lattice = ControlPlaneLattice::new(lattice_config(&settings)).expect("the lattice starts");
         let io = AsyncIo::open().expect("the asynchronous I/O opens");
-        lattice
-            .add_upstream(Arc::clone(&io) as Arc<dyn LatticeSource>)
-            .expect("the lattice takes the I/O");
         let host = Lake::new(
             Arc::clone(&lattice),
             NonZeroUsize::new(2).unwrap(),
@@ -139,7 +146,7 @@ impl Run {
         Run { lattice, io, host }
     }
 
-    fn package(&self, request: PackageRequest) -> Result<Packaged, PackageError> {
+    fn begin(&self, request: PackageRequest) -> Result<Receiver<Result<Packaged, PackageError>>, PackageError> {
         let (sender, receiver) = mpsc::channel();
         package_tokenizer(
             Arc::clone(&self.io),
@@ -149,7 +156,53 @@ impl Run {
                 sender.send(result).unwrap();
             }),
         )?;
+        Ok(receiver)
+    }
+
+    fn package(&self, request: PackageRequest) -> Result<Packaged, PackageError> {
+        let receiver = self.begin(request)?;
         receiver.recv_timeout(Duration::from_secs(60)).expect("the run reports")
+    }
+
+    /// Runs the next step of the hand-driven `io`, where this thread stands: waits until a frame is ready and runs the
+    /// frames that are. The run goes no further until the next step.
+    fn drive_step(&self) {
+        let begun = Instant::now();
+        loop {
+            assert!(
+                begun.elapsed() < Duration::from_secs(60),
+                "no step of the run became ready"
+            );
+            self.io.reap();
+            let mut frames = Vec::new();
+            self.io.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+            if frames.is_empty() {
+                continue;
+            }
+            for mut frame in frames {
+                let _ = frame.execute();
+                frame.do_finally();
+            }
+            return;
+        }
+    }
+
+    /// Runs the steps of the hand-driven `io`, where this thread stands, until the run reports.
+    fn drive(&self, receiver: &Receiver<Result<Packaged, PackageError>>) -> Result<Packaged, PackageError> {
+        let begun = Instant::now();
+        loop {
+            if let Ok(result) = receiver.try_recv() {
+                return result;
+            }
+            assert!(begun.elapsed() < Duration::from_secs(60), "the run never reported");
+            self.io.reap();
+            let mut frames = Vec::new();
+            self.io.pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+            for mut frame in frames {
+                let _ = frame.execute();
+                frame.do_finally();
+            }
+        }
     }
 }
 
@@ -402,6 +455,70 @@ fn the_special_tokens_keep_the_ids_the_generation_config_sets_in_a_fixed_order()
     );
     assert_eq!(files(r#"{"top_k": 20}"#), "{}");
     assert_eq!(files("[]"), "{}");
+}
+
+#[test]
+fn an_artifact_a_running_engine_holds_is_refused_by_path_and_not_written_in_place() {
+    let run = Run::start();
+    let fixture = Fixture::new(&Checkpoint::standard());
+    let guard = ArtifactGuard::hold(&fixture.artifact()).unwrap();
+    let error = run.package(fixture.in_place()).unwrap_err().to_string();
+    assert!(error.contains(&fixture.artifact().display().to_string()), "{error}");
+    assert_eq!(
+        fs::read(fixture.artifact()).unwrap(),
+        fixture.content,
+        "the artifact is untouched"
+    );
+    drop(guard);
+    run.package(fixture.in_place()).unwrap();
+}
+
+#[test]
+fn an_output_a_running_engine_holds_is_refused_by_path_and_not_replaced() {
+    let run = Run::start();
+    let fixture = Fixture::new(&Checkpoint::standard());
+    fs::write(fixture.path("out.edrl"), b"served").unwrap();
+    let guard = ArtifactGuard::hold(&fixture.path("out.edrl")).unwrap();
+    let error = run.package(fixture.to_output()).unwrap_err().to_string();
+    assert!(
+        error.contains(&fixture.path("out.edrl").display().to_string()),
+        "{error}"
+    );
+    assert_eq!(fs::read(fixture.path("out.edrl")).unwrap(), b"served");
+    drop(guard);
+    run.package(fixture.to_output()).unwrap();
+}
+
+#[test]
+fn a_run_keeps_its_claim_on_the_file_it_writes_until_it_reports() {
+    // On Windows a claim holds nothing (the engine's guard stops a write at its open), so only the Unix lock shows.
+    if cfg!(windows) {
+        return;
+    }
+    let run = Run::driven();
+    for in_place in [true, false] {
+        let fixture = Fixture::new(&Checkpoint::standard());
+        fs::write(fixture.path("out.edrl"), b"served").unwrap();
+        let request = if in_place {
+            fixture.in_place()
+        } else {
+            fixture.to_output()
+        };
+        let written = request.out.clone().unwrap_or_else(|| request.artifact.clone());
+        let receiver = run.begin(request).unwrap();
+        // In flight: the run reads through the hand-driven I/O, which has not stepped.
+        let refusal = ArtifactGuard::hold(&written).unwrap_err();
+        assert!(matches!(refusal, GuardError::Held { .. }), "{refusal}");
+        // After its first step the run has gone on and still waits for the next one.
+        run.drive_step();
+        let refusal = ArtifactGuard::hold(&written).unwrap_err();
+        assert!(
+            matches!(refusal, GuardError::Held { .. }),
+            "after the first step: {refusal}"
+        );
+        run.drive(&receiver).unwrap();
+        drop(ArtifactGuard::hold(&written).unwrap());
+    }
 }
 
 #[test]

@@ -8,6 +8,8 @@ use euhedral_inference_cuda::CudaError;
 use euhedral_inference_edrl::EdrlError;
 use thiserror::Error;
 
+use crate::artifact_guard::GuardError;
+
 /// What a refusal says is too large: one context, or the contexts of several sequences.
 fn what_does_not_fit(sequences: usize) -> String {
     if sequences > 1 {
@@ -237,6 +239,11 @@ pub enum EngineError {
         #[source]
         source: io::Error,
     },
+
+    /// The artifact could not be held against change (another engine or writer has it, or its file system takes no
+    /// locks).
+    #[error(transparent)]
+    Guard(#[from] GuardError),
 
     /// The runtime could not start the lattice or one of its sources.
     #[error("{0}")]

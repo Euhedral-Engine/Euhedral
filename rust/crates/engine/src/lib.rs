@@ -1,6 +1,7 @@
 //! The Qwen3.8 engine on RustEE: the runtime, the residency planner, the weight loader, the workspace and the
 //! sequence state.
 
+pub mod artifact_guard;
 pub mod composite;
 pub mod error;
 pub mod flash;
@@ -24,6 +25,7 @@ pub mod summary;
 mod warmup;
 pub mod workspace;
 
+pub use artifact_guard::{ArtifactGuard, GuardError, WriteClaim};
 pub use composite::{Composite, Replacement};
 pub use handoff::{Handoff, TimedOut};
 pub use runtime::{
