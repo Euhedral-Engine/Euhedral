@@ -27,6 +27,7 @@ pub mod block;
 pub mod buffers;
 pub mod embed;
 pub mod gdn;
+pub mod head;
 pub mod hyper;
 pub mod kernels;
 pub mod linear;
@@ -39,6 +40,7 @@ pub mod qsa;
 pub mod sequence;
 pub mod start;
 pub mod startup;
+pub mod step;
 
 use euhedral_inference_cuda::DevicePtr;
 use thiserror::Error;

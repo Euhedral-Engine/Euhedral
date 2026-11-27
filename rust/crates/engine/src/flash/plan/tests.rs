@@ -7,11 +7,17 @@ fn kinds(plan: &DensePlan) -> Vec<NodeKind> {
 }
 
 #[test]
-fn the_tiny_model_has_the_embedding_its_n_gram_roots_both_layers_and_the_final_mix() {
+fn the_tiny_model_has_the_embedding_its_n_gram_roots_both_layers_the_final_mix_and_the_head() {
     let plan = DensePlan::from_config(&tiny_config()).unwrap();
     let mut expected = vec![NodeKind::Embed, NodeKind::Block(0), NodeKind::End(0), NodeKind::PleIds];
     expected.extend((0..PARTS).map(NodeKind::PleGather));
-    expected.extend([NodeKind::Ple, NodeKind::Block(1), NodeKind::End(1), NodeKind::FinalMix]);
+    expected.extend([
+        NodeKind::Ple,
+        NodeKind::Block(1),
+        NodeKind::End(1),
+        NodeKind::FinalMix,
+        NodeKind::Head,
+    ]);
     assert_eq!(kinds(&plan), expected);
 }
 
@@ -43,6 +49,8 @@ fn each_layer_runs_its_block_then_its_end_injection_then_the_next_layer() {
     assert_eq!(plan.nodes()[at(NodeKind::Block(0))].after, [at(NodeKind::Embed)]);
     assert_eq!(plan.nodes()[at(NodeKind::End(0))].after, [at(NodeKind::Block(0))]);
     assert_eq!(plan.nodes()[at(NodeKind::FinalMix)].after, [at(NodeKind::End(1))]);
+    assert_eq!(plan.nodes()[at(NodeKind::Head)].after, [at(NodeKind::FinalMix)]);
+    assert_eq!(at(NodeKind::Head), plan.nodes().len() - 1, "the head is the last node");
 }
 
 #[test]
@@ -58,7 +66,8 @@ fn a_model_without_the_n_gram_layer_has_no_host_roots() {
             NodeKind::End(0),
             NodeKind::Block(1),
             NodeKind::End(1),
-            NodeKind::FinalMix
+            NodeKind::FinalMix,
+            NodeKind::Head
         ]
     );
 }

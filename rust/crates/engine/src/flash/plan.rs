@@ -1,6 +1,6 @@
 //! The nodes and edges of the dense part of a Flash-Next quantum (`ExecutionPlan`'s stage list for the non-diagnostic
 //! shape): the embedding, the n-gram embedding's host roots and its device stage at the layer that holds it, and for
-//! each layer the block, the layer's mixture of experts and the end injection, then the final mix.
+//! each layer the block, the layer's mixture of experts and the end injection, then the final mix and the head.
 //!
 //! The nodes are what a session builds a stage for; [`DensePlan::spec`] is the RustEE graph over them. A plan made
 //! with [`DensePlan::with_moe`] puts a layer's MoE nodes between its block and its end injection (the shape of
@@ -33,6 +33,8 @@ pub enum NodeKind {
     End(usize),
     /// The final mixer over the last row.
     FinalMix,
+    /// The logits of the last row and the copy of what the host reads of them.
+    Head,
     /// The router of layer `n`'s MoE block, and the copy of its choice to the host.
     MoeRoute(usize),
     /// The shared expert of layer `n`.
@@ -63,6 +65,7 @@ impl NodeKind {
             NodeKind::Block(_) => "flash block",
             NodeKind::End(_) => "flash end inject",
             NodeKind::FinalMix => "flash final mix",
+            NodeKind::Head => "flash head",
             NodeKind::MoeRoute(_) => "flash moe route",
             NodeKind::MoeShared(_) => "flash moe shared",
             NodeKind::MoePlan(_) => "flash moe plan",
@@ -162,6 +165,7 @@ impl DensePlan {
             last = nodes.len() - 1;
         }
         nodes.push(Node::new(NodeKind::FinalMix, vec![last]));
+        nodes.push(Node::new(NodeKind::Head, vec![nodes.len() - 1]));
         Ok(Self { nodes })
     }
 
