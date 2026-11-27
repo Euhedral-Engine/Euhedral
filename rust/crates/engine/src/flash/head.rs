@@ -125,27 +125,41 @@ impl HeadStage {
         }
     }
 
-    /// What the host reads, from what the quantum offers: the row when it has a row readback (whose rows are
-    /// `row_bytes` bytes), else the key of its selection at `keys`.
-    pub fn select(&self, row_bytes: Option<usize>, keys: Option<DevicePtr>) -> Result<Select, FlashError> {
-        if let Some(bytes) = row_bytes {
-            if bytes as u64 != self.row_bytes() {
-                return Err(FlashError::refused(
-                    OP,
-                    format!(
-                        "the row readback holds rows of {bytes} bytes, the logits row is {}",
-                        self.row_bytes()
-                    ),
-                ));
-            }
-            return Ok(Select::Row);
+    /// Where the head's row goes and how the host reads it, from what the quantum scores and offers: `logits_rows`
+    /// rows (the head writes one: the last of one sequence's rows), a row readback (`row_bytes` of its rows and where
+    /// they are copied to) and a selection (its keys and where they are copied to). The row readback wins when both
+    /// are offered. Refuses a count of rows other than one, a readback of another row size and an offer of neither.
+    pub fn route<D>(
+        &self,
+        logits_rows: usize,
+        row: Option<(usize, D)>,
+        keys: Option<(DevicePtr, D)>,
+    ) -> Result<(Select, D), FlashError> {
+        if logits_rows != 1 {
+            return Err(FlashError::refused(
+                OP,
+                format!("the head writes one logits row, the quantum scores {logits_rows}"),
+            ));
         }
-        keys.map(Select::Key).ok_or_else(|| {
-            FlashError::refused(
+        match (row, keys) {
+            (Some((bytes, destination)), _) => {
+                if bytes as u64 != self.row_bytes() {
+                    return Err(FlashError::refused(
+                        OP,
+                        format!(
+                            "the row readback holds rows of {bytes} bytes, the logits row is {}",
+                            self.row_bytes()
+                        ),
+                    ));
+                }
+                Ok((Select::Row, destination))
+            }
+            (None, Some((keys, destination))) => Ok((Select::Key(keys), destination)),
+            (None, None) => Err(FlashError::refused(
                 OP,
                 "a quantum that scores a row has neither a selection nor a row readback".to_owned(),
-            )
-        })
+            )),
+        }
     }
 }
 
@@ -158,34 +172,22 @@ impl Launch for HeadStage {
         if self.idle(quantum) {
             return Ok(());
         }
-        // The head writes one row: the last of one sequence's rows.
         let [segment] = quantum.segments() else {
             return Err(fatal(format!(
                 "the head serves one sequence, the quantum has {} segments",
                 quantum.segments().len()
             )));
         };
-        if quantum.logits_rows != 1 {
-            return Err(fatal(format!(
-                "the head writes one logits row, the quantum scores {}",
-                quantum.logits_rows
-            )));
-        }
-        let select = self
-            .select(
-                segment
-                    .row_readback
-                    .as_ref()
-                    .map(|rows| rows.row(0).map_or(0, <[u8]>::len)),
-                segment.selection.as_ref().map(|selection| selection.device_keys()),
-            )
-            .map_err(fatal)?;
-        // The pinned buffer belongs to the quantum, which retires only after the marker that follows this launch.
-        let destination = match (&segment.row_readback, &segment.selection) {
-            (Some(rows), _) => rows.pinned(),
-            (None, Some(selection)) => selection.readback(),
-            (None, None) => return Err(fatal("a quantum that scores a row has nowhere to copy it")),
-        };
+        let row = segment
+            .row_readback
+            .as_ref()
+            // The pinned buffer belongs to the quantum, which retires only after the marker that follows this launch.
+            .map(|rows| (rows.row(0).map_or(0, <[u8]>::len), rows.pinned()));
+        let keys = segment
+            .selection
+            .as_ref()
+            .map(|selection| (selection.device_keys(), selection.readback()));
+        let (select, destination) = self.route(quantum.logits_rows, row, keys).map_err(fatal)?;
         let mut list = self.ops(kernels.exact_numerics(), select).map_err(fatal)?;
         let (source, bytes) = self.readback(select);
         list.push(Op::Readback {

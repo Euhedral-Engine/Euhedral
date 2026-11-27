@@ -18,6 +18,29 @@ fn a_row_count_takes_the_bucket_javas_row_bucket_gives_it() {
 }
 
 #[test]
+fn a_step_starts_on_the_graph_in_the_place_of_its_bucket_among_the_sizes() {
+    let buckets = Buckets::new(512, 256, 8).unwrap();
+    let places: Vec<usize> = [1, 2, 16, 17, 512]
+        .into_iter()
+        .map(|rows| buckets.index_for(rows).unwrap())
+        .collect();
+    assert_eq!(places, [0, 1, 1, 2, 2]);
+    // With no middle bucket the graphs are two, and the second serves every step above one row.
+    let small = Buckets::new(8, 3, 2).unwrap();
+    assert_eq!([1, 2, 8].map(|rows| small.index_for(rows).unwrap()), [0, 1, 1]);
+    assert_eq!(Buckets::new(1, 3, 2).unwrap().index_for(1).unwrap(), 0);
+}
+
+#[test]
+fn a_step_with_no_graph_to_start_on_is_refused_naming_the_rows() {
+    let buckets = Buckets::new(512, 256, 8).unwrap();
+    assert!(buckets.index_for(0).is_err());
+    assert!(buckets.index_for(513).unwrap_err().to_string().contains("513"));
+    let wide = buckets.index_for(usize::MAX).unwrap_err().to_string();
+    assert!(wide.contains(&usize::MAX.to_string()), "{wide}");
+}
+
+#[test]
 fn a_model_whose_largest_step_is_under_sixteen_rows_has_no_middle_bucket() {
     let buckets = Buckets::new(8, 3, 2).unwrap();
     assert_eq!(buckets.sizes().as_slice(), [1, 8]);

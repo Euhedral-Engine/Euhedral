@@ -95,17 +95,38 @@ fn a_head_the_weights_or_the_logits_cannot_honour_is_refused() {
 }
 
 #[test]
-fn the_host_reads_the_row_when_the_quantum_has_a_row_readback_else_the_key_and_refuses_neither() {
+fn the_host_reads_the_row_to_its_readback_when_the_quantum_has_one_else_the_key_to_the_selections_and_refuses_neither()
+{
     let stage = head();
     let keys = at(0x300000);
     let row = VOCABULARY as usize * 2;
-    assert_eq!(stage.select(Some(row), None).unwrap(), Select::Row);
-    assert_eq!(stage.select(Some(row), Some(keys)).unwrap(), Select::Row);
-    assert_eq!(stage.select(None, Some(keys)).unwrap(), Select::Key(keys));
-    assert!(stage.select(None, None).is_err());
-    let message = stage.select(Some(row + 2), Some(keys)).unwrap_err().to_string();
+    assert_eq!(stage.route(1, Some((row, "row")), None).unwrap(), (Select::Row, "row"));
+    assert_eq!(
+        stage.route(1, Some((row, "row")), Some((keys, "key"))).unwrap(),
+        (Select::Row, "row"),
+        "the row readback wins when both are offered"
+    );
+    assert_eq!(
+        stage.route(1, None, Some((keys, "key"))).unwrap(),
+        (Select::Key(keys), "key")
+    );
+    assert!(stage.route::<&str>(1, None, None).is_err());
+    let message = stage
+        .route(1, Some((row + 2, "row")), Some((keys, "key")))
+        .unwrap_err()
+        .to_string();
     assert!(
         message.contains(&(row + 2).to_string()) && message.contains(&row.to_string()),
         "{message}"
     );
+}
+
+#[test]
+fn a_head_refuses_a_quantum_that_scores_any_other_count_of_rows_than_one() {
+    let stage = head();
+    let row = VOCABULARY as usize * 2;
+    for rows in [0, 2, 9] {
+        let message = stage.route(rows, Some((row, ())), None).unwrap_err().to_string();
+        assert!(message.contains(&format!("scores {rows}")), "{message}");
+    }
 }

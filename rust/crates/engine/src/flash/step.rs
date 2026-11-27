@@ -93,6 +93,18 @@ impl Buckets {
         })
     }
 
+    /// Where the bucket of a step of `rows` rows is among the [`sizes`](Buckets::sizes): the place of its graph, which
+    /// [`FlashStep`] builds in that order. Refuses what [`bucket_for`](Buckets::bucket_for) refuses, and a count that
+    /// does not fit 32 bits.
+    pub fn index_for(&self, rows: usize) -> Result<usize, FlashError> {
+        let rows = u32::try_from(rows).map_err(|_| FlashError::refused(OP, format!("a step of {rows} rows")))?;
+        let bucket = self.bucket_for(rows)?;
+        self.sizes()
+            .iter()
+            .position(|size| *size == bucket)
+            .ok_or_else(|| FlashError::refused(OP, format!("no graph for the bucket of {bucket} rows")))
+    }
+
     /// The distinct buckets, ascending.
     pub fn sizes(&self) -> SmallVec<[u32; 3]> {
         let mut sizes: SmallVec<[u32; 3]> = [1, MIDDLE_BUCKET.min(self.max_rows), self.max_rows]
@@ -218,14 +230,11 @@ impl FlashStep {
     /// Starts `quantum`, whose input record the owner has prepared, on the graph of its bucket, behind `after` (the
     /// quantum before it on the workspace, until it retires).
     pub fn start(&self, quantum: Quantum, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StepError> {
-        let rows = u32::try_from(quantum.rows())
-            .map_err(|_| FlashError::refused(OP, format!("a step of {} rows", quantum.rows())))?;
-        let bucket = self.buckets.bucket_for(rows)?;
+        let index = self.buckets.index_for(quantum.rows())?;
         let entry = self
             .graphs
-            .iter()
-            .find(|entry| entry.bucket == bucket)
-            .ok_or_else(|| FlashError::refused(OP, format!("no graph for the bucket of {bucket} rows")))?;
+            .get(index)
+            .ok_or_else(|| FlashError::refused(OP, format!("no graph for the bucket of {} rows", quantum.rows())))?;
         let serial = quantum.id();
         let predecessors: SmallVec<[Predecessor<'_>; 4]> = after
             .iter()
