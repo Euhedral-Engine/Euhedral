@@ -375,30 +375,24 @@ impl Run {
     /// Ends the run when everything is settled: every chunk that started has been concluded, nothing more starts, and
     /// the count is recorded as far as it can be.
     fn settle(self: &Arc<Self>) {
-        let next = self.next.load(Ordering::SeqCst);
-        let failed = self.failed.load(Ordering::SeqCst);
-        if self.concluded.load(Ordering::SeqCst) != next
-            || !(failed || next >= self.limit.load(Ordering::SeqCst))
-            || self.marking.load(Ordering::SeqCst)
-            || (self.recorded.load(Ordering::SeqCst) != self.prefix.load(Ordering::SeqCst)
-                && !self.broken.load(Ordering::SeqCst))
-        {
-            return;
-        }
+        let completed = match settled(&**self) {
+            Settled::Pending => return,
+            Settled::Failed => None,
+            Settled::Done { completed } => Some(completed),
+        };
         if self.ended.swap(true, Ordering::SeqCst) {
             return;
         }
         drop(self.more.try_claim().and_then(|mut more| more.take()));
         drop(self.mark.try_claim().and_then(|mut mark| mark.take()));
-        let completed = self.recorded.load(Ordering::SeqCst);
         let partial = self.partial.try_claim().and_then(|mut partial| partial.take());
-        if failed {
+        let Some(completed) = completed else {
             drop(partial);
             let error = self.failure.try_claim().and_then(|mut failure| failure.take());
             return self.end(Err(
                 error.unwrap_or_else(|| ReferenceError::Engine("the run failed".to_owned()))
             ));
-        }
+        };
         let Some(mut partial) = partial else {
             return self.end(Err(ReferenceError::Engine("the partial file is gone".to_owned())));
         };
@@ -419,6 +413,87 @@ impl Run {
             }));
         }
     }
+}
+
+/// What `settle` reads, stage by stage, in the order the stages are called (`settled`). Every load is SeqCst.
+trait Reading {
+    /// The counters. `concluded` is loaded before `next`: both only grow and `concluded <= next`, so their equality
+    /// is one instant with no chunk in flight.
+    fn counters(&self) -> Counters;
+    /// Whether a count write is in flight. Called after `counters`: a count write sets `broken` and calls `fail`
+    /// while `marking` is held and releases it after, so a `marking` read of false after `broken` was seen true
+    /// follows that `fail`.
+    fn marking(&self) -> bool;
+    /// `(failed, limit)`. Called after the guard has passed: every chunk `fail` precedes its `concluded` increment,
+    /// so a passed guard makes this read see every `fail`. A `failed` read before the guard can miss one that lands
+    /// while the guard is still closed.
+    fn late(&self) -> (bool, usize);
+}
+
+impl Reading for Run {
+    fn counters(&self) -> Counters {
+        let concluded = self.concluded.load(Ordering::SeqCst);
+        let next = self.next.load(Ordering::SeqCst);
+        Counters {
+            concluded,
+            next,
+            recorded: self.recorded.load(Ordering::SeqCst),
+            prefix: self.prefix.load(Ordering::SeqCst),
+            broken: self.broken.load(Ordering::SeqCst),
+        }
+    }
+
+    fn marking(&self) -> bool {
+        self.marking.load(Ordering::SeqCst)
+    }
+
+    fn late(&self) -> (bool, usize) {
+        (self.failed.load(Ordering::SeqCst), self.limit.load(Ordering::SeqCst))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Counters {
+    next: usize,
+    concluded: usize,
+    recorded: usize,
+    prefix: usize,
+    broken: bool,
+}
+
+/// What a settle decides.
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// Something is still running or to be recorded: a later settle decides.
+    Pending,
+    /// The run ends with the recorded failure; the durable count covers the chunks before it.
+    Failed,
+    /// The run ends without a failure, with `completed` chunks durable.
+    Done { completed: usize },
+}
+
+/// Decides, reading `counters`, then `marking`, then `late` (only while the guard still holds), so each read is
+/// later than the ones before it. The guard is: every started chunk concluded, the count caught up with the prefix
+/// (or given up on), and no count write in flight.
+fn settled(reading: &impl Reading) -> Settled {
+    let Counters {
+        next,
+        concluded,
+        recorded,
+        prefix,
+        broken,
+    } = reading.counters();
+    if concluded != next || (recorded != prefix && !broken) || reading.marking() {
+        return Settled::Pending;
+    }
+    let (failed, limit) = reading.late();
+    if failed {
+        return Settled::Failed;
+    }
+    if next >= limit {
+        return Settled::Done { completed: recorded };
+    }
+    Settled::Pending
 }
 
 /// The shared state of one chunk's run. The chunk ends when the last holder lets go: the sink, and every frame that
@@ -529,5 +604,130 @@ impl LogitsSink for ReferenceSink {
 
     fn finished(&mut self, outcome: GenerationOutcome) {
         let _ = self.run.outcome.set(outcome);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::{Counters, Reading, Settled, settled};
+
+    /// A reading that records which stage was read, in order.
+    struct Fake {
+        counters: Counters,
+        marking: bool,
+        failed: bool,
+        limit: usize,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl Reading for Fake {
+        fn counters(&self) -> Counters {
+            self.calls.borrow_mut().push("counters");
+            self.counters
+        }
+
+        fn marking(&self) -> bool {
+            self.calls.borrow_mut().push("marking");
+            self.marking
+        }
+
+        fn late(&self) -> (bool, usize) {
+            self.calls.borrow_mut().push("late");
+            (self.failed, self.limit)
+        }
+    }
+
+    /// Three chunks all started and concluded, the count recorded over the prefix of `prefix` chunks.
+    fn quiet(prefix: usize) -> Counters {
+        Counters {
+            next: 3,
+            concluded: 3,
+            recorded: prefix,
+            prefix,
+            broken: false,
+        }
+    }
+
+    fn decide(counters: Counters, marking: bool, failed: bool, limit: usize) -> (Settled, Vec<&'static str>) {
+        let fake = Fake {
+            counters,
+            marking,
+            failed,
+            limit,
+            calls: RefCell::new(Vec::new()),
+        };
+        let outcome = settled(&fake);
+        (outcome, fake.calls.into_inner())
+    }
+
+    #[test]
+    fn a_run_that_is_not_quiet_is_pending_and_reads_nothing_late() {
+        let open = Counters {
+            concluded: 2,
+            ..quiet(1)
+        };
+        let lagging = Counters {
+            recorded: 0,
+            ..quiet(1)
+        };
+        for counters in [open, lagging] {
+            assert_eq!(decide(counters, false, true, 3), (Settled::Pending, vec!["counters"]));
+        }
+        assert_eq!(
+            decide(quiet(1), true, true, 3),
+            (Settled::Pending, vec!["counters", "marking"])
+        );
+    }
+
+    #[test]
+    fn the_stages_are_read_counters_then_marking_then_late() {
+        let (_, calls) = decide(quiet(3), false, false, 3);
+        assert_eq!(calls, vec!["counters", "marking", "late"]);
+    }
+
+    #[test]
+    fn a_failure_read_late_ends_the_run_with_the_error() {
+        assert_eq!(decide(quiet(1), false, true, 3).0, Settled::Failed);
+        assert_eq!(decide(quiet(0), false, true, 3).0, Settled::Failed);
+    }
+
+    #[test]
+    fn a_run_without_failure_is_done_with_the_recorded_count() {
+        assert_eq!(decide(quiet(3), false, false, 3).0, Settled::Done { completed: 3 });
+        let capped = Counters {
+            next: 2,
+            concluded: 2,
+            ..quiet(2)
+        };
+        assert_eq!(decide(capped, false, false, 2).0, Settled::Done { completed: 2 });
+    }
+
+    #[test]
+    fn a_resume_past_the_limit_is_done() {
+        // `stop_after` below the completed count: the first chunk to start is already past the limit.
+        let resumed = Counters {
+            next: 5,
+            concluded: 5,
+            ..quiet(5)
+        };
+        assert_eq!(decide(resumed, false, false, 2).0, Settled::Done { completed: 5 });
+    }
+
+    #[test]
+    fn a_failed_count_write_ends_the_run_with_its_error_though_the_count_lags() {
+        let broken = Counters {
+            broken: true,
+            recorded: 1,
+            prefix: 2,
+            ..quiet(2)
+        };
+        assert_eq!(decide(broken, false, true, 3).0, Settled::Failed);
+    }
+
+    #[test]
+    fn a_run_without_failure_is_pending_while_more_chunks_are_to_start() {
+        assert_eq!(decide(quiet(3), false, false, 4).0, Settled::Pending);
     }
 }
