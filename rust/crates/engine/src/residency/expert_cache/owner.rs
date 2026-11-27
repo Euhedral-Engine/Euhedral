@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
+use euhedral_core::generics::KeySlot;
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_graph::Marker;
 use euhedral_memory::{SlotArena, SlotLease};
@@ -59,20 +60,35 @@ pub type Listener = Box<dyn FnOnce(Outcome) + Send>;
 /// itself to the owner, whose next turn tells the listener that the request was abandoned: on a worker, with the claim
 /// free, and not in the drop (which may run inside the claim or while a panic unwinds). Only when the owner is gone, and
 /// nothing could tell it, is the listener told in the drop.
+///
+/// The listener sits in a [`KeySlot`], shared with whoever posted the request: whoever takes it first (one swap) tells it,
+/// so the owner and a poster that finds the source complete after posting never both tell it, and neither can miss it.
 pub(crate) struct Reply {
-    listener: Option<Listener>,
+    listener: Arc<KeySlot<Listener>>,
     inbox: Weak<Inbox>,
 }
 
 impl Reply {
     pub(super) fn new(listener: Listener, inbox: Weak<Inbox>) -> Reply {
         Reply {
-            listener: Some(listener),
+            listener: Arc::new(KeySlot::with_key(Box::new(listener))),
             inbox,
         }
     }
 
-    fn tell(mut self, outcome: Outcome) {
+    /// The listener's slot, for a poster that must tell it itself.
+    pub(super) fn slot(&self) -> Arc<KeySlot<Listener>> {
+        Arc::clone(&self.listener)
+    }
+
+    /// Tells the listener in `slot` that the cache is closed, if nobody has told it.
+    pub(super) fn refuse(slot: &KeySlot<Listener>) {
+        if let Some(listener) = slot.take() {
+            listener(Outcome::Failed(CacheError::Closed));
+        }
+    }
+
+    fn tell(self, outcome: Outcome) {
         if let Some(listener) = self.listener.take() {
             listener(outcome);
         }
@@ -89,10 +105,7 @@ impl Drop for Reply {
         let Some(listener) = self.listener.take() else {
             return;
         };
-        let reply = Reply {
-            listener: Some(listener),
-            inbox: Weak::new(),
-        };
+        let reply = Reply::new(listener, Weak::new());
         match self.inbox.upgrade() {
             Some(inbox) => inbox.post(Message::Orphaned(reply)),
             None => {

@@ -3,7 +3,7 @@
 
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::generics::LatticeSource;
@@ -12,7 +12,7 @@ use euhedral_memory::SlotArena;
 
 use super::CacheError;
 use super::host::{CopyLane, DeviceSlots, Frames};
-use super::owner::{Listener, Message, Outcome, Owner, Parts, Request};
+use super::owner::{Listener, Message, Outcome, Owner, Parts, Reply, Request};
 use super::source::{Inbox, OwnerSource};
 use super::stats::{CacheSnapshot, CacheStats};
 use crate::handoff::Handoff;
@@ -131,15 +131,27 @@ impl ExpertCache {
             listener(Outcome::Failed(CacheError::Closed));
             return Ok(());
         }
-        self.source.post(Message::Request(Request {
+        self.send(Request {
             id,
             key,
             bytes,
             scan,
             cancel,
             reply: self.source.reply(listener),
-        }));
+        });
         Ok(())
+    }
+
+    /// Posts `request`, then looks again at whether the source completed: a request posted after the owner's last drain
+    /// is told [`CacheError::Closed`] here, by the shared slot, so it is told once, by whoever takes the listener first.
+    /// (Split from `fetch` so that a test can post between the check and the post.)
+    pub(super) fn send(&self, request: Request) {
+        let slot = request.reply.slot();
+        self.source.post(Message::Request(request));
+        fence(Ordering::SeqCst);
+        if self.source.is_complete() {
+            Reply::refuse(&slot);
+        }
     }
 
     /// Sets `cancel` and has the owner end the requests that wait on it.

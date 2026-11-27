@@ -13,7 +13,7 @@ use std::fs::write;
 use std::io;
 use std::mem::forget;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::time::Duration;
 
 use euhedral_core::control_plane::ControlPlaneLattice;
@@ -28,6 +28,7 @@ use euhedral_io::{Continuation, IoDoneOwned};
 use euhedral_memory::{LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope, SlotArena, TierPool};
 
 use super::host::{CopyJob, CopyLane, DeviceSlots, Frames, SubmitFailure};
+use super::owner::{Reply, Request};
 use super::{CacheConfig, CacheError, ExpertCache, ExpertLease, Listener, Outcome};
 use crate::handoff::Handoff;
 use crate::residency::experts::{
@@ -1330,6 +1331,40 @@ fn a_closed_cache_that_is_done_refuses_a_request_on_the_calling_thread() {
         rig.cache.close().wait(HANG).is_ok(),
         "a second close of a done cache never ended"
     );
+}
+
+#[test]
+fn a_request_posted_after_the_source_completed_is_told_closed_once_by_its_poster() {
+    let rig = Rig::new(Settings::default());
+    let closed = rig.cache.close();
+    rig.poll();
+    assert!(closed.wait(HANG).is_ok(), "the close never ended");
+    // The interleaving: `fetch` passed its check while the source was live, and the source completed before the post.
+    let told = Told::default();
+    let sink = told.clone();
+    let told_twice = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&told_twice);
+    rig.cache.send(Request {
+        id: id(0),
+        key: 0,
+        bytes: RECORD,
+        scan: false,
+        cancel: Arc::new(AtomicBool::new(false)),
+        reply: Reply::new(
+            Box::new(move |outcome| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                *locked(&sink.0) = Some(outcome);
+            }),
+            Weak::new(),
+        ),
+    });
+    assert_eq!(
+        told.failure(),
+        CacheError::Closed,
+        "a request posted after the source completed was left silent"
+    );
+    rig.poll();
+    assert_eq!(told_twice.load(Ordering::SeqCst), 1, "the request was told twice");
 }
 
 #[test]

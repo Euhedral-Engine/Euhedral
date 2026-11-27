@@ -28,7 +28,7 @@
 
 use std::fmt::{self, Formatter};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Arc, Weak};
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
@@ -175,18 +175,21 @@ impl OwnerSource {
         };
         // Cleared before the drain, so that a record offered after the drain's end sets it again.
         self.inbox.pending.swap(false, Ordering::SeqCst);
-        let finished = owner.turn();
-        let shut = owner.is_shut();
+        let mut finished = owner.turn();
+        if owner.is_shut() {
+            // Closed with nothing in flight: the source ends, and the lattice lets it go. The records posted before the mark
+            // are drained once more, under the claim; a poster that offers after the mark sees it (its own fence) and
+            // tells its listener itself, and the shared slot tells it once.
+            self.downstream.complete();
+            fence(Ordering::SeqCst);
+            finished.extend(owner.turn());
+        }
         // The claim is free before anyone is told: a listener may post, and the next turn may enter.
         owner.release_seq_cst();
         for finished in finished {
             if catch_unwind(AssertUnwindSafe(|| finished.deliver())).is_err() {
                 log::error!("a listener of the expert cache panicked: the outcomes after it were still told");
             }
-        }
-        if shut {
-            // Closed with nothing in flight: the source ends, and the lattice lets it go. A fetch finds it complete.
-            self.downstream.complete();
         }
     }
 
