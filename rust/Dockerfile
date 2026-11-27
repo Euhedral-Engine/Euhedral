@@ -1,12 +1,11 @@
 # syntax=docker/dockerfile:1
 # The Rust server image: the linux-x64 server bundle in the same distroless base as the Java image (../Dockerfile).
 # Build from the repository root:  docker build -f rust/Dockerfile -t euhedral-rust .
-FROM eclipse-temurin:25-jdk-noble AS build
+FROM ubuntu:24.04 AS build
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends curl xz-utils ca-certificates gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
-# The pinned Zig builds the native library; the pinned Rust (mise.toml, rust/rust-toolchain.toml) builds llguidance
-# (with cargo-zigbuild) and the server.
+# The pinned Zig builds the native library; the pinned Rust (mise.toml, rust/rust-toolchain.toml) builds the server.
 ARG ZIG_SHA256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
 RUN curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz \
     && printf '%s  %s\n' "$ZIG_SHA256" /tmp/zig.tar.xz | sha256sum -c - \
@@ -15,7 +14,7 @@ RUN curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.x
     && rm /tmp/zig.tar.xz
 ENV ZIG=/opt/zig/zig
 ARG RUSTUP_SHA256=4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10
-# The Rust version and components come from rust/rust-toolchain.toml; the Zig and cargo-zigbuild pins must match mise.toml.
+# The Rust version and components come from rust/rust-toolchain.toml; the Zig pin must match mise.toml.
 COPY rust/rust-toolchain.toml /tmp/rust-toolchain.toml
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:/opt/zig:$PATH
 RUN curl -fsSL https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init -o /tmp/rustup-init \
@@ -23,13 +22,12 @@ RUN curl -fsSL https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown
     && chmod +x /tmp/rustup-init \
     && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$(awk -F'"' '/^channel/ {print $2}' /tmp/rust-toolchain.toml)" \
         --component rustfmt --component clippy \
-    && rm /tmp/rustup-init /tmp/rust-toolchain.toml \
-    && cargo install cargo-zigbuild --version 0.23.4 --locked
+    && rm /tmp/rustup-init /tmp/rust-toolchain.toml
 COPY . .
-# build/native/linux-x64 (the CUDA library, runtime, NVRTC, llguidance, kernel sources and headers), then the bundle
-# from it and the health probe.
-RUN ./gradlew nativeBuildLinuxX64 -Peuhedral.cuda.force-download=true --no-daemon
-RUN cd rust && cargo xtask bundle --product linux-x64 \
+# build/native/linux-x64 (the CUDA library, runtime, NVRTC, kernel sources and headers), then the bundle from it and
+# the health probe.
+RUN cd rust && cargo xtask native --product linux-x64 --force-download \
+    && cargo xtask bundle --product linux-x64 \
     && cargo build --release --bin euhedral-health-probe
 
 FROM gcr.io/distroless/cc-debian13:nonroot

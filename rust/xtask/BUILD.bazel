@@ -12,6 +12,14 @@ rust_binary(
     name = "xtask",
     crate_name = "xtask",
     crate_root = "src/main.rs",
+    deps = [
+        "@euhedral_crates//:lzma-rs",
+        "@euhedral_crates//:serde",
+        "@euhedral_crates//:serde_json",
+        "@euhedral_crates//:sha2",
+        "@euhedral_crates//:tar",
+        "@euhedral_crates//:zip",
+    ],
     edition = "2024",
     rustc_env = {
         "CARGO_MANIFEST_DIR": "rust/xtask",
@@ -29,6 +37,9 @@ rust_binary(
 rust_test(
     name = "xtask_bin_test",
     crate = ":xtask",
+    deps = [
+        "@euhedral_crates//:tempfile",
+    ],
     edition = "2024",
     version = "0.1.0",
 )
