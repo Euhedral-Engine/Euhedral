@@ -107,6 +107,14 @@ impl GdnShape {
         self.taps - 1
     }
 
+    /// The bytes of a sequence's state in this layer: the convolution history (BF16 rows of the channels) and the
+    /// recurrent matrices (FP32, one for each value head).
+    pub fn state_bytes(&self) -> (u64, u64) {
+        let history = u64::from(self.history_rows()) * u64::from(self.channels()) * 2;
+        let recurrent = u64::from(self.value_heads) * u64::from(HEAD_DIM) * u64::from(HEAD_DIM) * 4;
+        (history, recurrent)
+    }
+
     fn carve(&self, carver: &mut Carver, rows: u32) -> GdnScratch {
         GdnScratch {
             qkv: carver.take(bf16_bytes(rows, self.channels())),

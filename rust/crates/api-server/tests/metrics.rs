@@ -37,7 +37,7 @@ fn the_metrics_are_prometheus_text_with_the_series_of_the_server_and_the_engine(
     let app = "application=\"euhedral-inference\"";
     assert!(body.starts_with("# HELP euhedral_completion_tokens_total Generated tokens, reasoning included\n# TYPE euhedral_completion_tokens_total counter\n"));
     let info = format!(
-        "euhedral_engine_info{{{app},artifact=\"unknown\",model=\"euhedral-test-model\",speculation=\"none\",speculative_depth=\"0\"}} 1\n"
+        "euhedral_engine_info{{{app},artifact=\"unknown\",family=\"unknown\",model=\"euhedral-test-model\",speculation=\"none\",speculative_depth=\"0\"}} 1\n"
     );
     assert!(body.contains(&info), "{body}");
     assert!(body.contains(&format!("euhedral_engine_context_tokens{{{app}}} 4096.0\n")));

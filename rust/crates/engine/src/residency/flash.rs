@@ -435,9 +435,13 @@ pub fn plan_flash(
     }
     let mapped_embedding = embedding
         .filter(|_| embedding_mapped)
-        .map_or(0, |index| objects[index].bytes);
+        .map_or(0, |index| objects[index].bytes.next_multiple_of(HOST_ALIGNMENT));
 
-    let fixed_bytes: u64 = fixed.iter().map(|index| objects[*index].bytes).sum();
+    // The arenas place every object at a multiple of their alignment, so the plan counts each object's rounded size.
+    let fixed_bytes: u64 = fixed
+        .iter()
+        .map(|index| objects[*index].bytes.next_multiple_of(ARENA_ALIGNMENT))
+        .sum();
     let movable: Vec<(usize, Movable<'_>)> = fixed
         .iter()
         .filter_map(|index| {
@@ -458,8 +462,15 @@ pub fn plan_flash(
     let movable_bytes: u64 = movable_objects.iter().map(|object| object.bytes).sum();
     let minimum_cache = minimum.saturating_mul(slot_bytes);
     let ring_of = |selection: &Selection| ring_geometry(selection, ring_slots).map_or(0, |ring| ring.bytes());
-    let device_need =
-        |selection: &Selection| fixed_bytes - selection.staged_bytes - selection.mapped_bytes + ring_of(selection);
+    let device_need = |selection: &Selection| {
+        let left: u64 = selection
+            .taken
+            .iter()
+            .filter_map(|index| movable.get(*index))
+            .map(|(_, object)| object.bytes.next_multiple_of(ARENA_ALIGNMENT))
+            .sum();
+        fixed_bytes - left + ring_of(selection)
+    };
 
     // The fewest bytes moved to the host that leave the minimum cache.
     let base_reserved = reserved_with(workspace_of(PREFILL_CHUNK_TOKENS)?);
@@ -532,7 +543,14 @@ pub fn plan_flash(
         slots: file_staging_slots(config, streaming.concurrent_reads) as usize,
         slot_bytes: slot_bytes.next_multiple_of(HOST_ALIGNMENT),
     };
-    let pinned = mapped_embedding + selection.staged_bytes + selection.mapped_bytes + expert_staging.bytes();
+    let mapped_taken: u64 = selection
+        .taken
+        .iter()
+        .filter_map(|index| movable.get(*index))
+        .filter(|(_, object)| object.mapped)
+        .map(|(_, object)| object.bytes.next_multiple_of(HOST_ALIGNMENT))
+        .sum();
+    let pinned = mapped_embedding + selection.staged_bytes + mapped_taken + expert_staging.bytes();
     if pinned > pinnable {
         return Err(match inputs.host.source {
             BudgetSource::Unknown => PlanError::HostBudgetUnknown { needed: pinned },
@@ -592,7 +610,7 @@ pub fn plan_flash(
             slack,
         },
         host: HostBytes {
-            mapped: mapped_embedding + selection.mapped_bytes,
+            mapped: mapped_embedding + mapped_taken,
             staged: selection.staged_bytes,
             expert_staging_pinned: expert_staging.bytes(),
             expert_ram,

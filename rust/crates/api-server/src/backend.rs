@@ -177,6 +177,8 @@ pub struct PrefixCacheReport {
 pub struct EngineReport {
     /// The artifact the model was loaded from, `None` when it was not profiled.
     pub artifact: Option<String>,
+    /// The model family the engine serves (`dense`, `flash-next`); `unknown` without an engine.
+    pub family: String,
     /// The speculative strategy: `none`, `mtp` or `dflash2`.
     pub speculation: String,
     /// The tokens drafted per verification; 0 without speculation.
@@ -201,6 +203,7 @@ impl Default for EngineReport {
     fn default() -> EngineReport {
         EngineReport {
             artifact: None,
+            family: "unknown".to_owned(),
             speculation: "none".to_owned(),
             speculative_depth: 0,
             workers: 0,

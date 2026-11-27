@@ -27,6 +27,7 @@ sha2.workspace = true
 crc32fast.workspace = true
 euhedral-inference-edrl = { path = "../edrl" }
 serde_json.workspace = true
+tempfile.workspace = true
 euhedral-inference-api-server = { path = ".", features = ["test-support"] }
 euhedral-hardware-utils.workspace = true
 test-support = { path = "../test-support" }

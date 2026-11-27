@@ -95,8 +95,7 @@ refuse, naming the path, when an engine holds it. A program that does not use Eu
 the name, and the engine keeps the file it holds, but a later open by the old name would find nothing or another file.
 So the engine checks every open of the artifact it makes while starting (the index reads and the disk tier's handles)
 against the file it holds, and refuses a start in which the name has come to name another file, naming the path; it
-also refuses at the hold when the name changed between its open and its lock. The Flash-Next start holds the file
-but does not yet check its opens this way. A file system that takes no locks stops the engine at start, naming the path and the error. On NFS
+also refuses at the hold when the name changed between its open and its lock. The Flash-Next start does the same for its index open and its expert reads. A file system that takes no locks stops the engine at start, naming the path and the error. On NFS
 the tools open their output for writing to take the lock, as byte-range locks need.
 
 ## Starting

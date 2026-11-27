@@ -395,13 +395,13 @@ pub(crate) fn file_len(file: OwnedFile) -> (io::Result<u64>, OwnedFile) {
 }
 
 /// Checks that `file`, opened by `path`, is the file the engine holds, and gives the file back.
-fn admitted(guards: &[ArtifactGuard], path: &Path, file: OwnedFile) -> (Result<(), GuardError>, OwnedFile) {
+pub(crate) fn admitted(guards: &[ArtifactGuard], path: &Path, file: OwnedFile) -> (Result<(), GuardError>, OwnedFile) {
     let file = File::from(file);
     (admit_held(guards, path, &file), OwnedFile::from(file))
 }
 
 /// Opens the artifact at `path` for the disk tier's reads, refusing a handle that is not the file the engine holds.
-fn open_artifact(guards: &[ArtifactGuard], path: &Path) -> Result<ArtifactFile, EngineError> {
+pub(crate) fn open_artifact(guards: &[ArtifactGuard], path: &Path) -> Result<ArtifactFile, EngineError> {
     ArtifactFile::open_admitted(path, |opened| {
         admit_held(guards, path, opened).map_err(io::Error::other)
     })
