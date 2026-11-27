@@ -568,8 +568,8 @@ impl Generation {
 
 /// Opens the prefix cache the plan granted memory for, once for the engine; `None` (and why, once, in the log) when the
 /// engine cannot use it: the chunk is not a multiple of the checkpoint granule or does not divide the interval between
-/// checkpoints. Requests that speculate neither restore nor capture (the state of a draft is not stored); the others do,
-/// on an engine whose sequences can speculate too. Nothing is
+/// checkpoints. A drafting request stores and restores its drafter's state with the target's (the MTP cache, or the
+/// DFlash2 rings), so an engine whose drafter cannot be stored in one checkpoint opens no cache. Nothing is
 /// opened, and nothing is logged, when the plan granted no memory (`prefix-cache.size: 0`).
 fn open_cache(
     core: &Arc<Core>,
@@ -599,6 +599,10 @@ fn open_cache(
     let spec = CacheSpec {
         library: &core.library,
         config,
+        drafter: config
+            .dflash2
+            .as_ref()
+            .filter(|_| residency.draft_depth > 0 && residency.profile.speculation == ArtifactSpeculation::Dflash2),
         format: residency.kv_format,
         settings,
         granted: residency.prefix_cache_bytes,

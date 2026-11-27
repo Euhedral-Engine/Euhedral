@@ -35,6 +35,7 @@ pub struct DrafterBuffers {
     ring_keys: DeviceBuffer,
     ring_values: DeviceBuffer,
     ring_bytes: u64,
+    layers: usize,
 }
 
 impl DrafterBuffers {
@@ -58,6 +59,7 @@ impl DrafterBuffers {
             ring_keys: DeviceBuffer::alloc(library, rings)?,
             ring_values: DeviceBuffer::alloc(library, rings)?,
             ring_bytes,
+            layers: config.layers,
         })
     }
 
@@ -69,6 +71,16 @@ impl DrafterBuffers {
     /// The rows the taps hold.
     pub fn tap_capacity(&self) -> u64 {
         self.tap_capacity
+    }
+
+    /// The drafter's layers: each has a ring of keys and one of values.
+    pub fn layers(&self) -> usize {
+        self.layers
+    }
+
+    /// Bytes of one ring.
+    pub fn ring_size(&self) -> u64 {
+        self.ring_bytes
     }
 
     /// The ring of keys of the drafter's layer `layer`.

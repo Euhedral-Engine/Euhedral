@@ -244,6 +244,9 @@ impl Speculating {
 
     /// The restore that was asked for was refused: the prompt starts from its first row.
     pub(super) fn start_over(&mut self) {
+        if let Some(drafter) = self.drafter.as_mut() {
+            *drafter = Drafter::default();
+        }
         self.mtp_position = 0;
         self.prompt_catch_up = None;
         self.resuming = false;
@@ -736,5 +739,14 @@ mod tests {
         assert_eq!(state.prompt_catch_up, Some(1));
         assert_eq!(state.mtp_position, 2559);
         assert!(state.resuming);
+    }
+
+    #[test]
+    fn a_refused_restore_starts_the_drafters_context_over_too() {
+        let mut state = state().with_drafter();
+        state.drafter_mut().unwrap().resumed_at(2560);
+        state.start_over();
+        state.drafter_mut().unwrap().tapped(40).unwrap();
+        assert_eq!(state.drafter_mut().unwrap().begin_step(40, 6).unwrap(), Some((0, 40)));
     }
 }

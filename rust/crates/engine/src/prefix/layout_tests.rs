@@ -3,8 +3,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use euhedral_inference_settings::KvFormat;
 
-use super::fixtures::{arena, compact, config, tokens};
-use super::{Buffer, CheckpointLayout, NodeId, PrefixTree, SlotCopy, Speculation};
+use super::fixtures::{arena, compact, config, drafter, tokens};
+use super::{Buffer, CheckpointLayout, LayoutError, NodeId, PrefixTree, SlotCopy, Speculation};
 use crate::model::{LayerKind, ModelConfig};
 use crate::residency::footprint::page_bytes;
 
@@ -113,6 +113,19 @@ struct Rig {
 impl Rig {
     fn new(config: ModelConfig, slots: u32) -> Self {
         let layout = CheckpointLayout::new(&config, FORMAT).unwrap();
+        Rig::over(config, layout, slots)
+    }
+
+    /// A rig over `layout`, which holds a drafter's rings.
+    fn drafting(config: ModelConfig, layers: usize, window: usize, slots: u32) -> Self {
+        let layout = CheckpointLayout::new(&config, FORMAT)
+            .unwrap()
+            .with_drafter(&drafter(layers, window))
+            .unwrap();
+        Rig::over(config, layout, slots)
+    }
+
+    fn over(config: ModelConfig, layout: CheckpointLayout, slots: u32) -> Self {
         let tree = PrefixTree::new(arena(slots, layout.slot_bytes()));
         let host = vec![0; slots as usize * layout.slot_bytes() as usize];
         Rig {
@@ -125,6 +138,20 @@ impl Rig {
 
     fn device(&self, kv_pages: usize, mtp_pages: usize) -> Device {
         Device::new(&self.config, kv_pages, mtp_pages)
+    }
+
+    /// A device whose drafter has `layers` rings of keys and of values of `ring_bytes` each.
+    fn drafting_device(&self, kv_pages: usize, layers: usize, ring_bytes: usize) -> Device {
+        let mut device = self.device(kv_pages, 0);
+        for layer in 0..layers {
+            device
+                .buffers
+                .insert(Buffer::DrafterKeys { layer }, vec![0; ring_bytes]);
+            device
+                .buffers
+                .insert(Buffer::DrafterValues { layer }, vec![0; ring_bytes]);
+        }
+        device
     }
 
     /// Reserves, captures and publishes the node `[parent.position, position)` of `tokens` from `device`.
@@ -158,6 +185,10 @@ fn is_gdn(buffer: Buffer) -> bool {
 
 fn is_kv(buffer: Buffer) -> bool {
     matches!(buffer, Buffer::KvPage { .. })
+}
+
+fn is_ring(buffer: Buffer) -> bool {
+    matches!(buffer, Buffer::DrafterKeys { .. } | Buffer::DrafterValues { .. })
 }
 
 fn is_mtp(buffer: Buffer) -> bool {
@@ -481,4 +512,152 @@ fn bf16_pages_are_larger_and_size_the_slot() {
     assert!(bf16.slot_bytes() > nvfp4.slot_bytes());
     assert_eq!(bf16.page_slots(0, 768), 3);
     assert_eq!(bf16.gdn_slots(), 1);
+}
+
+// --- DFlash2 state: each drafter layer's ring of keys then its ring of values, whole, in every node.
+
+/// Three layers of 2000-row windows: a ring is 256000 bytes, which no slot holds a whole number of.
+const LAYERS: usize = 3;
+const WINDOW: usize = 2000;
+const RING: usize = WINDOW * 128;
+
+#[test]
+fn dflash2_state_is_every_layers_two_rings_whatever_the_span() {
+    let rig = Rig::drafting(compact(), LAYERS, WINDOW, 8);
+    let layout = &rig.layout;
+    let rings = 2 * LAYERS as u64 * RING as u64;
+    let slots = rings.div_ceil(layout.slot_bytes()) as usize;
+    assert!(slots > 1, "the rings span several slots");
+    for (start, position) in [(0, 256), (0, 2048), (512, 1024)] {
+        assert_eq!(layout.speculative_slots(Speculation::Dflash2, start, position), slots);
+    }
+    assert_eq!(
+        layout.slots(0, 768, Some(Speculation::Dflash2)),
+        layout.slots(0, 768, None) + slots
+    );
+    assert!(layout.has_speculation(Speculation::Dflash2));
+    assert!(!layout.has_speculation(Speculation::Mtp) || compact().mtp_layer_count > 0);
+}
+
+#[test]
+fn a_layout_given_no_drafter_holds_no_dflash2_state() {
+    let layout = CheckpointLayout::new(&compact(), FORMAT).unwrap();
+    assert!(!layout.has_speculation(Speculation::Dflash2));
+}
+
+#[test]
+fn a_drafter_with_no_layer_or_a_window_the_rings_cannot_hold_is_refused() {
+    let layout = || CheckpointLayout::new(&compact(), FORMAT).unwrap();
+    let none = layout().with_drafter(&drafter(0, WINDOW)).unwrap_err();
+    assert_eq!(none, LayoutError::DrafterLayers { layers: 0 });
+    assert!(none.to_string().contains('0'), "{none}");
+    let empty = layout().with_drafter(&drafter(LAYERS, 0)).unwrap_err();
+    assert_eq!(empty, LayoutError::DrafterWindow { window: 0, max: 2048 });
+    let wide = layout().with_drafter(&drafter(LAYERS, 4096)).unwrap_err();
+    assert_eq!(
+        wide,
+        LayoutError::DrafterWindow {
+            window: 4096,
+            max: 2048
+        }
+    );
+    assert!(
+        wide.to_string().contains("4096") && wide.to_string().contains("2048"),
+        "{wide}"
+    );
+}
+
+#[test]
+fn capturing_then_restoring_reproduces_every_ring_byte_for_byte() {
+    let mut rig = Rig::drafting(compact(), LAYERS, WINDOW, 16);
+    let stored = tokens(0, 768);
+    let mut device = rig.drafting_device(3, LAYERS, RING);
+    device.fill(3, |_| true);
+    let root = rig.tree.root();
+    let node = rig.capture(&device, root, &stored, 768, Some(Speculation::Dflash2));
+
+    let mut restored = rig.drafting_device(3, LAYERS, RING);
+    rig.restore(&mut restored, &[node], Some(Speculation::Dflash2));
+    let rings: Vec<_> = device
+        .buffers
+        .keys()
+        .copied()
+        .filter(|&buffer| is_ring(buffer))
+        .collect();
+    assert_eq!(rings.len(), 2 * LAYERS);
+    for buffer in device
+        .buffers
+        .keys()
+        .copied()
+        .filter(|&buffer| is_ring(buffer) || is_gdn(buffer) || is_kv(buffer))
+    {
+        assert!(device.same(&restored, buffer), "{buffer:?}");
+    }
+}
+
+#[test]
+fn a_chain_restores_the_leafs_rings_and_not_its_parents() {
+    let mut rig = Rig::drafting(compact(), LAYERS, WINDOW, 32);
+    let stored = tokens(0, 1280);
+    let mut device = rig.drafting_device(5, LAYERS, RING);
+    device.fill(5, |_| true);
+    let root = rig.tree.root();
+    let first = rig.capture(&device, root, &stored, 512, Some(Speculation::Dflash2));
+    let mut parents = rig.drafting_device(5, LAYERS, RING);
+    parents.buffers.clone_from(&device.buffers);
+    // The sequence goes on, its rings with it, and the second node stores them as they are then.
+    device.fill(9, |_| true);
+    let second = rig.capture(&device, first, &stored, 1280, Some(Speculation::Dflash2));
+
+    let mut restored = rig.drafting_device(5, LAYERS, RING);
+    rig.restore(&mut restored, &[first, second], Some(Speculation::Dflash2));
+    for buffer in device.buffers.keys().copied().filter(|&buffer| is_ring(buffer)) {
+        assert!(device.same(&restored, buffer), "{buffer:?}");
+        assert!(!parents.same(&restored, buffer), "{buffer:?} is the parent's");
+    }
+}
+
+#[test]
+fn a_restore_without_dflash2_state_leaves_the_rings_alone() {
+    let mut rig = Rig::drafting(compact(), LAYERS, WINDOW, 16);
+    let stored = tokens(0, 768);
+    let mut device = rig.drafting_device(3, LAYERS, RING);
+    device.fill(3, |_| true);
+    let root = rig.tree.root();
+    let node = rig.capture(&device, root, &stored, 768, None);
+
+    let mut restored = rig.drafting_device(3, LAYERS, RING);
+    rig.restore(&mut restored, &[node], None);
+    for (&buffer, bytes) in &restored.buffers {
+        if is_ring(buffer) {
+            assert!(bytes.iter().all(|&byte| byte == 0), "{buffer:?} was written");
+        }
+    }
+}
+
+#[test]
+fn a_dflash2_nodes_copies_cover_each_byte_of_its_slots_once_without_overlap() {
+    let mut rig = Rig::drafting(compact(), LAYERS, WINDOW, 16);
+    let mut device = rig.drafting_device(4, LAYERS, RING);
+    device.fill(2, |_| true);
+    let root = rig.tree.root();
+    let node = rig.capture(&device, root, &tokens(0, 1024), 1024, Some(Speculation::Dflash2));
+    let mut ranges: Vec<_> = rig
+        .layout
+        .copies(rig.tree.node(node))
+        .iter()
+        .map(|copy| (copy.host, copy.host + copy.bytes))
+        .collect();
+    ranges.sort_unstable();
+    for pair in ranges.windows(2) {
+        assert!(pair[0].1 <= pair[1].0, "{pair:?} overlap");
+    }
+    let rings: u64 = rig
+        .layout
+        .copies(rig.tree.node(node))
+        .iter()
+        .filter(|copy| is_ring(copy.buffer))
+        .map(|copy| copy.bytes)
+        .sum();
+    assert_eq!(rings, 2 * LAYERS as u64 * RING as u64);
 }
