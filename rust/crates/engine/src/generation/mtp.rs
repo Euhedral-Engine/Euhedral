@@ -145,7 +145,7 @@ impl Speculating {
         self.drafter.as_mut()
     }
 
-    /// How the request drafts, for its checkpoints.
+    /// The request's draft kind.
     pub(super) fn draft_kind(&self) -> DraftKind {
         match (&self.drafter, self.drafting) {
             (Some(_), drafting) => DraftKind::Dflash2 { drafting },
@@ -252,8 +252,7 @@ impl Speculating {
         self.resuming = true;
     }
 
-    /// A restore of the checkpoint at `position` left `resume` to set: the MTP layer's catch-up state, or the DFlash2
-    /// drafter's context, which then starts at the position.
+    /// Sets the state `resume` names after a restore at `position`.
     pub(super) fn restored(&mut self, position: u64, resume: Resume) {
         match resume {
             Resume::Mtp { whole } => self.resumed_at(position as u32, whole),

@@ -60,7 +60,7 @@ use super::mailbox::{Address, Turn};
 use super::mtp::{Joining, Speculating, Verifying};
 use super::order::Order;
 use super::pool::Lease;
-use super::prefix_plan::{Carrier, DraftKind, Resume, carrier, resume};
+use super::prefix_plan::{DraftKind, Resume, kind_of, prefill_carries, resume};
 use super::request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
@@ -512,12 +512,12 @@ fn route(
     }
 }
 
-/// How the request in `mode` drafts, for its checkpoints.
+/// The draft kind of the request in `mode`.
 fn drafts_of(mode: &Mode) -> DraftKind {
-    match mode {
-        Mode::Speculative { state, .. } => state.draft_kind(),
-        _ => DraftKind::Plain,
-    }
+    kind_of(match mode {
+        Mode::Speculative { state, .. } => Some(state),
+        _ => None,
+    })
 }
 
 /// The state of a request that speculates by `route`, or `None` for a request that does not.
@@ -1413,9 +1413,6 @@ impl Owner {
                 run.prompt.get(position as usize).copied(),
             )
         });
-        // The MTP layer's draft: the DFlash2 drafter's rings are restored whole, with no row to pair. The draft's last
-        // row of the checkpoint was paired with the token the stored prompt had at the position: with the same token
-        // here it is the row a cold run computes, and is restored with the others.
         let (mtp_drafting, whole) = match resume {
             Resume::Mtp { whole } => (true, whole),
             _ => (false, false),
@@ -1482,8 +1479,6 @@ impl Owner {
         run.carried = retained;
         run.carried_marker = Some(reserved);
         if let Mode::Speculative { state, .. } = &mut run.mode {
-            // Unless the MTP layer's last row came whole, the draft pairs the hidden row it was restored with and the
-            // token at the position, before the chunks do.
             state.restored(position, resume);
         }
         Ok(())
@@ -2215,12 +2210,7 @@ impl Owner {
         // A chunk that ends at a checkpoint has nothing chained behind it: it retires, and the state it leaves is captured
         // before the next chunk starts (see `PromptCheckpoints`).
         let end = run.offset + next_rows(next);
-        // A chunk of a request that drafts is captured after its draft update instead: the draft's state is not whole
-        // before. The prompt's last chunk of a speculative request is never captured: its first step follows at once.
-        let carries = match next {
-            Step::Prefill { last, .. } => carrier(drafts_of(&run.mode), last) == Carrier::Prefill,
-            _ => false,
-        };
+        let carries = prefill_carries(drafts_of(&run.mode), next);
         let checkpoint = carries
             && run
                 .checkpoints

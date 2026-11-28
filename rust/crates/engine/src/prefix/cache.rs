@@ -237,7 +237,7 @@ pub struct CacheParts {
     pub interval: u32,
     /// Tokens a prefill chunk takes.
     pub chunk: u32,
-    /// The draft state the requests' checkpoints hold beside the base state, when the plan has them draft.
+    /// The draft state the checkpoints hold beside the base state, if any.
     pub drafting: Option<Speculation>,
     /// The most a copy piece moves.
     pub piece_bytes: u64,
@@ -276,8 +276,7 @@ impl PrefixCache {
         if interval == 0 || chunk == 0 || !interval.is_multiple_of(chunk) {
             return Err(OpenError::Interval);
         }
-        // The smallest node a request stores is a chunk's: the base state, and the draft's when the requests draft. An
-        // arena too small for one could never store a checkpoint: refuse it here, not by skipping every capture.
+        // Refuses an arena that cannot hold one chunk's checkpoint.
         let base = layout.slots(0, chunk, None);
         if base > arena.capacity() as usize {
             return Err(OpenError::BaseCapacity {

@@ -417,7 +417,6 @@ fn a_second_checkpoint_extends_the_first() {
 
 #[test]
 fn a_checkpoint_larger_than_the_arena_is_skipped_and_counted() {
-    // One chunk's checkpoint fits (the cache opens); a node of two chunks does not.
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
     let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
@@ -747,7 +746,7 @@ fn a_cache_over_the_wrong_slot_size_or_an_off_grid_interval_does_not_open() {
     assert!(PrefixCacheHandle::open(parts(layout.slot_bytes(), 0), inline()).is_err());
 }
 
-/// Parts over `layout` with an arena of `slots` slots, the requests' checkpoints holding `drafting`.
+/// Parts over `layout` with an arena of `slots` slots and `drafting` state in the checkpoints.
 fn parts_with(layout: &CheckpointLayout, slots: u32, drafting: Option<Speculation>) -> CacheParts {
     CacheParts {
         layout: layout.clone(),
@@ -803,7 +802,6 @@ fn a_cache_whose_arena_cannot_hold_one_mtp_checkpoint_does_not_open_when_request
         "{message}"
     );
     assert!(PrefixCacheHandle::open(parts_with(&layout, needed as u32, Some(Speculation::Mtp)), inline()).is_ok());
-    // A model that has an MTP layer does not turn the cache off for requests that never draft with it.
     assert!(PrefixCacheHandle::open(parts_with(&layout, base as u32, None), inline()).is_ok());
 }
 

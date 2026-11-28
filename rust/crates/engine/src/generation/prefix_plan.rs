@@ -1,41 +1,46 @@
-//! The owner's choices about the prefix cache that depend on how the request kind, as pure functions of the run's
-//! mode and step: which quantum of a prompt chunk carries the checkpoint, and what a restore sets the speculative state
-//! to. The owner calls them where it admits a chunk and where it restores a hit.
+//! Which quantum of a prompt chunk carries a checkpoint, and what a restore sets the speculative state to. Pure
+//! functions of the request's draft kind and step.
 
-/// How the run speculates, as far as its checkpoints are concerned.
+use super::mtp::Speculating;
+use super::source::Step;
+
+/// How a request drafts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DraftKind {
-    /// The request does not speculate.
+    /// Does not speculate.
     Plain,
-    /// The request speculates on the MTP route but does not draft (one token wanted, or no room for a row).
+    /// Speculates on the MTP route without drafting.
     Idle,
-    /// The MTP layer kind: its cache is part of the checkpoint.
+    /// Drafts with the MTP layer.
     Mtp,
-    /// The route is DFlash2; `drafting` tells whether the drafter's rings are part of the checkpoint.
+    /// Speculates on the DFlash2 route; `drafting` tells whether it drafts.
     Dflash2 { drafting: bool },
 }
 
 impl DraftKind {
-    /// Whether the checkpoints of the run hold the draft's state.
+    /// Whether the checkpoints hold the draft's state.
     fn drafting(self) -> bool {
         matches!(self, DraftKind::Mtp | DraftKind::Dflash2 { drafting: true })
     }
 }
 
-/// The quantum of a prompt chunk that carries the checkpoint at the chunk's end.
+/// The kind of the request whose speculative state is `state`, `None` for a request that does not speculate.
+pub(super) fn kind_of(state: Option<&Speculating>) -> DraftKind {
+    state.map_or(DraftKind::Plain, Speculating::draft_kind)
+}
+
+/// The quantum of a prompt chunk that carries the checkpoint at its end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Carrier {
-    /// The chunk's base prefill.
+    /// The base prefill.
     Prefill,
-    /// The drafter's update of the chunk (the MTP catch-up, or the DFlash2 context update), once its rows are in the
-    /// draft's state.
+    /// The draft update (the MTP catch-up or the DFlash2 context update).
     DraftUpdate,
-    /// No quantum of the chunk: the prompt's last chunk of a speculative request is never captured (its first step
-    /// follows at once).
+    /// No quantum.
     Nothing,
 }
 
-/// The carrier of a prompt chunk, `last` when it is the prompt's last.
+/// The carrier of a prompt chunk; `last` is whether it ends the prompt.
 pub(super) fn carrier(kind: DraftKind, last: bool) -> Carrier {
     match (kind, last) {
         (DraftKind::Plain, _) => Carrier::Prefill,
@@ -45,8 +50,17 @@ pub(super) fn carrier(kind: DraftKind, last: bool) -> Carrier {
     }
 }
 
-/// Whether an MTP catch-up that completes a chunk ending at a wanted checkpoint captures it. The catch-up that
-/// re-pairs a restored checkpoint's last row (`resuming`) completes no chunk.
+/// Whether `step` of a request of `kind` carries the checkpoint at its end: a prompt chunk whose carrier is the
+/// prefill.
+pub(super) fn prefill_carries(kind: DraftKind, step: Step) -> bool {
+    match step {
+        Step::Prefill { last, .. } => carrier(kind, last) == Carrier::Prefill,
+        _ => false,
+    }
+}
+
+/// Whether an MTP catch-up captures: the checkpoint is `wanted` and the catch-up is not the re-pairing of a restore
+/// (`resuming`).
 pub(super) fn catch_up_captures(wanted: bool, resuming: bool) -> bool {
     wanted && !resuming
 }
@@ -54,17 +68,16 @@ pub(super) fn catch_up_captures(wanted: bool, resuming: bool) -> bool {
 /// What a restore sets the speculative state to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Resume {
-    /// The state has nothing of the draft's to set.
+    /// Nothing.
     Nothing,
-    /// The MTP layer's cache was restored: whole, with the checkpoint's last row paired with the prompt's token, or
-    /// short of that row, which a catch-up of one row re-pairs.
+    /// The MTP cache is restored; `whole` when its last row is paired with the prompt's token.
     Mtp { whole: bool },
-    /// The DFlash2 drafter's rings were restored whole; the drafter's context resumes at the position.
+    /// The DFlash2 drafter's context resumes at the position.
     Drafter,
 }
 
-/// The state a restore of a checkpoint whose last row was paired with `paired` leaves, when the prompt has `token` at
-/// the checkpoint's position.
+/// The state a restore leaves: `paired` is the token the checkpoint's last row was paired with, `token` the prompt's
+/// token at the checkpoint's position.
 pub(super) fn resume(kind: DraftKind, paired: Option<u32>, token: Option<u32>) -> Resume {
     match kind {
         DraftKind::Plain | DraftKind::Idle => Resume::Nothing,
@@ -78,6 +91,7 @@ pub(super) fn resume(kind: DraftKind, paired: Option<u32>, token: Option<u32>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation::mtp::Speculating;
 
     const DRAFTING: [DraftKind; 2] = [DraftKind::Mtp, DraftKind::Dflash2 { drafting: true }];
     const NOT_DRAFTING: [DraftKind; 2] = [DraftKind::Idle, DraftKind::Dflash2 { drafting: false }];
@@ -140,5 +154,47 @@ mod tests {
         for kind in [DraftKind::Plain, DraftKind::Idle] {
             assert_eq!(resume(kind, Some(7), Some(7)), Resume::Nothing, "{kind:?}");
         }
+    }
+
+    const CHUNK: Step = Step::Prefill { rows: 512, last: false };
+    const LAST: Step = Step::Prefill { rows: 40, last: true };
+
+    #[test]
+    fn only_a_prompt_chunk_whose_carrier_is_the_prefill_carries_at_the_prefill() {
+        for kind in [
+            DraftKind::Plain,
+            DraftKind::Idle,
+            DraftKind::Dflash2 { drafting: false },
+        ] {
+            assert!(prefill_carries(kind, CHUNK), "{kind:?}");
+        }
+        for kind in DRAFTING {
+            assert!(!prefill_carries(kind, CHUNK), "{kind:?}");
+        }
+        assert!(prefill_carries(DraftKind::Plain, LAST));
+        for kind in DRAFTING.into_iter().chain(NOT_DRAFTING) {
+            assert!(!prefill_carries(kind, LAST), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_step_that_is_not_a_prompt_chunk_carries_nothing_at_the_prefill() {
+        for step in [
+            Step::Decode,
+            Step::PromptCatchUp { rows: 512 },
+            Step::Speculate { drafts: 3 },
+        ] {
+            assert!(!prefill_carries(DraftKind::Plain, step), "{step:?}");
+        }
+    }
+
+    #[test]
+    fn the_kind_of_a_request_is_plain_without_speculative_state() {
+        assert_eq!(kind_of(None), DraftKind::Plain);
+        assert_eq!(kind_of(Some(&Speculating::new(3, 4096, 3000, 64))), DraftKind::Mtp);
+        assert_eq!(
+            kind_of(Some(&Speculating::new(3, 4096, 3000, 64).with_drafter())),
+            DraftKind::Dflash2 { drafting: true }
+        );
     }
 }
