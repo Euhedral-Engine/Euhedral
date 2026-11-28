@@ -35,6 +35,7 @@ use euhedral_inference_cuda::DevicePtr;
 
 use super::acceptance::{Accepted, accept, accept_tokens};
 use super::dflash2::{Drafter, DrafterStep};
+use super::prefix_plan::{DraftKind, catch_up_captures};
 use super::request::{FinishReason, Verification};
 use super::sampled::SampledRows;
 use super::source::{Admission, Flying, Mode, OVERLAP_MAX_START_POSITION, Owner, Role, Run, Step};
@@ -142,6 +143,15 @@ impl Speculating {
 
     pub(super) fn drafter_mut(&mut self) -> Option<&mut Drafter> {
         self.drafter.as_mut()
+    }
+
+    /// How the request drafts, for its checkpoints.
+    pub(super) fn draft_kind(&self) -> DraftKind {
+        match (&self.drafter, self.drafting) {
+            (Some(_), drafting) => DraftKind::Dflash2 { drafting },
+            (None, true) => DraftKind::Mtp,
+            (None, false) => DraftKind::Idle,
+        }
     }
 
     /// The prompt chunk's rows were taken by the context update: nothing is left to catch up.
@@ -379,11 +389,11 @@ impl Owner {
         // restored checkpoint's last row completes no chunk.
         let end = first + rows - 1;
         let resuming = mem::take(&mut state.resuming);
-        let checkpoint = !resuming
-            && run
-                .checkpoints
-                .as_ref()
-                .is_some_and(|checkpoints| checkpoints.wants(end));
+        let wanted = run
+            .checkpoints
+            .as_ref()
+            .is_some_and(|checkpoints| checkpoints.wants(end));
+        let checkpoint = catch_up_captures(wanted, resuming);
         let admission = Admission {
             role: Role::PromptCatchUp,
             kind: QuantumKind::Draft,

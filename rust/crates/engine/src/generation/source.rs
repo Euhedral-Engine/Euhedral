@@ -60,6 +60,7 @@ use super::mailbox::{Address, Turn};
 use super::mtp::{Joining, Speculating, Verifying};
 use super::order::Order;
 use super::pool::Lease;
+use super::prefix_plan::{Carrier, DraftKind, Resume, carrier, resume};
 use super::request::{
     AdmissionError, CancelHandle, FinishReason, GenerationOutcome, GenerationRequest, QuantumEvent, Speculation,
 };
@@ -508,6 +509,14 @@ fn route(
             (None, Some(depth)) => Ok(Route::Mtp(depth)),
             (None, None) => Err(AdmissionError::SpeculationUnavailable),
         },
+    }
+}
+
+/// How the request in `mode` drafts, for its checkpoints.
+fn drafts_of(mode: &Mode) -> DraftKind {
+    match mode {
+        Mode::Speculative { state, .. } => state.draft_kind(),
+        _ => DraftKind::Plain,
     }
 }
 
@@ -1397,17 +1406,20 @@ impl Owner {
         let core = &shared.core;
         let position = u64::from(hit.position());
         let reset = mem::take(&mut self.used);
-        // The MTP layer's draft: the DFlash2 drafter's rings are restored whole, with no row to pair.
-        let drafting = self.drafts() && !self.dflash2();
-        // The draft's last row of the checkpoint was paired with the token the stored prompt had at the position: with
-        // the same token here it is the row a cold run computes, and is restored with the others.
-        let whole = drafting
-            && hit.paired().is_some()
-            && self
-                .run
-                .as_ref()
-                .and_then(|run| run.prompt.get(position as usize).copied())
-                == hit.paired();
+        let resume = self.run.as_ref().map_or(Resume::Nothing, |run| {
+            resume(
+                drafts_of(&run.mode),
+                hit.paired(),
+                run.prompt.get(position as usize).copied(),
+            )
+        });
+        // The MTP layer's draft: the DFlash2 drafter's rings are restored whole, with no row to pair. The draft's last
+        // row of the checkpoint was paired with the token the stored prompt had at the position: with the same token
+        // here it is the row a cold run computes, and is restored with the others.
+        let (mtp_drafting, whole) = match resume {
+            Resume::Mtp { whole } => (true, whole),
+            _ => (false, false),
+        };
         let mut retained = KvRetained::default();
         let (_, reserved) = core
             .lane_table()
@@ -1422,7 +1434,7 @@ impl Owner {
                 cache.appended(position).map_err(why("the cache's frontier"))?;
                 // The rows are part of the sequence from here: the copy's job is ordered before everything that reads them.
                 cache.commit(position).map_err(why("the cache's frontier"))?;
-                if drafting {
+                if mtp_drafting {
                     // The draft's cache holds the rows below the checkpoint's last position, and the last too when the
                     // prompt has the token the checkpoint paired it with: otherwise that row is recomputed.
                     let rows = if whole { position } else { position - 1 };
@@ -1440,7 +1452,7 @@ impl Owner {
             .refs(KvSource::Base)
             .map_err(why("the sequence's references"))?
             .ordered_after(reserved, core.lanes());
-        if drafting {
+        if mtp_drafting {
             // The draft cache's reservation is claimed too; the references above hold its view.
             self.sequence
                 .refs(KvSource::Mtp)
@@ -1470,20 +1482,19 @@ impl Owner {
         run.carried = retained;
         run.carried_marker = Some(reserved);
         if let Mode::Speculative { state, .. } = &mut run.mode {
-            if drafting {
+            match resume {
                 // Unless the last row came whole, the draft pairs the hidden row it was restored with and the token at
                 // the position, before the chunks do.
-                state.resumed_at(position as u32, whole);
-            } else if let Some(drafter) = state.drafter_mut() {
-                drafter.resumed_at(position);
+                Resume::Mtp { whole } => state.resumed_at(position as u32, whole),
+                Resume::Drafter => {
+                    if let Some(drafter) = state.drafter_mut() {
+                        drafter.resumed_at(position);
+                    }
+                }
+                Resume::Nothing => {}
             }
         }
         Ok(())
-    }
-
-    /// Whether the request drafts: its checkpoints hold the draft's state.
-    fn drafts(&self) -> bool {
-        matches!(self.run.as_ref().map(|run| &run.mode), Some(Mode::Speculative { state, .. }) if state.drafting())
     }
 
     /// The cache answered the restore.
@@ -2212,14 +2223,13 @@ impl Owner {
         // A chunk that ends at a checkpoint has nothing chained behind it: it retires, and the state it leaves is captured
         // before the next chunk starts (see `PromptCheckpoints`).
         let end = run.offset + next_rows(next);
-        // A chunk of a request that drafts is captured after its catch-up instead: the draft's cache is not whole before.
-        // The prompt's last chunk of a speculative request is never captured: its first step follows at once.
-        let capturable = match (&run.mode, next) {
-            (Mode::Speculative { .. }, Step::Prefill { last, .. }) => !drafting && !last,
-            _ => true,
+        // A chunk of a request that drafts is captured after its draft update instead: the draft's state is not whole
+        // before. The prompt's last chunk of a speculative request is never captured: its first step follows at once.
+        let carries = match next {
+            Step::Prefill { last, .. } => carrier(drafts_of(&run.mode), last) == Carrier::Prefill,
+            _ => false,
         };
-        let checkpoint = matches!(next, Step::Prefill { .. })
-            && capturable
+        let checkpoint = carries
             && run
                 .checkpoints
                 .as_ref()
