@@ -143,11 +143,11 @@ fn failure_report(description: &str, action: &str) -> String {
     )
 }
 
-/// The report of a server that could not listen on `port`.
-fn bind_report(port: u16, error: &io::Error) -> String {
+/// The report of a server that could not listen on `host` and `port`, the values of `server.host` and `server.port`.
+fn bind_report(host: IpAddr, port: u16, error: &io::Error) -> String {
     if error.kind() == io::ErrorKind::AddrInUse {
         failure_report(
-            &format!("Web server failed to start. Port {port} was already in use."),
+            &format!("Web server failed to start. Port {port} was already in use on server.host {host}."),
             &format!(
                 "Identify and stop the process that's listening on port {port} or configure this application to \
                  listen on another port."
@@ -155,7 +155,7 @@ fn bind_report(port: u16, error: &io::Error) -> String {
         )
     } else {
         failure_report(
-            &format!("Web server failed to start on port {port}:\n\n    {error}"),
+            &format!("Web server failed to start on server.host {host}, server.port {port}:\n\n    {error}"),
             &format!("Correct what the message names. {SETTINGS_HELP}"),
         )
     }
@@ -234,7 +234,7 @@ pub fn mark_process_start() {
     PROCESS_START.get_or_init(Instant::now);
 }
 
-/// Starts the backend with `start`, serves the API on `settings.server.port`, calls `wait_for_stop` with the address
+/// Starts the backend with `start`, serves the API on `settings.server.host` and `settings.server.port` (that address only), calls `wait_for_stop` with the address
 /// the server listens on and, when it returns, stops in order (see the crate documentation). Returns the process's exit
 /// code: what `wait_for_stop` returned after a stop, [`EXIT_START_FAILED`] when the backend or the server did not start
 /// (the report is on the error stream).
@@ -289,15 +289,12 @@ pub fn serve_waiting(
     let server = match started {
         Ok(server) => server,
         Err(error) => {
-            say(&bind_report(port, &error));
+            say(&bind_report(host, port, &error));
             stop_backend(shutdown, timeout);
             return EXIT_START_FAILED;
         }
     };
-    log::info!(
-        "Listening on port {}, serving model {model}",
-        server.local_addr().port()
-    );
+    log::info!("Listening on {}, serving model {model}", server.local_addr());
     if let Some(start) = PROCESS_START.get() {
         log::info!("Started in {:.3} seconds", start.elapsed().as_secs_f64());
     }

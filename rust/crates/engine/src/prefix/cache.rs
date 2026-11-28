@@ -100,9 +100,9 @@ pub enum OpenError {
     SlotBytes { arena: u64, layout: u64 },
     #[error("the checkpoint interval must be a positive multiple of the chunk")]
     Interval,
-    /// The arena cannot hold the checkpoint of one chunk of base state. Every checkpoint ends on a multiple of the
-    /// chunk, so the span a capture adds to the tree is at least one chunk: an arena that holds one chunk's checkpoint
-    /// holds any node.
+    /// The arena cannot hold the checkpoint of one chunk of base state, the least one checkpoint takes (every capture
+    /// ends on a multiple of the chunk, so a node spans at least a chunk). Opening guarantees that minimum only: a node
+    /// that spans more, up to the interval, or one that holds MTP state and does not start at 0, takes more slots.
     #[error("a chunk's checkpoint takes {needed} slots and the arena has {slots}")]
     BaseCapacity { needed: usize, slots: u32 },
     #[error("the requests' checkpoints hold {kind:?} state, which the layout has no room for")]
