@@ -145,7 +145,7 @@ impl CheckpointLayout {
         }
         self.rings = Some(Rings {
             layers: drafter.layers,
-            ring_bytes: DrafterBuffers::ring_bytes(drafter),
+            ring_bytes: DrafterBuffers::ring_bytes_for(drafter),
         });
         Ok(self)
     }
