@@ -4,16 +4,9 @@ EXPORTS
     cuCtxGetCurrent_v2
     cuCtxGetDevice
     cuDeviceGetAttribute
-    cuFuncGetParamInfo
     cuFuncSetAttribute
     cuGetErrorString
     cuInit
-    cuLaunchKernel
-    cuLaunchKernelEx
-    cuLaunchKernel_ptsz
     cuModuleGetFunction
     cuModuleLoadData
     cuModuleUnload
-    cuStreamWaitValue32_v2
-    cuStreamWriteValue32_v2
-    cuTensorMapEncodeTiled
