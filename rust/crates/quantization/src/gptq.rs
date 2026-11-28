@@ -1199,7 +1199,7 @@ fn object_steps(rows: u64, k: u64, format: &Format, slice_rows: NonZeroU64) -> V
 }
 
 /// An object the GPTQ lanes round: `rows` rows of `k` columns, in `format`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectShape {
     pub rows: u64,
     pub k: u64,
@@ -1217,6 +1217,12 @@ fn object_needs(object: &ObjectShape, slice_rows: NonZeroU64) -> Result<StagingN
             object.rows, object.k
         )));
     }
+    if object.format.group == 0 {
+        return Err(MemoryError::Refused(format!(
+            "an object in {} has scale groups of no columns",
+            object.format.name
+        )));
+    }
     let mut needs = StagingNeeds::new();
     for step in object_steps(object.rows, object.k, &object.format, slice_rows) {
         needs.step(step)?;
@@ -1228,7 +1234,8 @@ fn object_needs(object: &ObjectShape, slice_rows: NonZeroU64) -> Result<StagingN
 /// one head alone), each of `lanes` lanes rounding one object of the group at a time, in slices of `slice_rows` rows:
 /// for each group the [`StagingNeeds::together`] of its objects, and for each class the most any group needs. Each
 /// lane's step holds its staging until the step ends, and a lane starts its next step after. No lanes or no groups need
-/// nothing. Refuses `slice_rows` of 0, and an object whose staging no pool class holds.
+/// nothing. Refuses `slice_rows` of 0, an object whose staging no pool class holds, and a format whose scale groups
+/// have no columns.
 pub fn lane_staging(groups: &[Vec<ObjectShape>], lanes: usize, slice_rows: u64) -> Result<StagingNeeds, MemoryError> {
     let Some(slice_rows) = NonZeroU64::new(slice_rows) else {
         return Err(MemoryError::Refused("a slice of 0 rows".to_owned()));
@@ -1493,10 +1500,16 @@ mod tests {
     }
 
     #[test]
-    fn a_slice_of_no_rows_and_an_object_too_large_to_stage_are_refused() {
+    fn a_slice_of_no_rows_an_object_too_large_to_stage_and_a_format_of_empty_groups_are_refused() {
         assert!(matches!(lane_staging(&[vec![a()]], 3, 0), Err(MemoryError::Refused(_))));
         assert!(matches!(
             lane_staging(&[vec![object(8, u64::MAX / 4, nvfp4())]], 3, 8),
+            Err(MemoryError::Refused(_))
+        ));
+        let mut format = nvfp4();
+        format.group = 0;
+        assert!(matches!(
+            lane_staging(&[vec![object(8, 4096, format)]], 3, 8),
             Err(MemoryError::Refused(_))
         ));
     }

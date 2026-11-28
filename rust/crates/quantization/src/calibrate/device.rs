@@ -89,7 +89,8 @@ pub const ROUNDING_LANES: usize = 3;
 pub const DEVICE_RESERVE: u64 = 8 << 30;
 /// Pinned bytes the layers are read into.
 pub const STAGING_BYTES: u64 = 4 << 30;
-/// Pinned bytes a trellis run's lanes stage through when the budget is not set; at least the GPTQ lane's warm set.
+/// The fewest pinned bytes a trellis run's lanes stage through when the budget is not set; the GPTQ lane's warm set
+/// when that is more.
 pub const TRELLIS_PINNED_BYTES: u64 = 1 << 30;
 /// Bytes of one upload copy.
 pub const UPLOAD_CHUNK_BYTES: usize = 64 << 20;
@@ -241,14 +242,50 @@ fn gpu_error(error: impl Display) -> GpuError {
     GpuError::Invalid(error.to_string())
 }
 
-/// What the GPTQ lanes of a run round, one group after another, each with the format the recipe gives it: in a layer
-/// run each text layer's objects and, unless the MTP block is skipped, the MTP layer's and its input projection alone;
-/// in every run the output head alone, and the draft head alone, one row per draft id. Fails when the checkpoint or
-/// the recipe does not know an object.
-fn lane_groups(objects: &Qwen38Objects, settings: &Settings) -> Result<Vec<Vec<ObjectShape>>, CalibrateError> {
+/// The shapes of a checkpoint's objects that [`lane_groups`] reads.
+trait ObjectShapes {
+    /// The text layers.
+    fn layers(&self) -> usize;
+    /// The hidden width.
+    fn hidden(&self) -> u64;
+    /// The objects of text layer `layer`.
+    fn layer_objects(&self, layer: usize) -> Result<Vec<String>, CalibrateError>;
+    /// The rows and columns of object `name`.
+    fn rows_columns(&self, name: &str) -> Result<(u64, u64), CalibrateError>;
+}
+
+impl ObjectShapes for Qwen38Objects {
+    fn layers(&self) -> usize {
+        self.config.full_attention.len()
+    }
+
+    fn hidden(&self) -> u64 {
+        self.config.hidden
+    }
+
+    fn layer_objects(&self, layer: usize) -> Result<Vec<String>, CalibrateError> {
+        Qwen38Objects::layer_objects(self, layer).map_err(|error| CalibrateError::failed("the layer's objects", error))
+    }
+
+    fn rows_columns(&self, name: &str) -> Result<(u64, u64), CalibrateError> {
+        let source = self.object(name).map_err(|error| CalibrateError::failed(name, error))?;
+        Ok((source.rows, source.columns))
+    }
+}
+
+/// What the GPTQ lanes of a run round, one group after another, each with the format `recipe` gives it: unless the run
+/// is a `trellis` one, each text layer's objects and, unless `skip_mtp`, the MTP layer's and its input projection
+/// alone; in every run the output head alone, and the draft head alone, of `draft_rows` rows. Fails when the
+/// checkpoint or the recipe does not know an object.
+fn lane_groups(
+    objects: &impl ObjectShapes,
+    recipe: &Recipe,
+    trellis: bool,
+    skip_mtp: bool,
+    draft_rows: u64,
+) -> Result<Vec<Vec<ObjectShape>>, CalibrateError> {
     let shape = |name: &str, rows: u64, k: u64| {
-        let format = settings
-            .recipe
+        let format = recipe
             .format(name)
             .map_err(|error| CalibrateError::failed(name, error))?;
         Ok(ObjectShape {
@@ -258,28 +295,24 @@ fn lane_groups(objects: &Qwen38Objects, settings: &Settings) -> Result<Vec<Vec<O
         })
     };
     let source = |name: &str| {
-        let source = objects
-            .object(name)
-            .map_err(|error| CalibrateError::failed(name, error))?;
-        shape(name, source.rows, source.columns)
+        let (rows, columns) = objects.rows_columns(name)?;
+        shape(name, rows, columns)
     };
-    let hidden = objects.config.hidden;
+    let hidden = objects.hidden();
     let mut groups = Vec::new();
-    if settings.trellis.is_none() {
-        for layer in 0..objects.config.full_attention.len() {
-            let names = objects
-                .layer_objects(layer)
-                .map_err(|error| CalibrateError::failed("the layer's objects", error))?;
+    if !trellis {
+        for layer in 0..objects.layers() {
+            let names = objects.layer_objects(layer)?;
             groups.push(names.iter().map(|name| source(name)).collect::<Result<_, _>>()?);
         }
-        if !settings.skip_mtp {
+        if !skip_mtp {
             let names = MTP_OBJECTS.iter().filter(|name| name.starts_with("mtp/layer/"));
             groups.push(names.map(|name| source(name)).collect::<Result<_, _>>()?);
             groups.push(vec![shape(INPUT_PROJECTION, hidden, 2 * hidden)?]);
         }
     }
     groups.push(vec![source(OUTPUT_HEAD)?]);
-    groups.push(vec![shape(DRAFT_HEAD, settings.draft_ids.len() as u64, hidden)?]);
+    groups.push(vec![shape(DRAFT_HEAD, draft_rows, hidden)?]);
     Ok(groups)
 }
 
@@ -321,7 +354,15 @@ impl Calibration {
         } else {
             settings.lanes.max(1)
         };
-        let warm = lane_staging(&lane_groups(&objects, &settings)?, gptq_lanes, HEAD_ROWS as u64)
+        let slice_rows = HEAD_ROWS;
+        let groups = lane_groups(
+            objects.as_ref(),
+            &settings.recipe,
+            settings.trellis.is_some(),
+            settings.skip_mtp,
+            settings.draft_ids.len() as u64,
+        )?;
+        let warm = lane_staging(&groups, gptq_lanes, slice_rows as u64)
             .map_err(|error| CalibrateError::failed("the staging the GPTQ lanes hold", error))?;
         let lane_pinned_bytes =
             lane_pinned_budget(settings.lane_pinned_bytes, warm.bytes(), settings.trellis.is_some())?;
@@ -493,7 +534,7 @@ impl Calibration {
                 recipe: settings.recipe.clone(),
                 damp: settings.damp,
                 act_order: settings.act_order,
-                slice_rows: HEAD_ROWS,
+                slice_rows,
             },
             out: heads_out,
             io,
@@ -1080,6 +1121,133 @@ fn release(inner: Arc<Inner>, weights: LayerWeights, then: Once<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use crate::recipe::Quantization;
+
+    /// A checkpoint of two text layers, the second of full attention, where each object has its own shape.
+    struct Checkpoint {
+        shapes: HashMap<String, (u64, u64)>,
+    }
+
+    const HIDDEN: u64 = 512;
+
+    fn layer_names(layer: usize) -> Vec<String> {
+        let roles = if layer == 1 {
+            [
+                "attention/query_key",
+                "attention/gate_value",
+                "attention/output",
+                "mlp/gate_up",
+                "mlp/down",
+            ]
+        } else {
+            ["gdn/query_key", "gdn/value_z", "gdn/output", "mlp/gate_up", "mlp/down"]
+        };
+        roles.iter().map(|role| format!("text/layers/{layer}/{role}")).collect()
+    }
+
+    fn checkpoint() -> Checkpoint {
+        let mut names = layer_names(0);
+        names.extend(layer_names(1));
+        names.extend(MTP_OBJECTS.iter().map(|name| name.to_string()));
+        names.push(OUTPUT_HEAD.to_string());
+        let shapes = names
+            .into_iter()
+            .zip(1..)
+            .map(|(name, index)| (name, (64 * index, 128 * index)))
+            .collect();
+        Checkpoint { shapes }
+    }
+
+    impl ObjectShapes for Checkpoint {
+        fn layers(&self) -> usize {
+            2
+        }
+
+        fn hidden(&self) -> u64 {
+            HIDDEN
+        }
+
+        fn layer_objects(&self, layer: usize) -> Result<Vec<String>, CalibrateError> {
+            Ok(layer_names(layer))
+        }
+
+        fn rows_columns(&self, name: &str) -> Result<(u64, u64), CalibrateError> {
+            self.shapes
+                .get(name)
+                .copied()
+                .ok_or_else(|| CalibrateError::Invalid(format!("unknown object {name}")))
+        }
+    }
+
+    /// The shapes of groups of (name, rows, columns), each in the format `recipe` gives its name.
+    fn expected(recipe: &Recipe, groups: &[Vec<(String, u64, u64)>]) -> Vec<Vec<ObjectShape>> {
+        let shape = |(name, rows, k): &(String, u64, u64)| ObjectShape {
+            rows: *rows,
+            k: *k,
+            format: rounded(recipe.format(name).unwrap()),
+        };
+        groups.iter().map(|group| group.iter().map(shape).collect()).collect()
+    }
+
+    /// The group of `names`, in their checkpoint shapes.
+    fn group(checkpoint: &Checkpoint, names: &[String]) -> Vec<(String, u64, u64)> {
+        names
+            .iter()
+            .map(|name| {
+                let (rows, k) = checkpoint.shapes[name];
+                (name.clone(), rows, k)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_runs_lanes_round_its_layers_mtp_block_and_heads_in_their_shapes() {
+        let checkpoint = checkpoint();
+        let layers = [group(&checkpoint, &layer_names(0)), group(&checkpoint, &layer_names(1))];
+        let mtp_layer = [
+            "mtp/layer/attention/query_key_gate_value",
+            "mtp/layer/attention/output",
+            "mtp/layer/mlp/gate_up",
+            "mtp/layer/mlp/down",
+        ]
+        .map(String::from);
+        let mtp = [
+            group(&checkpoint, &mtp_layer),
+            vec![(INPUT_PROJECTION.to_string(), HIDDEN, 2 * HIDDEN)],
+        ];
+        let heads = [
+            group(&checkpoint, &[OUTPUT_HEAD.to_string()]),
+            vec![(DRAFT_HEAD.to_string(), 7, HIDDEN)],
+        ];
+
+        let recipe = Recipe::new(Quantization::Nvfp4, false, None).unwrap();
+        let whole = [&layers[..], &mtp[..], &heads[..]].concat();
+        assert_eq!(
+            lane_groups(&checkpoint, &recipe, false, false, 7).unwrap(),
+            expected(&recipe, &whole)
+        );
+        let no_mtp = [&layers[..], &heads[..]].concat();
+        assert_eq!(
+            lane_groups(&checkpoint, &recipe, false, true, 7).unwrap(),
+            expected(&recipe, &no_mtp)
+        );
+        let trellis = Recipe::new(Quantization::Trellis, false, None).unwrap();
+        assert_eq!(
+            lane_groups(&checkpoint, &trellis, true, false, 7).unwrap(),
+            expected(&trellis, &heads)
+        );
+    }
+
+    #[test]
+    fn an_object_the_checkpoint_does_not_know_fails_the_groups() {
+        let mut checkpoint = checkpoint();
+        checkpoint.shapes.remove("text/layers/1/mlp/down");
+        let recipe = Recipe::new(Quantization::Nvfp4, false, None).unwrap();
+        assert!(lane_groups(&checkpoint, &recipe, false, false, 7).is_err());
+        assert!(lane_groups(&checkpoint, &recipe, true, false, 7).is_ok());
+    }
 
     #[test]
     fn an_unset_pinned_budget_is_the_warm_set_and_a_trellis_run_keeps_its_floor() {
