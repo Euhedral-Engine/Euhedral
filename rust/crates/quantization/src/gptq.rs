@@ -33,7 +33,9 @@ use crate::gptq::format::{
 use crate::gptq::sd4::{CODES, ENTRIES};
 use crate::gptq::state::{QuantState, StateError};
 use crate::kernels::{Compiled, Module, ModuleError, Modules};
-use crate::memory::{Claims, Device, LaneMemory, Memory, MemoryError, Staged, StepBytes, pinned_bytes, reclaim};
+use crate::memory::{
+    Claims, Device, LaneMemory, Memory, MemoryError, Staged, StagingNeeds, StepBytes, pinned_bytes, reclaim,
+};
 
 /// Why a step could not be started or did not finish.
 #[derive(Debug, Error)]
@@ -415,6 +417,12 @@ struct FactorState {
 }
 
 impl GptqLane {
+    /// Puts the staging of `needs` in the lane's pinned pool ([`LaneMemory::prewarm`]), charging `claims.pinned`. Call
+    /// it before the lane's first step, outside a frame.
+    pub fn prewarm_staging(&self, needs: &StagingNeeds, claims: &mut Claims) -> Result<(), GptqError> {
+        Ok(self.parts.memory.prewarm(needs, &mut claims.pinned)?)
+    }
+
     /// The memory [`factor`](Self::factor) of a `k` by `k` Hessian takes, to be claimed before it. It asks cuSOLVER
     /// for the workspace it needs, which enqueues nothing.
     pub fn factor_bytes(&mut self, k: usize) -> Result<StepBytes, GptqError> {
@@ -423,7 +431,7 @@ impl GptqLane {
         let words = 4 * k;
         Ok(StepBytes {
             device: 4 * k * k + 2 * words + 12 + 4 * u64::try_from(floats.max(1)).unwrap_or(1),
-            pinned: pinned_bytes([words, words, 12]),
+            pinned: pinned_bytes(factor_staging(k)),
         })
     }
 
@@ -629,12 +637,12 @@ impl GptqLane {
         let (rows, k) = (rows as u64, k as u64);
         let mut bytes = StepBytes {
             device: 4,
-            pinned: pinned_bytes([4]),
+            pinned: pinned_bytes(scales_staging(k, false)),
         };
         if format.sd4 {
             let (costs, small) = (8 * (CODES * CODES) as u64, 8 * CODES as u64);
             bytes.device += costs + 2 * small + 8 * k + 4 * self.chunk_rows(k).min(rows) * k;
-            bytes.pinned += pinned_bytes([costs, small, small, 4 * k, 4 * k]);
+            bytes.pinned = pinned_bytes(scales_staging(k, true));
         }
         Ok(bytes)
     }
@@ -895,14 +903,7 @@ impl GptqLane {
         let (n, k, group) = (n as u64, factor.k as u64, format.group as u64);
         let groups = k / group;
         let dead = dead_columns(&factor.importance, &factor.order).len() as u64;
-        let scale_bytes = if format.nvfp4 { 1 } else { 2 };
-        let mut staged = vec![2 * n * k, scale_bytes * n * groups, 4 * k, 4 * k, 4 * k, 4 * k];
-        if dead > 0 {
-            staged.push(4 * dead);
-        }
-        if format.sd4 {
-            staged.push(ENTRIES as u64);
-        }
+        let staged = round_staging(n, k, format, dead);
         let device = 4 * (2 * n * k + n * groups + 2 * n * BLOCK as u64 + n * group) + staged.iter().sum::<u64>();
         StepBytes {
             device,
@@ -1123,6 +1124,59 @@ fn round_choose<Q: LaneEnqueue<Kernel = CudaKernel>>(
     }
 }
 
+/// The staging buffers (bytes) [`GptqLane::factor`] of a `k` by `k` Hessian holds at once.
+fn factor_staging(k: u64) -> [u64; 3] {
+    [4 * k, 4 * k, 12]
+}
+
+/// The staging buffers (bytes) [`GptqLane::tensor_scales`] of `k` columns holds at once; `sd4` adds the table search's.
+fn scales_staging(k: u64, sd4: bool) -> Vec<u64> {
+    let mut staged = vec![4];
+    if sd4 {
+        let (costs, small) = (8 * (CODES * CODES) as u64, 8 * CODES as u64);
+        staged.extend([costs, small, small, 4 * k, 4 * k]);
+    }
+    staged
+}
+
+/// The staging buffers (bytes) [`GptqLane::round`] of `n` rows of `k` columns holds at once, with `dead` dead columns.
+fn round_staging(n: u64, k: u64, format: &Format, dead: u64) -> Vec<u64> {
+    let groups = k / format.group as u64;
+    let scale_bytes = if format.nvfp4 { 1 } else { 2 };
+    let mut staged = vec![2 * n * k, scale_bytes * n * groups, 4 * k, 4 * k, 4 * k, 4 * k];
+    if dead > 0 {
+        staged.push(4 * dead);
+    }
+    if format.sd4 {
+        staged.push(ENTRIES as u64);
+    }
+    staged
+}
+
+/// Adds to `needs` the staging an object of `rows` rows and `k` columns takes in `format`, rounded in slices of
+/// `slice_rows` rows: its factor, its tensor scales (NVFP4) and its slices, the first and the last. The dead columns
+/// of its Hessian are not known before the factor, so a slice that stages them holds one more buffer than this adds.
+pub fn object_staging(
+    needs: &mut StagingNeeds,
+    rows: u64,
+    k: u64,
+    format: &Format,
+    slice_rows: u64,
+) -> Result<(), MemoryError> {
+    needs.step(factor_staging(k))?;
+    if format.nvfp4 {
+        needs.step(scales_staging(k, format.sd4))?;
+    }
+    let slice_rows = slice_rows.max(1);
+    let last = rows % slice_rows;
+    for n in [rows.min(slice_rows), last] {
+        if n > 0 {
+            needs.step(round_staging(n, k, format, 0))?;
+        }
+    }
+    Ok(())
+}
+
 fn round_all(
     stream: &mut CudaStream,
     parts: &mut LaneParts,
@@ -1244,4 +1298,44 @@ fn round_collect(
         table: state.table,
     };
     Ok(Step::Done(quant))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
+mod tests {
+    use super::*;
+
+    fn nvfp4() -> Format {
+        Format {
+            name: "NVFP4".to_string(),
+            layout: String::new(),
+            group: 16,
+            qmin: 0,
+            qmax: 0,
+            nvfp4: true,
+            sd4: false,
+        }
+    }
+
+    #[test]
+    fn an_object_stages_its_factor_its_scales_and_its_slices() {
+        let mut needs = StagingNeeds::new();
+        object_staging(&mut needs, 100, 4096, &nvfp4(), 16384).unwrap();
+        // Factor: 16384, 16384 and 12 bytes; scales: 4; the slice of 100 rows: 819200, 25600 and four of 16384.
+        let mut expected = vec![4096, 16384, 16384, 16384, 16384, 32768, 1_048_576];
+        expected.sort_unstable();
+        assert_eq!(needs.buffers().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn an_object_of_several_slices_stages_the_whole_slice_and_the_last_one() {
+        let mut whole = StagingNeeds::new();
+        object_staging(&mut whole, 8, 4096, &nvfp4(), 8).unwrap();
+        let mut sliced = StagingNeeds::new();
+        object_staging(&mut sliced, 20, 4096, &nvfp4(), 8).unwrap();
+        // Slices of 8, 8 and 4 rows: the 8 rows' staging, and the tail's 4 rows of codes, one class below.
+        let mut expected: Vec<usize> = whole.buffers().chain([32768]).collect();
+        expected.sort_unstable();
+        assert_eq!(sliced.buffers().collect::<Vec<_>>(), expected);
+    }
 }

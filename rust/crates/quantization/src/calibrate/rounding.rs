@@ -21,8 +21,8 @@ use super::files::save;
 use super::schedule::{Schedule, Settled};
 use crate::gptq::format::Format;
 use crate::gptq::state::QuantState;
-use crate::gptq::{DeviceRange, Factor, Finished, GptqLane, Refused, RoundRequest, TensorScales};
-use crate::memory::{Claims, StepBytes};
+use crate::gptq::{DeviceRange, Factor, Finished, GptqLane, Refused, RoundRequest, TensorScales, object_staging};
+use crate::memory::{Claims, StagingNeeds, StepBytes};
 use crate::recipe::{Format as StoredFormat, Recipe};
 use crate::step::idle;
 
@@ -131,6 +131,9 @@ pub unsafe fn round_all(
     order: Vec<usize>,
     then: Then<Ended>,
 ) {
+    if let Err(error) = prewarm(&services, &lanes, &linears) {
+        return then(Err(error));
+    }
     let names = linears.iter().map(|linear| linear.name.clone()).collect();
     let decoded = linears
         .iter()
@@ -162,6 +165,38 @@ pub unsafe fn round_all(
             round.schedule.park(number, lane);
         }
     }
+}
+
+/// Puts the pinned staging the layer's steps need in the lanes' pool before the first step runs, so that no step
+/// allocates page-locked memory: the pool keeps the buffers, and the layers after the first find them there.
+fn prewarm(services: &Services, lanes: &[GptqLane], linears: &[Linear]) -> Result<(), CalibrateError> {
+    let Some(lane) = lanes.first() else { return Ok(()) };
+    let mut needs = StagingNeeds::new();
+    for linear in linears {
+        let format = services
+            .settings
+            .recipe
+            .format(&linear.name)
+            .map_err(|error| CalibrateError::failed(&linear.name, error))?;
+        object_staging(
+            &mut needs,
+            linear.rows,
+            linear.columns as u64,
+            &rounded(format),
+            services.settings.slice_rows as u64,
+        )
+        .map_err(|error| CalibrateError::failed("the staging the layer needs", error))?;
+    }
+    let mut claims = claims_for(
+        services,
+        StepBytes {
+            device: 0,
+            pinned: needs.bytes(),
+        },
+        "gptq prewarm",
+    )?;
+    lane.prewarm_staging(&needs, &mut claims)
+        .map_err(|error| CalibrateError::failed("the pinned staging prewarm", error))
 }
 
 /// The linears with the decoded weights the round gave back.

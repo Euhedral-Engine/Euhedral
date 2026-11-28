@@ -11,8 +11,10 @@
 //! allocation takes its share of them. A device buffer's share is given back when the buffer is freed.
 
 use std::array::from_fn;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::iter::repeat_n;
 use std::sync::Arc;
 
 use euhedral_gpu::{GpuError, LaneEnqueue, LaneStream};
@@ -358,6 +360,80 @@ pub fn pinned_bytes(sizes: impl IntoIterator<Item = u64>) -> u64 {
         .fold(0, u64::saturating_add)
 }
 
+/// The pinned staging buffers a run's steps hold at once, by size class: what [`LaneMemory::prewarm`] puts in the pool
+/// before the first step, so that no step allocates page-locked memory.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StagingNeeds {
+    /// For each size class in bytes, the most buffers of it one step holds at once.
+    classes: BTreeMap<usize, usize>,
+}
+
+impl StagingNeeds {
+    /// No staging.
+    pub fn new() -> StagingNeeds {
+        StagingNeeds::default()
+    }
+
+    /// Adds one step that holds a staging buffer of each of `sizes` bytes at once. A class's count is the most any
+    /// added step holds of it (steps of a lane run one after another). Refuses a size no class holds; nothing is added
+    /// then.
+    pub fn step(&mut self, sizes: impl IntoIterator<Item = u64>) -> Result<(), MemoryError> {
+        let mut held = BTreeMap::<usize, usize>::new();
+        for bytes in sizes {
+            let wanted = usize::try_from(bytes.max(1)).unwrap_or(usize::MAX);
+            let class = PinnedPool::class_bytes(wanted)
+                .ok_or_else(|| MemoryError::Refused(format!("{bytes} bytes is too large for a pinned buffer")))?;
+            *held.entry(class).or_default() += 1;
+        }
+        for (class, count) in held {
+            let most = self.classes.entry(class).or_default();
+            *most = (*most).max(count);
+        }
+        Ok(())
+    }
+
+    /// The pool bytes of every buffer: what a claim for the prewarm must cover.
+    pub fn bytes(&self) -> u64 {
+        self.classes
+            .iter()
+            .map(|(class, count)| *class as u64 * *count as u64)
+            .fold(0, u64::saturating_add)
+    }
+
+    /// The size class of each buffer, one entry per buffer, smallest class first.
+    pub fn buffers(&self) -> impl Iterator<Item = usize> + '_ {
+        self.classes.iter().flat_map(|(class, count)| repeat_n(*class, *count))
+    }
+}
+
+/// Holds one buffer from `acquire` for each of `needs`, then gives them all back together, so that each lives in the
+/// pool afterwards. The buffers' bytes are charged to `claim` for as long as they are held. Allocating a buffer is the
+/// only work `acquire` does; it is called outside any step.
+fn warm<T>(
+    needs: &StagingNeeds,
+    claim: &mut Option<Claim>,
+    mut acquire: impl FnMut(usize) -> Result<T, MemoryError>,
+) -> Result<(), MemoryError> {
+    let charged = charge(claim, usize::try_from(needs.bytes()).unwrap_or(usize::MAX), "pinned")?;
+    let mut held = Vec::new();
+    for class in needs.buffers() {
+        held.push(acquire(class)?);
+    }
+    drop(held);
+    drop(charged);
+    Ok(())
+}
+
+impl LaneMemory {
+    /// Puts the buffers of `needs` in the pinned pool: it holds at least that many of each class, taken from `claim`
+    /// while they are acquired. Allocates (waits on the driver for each new buffer): call it outside a frame, before
+    /// the first step. Fails with the pool's error, or when `claim` is missing or holds fewer bytes than
+    /// [`StagingNeeds::bytes`]; buffers acquired by then stay in the pool.
+    pub fn prewarm(&self, needs: &StagingNeeds, claim: &mut Option<Claim>) -> Result<(), MemoryError> {
+        warm(needs, claim, |class| Ok(self.pinned.acquire(class)?))
+    }
+}
+
 /// A device buffer with a page-locked twin of the same size: what goes up, or what comes back.
 #[derive(Debug)]
 pub struct Staged {
@@ -463,5 +539,146 @@ impl Staged {
         // SAFETY: as `upload`; nothing reads the host side before the retirement.
         unsafe { queue.copy_to_host(self.host.as_mut_ptr(), self.device.addr(), bytes) }?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test: a failed unwrap is the failure"
+)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use euhedral_memory::{LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope};
+
+    use super::*;
+
+    /// A pool of staging buffers that allocates only when it holds none of the class.
+    #[derive(Default)]
+    struct FakePool {
+        held: RefCell<Vec<usize>>,
+        allocated: RefCell<Vec<usize>>,
+    }
+
+    /// A loan: dropping it gives the buffer back to the pool.
+    struct Loan {
+        pool: Rc<FakePool>,
+        class: usize,
+    }
+
+    impl Drop for Loan {
+        fn drop(&mut self) {
+            self.pool.held.borrow_mut().push(self.class);
+        }
+    }
+
+    fn acquire(pool: &Rc<FakePool>, class: usize) -> Result<Loan, MemoryError> {
+        let mut held = pool.held.borrow_mut();
+        match held.iter().position(|have| *have == class) {
+            Some(at) => {
+                held.swap_remove(at);
+            }
+            None => pool.allocated.borrow_mut().push(class),
+        }
+        Ok(Loan {
+            pool: Rc::clone(pool),
+            class,
+        })
+    }
+
+    fn claim_of(bytes: u64) -> (Arc<Planner>, Option<Claim>) {
+        let planner = Planner::new([LocationSpec {
+            kind: LocationKind::HostPinned,
+            capacity: 1 << 30,
+            reserve: 0,
+        }]);
+        let owner = planner.open_owner(OwnerSpec::new("test", Priority(0), Scope::Process));
+        let claim = planner
+            .claim(owner, euhedral_memory::LocationId(0), bytes, "test")
+            .unwrap();
+        (planner, Some(claim))
+    }
+
+    fn needs_of(steps: &[&[u64]]) -> StagingNeeds {
+        let mut needs = StagingNeeds::new();
+        for step in steps {
+            needs.step(step.iter().copied()).unwrap();
+        }
+        needs
+    }
+
+    #[test]
+    fn a_step_needs_its_size_classes_and_a_class_counts_the_most_one_step_holds() {
+        let needs = needs_of(&[&[1, 4096, 5000], &[4096, 5000, 5000, 9000], &[100]]);
+        assert_eq!(
+            needs.buffers().collect::<Vec<_>>(),
+            vec![4096, 4096, 8192, 8192, 16384],
+            "two of 4096 (the first step), two of 8192 (the second), one of 16384"
+        );
+        assert_eq!(needs.bytes(), 2 * 4096 + 2 * 8192 + 16384);
+        assert_eq!(StagingNeeds::new().bytes(), 0);
+        assert_eq!(StagingNeeds::new().buffers().count(), 0);
+    }
+
+    #[test]
+    fn a_size_no_class_holds_is_refused_and_adds_nothing() {
+        let mut needs = needs_of(&[&[4096]]);
+        let before = needs.clone();
+        assert!(matches!(needs.step([4096, u64::MAX]), Err(MemoryError::Refused(_))));
+        assert_eq!(needs, before);
+    }
+
+    #[test]
+    fn the_prewarm_acquires_exactly_the_classes_the_steps_need_and_leaves_them_in_the_pool() {
+        let needs = needs_of(&[&[4096, 4096, 20_000], &[70_000]]);
+        let (_planner, mut claim) = claim_of(needs.bytes());
+        let pool = Rc::new(FakePool::default());
+        warm(&needs, &mut claim, |class| acquire(&pool, class)).unwrap();
+        let mut allocated = pool.allocated.borrow().clone();
+        allocated.sort_unstable();
+        assert_eq!(allocated, vec![4096, 4096, 32_768, 131_072]);
+        let mut held = pool.held.borrow().clone();
+        held.sort_unstable();
+        assert_eq!(held, allocated, "every buffer is back in the pool");
+
+        // The first step then takes its buffers from the pool: nothing is allocated.
+        let loans: Vec<Loan> = [4096u64, 4096, 20_000]
+            .into_iter()
+            .map(|bytes| acquire(&pool, PinnedPool::class_bytes(bytes as usize).unwrap()).unwrap())
+            .collect();
+        assert_eq!(pool.allocated.borrow().len(), 4, "the step allocated nothing");
+        drop(loans);
+    }
+
+    #[test]
+    fn a_prewarm_without_a_claim_that_covers_it_acquires_nothing() {
+        let needs = needs_of(&[&[4096, 8192]]);
+        let pool = Rc::new(FakePool::default());
+        assert!(matches!(
+            warm(&needs, &mut None, |class| acquire(&pool, class)),
+            Err(MemoryError::Refused(_))
+        ));
+        let (_planner, mut small) = claim_of(needs.bytes() - 1);
+        assert!(matches!(
+            warm(&needs, &mut small, |class| acquire(&pool, class)),
+            Err(MemoryError::Refused(_))
+        ));
+        assert!(pool.allocated.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_failed_acquisition_ends_the_prewarm_with_its_error() {
+        let needs = needs_of(&[&[4096, 8192]]);
+        let (_planner, mut claim) = claim_of(needs.bytes());
+        let mut calls = 0;
+        let result = warm(&needs, &mut claim, |_| {
+            calls += 1;
+            Err::<(), _>(MemoryError::Refused("the pool is out".to_string()))
+        });
+        assert!(matches!(result, Err(MemoryError::Refused(text)) if text == "the pool is out"));
+        assert_eq!(calls, 1);
     }
 }
