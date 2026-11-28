@@ -282,7 +282,7 @@ fn a_greedy_chat_completion_matches_the_engine_and_a_cancel_frees_the_sequence()
     );
 
     // The same prompt, run straight on the engine as the benchmark runs it: greedy, the artifact's speculation.
-    let runtime = host.runtime();
+    let runtime = host.runtime().expect("a dense engine");
     let (reference, reason) = run_on_engine(runtime, &prompt_ids, &tokenizer, SamplingConfig::greedy(0));
     assert_eq!(reason, FinishReason::Stop);
     assert_eq!(

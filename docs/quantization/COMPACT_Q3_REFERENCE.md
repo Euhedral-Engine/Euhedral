@@ -45,7 +45,7 @@ to it. Round-to-nearest conversion takes `fp16(max-abs / qmax)`; calibrated conv
 the `q3` artifact) searches each group's scale and uses the whole code range, including the most negative code. Rows are padded
 on K to 128.
 
-The Java loader validates descriptor metadata, reads the exact payload range, allocates the exact byte count, uploads the bytes
+The loader validates descriptor metadata, reads the exact payload range, allocates the exact byte count, uploads the bytes
 and keeps fused objects as fused `TensorHandle` instances. It does not quantize, dequantize, split or repack at load time.
 
 Layout sources: `native/src/q3/layout.cuh` and `native/src/q45/layout.cuh` (device), `tools/euhedral_artifacts/grouped.py`

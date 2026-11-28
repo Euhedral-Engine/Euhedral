@@ -424,7 +424,7 @@ SWIFT_CONFIG = {"text_config": {
     "linear_num_value_heads": 48, "linear_key_head_dim": 128, "linear_value_head_dim": 128,
     "linear_conv_kernel_dim": 4, "rms_norm_eps": 1e-6, "rope_parameters": {"rope_theta": 10000000.0},
     "partial_rotary_factor": 0.25, "max_position_embeddings": 262144, "hidden_act": "silu"}}
-FIXTURE = Path(__file__).resolve().parent.parent / "core/src/test/resources/trellis-artifact-fixture.bin"
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "trellis-artifact-fixture.bin"
 
 
 def sized_add_quant(plans, recipe, name, matrix, q3_format, *_):

@@ -6,7 +6,7 @@ the second. This file describes the kernels, their measured performance, the num
 rejected. It covers the Q3, Q4 and Q5 linears; NVFP4 linears run on native FP4 tensor cores ([NVFP4_NATIVE.md](NVFP4_NATIVE.md)).
 
 Hardware for every measurement: RTX 5070 Ti (sm_120, 70 SMs), driver 615.71, desktop session running. Sources:
-`native/src/q3_mx/kernels.cu` (kernels), `native/src/host/q3_mx.c` (host route), `CudaGpuMemory.invokeQ3Mx` (Java route).
+`native/src/q3_mx/kernels.cu` (kernels), `native/src/host/q3_mx.c` (host route), the `cuda` crate launch table (`rust/crates/cuda/src/launch`).
 Attention prefill is in `native/src/attention/nvfp4_prefill_fa2.cuh` (last section).
 
 ## Design

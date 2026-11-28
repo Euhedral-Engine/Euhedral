@@ -27,7 +27,7 @@ steps ([DFLASH2.md](DFLASH2.md) section 6, `nvfp4-compressed`):
 The model predicts MTP4 on chat prompts at 120.5 tok/s at 4K, against 114.5 measured on the benchmark's chat corpus.
 Predictions rank policies; they are not measurements.
 
-The prompts (`tools/mtp_draft_prompts.py`, rendered with the checkpoint's chat template, repository files at `main`)
+The prompts (a retired prompt-set tool, rendered with the checkpoint's chat template, repository files at `main`)
 come in three sets of 8:
 - **chat:** the benchmark chat corpus's tasks, four over a 3.5K-token document and four standalone, thinking off;
 - **code:** tests, review, a whole-file edit and a long refactor over real repository files (up to 7.3K tokens), plus
@@ -110,7 +110,7 @@ and the replay above reproduces their verification counts exactly.
 Setup:
 - `nvfp4-compressed`, 256 tokens, one round;
 - the 24 prompts above, with residency planned for 16K;
-- `tools/mtp_draft_prompts.py --context` sets at 16K (four chat document tasks, four agent transcripts with earlier
+- the retired prompt-set tool's context mode sets at 16K (four chat document tasks, four agent transcripts with earlier
   file reads) and at 32K.
 
 Decode tok/s, all prompts / chat / code / agentic:

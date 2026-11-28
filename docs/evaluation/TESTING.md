@@ -4,53 +4,30 @@ For toolchain setup and build commands, see [building and testing](../developmen
 
 ## Host tests
 
-`./gradlew test` runs the CPU tests of every module. They need no GPU. Tests that touch process-wide state
-(the Euhedral lattice, system properties, ports) are serialized or run in a JVM of their own; the rest run in
-parallel.
+`mise run rust-test` (`cargo test --workspace` in `rust/`) runs the CPU tests of every crate. They need no GPU.
+`mise run rust-check` adds the layer check, formatting and clippy. A test that reads a file makes it with `tempfile`:
+CI runs every test under Bazel's sandbox, where a crate's own files are not on disk.
 
-## CUDA tests
+## Device tests
 
-`./gradlew :core:cudaTest :api:cudaTest` runs every CUDA test, in three steps:
+A test that needs the GPU, the native library or a model is marked `#[ignore]` and skips with a message when its
+setting is missing. Run one binary or one test by name with `--ignored`:
 
-1. **Light** (`cudaLightTest`): classes that load no artifact and use little device memory. Several JVMs run them at
-   once (`-PcudaForks=N`, default 4).
-2. **Model groups** (`cudaModelTest`): classes that load an artifact, directly or through an engine. All of them run
-   in **one JVM**, ordered by group, and each artifact is loaded **once**: the first class that needs it loads it,
-   the rest find it ready, and the next group closes it before loading its own (two models do not fit the GPU).
-3. **Flash-Next** (`cudaFlashNextTest`): the same, for the Flash-Next groups, in a Gradle run of its own: its
-   whole-model classes pin host memory sized from what the cgroup has left, and the Qwen3.8 groups fill it with page cache.
-4. **Own JVM** (`cudaOwnJvmTest`): classes that cannot share a process, one JVM each.
+```bash
+cd rust
+cargo test --release -p euhedral-inference-engine --test device -- --ignored --nocapture <test name>
+```
 
-A class tells which kind it is with an annotation from `ModelGroup` (core test sources, `core/testing`), which is also
-a JUnit tag:
+Settings are looked up in this order: `EUHEDRAL_TEST_<KEY>` in the environment (`euhedral.qwen.rco-artifact` is
+`EUHEDRAL_TEST_QWEN_RCO_ARTIFACT`), then `~/.config/euhedral/test.properties` (or the file named by
+`EUHEDRAL_TEST_CONFIG`), then `gradle.properties` in the Gradle user home (`~/.gradle/gradle.properties`), kept as a fallback for existing setups. The native library is named by `euhedral.cuda.library` (`EUHEDRAL_TEST_CUDA_LIBRARY`), normally the `libeuhedral_cuda.so` that `cargo xtask native` builds under `build/native/linux-x64/lib/`.
 
-| Annotation | The class |
-| --- | --- |
-| none | needs no artifact; runs in the light step |
-| `@ModelGroup.CompactQ3`, `@ModelGroup.Nvfp4`, `@ModelGroup.FlashNext` | works on that artifact's model directly (`SharedQwen38.q3()`, `nvfp4()`) |
-| `@ModelGroup.CompactQ3Engine`, `Nvfp4Engine`, `FlashNextEngine` | starts an `InferenceEngine` over that artifact (`SharedEngines`) |
-| `@ModelGroup.OwnJvm` | needs a fresh process; say why in a comment |
+CI builds the device tests once and runs them in groups with `scripts/ci-device.py` (`pack` writes the archive,
+`run GROUP` runs one group, `check` fails unless every ignored test is in exactly one group). The groups keep the tests
+that load a model together, so an artifact loads once per group, and keep the Flash-Next groups apart, because their
+whole-model tests pin host memory sized from what the cgroup has left.
 
-The `api` module has no access to core's test classes: its CUDA classes carry the same names as plain
-`@Tag("engine-q3")` and so on.
-
-### Sharing state
-
-`Shared` keeps JVM-wide values (the device handle, a model, an engine), creates each on first use and closes them
-after the last test. Asking for a value of another group closes the previous group's values first. A test:
-
-- takes what it needs from the shared fixtures instead of loading in each method,
-- frees what it allocates and restores any toggle in a `finally`,
-- reads counters as differences (an engine is not fresh when the test starts),
-- never closes a shared value.
-
-Tests of one class that need different engines are ordered by engine (`@TestMethodOrder`) so the engine changes
-once.
-
-### Running one class
-
-`./gradlew :core:cudaIntegrationTest --tests '*FullModelCudaIntegrationTest'` runs the selected classes in one JVM,
-whatever their kind.
+Stop any serving container before running a device test.
 
 ### Keeping the suite fast
 
@@ -58,4 +35,4 @@ whatever their kind.
 - Time before cutting: a scalar CPU reference over the whole model, or a sweep over many row counts, costs far more
   than the check it supports. Keep a representative case for each boundary the test is about, and say in a comment
   why the reduced case still covers it.
-- A `@Timeout` is hang detection: about ten times the expected runtime.
+- A deadline in a test is hang detection: about ten times the expected runtime.

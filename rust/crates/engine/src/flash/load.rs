@@ -219,6 +219,16 @@ pub struct FixedWeights {
 }
 
 impl FixedWeights {
+    /// Weights with no objects: every lookup refuses.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            by_name: HashMap::new(),
+            files: HashMap::new(),
+            sd4: HashMap::new(),
+        }
+    }
+
     /// The object `name`. Refuses a name the plan did not place on the device or in host memory, naming it.
     pub fn weight(&self, name: &str) -> Result<Weight, FlashError> {
         self.by_name

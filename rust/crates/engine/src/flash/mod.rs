@@ -23,10 +23,15 @@ macro_rules! eager {
     )+};
 }
 
+pub mod assembly;
 pub mod block;
 pub mod buffers;
+pub mod chunks;
+pub mod device;
 pub mod embed;
+pub mod engine;
 pub mod gdn;
+pub mod generate;
 pub mod head;
 pub mod hyper;
 pub mod kernels;
@@ -37,7 +42,9 @@ pub mod ops;
 pub mod plan;
 pub mod ple;
 pub mod qsa;
+pub mod seq_state;
 pub mod sequence;
+pub mod serve;
 pub mod start;
 pub mod startup;
 pub mod step;

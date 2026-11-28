@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# The Rust server image: the linux-x64 server bundle in the same distroless base as the Java image (../Dockerfile).
+# The Rust server image: the linux-x64 server bundle in a distroless base.
 # Build from the repository root:  docker build -f rust/Dockerfile -t euhedral-rust .
 FROM debian:trixie-slim AS build
 WORKDIR /src

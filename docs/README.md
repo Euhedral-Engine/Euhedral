@@ -29,8 +29,6 @@ Start with the repository [quick start](../README.md#quick-start) to convert a c
 | [Kernels](kernels/README.md) | Attention, tensor-core prefill, native FP4 and CUDA graphs |
 | [Flash-Next](flash-next/README.md) | Model execution, artifacts, storage tiers, expert caching and performance |
 | [NVIDIA hardware](nvidia/README.md) | Hardware measurements and the microbenchmark harness |
-| [Design specs](superpowers/specs/) | Dated design specifications |
-| [Implementation plans](superpowers/plans/) | Dated implementation plans |
 
 Artifact conversion is covered in [tools](../tools/README.md); calibration and drafter training are covered in the
-[quantization module](../quantization/README.md). The [native module](../native/README.md) describes the CUDA source layout.
+[quantization tools](../rust/crates/quantize/README.md). The [native module](../native/README.md) describes the CUDA source layout.

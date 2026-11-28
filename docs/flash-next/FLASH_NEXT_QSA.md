@@ -3,7 +3,7 @@
 Execution of the sparse-attention layers of Qwen3.8-Flash-Next (HF `qwen4_exp`): 12 of its 48 layers (3, 7, ..., 47) run
 `Qwen4ExpTextAttention` with its `Qwen4ExpTextQSAIndexer` (upstream revision `f5ab85619d989359ef47b5efed8a91a15045627b`,
 `modular_qwen4_exp.py`). This note records what the code computes, the selection rule, the kernels, the numerics and what was
-measured. Sources: `native/src/qwen4/qsa_{norm,index,attention}.cuh`, `core/.../model/qwen4/Qsa{Ops,State,Layer}.java`.
+measured. Sources: `native/src/qwen4/qsa_{norm,index,attention}.cuh`, `rust/crates/engine/src/flash/qsa/`.
 
 ## What upstream computes
 
@@ -118,8 +118,8 @@ Scores are tiled over rows so that the scratch stays bounded: the FP32 scores of
 
 ## Validation
 
-Tests are `model.qwen4.Qsa*CudaIntegrationTest` (`./gradlew :core:cudaIntegrationTest --tests '*model.qwen4.Qsa*'`; a Blackwell GPU, and for the
-layer tests the artifact and the fixtures). The references are in `QsaReference`: a port of the upstream per-query indexer
+Tests are the `#[ignore]` device tests of the `qsa` module and `rust/crates/engine/tests/device/flash` (run with `--ignored`; a Blackwell GPU, and for the
+layer tests the artifact and the fixtures). The references are a port of the upstream per-query indexer
 loop and attention, written with PyTorch's rounding.
 
 - operators on synthetic data: norm and RoPE (strided, in place, positions to 16,000,000), pooling across chunkings of 97 tokens (1,

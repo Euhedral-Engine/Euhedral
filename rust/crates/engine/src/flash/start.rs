@@ -2,7 +2,12 @@
 //! holds and the host budget its plan is made against. Each is a pure function over what the startup read, so a
 //! refusal is a returned value that names the setting and its value.
 
-use euhedral_inference_edrl::{DETECT_BYTES, EdrlError, ModelFamily};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
+pub use euhedral_inference_edrl::ModelFamily;
+use euhedral_inference_edrl::{DETECT_BYTES, EdrlError};
 use euhedral_inference_settings::{BatchingSettings, MemorySettings, Settings};
 
 use crate::error::EngineError;
@@ -36,6 +41,28 @@ pub fn compute_streams(memory: &MemorySettings) -> Result<usize, EngineError> {
 pub fn check_settings(settings: &Settings) -> Result<usize, EngineError> {
     one_sequence(&settings.batching)?;
     compute_streams(&settings.memory)
+}
+
+/// The family's name as the server reports it (the `family` label of `euhedral_engine_info` and the startup summary).
+pub fn family_name(family: ModelFamily) -> &'static str {
+    match family {
+        ModelFamily::DenseV2 => "dense",
+        ModelFamily::FlashNextV3 => "flash-next",
+    }
+}
+
+/// The family of the artifact at `path`, from its first bytes, or the refusal that names what the file is or why it
+/// cannot be read.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "startup: the artifact's first bytes are read once, before the engine starts"
+)]
+pub fn family_at(path: &Path) -> Result<ModelFamily, EngineError> {
+    let mut head = [0u8; DETECT_BYTES];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .map_err(|error| EngineError::Runtime(format!("{} cannot be read ({error})", path.display())))?;
+    family_of(&head)
 }
 
 /// The family of the artifact whose first bytes are `head`, or the refusal that names what the file is: a magic, a
@@ -89,6 +116,12 @@ mod tests {
         assert_eq!(family_of(&head(3, 1)).expect("flash"), ModelFamily::FlashNextV3);
         let refused = family_of(&head(3, 7)).expect_err("unknown architecture").to_string();
         assert!(refused.contains("architecture 7"), "{refused}");
+    }
+
+    #[test]
+    fn each_family_has_its_own_name() {
+        assert_eq!(family_name(ModelFamily::DenseV2), "dense");
+        assert_eq!(family_name(ModelFamily::FlashNextV3), "flash-next");
     }
 
     #[test]

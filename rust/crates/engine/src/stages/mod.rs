@@ -46,6 +46,7 @@ use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 
 use crate::error::EngineError;
+use crate::flash::block::ChunkPlacement;
 use crate::flash::moe::block::MoeBlock;
 use crate::flash::ple::PleRows;
 use crate::model::ModelConfig;
@@ -806,6 +807,8 @@ pub struct Quantum {
     pub(crate) ple: Option<Arc<PleRows>>,
     /// What the Flash-Next mixture-of-experts stages hand to one another for this quantum ([`Quantum::with_moe_block`]).
     pub(crate) moe: Option<Arc<MoeBlock>>,
+    /// Where the quantum's rows lie in their sequence and the cache tables its cache layers read ([`Quantum::with_chunk_placement`]).
+    pub(crate) placement: Option<Arc<ChunkPlacement>>,
 }
 
 /// The next quantum's id.
@@ -896,6 +899,7 @@ impl Quantum {
             disk: None,
             ple: None,
             moe: None,
+            placement: None,
         })
     }
 
@@ -985,6 +989,7 @@ impl Quantum {
             disk: None,
             ple: None,
             moe: None,
+            placement: None,
         })
     }
 
@@ -1383,6 +1388,18 @@ impl Quantum {
     pub fn with_moe_block(mut self, block: Arc<MoeBlock>) -> Self {
         self.moe = Some(block);
         self
+    }
+
+    /// Where this quantum's rows lie in their sequence, with the page tables of the layers that read the cache: the
+    /// chunk position a Flash-Next sequence's owner supplies.
+    pub fn with_chunk_placement(mut self, placement: Arc<ChunkPlacement>) -> Self {
+        self.placement = Some(placement);
+        self
+    }
+
+    /// The chunk placement, if the quantum carries one.
+    pub fn chunk_placement(&self) -> Option<&Arc<ChunkPlacement>> {
+        self.placement.as_ref()
     }
 
     /// The hand-over of the mixture-of-experts stages, if the quantum carries one.

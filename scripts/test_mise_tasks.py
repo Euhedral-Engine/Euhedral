@@ -13,13 +13,12 @@ class MiseTasksTest(unittest.TestCase):
         data = tomllib.loads((ROOT / "mise.toml").read_text())
         tasks = data["tasks"]
         expected = {
-            "format-check", "format", "test", "native-build", "native-test",
-            "native-verify", "cuda-test", "benchmark-validate", "benchmark-smoke",
-            "benchmark-baseline", "full-build", "deploy", "test-deploy",
+            "native-test", "rust-check", "rust-test", "rust-native", "rust-native-verify", "deploy", "test-deploy",
         }
         self.assertLessEqual(expected, tasks.keys())
-        self.assertIn("nativeVerify", tasks["full-build"]["run"])
-        self.assertIn("build", tasks["full-build"]["run"])
+        self.assertFalse(any("gradlew" in str(task.get("run")) for task in tasks.values()))
+        self.assertNotIn("java", data["tools"])
+        self.assertNotIn("gradle", data["tools"])
         self.assertIn("scripts/deploy-main.py", tasks["deploy"]["run"])
         self.assertNotIn("docker-run", tasks)
         self.assertIn('arg "<file>"', tasks["deploy"]["usage"])
@@ -28,19 +27,14 @@ class MiseTasksTest(unittest.TestCase):
         self.assertIn('      - "mise.toml"', workflow)
         self.assertNotIn('      - ".mise.toml"', workflow)
         self.assertIn("  push:\n    branches: [main]", workflow)
-        self.assertEqual(2, workflow.count('      - "api/**"'))
-        self.assertEqual(2, workflow.count('      - "core/**"'))
-        self.assertEqual(2, workflow.count('      - "benchmark/**"'))
         for action in (
             "actions/checkout@v7.0.1",
             "jdx/mise-action@v5.0.0",
-            "gradle/actions/setup-gradle@v6.4.0",
             "actions/cache@v6.1.0",
             "actions/setup-python@v7.0.0",
             "actions/upload-artifact@v7.0.1",
         ):
             self.assertIn(f"uses: {action}", workflow)
-        self.assertIn("cache-provider: basic", workflow)
         self.assertIn("native/.zig-cache", workflow)
         self.assertIn("native/.zig-global-cache", workflow)
         self.assertIn("hashFiles('mise.toml', 'native/build.zig', 'native/native-products.json')", workflow)

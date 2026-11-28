@@ -27,7 +27,7 @@ staging buffer. A pageable tier copies a hit into a staging buffer first.
 
 By default the budget is automatic: what the machine can spare now (`MemAvailable`, or the headroom of the process's cgroup and
 its ancestors when that is less), less room for the operating system (10%, never closer than 4 GiB to exhaustion) and for the
-runtime itself (the JVM heap's room to grow, at most 2 GiB; 1 GiB for native allocations; and 6 GiB of page cache for the
+runtime itself (2 GiB for the process's own growth; 1 GiB for native allocations; and 6 GiB of page cache for the
 n-gram rows, which settle there in a run). `memory.host-limit` states the budget instead and is respected as stated:
 smaller than the automatic one (0 means no RAM tier, so every device miss reads the artifact, `FILE_BACKED`) or larger,
 with a warning when the machine cannot spare that much now. The budget controls memory only: the tier's records, the
