@@ -1,12 +1,13 @@
 //! `euhedral-health-probe`: the container's health check. The image has no shell and no curl, so the check is this
 //! binary: it asks `GET /health` of the server on this machine and exits 0 on `200`, else 1.
 //!
-//! The port is `EUHEDRAL_SERVER_PORT`, else `PORT`, else 1738, the variables and the default the server reads. Connecting,
+//! The port is `EUHEDRAL_SERVER_PORT`, else `PORT`, else 1738, the variables and the default the server reads. The host is `EUHEDRAL_SERVER_HOST`, else every interface; the probe connects to that address, or to 127.0.0.1
+//! when the server listens on every interface (`::` or `0.0.0.0`). Connecting,
 //! writing and reading each give up after two seconds.
 
 use std::env::var;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -25,6 +26,23 @@ fn port_from(server_port: Option<String>, port: Option<String>) -> Result<u16, S
     text.trim()
         .parse()
         .map_err(|_| format!("the port {text:?} is not a port number"))
+}
+
+/// The address the probe connects to: the one `server_host` names, or 127.0.0.1 when it is unset or names every
+/// interface (the unspecified address of either family).
+fn host_from(server_host: Option<String>) -> Result<IpAddr, String> {
+    let Some(text) = server_host else {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    };
+    let host: IpAddr = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("the host {text:?} is not an IP address"))?;
+    Ok(if host.is_unspecified() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        host
+    })
 }
 
 /// Asks `GET /health` of `address`; `Ok` only for a `200` answer.
@@ -58,8 +76,10 @@ fn check(address: SocketAddr, timeout: Duration) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let result = port_from(var("EUHEDRAL_SERVER_PORT").ok(), var("PORT").ok())
-        .and_then(|port| check(SocketAddr::from((Ipv4Addr::LOCALHOST, port)), TIMEOUT));
+    let result = host_from(var("EUHEDRAL_SERVER_HOST").ok()).and_then(|host| {
+        let port = port_from(var("EUHEDRAL_SERVER_PORT").ok(), var("PORT").ok())?;
+        check(SocketAddr::new(host, port), TIMEOUT)
+    });
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -129,6 +149,20 @@ mod tests {
         let address = listener.local_addr().expect("address");
         let error = check(address, Duration::from_millis(200)).expect_err("no answer");
         assert!(error.contains("cannot read"), "{error}");
+    }
+
+    #[test]
+    fn the_probe_connects_to_the_configured_host_and_to_loopback_for_every_interface() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(host_from(None), Ok(loopback));
+        assert_eq!(host_from(Some("::".into())), Ok(loopback));
+        assert_eq!(host_from(Some("0.0.0.0".into())), Ok(loopback));
+        assert_eq!(host_from(Some("::1".into())), Ok("::1".parse().expect("address")));
+        assert_eq!(
+            host_from(Some(" 10.1.2.3 ".into())),
+            Ok("10.1.2.3".parse().expect("address"))
+        );
+        assert!(host_from(Some("localhost".into())).is_err());
     }
 
     #[test]

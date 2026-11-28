@@ -151,7 +151,7 @@ pub fn first_sequence_bytes(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
         config,
         plan.kv_format,
         plan.verified_rows(),
-        plan.profile.speculation == Speculation::Mtp && plan.draft_depth > 0,
+        plan.drafts_with() == Speculation::Mtp,
         plan.rows.rows,
     ) + drafter_bytes(config, plan.profile.speculation, plan.draft_depth, plan.rows.rows)
 }
@@ -175,7 +175,7 @@ pub fn drafter_bytes(config: &ModelConfig, speculation: Speculation, draft_depth
 /// The MTP layer's cache of the plan's first sequence at `max_context_tokens`: 0 without a drafter. The runtime
 /// reserve pays for it.
 pub fn mtp_cache_bytes_of(plan: &ResidencyPlan, config: &ModelConfig) -> u64 {
-    if plan.draft_depth > 0 && plan.profile.speculation == Speculation::Mtp {
+    if plan.drafts_with() == Speculation::Mtp {
         mtp_cache_bytes(config, plan.kv_format, plan.max_context_tokens as u64)
     } else {
         0

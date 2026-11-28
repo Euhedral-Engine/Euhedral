@@ -22,7 +22,6 @@
 use std::mem;
 use std::sync::Arc;
 
-use super::prefix_plan::{Carrier, carrier};
 use super::source::{Admission, Flying, Mode, OVERLAP_MAX_START_POSITION, Owner, Role, Run};
 use crate::prefix::SequenceAddresses;
 use crate::stages::attention::KvSource;
@@ -145,11 +144,10 @@ impl Owner {
         // The chunk that ends at a checkpoint is captured once its rows are in the rings: nothing is chained behind
         // the update, and the next chunk waits for the capture.
         let end = start as usize + rows;
-        let checkpoint = carrier(state.draft_kind(), false) == Carrier::DraftUpdate
-            && run
-                .checkpoints
-                .as_ref()
-                .is_some_and(|checkpoints| checkpoints.wants(end));
+        let checkpoint = run
+            .checkpoints
+            .as_ref()
+            .is_some_and(|checkpoints| checkpoints.wants(end));
         let refs = self.admit_context(start, rows, checkpoint)?;
         if let Some(refs) = refs
             && let Some(run) = self.run.as_mut()

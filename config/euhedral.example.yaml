@@ -27,6 +27,7 @@ sampling:                                     # used for the fields a request le
   top-p: 0.95                                 # optional, default 0.95: the probability mass kept, above 0 and at most 1
 
 server:
+  host: "::"                                  # optional, default "::" (every interface): the IP address to listen on, such as 127.0.0.1 to accept local connections only
   port: 1738                                  # optional, default 1738: the port to listen on
   shutdown-timeout: 10s                       # optional, default 10s: how long closing the engine waits for its workers to stop
   requests:

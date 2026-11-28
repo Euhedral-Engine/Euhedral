@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use euhedral_inference_settings::{
@@ -245,4 +246,26 @@ fn load_reads_the_located_file_then_the_environment() {
     assert_eq!(load(&[], &vars).unwrap().server.port, 8002);
     let missing = load(&[OsString::from("--config=/nope/c.yaml")], &env(&[])).unwrap_err();
     assert_eq!(missing.0[0].message(), "configuration file not found: /nope/c.yaml");
+}
+
+#[test]
+fn the_host_is_an_ip_address_and_defaults_to_every_interface() {
+    assert_eq!(
+        load_with(MODEL, &[]).unwrap().server.host,
+        "::".parse::<IpAddr>().unwrap()
+    );
+    let loopback = load_with(MODEL, &[("EUHEDRAL_SERVER_HOST", "127.0.0.1")]).unwrap();
+    assert_eq!(loopback.server.host, "127.0.0.1".parse::<IpAddr>().unwrap());
+    let v6 = load_with(MODEL, &[("EUHEDRAL_SERVER_HOST", "::1")]).unwrap();
+    assert_eq!(v6.server.host, "::1".parse::<IpAddr>().unwrap());
+}
+
+#[test]
+fn a_host_that_is_not_an_ip_address_is_refused_naming_the_key_and_the_value() {
+    let found = load_with(MODEL, &[("EUHEDRAL_SERVER_HOST", "localhost")]).unwrap_err();
+    assert_eq!(
+        found.0[0].message(),
+        "server.host (EUHEDRAL_SERVER_HOST): not an IP address: localhost"
+    );
+    assert_eq!(found.0[0].key(), Some("server.host"));
 }

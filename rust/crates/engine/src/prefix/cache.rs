@@ -100,10 +100,16 @@ pub enum OpenError {
     SlotBytes { arena: u64, layout: u64 },
     #[error("the checkpoint interval must be a positive multiple of the chunk")]
     Interval,
+    /// The arena cannot hold the checkpoint of one chunk of base state, the least one checkpoint takes (every capture
+    /// ends on a multiple of the chunk, so a node spans at least a chunk). Opening guarantees that minimum only: a node
+    /// that spans more, up to the interval, or one that holds MTP state and does not start at 0, takes more slots.
     #[error("a chunk's checkpoint takes {needed} slots and the arena has {slots}")]
     BaseCapacity { needed: usize, slots: u32 },
     #[error("the requests' checkpoints hold {kind:?} state, which the layout has no room for")]
     NoState { kind: Speculation },
+    /// The arena cannot hold one chunk's checkpoint of the draft state the requests store (`CacheParts::drafting`).
+    /// The cache asks for room only for state its requests will store: an engine whose requests never draft opens with
+    /// `drafting` unset and is sized for base state alone.
     #[error("a chunk's checkpoint that holds {kind:?} state takes {needed} slots and the arena has {slots}")]
     Capacity {
         kind: Speculation,
@@ -237,7 +243,8 @@ pub struct CacheParts {
     pub interval: u32,
     /// Tokens a prefill chunk takes.
     pub chunk: u32,
-    /// The draft state the checkpoints hold beside the base state, if any.
+    /// The draft state the requests' checkpoints hold beside the base state: the kind of the requests that draft, and
+    /// `None` when no request does.
     pub drafting: Option<Speculation>,
     /// The most a copy piece moves.
     pub piece_bytes: u64,

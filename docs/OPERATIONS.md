@@ -58,6 +58,7 @@ See [Docker deployment](DEPLOYMENT.md) for both formats and the cutover checks.
 | `kernels.rms-norm-decode-slices` | auto | Slices of the output pass of a one-row RMS norm (a decode step). `auto` is 40 on every card, the value chosen with the sliced kernel; 1 to 65535, and the output is the same for any count, so try other values on another card. |
 | `kernels.fused-verify-from` | auto | The fewest keys at which the fused verifier kernel serves each of 0 to 8 verified rows, as nine comma-separated whole numbers or `never`. `auto` is `never,never,49152,16384,4096,2048,16384,16384,12288`, measured on an RTX 5070 Ti. The fused kernel serves only from 2048 keys, so entries below 2048 have no effect. |
 | `kernels.trellis.*` | 512, auto, 64, 128 | Trellis kernel thresholds ([TRELLIS.md](quantization/TRELLIS.md#speed)): `tensor-core-max-tokens`, `target-blocks` (auto = 8 per streaming multiprocessor), `whole-k-min-tokens`, `wide-block-min-tokens`. |
+| `server.host` | `"::"` | The IP address to listen on, only that address; `::` is every interface (both families where the host has IPv6, else IPv4), `127.0.0.1` accepts local connections only. Quote `::` in YAML (`host: "::"`): unquoted it is a parse error. The container health check connects to the host (127.0.0.1 for `::` and `0.0.0.0`). A value that is not an IP address stops the server at start. |
 | `server.shutdown-timeout` | 10s | How long closing the engine waits for its workers to stop. |
 | `server.requests.default-max-tokens` | 4096 | Completion length when a request sets none. |
 | `server.requests.max-queued` | 16 | Requests waiting while every generation slot is busy; more are refused with 503. |
@@ -135,7 +136,7 @@ the kernels, which is most of the time):
 ```text
 Context 32768 tokens x 1 sequence: 13465 MiB of the 15083 MiB available on the GPU, 0 MiB of weights in host memory
 Prefix cache: 4095 MiB pinned, a checkpoint every 2048 tokens
-Listening on port 1738, serving model qwen3_8_27b_nvfp4_trellis_rco
+Listening on [::]:1738, serving model qwen3_8_27b_nvfp4_trellis_rco
 Started in 128.440 seconds
 ```
 

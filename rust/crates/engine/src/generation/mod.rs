@@ -234,7 +234,7 @@ impl Generation {
             }),
             _ => None,
         };
-        let dflash2 = if residency.draft_depth > 0 && residency.profile.speculation == ArtifactSpeculation::Dflash2 {
+        let dflash2 = if residency.drafts_with() == ArtifactSpeculation::Dflash2 {
             let drafter = config
                 .dflash2
                 .as_ref()
@@ -568,15 +568,23 @@ impl Generation {
     }
 }
 
+/// Whether the requests draft with the MTP layer: the plan drafts with it (`drafts_with`) and the draft head's token
+/// ids are there (`token_ids`), without which no sequence drafts.
+fn mtp_requests_draft(drafts_with: ArtifactSpeculation, token_ids: bool) -> bool {
+    drafts_with == ArtifactSpeculation::Mtp && token_ids
+}
+
 /// Opens the prefix cache the plan granted memory for, once for the engine; `None` (and why, once, in the log) when the
 /// engine cannot use it: the chunk is not a multiple of the checkpoint granule or does not divide the interval between
 /// checkpoints. A drafting request stores and restores its drafter's state with the target's (the MTP cache, or the
-/// DFlash2 rings), so an engine whose drafter cannot be stored in one checkpoint opens no cache. Nothing is
+/// DFlash2 rings), so an engine whose drafter cannot be stored in one checkpoint opens no cache; `mtp` is whether the
+/// requests draft with the MTP layer, and an engine whose requests never draft is sized for base state alone. Nothing is
 /// opened, and nothing is logged, when the plan granted no memory (`prefix-cache.size: 0`).
 fn open_cache(
     core: &Arc<Core>,
     config: &Arc<ModelConfig>,
     residency: &ResidencyPlan,
+    mtp: bool,
     claim: Option<Claim>,
 ) -> Option<PrefixCacheHandle> {
     if residency.prefix_cache_bytes == 0 {
@@ -604,8 +612,8 @@ fn open_cache(
         drafter: config
             .dflash2
             .as_ref()
-            .filter(|_| residency.draft_depth > 0 && residency.profile.speculation == ArtifactSpeculation::Dflash2),
-        mtp: residency.draft_depth > 0 && residency.profile.speculation == ArtifactSpeculation::Mtp,
+            .filter(|_| residency.drafts_with() == ArtifactSpeculation::Dflash2),
+        mtp,
         format: residency.kv_format,
         settings,
         granted: residency.prefix_cache_bytes,
@@ -679,7 +687,8 @@ impl Generations {
         ));
         let count = sequences.len();
         let peers: Arc<[Arc<Address<Owner>>]> = addresses.iter().map(Arc::clone).collect();
-        let prefix = open_cache(core, config, residency, prefix_claim);
+        let mtp_drafts = mtp_requests_draft(residency.drafts_with(), draft_ids.is_some());
+        let prefix = open_cache(core, config, residency, mtp_drafts, prefix_claim);
         let mut generations: Vec<Generation> = Vec::with_capacity(count);
         let mut waiting = sequences.into_iter().zip(addresses).enumerate();
         while let Some((index, (sequence, address))) = waiting.next() {
@@ -957,6 +966,17 @@ impl Generations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requests_draft_with_mtp_only_when_the_plan_drafts_with_it_and_the_token_ids_are_there() {
+        assert!(mtp_requests_draft(ArtifactSpeculation::Mtp, true));
+        assert!(
+            !mtp_requests_draft(ArtifactSpeculation::Mtp, false),
+            "the ids are missing"
+        );
+        assert!(!mtp_requests_draft(ArtifactSpeculation::Dflash2, true));
+        assert!(!mtp_requests_draft(ArtifactSpeculation::None, true));
+    }
 
     #[test]
     fn no_request_begins_on_an_owner_once_the_engine_stops() {

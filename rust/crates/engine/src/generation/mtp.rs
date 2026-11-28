@@ -35,7 +35,7 @@ use euhedral_inference_cuda::DevicePtr;
 
 use super::acceptance::{Accepted, accept, accept_tokens};
 use super::dflash2::{Drafter, DrafterStep};
-use super::prefix_plan::{Carrier, DraftKind, Resume, carrier, catch_up_captures};
+use super::prefix_plan::{DraftKind, Resume, catch_up_captures};
 use super::request::{FinishReason, Verification};
 use super::sampled::SampledRows;
 use super::source::{Admission, Flying, Mode, OVERLAP_MAX_START_POSITION, Owner, Role, Run, Step};
@@ -252,7 +252,8 @@ impl Speculating {
         self.resuming = true;
     }
 
-    /// Sets the state `resume` names after a restore at `position`.
+    /// Sets the state `resume` names after a restore at `position`. `Resume::Drafter` does nothing when the state has
+    /// no drafter.
     pub(super) fn restored(&mut self, position: u64, resume: Resume) {
         match resume {
             Resume::Mtp { whole } => self.resumed_at(position as u32, whole),
@@ -406,8 +407,7 @@ impl Owner {
             .checkpoints
             .as_ref()
             .is_some_and(|checkpoints| checkpoints.wants(end));
-        let checkpoint =
-            carrier(state.draft_kind(), false) == Carrier::DraftUpdate && catch_up_captures(wanted, resuming);
+        let checkpoint = catch_up_captures(wanted, resuming);
         let admission = Admission {
             role: Role::PromptCatchUp,
             kind: QuantumKind::Draft,

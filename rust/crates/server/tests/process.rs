@@ -42,7 +42,7 @@ impl Server {
                 Ok(0) | Err(_) => return false,
                 Ok(_) => {
                     self.announced.push_str(&line);
-                    if line.contains("Listening on port") {
+                    if line.contains("Listening on ") {
                         return true;
                     }
                 }
@@ -215,7 +215,7 @@ fn a_port_in_use_exits_with_one_and_names_the_port() {
     let mut server = spawn(&["--config", file.to_str().expect("a path"), "--scripted-backend"]);
     assert_eq!(exit_code(&mut server, HANG_GUARD), 1);
     let text = stderr_of(&mut server);
-    assert!(text.contains(&format!("Port {port} was already in use.")), "{text}");
+    assert!(text.contains(&format!("Port {port} was already in use")), "{text}");
 }
 
 /// Starts a scripted server and waits until its log says that it listens. `windows` are the hidden arguments that
