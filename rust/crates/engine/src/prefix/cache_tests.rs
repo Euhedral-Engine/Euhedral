@@ -186,6 +186,7 @@ impl Rig {
                 format: FORMAT,
                 interval: INTERVAL,
                 chunk: CHUNK,
+                drafting: None,
                 piece_bytes,
                 first_serial: 1 << 40,
             },
@@ -416,9 +417,11 @@ fn a_second_checkpoint_extends_the_first() {
 
 #[test]
 fn a_checkpoint_larger_than_the_arena_is_skipped_and_counted() {
-    let rig = Rig::new(2);
+    // One chunk's checkpoint fits (the cache opens); a node of two chunks does not.
+    let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
+    let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
-    let captured = rig.capture(&source, &tokens(0, 600), rig.cache.root(), 512, None);
+    let captured = rig.capture(&source, &tokens(0, 1100), rig.cache.root(), 1024, None);
     assert_eq!(answer(&captured), rig.cache.root(), "the cursor stays where it was");
     assert_eq!(rig.queued(), 0);
     let stats = rig.stats();
@@ -449,7 +452,7 @@ fn a_full_arena_evicts_the_least_recently_used_checkpoint() {
 #[test]
 fn a_pinned_checkpoint_is_not_evicted_and_a_released_one_is() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
-    let one = layout.slots(0, 256, None) as u32;
+    let one = layout.slots(0, CHUNK, None) as u32;
     let rig = Rig::new(one);
     let source = Device::new(FORMAT, 1024);
     let (a, b) = (tokens(0, 300), tokens(1000, 300));
@@ -516,7 +519,7 @@ fn a_capture_past_the_rows_the_sequence_holds_is_not_taken() {
 #[test]
 fn a_cancel_before_the_copies_unpins_without_an_error_or_a_job() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
-    let rig = Rig::new(layout.slots(0, 256, None) as u32);
+    let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
     let (a, b) = (tokens(0, 300), tokens(1000, 300));
     let first = rig.capture(&source, &a, rig.cache.root(), 256, None);
@@ -534,7 +537,7 @@ fn a_cancel_before_the_copies_unpins_without_an_error_or_a_job() {
 #[test]
 fn a_cancel_while_the_copies_run_unpins_and_is_not_counted_as_a_restore() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
-    let rig = Rig::new(layout.slots(0, 256, None) as u32);
+    let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
     let (a, b) = (tokens(0, 300), tokens(1000, 300));
     let first = rig.capture(&source, &a, rig.cache.root(), 256, None);
@@ -556,7 +559,7 @@ fn a_cancel_while_the_copies_run_unpins_and_is_not_counted_as_a_restore() {
 #[test]
 fn a_restore_whose_copy_fails_unpins_and_answers() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
-    let rig = Rig::new(layout.slots(0, 256, None) as u32);
+    let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
     let (a, b) = (tokens(0, 300), tokens(1000, 300));
     let first = rig.capture(&source, &a, rig.cache.root(), 256, None);
@@ -622,7 +625,7 @@ fn a_job_dropped_without_running_ends_the_request_as_a_failure() {
 #[test]
 fn a_hit_that_is_dropped_unpins() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
-    let rig = Rig::new(layout.slots(0, 256, None) as u32);
+    let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
     let first = rig.capture(&source, &tokens(0, 300), rig.cache.root(), 256, None);
     rig.run_all(&source);
@@ -727,6 +730,7 @@ fn a_cache_over_the_wrong_slot_size_or_an_off_grid_interval_does_not_open() {
         format: FORMAT,
         interval,
         chunk: CHUNK,
+        drafting: None,
         piece_bytes: 1 << 20,
         first_serial: 0,
     };
@@ -743,28 +747,75 @@ fn a_cache_over_the_wrong_slot_size_or_an_off_grid_interval_does_not_open() {
     assert!(PrefixCacheHandle::open(parts(layout.slot_bytes(), 0), inline()).is_err());
 }
 
+/// Parts over `layout` with an arena of `slots` slots, the requests' checkpoints holding `drafting`.
+fn parts_with(layout: &CheckpointLayout, slots: u32, drafting: Option<Speculation>) -> CacheParts {
+    CacheParts {
+        layout: layout.clone(),
+        arena: arena(slots, layout.slot_bytes()),
+        host: Arc::new(Host {
+            memory: Mutex::new(Vec::new()),
+        }),
+        format: FORMAT,
+        interval: INTERVAL,
+        chunk: CHUNK,
+        drafting,
+        piece_bytes: 1 << 20,
+        first_serial: 0,
+    }
+}
+
+#[test]
+fn a_cache_whose_arena_cannot_hold_one_base_checkpoint_does_not_open() {
+    let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
+    let needed = layout.slots(0, CHUNK, None);
+    let short = needed as u32 - 1;
+    let refused = PrefixCacheHandle::open(parts_with(&layout, short, None), inline()).err();
+    assert_eq!(refused, Some(OpenError::BaseCapacity { needed, slots: short }));
+    let message = refused.unwrap().to_string();
+    assert!(
+        message.contains(&needed.to_string()) && message.contains(&short.to_string()),
+        "{message}"
+    );
+    assert!(PrefixCacheHandle::open(parts_with(&layout, needed as u32, None), inline()).is_ok());
+}
+
+#[test]
+fn a_cache_whose_arena_cannot_hold_one_mtp_checkpoint_does_not_open_when_requests_draft_with_it() {
+    let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
+    let (base, needed) = (
+        layout.slots(0, CHUNK, None),
+        layout.slots(0, CHUNK, Some(Speculation::Mtp)),
+    );
+    assert!(needed > base, "the MTP state takes slots of its own");
+    let short = needed as u32 - 1;
+    let refused = PrefixCacheHandle::open(parts_with(&layout, short, Some(Speculation::Mtp)), inline()).err();
+    assert_eq!(
+        refused,
+        Some(OpenError::Capacity {
+            kind: Speculation::Mtp,
+            needed,
+            slots: short
+        })
+    );
+    let message = refused.unwrap().to_string();
+    assert!(
+        message.contains(&needed.to_string()) && message.contains(&short.to_string()),
+        "{message}"
+    );
+    assert!(PrefixCacheHandle::open(parts_with(&layout, needed as u32, Some(Speculation::Mtp)), inline()).is_ok());
+    // A model that has an MTP layer does not turn the cache off for requests that never draft with it.
+    assert!(PrefixCacheHandle::open(parts_with(&layout, base as u32, None), inline()).is_ok());
+}
+
 #[test]
 fn a_cache_whose_arena_cannot_hold_one_drafting_checkpoint_does_not_open() {
     let layout = CheckpointLayout::new(&compact(), FORMAT)
         .expect("layout")
         .with_drafter(&drafter(3, 2000))
         .expect("a drafter");
-    let host: Arc<dyn HostArena> = Arc::new(Host {
-        memory: Mutex::new(Vec::new()),
-    });
     let needed = layout.slots(0, CHUNK, Some(Speculation::Dflash2));
-    let parts = |slots: u32| CacheParts {
-        layout: layout.clone(),
-        arena: arena(slots, layout.slot_bytes()),
-        host: Arc::clone(&host),
-        format: FORMAT,
-        interval: INTERVAL,
-        chunk: CHUNK,
-        piece_bytes: 1 << 20,
-        first_serial: 0,
-    };
     let short = needed as u32 - 1;
-    let refused = PrefixCacheHandle::open(parts(short), inline()).err();
+    let refused = PrefixCacheHandle::open(parts_with(&layout, short, Some(Speculation::Dflash2)), inline()).err();
     assert_eq!(
         refused,
         Some(OpenError::Capacity {
@@ -778,7 +829,7 @@ fn a_cache_whose_arena_cannot_hold_one_drafting_checkpoint_does_not_open() {
         message.contains(&needed.to_string()) && message.contains(&short.to_string()),
         "{message}"
     );
-    assert!(PrefixCacheHandle::open(parts(needed as u32), inline()).is_ok());
+    assert!(PrefixCacheHandle::open(parts_with(&layout, needed as u32, Some(Speculation::Dflash2)), inline()).is_ok());
 }
 
 #[test]
@@ -850,7 +901,7 @@ fn a_request_without_speculation_restores_a_speculative_node_without_its_draft_s
 #[test]
 fn a_restore_into_pages_that_are_not_reserved_is_refused_without_a_job() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
-    let rig = Rig::new(layout.slots(0, 256, None) as u32);
+    let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
     let prompt = tokens(0, 300);
     let first = rig.capture(&source, &prompt, rig.cache.root(), 256, None);
@@ -908,7 +959,7 @@ fn a_restore_that_fails_sets_the_requests_kill_flag_before_it_answers() {
 #[test]
 fn a_restores_match_stays_pinned_until_its_job_ended() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
-    let rig = Rig::new(layout.slots(0, 256, None) as u32);
+    let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
     let (a, b) = (tokens(0, 300), tokens(1000, 300));
     let first = rig.capture(&source, &a, rig.cache.root(), 256, None);

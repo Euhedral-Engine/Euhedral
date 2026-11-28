@@ -100,6 +100,8 @@ pub enum OpenError {
     SlotBytes { arena: u64, layout: u64 },
     #[error("the checkpoint interval must be a positive multiple of the chunk")]
     Interval,
+    #[error("a chunk's checkpoint takes {needed} slots and the arena has {slots}")]
+    BaseCapacity { needed: usize, slots: u32 },
     #[error("a chunk's checkpoint that holds {kind:?} state takes {needed} slots and the arena has {slots}")]
     Capacity {
         kind: Speculation,
@@ -233,6 +235,8 @@ pub struct CacheParts {
     pub interval: u32,
     /// Tokens a prefill chunk takes.
     pub chunk: u32,
+    /// The draft state the requests' checkpoints hold beside the base state, when the plan has them draft.
+    pub drafting: Option<Speculation>,
     /// The most a copy piece moves.
     pub piece_bytes: u64,
     /// The first serial of the jobs it builds, so that no job's number is a quantum's.
@@ -257,6 +261,7 @@ impl PrefixCache {
             format,
             interval,
             chunk,
+            drafting,
             piece_bytes,
             first_serial,
         } = parts;
@@ -269,16 +274,24 @@ impl PrefixCache {
         if interval == 0 || chunk == 0 || !interval.is_multiple_of(chunk) {
             return Err(OpenError::Interval);
         }
-        // The drafter's rings are a fixed share of every checkpoint, which an arena too small for the first chunk's
-        // could never store: refuse it here, not by skipping every capture.
-        let kind = Speculation::Dflash2;
-        let needed = layout.slots(0, chunk, Some(kind));
-        if layout.has_speculation(kind) && needed > arena.capacity() as usize {
-            return Err(OpenError::Capacity {
-                kind,
-                needed,
+        // The smallest node a request stores is a chunk's: the base state, and the draft's when the requests draft. An
+        // arena too small for one could never store a checkpoint: refuse it here, not by skipping every capture.
+        let base = layout.slots(0, chunk, None);
+        if base > arena.capacity() as usize {
+            return Err(OpenError::BaseCapacity {
+                needed: base,
                 slots: arena.capacity(),
             });
+        }
+        if let Some(kind) = drafting {
+            let needed = layout.slots(0, chunk, Some(kind));
+            if needed > arena.capacity() as usize {
+                return Err(OpenError::Capacity {
+                    kind,
+                    needed,
+                    slots: arena.capacity(),
+                });
+            }
         }
         let tree = PrefixTree::new(Arc::clone(&arena));
         let root = tree.root();

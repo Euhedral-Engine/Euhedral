@@ -294,6 +294,7 @@ fn two_sequences_capture_and_restore_their_own_bytes_at_once() {
             library: &world.library,
             config: &world.config,
             drafter: None,
+            mtp: false,
             format,
             settings: PrefixCacheSettings {
                 size: ByteSize(granted),
