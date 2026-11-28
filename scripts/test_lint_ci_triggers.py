@@ -27,6 +27,13 @@ jobs:
     needs: changes
     if: contains(github.event.changes.added_labels.*.name, 'land') && needs.changes.outputs.rust == 'true'
     runs-on: x
+  landed:
+    needs: changes
+    if: github.event_name == 'push'
+    runs-on: x
+  gate-ok:
+    if: always() && (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land'))
+    runs-on: x
   land-guard:
     runs-on: x
 """
@@ -61,6 +68,22 @@ class LintCiTriggersTest(unittest.TestCase):
     def test_a_job_not_gated_on_land_fails(self):
         self.assertEqual(len(broken("    if: contains(github.event.changes.added_labels.*.name, 'land')\n", "")), 1)
         self.assertEqual(len(broken("    if: contains(github.event.changes.added_labels.*.name, 'land') && needs", "    if: needs")), 1)
+
+    def test_a_label_term_that_is_not_a_top_level_conjunct_fails(self):
+        land = "contains(github.event.changes.added_labels.*.name, 'land')"
+        for old, new in (
+            ("    if: " + land + "\n", "    if: always() || " + land + "\n"),
+            ("    if: " + land + "\n", "    if: " + land + " || needs.changes.result == 'success'\n"),
+            ("    if: " + land + "\n", "    if: !" + land + "\n"),
+            ("    if: " + land + "\n", "    if: (always() || " + land + ") && true\n"),
+            ("    if: github.event_name == 'push'\n", "    if: github.event_name == 'push' || always()\n"),
+        ):
+            self.assertEqual(len(broken(old, new)), 1, new)
+
+    def test_a_label_term_in_a_conjunction_passes(self):
+        land = "contains(github.event.changes.added_labels.*.name, 'land')"
+        self.assertEqual(broken("    if: " + land + "\n", "    if: always() && " + land + "\n"), [])
+        self.assertEqual(broken("    if: " + land + "\n", "    if: ${{ " + land + " && true }}\n"), [])
 
     def test_a_missing_guard_fails(self):
         self.assertEqual(len(broken("  land-guard:\n    runs-on: x\n", "")), 1)

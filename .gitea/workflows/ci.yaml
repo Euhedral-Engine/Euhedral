@@ -170,7 +170,7 @@ jobs:
   landed:
     name: landed
     needs: changes
-    if: github.event_name == 'push' && (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land'))
+    if: github.event_name == 'push'
     runs-on: arbiter-docker
     env:
       ARBITER_ARGS: "--mem 1G"
@@ -182,7 +182,7 @@ jobs:
       - name: The commit is a landed pull request
         env:
           GITEA_TOKEN: ${{ github.token }}
-          API_URL: ${{ github.server_url }}/api/v1
+          API_URL: ${{ github.api_url }}
           REPOSITORY: ${{ github.repository }}
         run: python3 scripts/ci-landed.py "$GITHUB_SHA"
       # Last step: the first failed job cancels the run (see the action).

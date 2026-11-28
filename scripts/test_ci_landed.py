@@ -1,7 +1,9 @@
 """ci-landed proves a commit pushed to an integration branch is the merge of a pull request head that passed its land run."""
 
 import importlib.util
+import subprocess
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +74,29 @@ class OnMainTest(unittest.TestCase):
 
     def test_a_commit_that_is_the_merge_of_a_tested_head_is_landed(self):
         self.assertIsNone(self.on_main({HEAD: [run()]}))
+
+
+class IsOnMainTest(unittest.TestCase):
+    def exit_code(self, code):
+        with mock.patch.object(ci_landed.subprocess, "run", return_value=subprocess.CompletedProcess([], code)):
+            return ci_landed.is_on_main(MERGE)
+
+    def test_exit_0_is_on_main_and_1_is_not(self):
+        self.assertTrue(self.exit_code(0))
+        self.assertFalse(self.exit_code(1))
+
+    def test_exit_128_is_an_error_not_a_no(self):
+        with self.assertRaises(ValueError):
+            self.exit_code(128)
+
+    def test_exit_128_makes_the_check_exit_2(self):
+        def is_on_main(sha):
+            with mock.patch.object(ci_landed.subprocess, "run", return_value=subprocess.CompletedProcess([], 128)):
+                return ci_landed.is_on_main(sha)
+
+        trees = {MERGE: "t", HEAD: "t"}
+        code = ci_landed.check(MERGE, is_on_main, lambda sha: [BASE, HEAD], trees.__getitem__, lambda commit, limit: {"workflow_runs": []})
+        self.assertEqual(code, 2)
 
 
 class CheckTest(unittest.TestCase):

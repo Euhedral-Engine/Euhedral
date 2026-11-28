@@ -90,7 +90,7 @@ def git(*args):
 
 
 def is_on_main(sha):
-    """Whether `sha` is an ancestor of origin/main; git's exit 128 (an unknown commit or ref) is an error, not a no."""
+    """Whether `sha` is an ancestor of origin/main; any exit but 0 and 1 (128: an unknown commit or ref) is an error, not a no."""
     code = subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], capture_output=True).returncode
     if code not in (0, 1):
         raise ValueError(f"git merge-base failed ({code})")
