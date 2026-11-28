@@ -3,7 +3,7 @@
 //! [`EngineRuntime::generate`](crate::EngineRuntime::generate) starts a greedy request and
 //! [`EngineRuntime::teacher_forced`](crate::EngineRuntime::teacher_forced) a teacher-forced run, each on an idle
 //! sequence from the pool. Both are carried by the sequence's owner (one for each sequence), which sits in a [`Mailbox`](mailbox::Mailbox): the frames that tell it something (a quantum
-//! retired, a logits row arrived, a parked quantum's lane work ran) post the message and run the owner's turn on their
+//! concluded, a logits row arrived, a parked quantum's lane work ran) post the message and run the owner's turn on their
 //! own worker if no other turn runs. The caller is told through its listener or sink, on a worker, and waits on a
 //! hand-off of its own.
 
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use euhedral_core::generics::FrameSink;
 use euhedral_data_structures::queues::MpscQueue;
-use euhedral_graph::{DEFAULT_RETRY_BACKSTOP, GraphRuntime, RetryCounts};
+use euhedral_graph::{DEFAULT_RETRY_BACKSTOP, GraphRuntime, RetryCounts, Slot};
 use euhedral_inference_cuda::{CudaLibrary, DevicePtr};
 use euhedral_inference_edrl::WeightFormat;
 use euhedral_memory::Claim;
@@ -55,6 +55,7 @@ use crate::quantum::{Executor, Preparer};
 use crate::residency::offload::StagingGeometry;
 use crate::residency::planner::ResidencyPlan;
 use crate::runtime::{Core, STAGE_RING_QUANTA, Units};
+use crate::stages::{Retired, Retirement};
 use crate::state::{SequenceId, SequenceState};
 use crate::workspace::Workspace;
 use crate::workspace::{input_records, input_records_for};
@@ -75,8 +76,36 @@ pub use request::{
     Verification,
 };
 pub(crate) use source::GREEDY_DEPTH;
-use source::{Audience, Drafts, Message, Owner, Rejected, Retired, Shared, StartFailed};
+use source::{Audience, Drafts, Message, Owner, Rejected, Shared, StartFailed};
 pub use teacher_forced::LogitsSink;
+
+/// Completes `place` with the quantum that retired, which concludes once the quanta admitted before it did. A quantum
+/// is refused at its start without a place, so a missing one is a fault, logged.
+fn complete(place: Option<Slot<Retirement>>, retired: Retired) {
+    match place {
+        Some(place) => place.complete(Retirement::Quantum(Box::new(retired))),
+        None => log::error!(
+            "a {:?} quantum retired with no place in its sequence's order",
+            retired.kind
+        ),
+    }
+}
+
+/// Completes each segment's place, in segment order, once, with what `retired` makes of that segment from the item `kept`
+/// holds for it: a segment's item stays its own whatever other segments have no place. A segment with no place is
+/// skipped (it would have been refused at its start).
+fn complete_each<T: Send + 'static, K>(
+    places: Vec<Option<Slot<T>>>,
+    kept: Vec<K>,
+    mut retired: impl FnMut(usize, K) -> T,
+) {
+    for (segment, (place, kept)) in places.into_iter().zip(kept).enumerate() {
+        match place {
+            Some(place) => place.complete(retired(segment, kept)),
+            None => log::error!("segment {segment} of a pass retired with no place in its sequence's order"),
+        }
+    }
+}
 
 /// The engine's admission of a request, as the answer `Owner::begin` takes.
 fn admit(core: &Core) -> Result<Units, AdmissionError> {
@@ -208,7 +237,6 @@ impl Generation {
         id: SequenceId,
         address: Arc<Address<Owner>>,
         order: &Arc<Order<Executor>>,
-        peers: &Arc<[Arc<Address<Owner>>]>,
         sequences: usize,
         draft_ids: Option<Arc<[u32]>>,
         prefix: Option<PrefixCacheHandle>,
@@ -220,9 +248,7 @@ impl Generation {
         let queue = MpscQueue::<Message>::new(GREEDY_DEPTH + 4);
         let (producer, inbox) = (queue.producer(), queue.consumer());
         let copies = prefix.as_ref().map(|_| (id, Arc::clone(order)));
-        let executor = match Self::executor(
-            core, config, residency, weights, &address, order, peers, sequences, copies,
-        ) {
+        let executor = match Self::executor(core, config, residency, weights, order, sequences, copies) {
             Ok(executor) => executor,
             Err(error) => return Err(Box::new((error, sequence))),
         };
@@ -319,9 +345,7 @@ impl Generation {
         config: &Arc<ModelConfig>,
         residency: &ResidencyPlan,
         weights: &Weights,
-        address: &Arc<Address<Owner>>,
         order: &Arc<Order<Executor>>,
-        peers: &Arc<[Arc<Address<Owner>>]>,
         sequences: usize,
         copies: Option<(SequenceId, Arc<Order<Executor>>)>,
     ) -> Result<Executor, EngineError> {
@@ -375,8 +399,7 @@ impl Generation {
             retries: Arc::new(RetryCounts::default()),
             retry_backstop: DEFAULT_RETRY_BACKSTOP,
         };
-        let retiring = Arc::clone(address);
-        let (passes, peers) = (Arc::clone(order), Arc::clone(peers));
+        let passes = Arc::clone(order);
         let executor = Executor::new(
             Arc::new(plan),
             &runtime,
@@ -384,27 +407,22 @@ impl Generation {
             Arc::clone(&core.gpu),
             core.settings.kernels.graphs.captures_per_view as usize,
             move |mut quantum, outcome| {
+                let mut places = quantum.take_places();
                 if quantum.segments().len() < 2 {
-                    // Runs the owner's turn on this worker when no other turn runs.
-                    retiring.post(Message::Retired(Box::new(Retired::whole(quantum, outcome))));
+                    // Concludes in its sequence's order, on this thread if it is the one that finds the quantum's turn.
+                    complete(places.pop().flatten(), Retired::whole(quantum, outcome));
                     return;
                 }
                 // A pass of several sequences: the workspace's owner is told first (what waits behind the pass starts, and
-                // the passes' rule hears of it), then each member's owner gets its own part.
+                // the passes' rule hears of it), then each member's part concludes in its own sequence's order.
                 passes.pass_retired(quantum.id());
                 let leases = quantum.take_leases();
                 let guards = quantum.take_flights();
                 let batch = Arc::new(quantum);
-                for (segment, (lease, guard)) in leases.into_iter().zip(guards).enumerate() {
-                    let sequence = batch.segments().get(segment).and_then(|part| part.sequence());
-                    let Some(owner) = sequence.and_then(|sequence| peers.get(sequence.0)) else {
-                        log::error!("a pass retired with a part of no sequence the engine holds");
-                        continue;
-                    };
-                    owner.post(Message::Retired(Box::new(Retired::part(
-                        &batch, segment, lease, guard, &outcome,
-                    ))));
-                }
+                let kept: Vec<_> = leases.into_iter().zip(guards).collect();
+                complete_each(places, kept, |segment, (lease, guard)| {
+                    Retirement::Quantum(Box::new(Retired::part(&batch, segment, lease, guard, &outcome)))
+                });
             },
         )
         .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))?
@@ -419,13 +437,8 @@ impl Generation {
         // The sequence's own transfer lane (sequences share them when there are fewer lanes than sequences), so that
         // one sequence's restore does not wait behind another's capture on a lane they would not share.
         let lane = core.transfer_lane_id(sequence.0 % core.copy_lanes(residency.offload.staging.is_some()));
-        // A copy job that ended tells the order, as a quantum's retirement does (what waits behind it starts), and then
-        // the sequence's owner, which counts it until now.
-        let owner = Arc::clone(address);
-        let ended = Box::new(move |serial| {
-            order.retired(sequence, serial);
-            owner.post(Message::CopyEnded);
-        });
+        // The workspace's order is told when a copy job ends, so that what waits behind it may start.
+        let ended = Box::new(move |serial| order.retired(sequence, serial));
         let copier = Copier::new(&runtime, core.lane_table().clone(), lane, sequence, ended)
             .map_err(|error| EngineError::Runtime(format!("the prefix cache's copy graph: {error:?}")))?;
         Ok(executor.with_copier(copier))
@@ -686,7 +699,6 @@ impl Generations {
             Generation::spawner(core),
         ));
         let count = sequences.len();
-        let peers: Arc<[Arc<Address<Owner>>]> = addresses.iter().map(Arc::clone).collect();
         let mtp_drafts = mtp_requests_draft(residency.drafts_with(), draft_ids.is_some());
         let prefix = open_cache(core, config, residency, mtp_drafts, prefix_claim);
         let mut generations: Vec<Generation> = Vec::with_capacity(count);
@@ -702,7 +714,6 @@ impl Generations {
                 SequenceId(index),
                 address,
                 &order,
-                &peers,
                 count,
                 draft_ids.clone(),
                 prefix.clone(),
@@ -986,5 +997,73 @@ mod tests {
         closing.store(true, Ordering::SeqCst);
         assert!(unless_closing(&closing, Some(&mut owner)).is_none());
         assert!(unless_closing::<i32>(&closing, None).is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the recording fake is shared between the test and the function each order calls"
+)]
+mod places {
+    use std::sync::Mutex;
+
+    use super::conclusion::Conclusion;
+    use super::*;
+
+    /// A sequence's order whose conclusions land in a list, in the order they concluded.
+    fn recording() -> (Conclusion<u32>, Arc<Mutex<Vec<u32>>>) {
+        let concluded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&concluded);
+        let order = Conclusion::new(move |value| sink.lock().unwrap_or_else(|p| p.into_inner()).push(value));
+        (order, concluded)
+    }
+
+    fn seen(list: &Arc<Mutex<Vec<u32>>>) -> Vec<u32> {
+        list.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    #[test]
+    fn each_segment_completes_its_own_sequences_place_once_in_segment_order() {
+        let (orders, lists): (Vec<_>, Vec<_>) = (0..3).map(|_| recording()).unzip();
+        let places = orders.iter().map(|order| Some(order.admit())).collect();
+        let mut asked = Vec::new();
+        let kept = vec![(); 3];
+        complete_each(places, kept, |segment, ()| {
+            asked.push(segment);
+            10 + segment as u32
+        });
+        assert_eq!(asked, [0, 1, 2], "each segment is asked for once, in order");
+        for (segment, list) in lists.iter().enumerate() {
+            assert_eq!(
+                seen(list),
+                [10 + segment as u32],
+                "sequence {segment} concluded its own segment, once"
+            );
+        }
+    }
+
+    #[test]
+    fn a_segment_without_a_place_leaves_the_others_to_conclude() {
+        let (first, first_list) = recording();
+        let (second, second_list) = recording();
+        let places = vec![Some(first.admit()), None, Some(second.admit())];
+        complete_each(places, vec![(); 3], |segment, ()| segment as u32);
+        assert_eq!(seen(&first_list), [0]);
+        assert_eq!(seen(&second_list), [2]);
+    }
+
+    #[test]
+    fn a_segment_without_a_place_does_not_shift_the_items_of_the_ones_after_it() {
+        let (orders, lists): (Vec<_>, Vec<_>) = (0..3).map(|_| recording()).unzip();
+        let places = vec![Some(orders[0].admit()), None, Some(orders[2].admit())];
+        let mut got = Vec::new();
+        complete_each(places, vec!["first", "second", "third"], |_, kept| {
+            got.push(kept);
+            0
+        });
+        assert_eq!(got, ["first", "third"], "the third segment got its own item");
+        assert!(seen(&lists[1]).is_empty());
     }
 }

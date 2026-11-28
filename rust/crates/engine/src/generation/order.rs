@@ -143,8 +143,24 @@ impl Launch for Executor {
 
     fn start(&self, job: Job, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
         match job {
-            Job::Quantum(quantum) => Executor::start(self, *quantum, kill, after),
-            Job::Copy(copy) => self.start_copy(copy, kill, after),
+            Job::Quantum(quantum) => {
+                if let Some(segment) = quantum.unplaced() {
+                    return Err(StartError::NoPlace {
+                        serial: quantum.id(),
+                        segment,
+                    });
+                }
+                Executor::start(self, *quantum, kill, after)
+            }
+            Job::Copy(copy) => {
+                if !copy.has_place() {
+                    return Err(StartError::NoPlace {
+                        serial: copy.serial(),
+                        segment: 0,
+                    });
+                }
+                self.start_copy(copy, kill, after)
+            }
         }
     }
 
