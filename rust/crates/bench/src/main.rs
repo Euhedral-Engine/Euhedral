@@ -24,7 +24,7 @@ use std::env::{self, consts};
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use euhedral_inference_bench::artifact::load_tokenizer;
 use euhedral_inference_bench::await_value;
@@ -508,7 +508,9 @@ fn drift_command(args: &[String]) -> Result<u8, Failure> {
         .transpose()?;
     let (mut runtime, mut owner) = start_engine(&first, &library)?;
     let store = Arc::new(RowStore::new(steps + 1));
+    let started = Instant::now();
     let collected = drift::collect(&runtime, prefix_ids.clone(), forced.clone(), &store);
+    eprintln!("drift: first run took {:.1} s", started.elapsed().as_secs_f64());
     if let (Ok(()), Some(exact)) = (&collected, &exact) {
         shutdown(owner, runtime);
         exact.release();
@@ -520,7 +522,9 @@ fn drift_command(args: &[String]) -> Result<u8, Failure> {
         let second = tool_settings(&artifact, config.as_deref(), prefix + steps + 1)?;
         (runtime, owner) = start_engine(&second, &library)?;
     }
+    let started = Instant::now();
     let compared = collected.and_then(|()| drift::compare(&runtime, prefix_ids, forced, &store));
+    eprintln!("drift: second run took {:.1} s", started.elapsed().as_secs_f64());
     shutdown(owner, runtime);
     let summaries = [drift::summarize(&compared?)];
     print!("{}", drift::report(&summaries, &[prefix], candidate));
