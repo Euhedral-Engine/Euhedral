@@ -3,7 +3,7 @@
 //! [`EngineRuntime::generate`](crate::EngineRuntime::generate) starts a greedy request and
 //! [`EngineRuntime::teacher_forced`](crate::EngineRuntime::teacher_forced) a teacher-forced run, each on an idle
 //! sequence from the pool. Both are carried by the sequence's owner (one for each sequence), which sits in a [`Mailbox`](mailbox::Mailbox): the frames that tell it something (a quantum
-//! retired, a logits row arrived, a parked quantum's lane work ran) post the message and run the owner's turn on their
+//! concluded, a logits row arrived, a parked quantum's lane work ran) post the message and run the owner's turn on their
 //! own worker if no other turn runs. The caller is told through its listener or sink, on a worker, and waits on a
 //! hand-off of its own.
 
