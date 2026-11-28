@@ -26,11 +26,7 @@
 #error "Euhedral CUDA ABI requires CUDA toolkit 13.1 or newer"
 #endif
 
-#ifdef _WIN32
-static __declspec(thread) cudaStream_t selected_stream;
-#else
 static _Thread_local cudaStream_t selected_stream;
-#endif
 
 int euhedral_cuda_synchronize(void) {
     cudaError_t status = cudaDeviceSynchronize();

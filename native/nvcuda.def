@@ -1,11 +1,9 @@
 LIBRARY nvcuda.dll
 EXPORTS
     cuCtxGetCurrent
-    cuCtxGetCurrent_v2
     cuCtxGetDevice
     cuDeviceGetAttribute
     cuFuncSetAttribute
-    cuGetErrorString
     cuInit
     cuModuleGetFunction
     cuModuleLoadData
