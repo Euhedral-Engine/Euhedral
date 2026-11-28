@@ -2,8 +2,8 @@
 //! from them, either the selection key of the greedy argmax or the whole BF16 row.
 //!
 //! The final mix of the last row is the head's norm: [`super::block::FinalMix`] writes it into
-//! [`FlashRegions::final_mixed`] (Java has no separate norm either), and the head multiplies it by the output
-//! weights. The head runs only for a quantum that scores a row ([`Quantum::logits_rows`] above 0), as Java's head runs
+//! [`FlashRegions::final_mixed`], and the head multiplies it by the output
+//! weights. The head runs only for a quantum that scores a row ([`Quantum::logits_rows`] above 0), so it runs
 //! only for the last chunk of a prompt.
 
 use euhedral_graph::StageError;

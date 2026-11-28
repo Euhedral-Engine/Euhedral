@@ -346,7 +346,7 @@ pub fn plan_fill_floats(x: u64, count: u64, value: f32) -> Result<Vec<Step>, Tre
 }
 
 /// Divides the `k` by `k` FP32 Hessian at `hessian` by `count`, the rows it was summed over: the form the quantizer
-/// takes. The count is a float in the kernel, as Java's.
+/// takes. The count is a float in the kernel.
 pub fn plan_normalise_hessian(hessian: u64, k: u32, count: u64) -> Result<Vec<Step>, TrellisError> {
     if count == 0 {
         return Err(TrellisError::NotMultiple {

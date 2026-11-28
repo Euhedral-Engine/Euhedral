@@ -7,7 +7,7 @@ confident, then verify everything at once.
 
 ## Method
 
-`MtpDraftConfidenceCudaIntegrationTest` runs `MtpDecoder` in observation mode (`observe(listener, true)`):
+The observation run (a measurement harness the Rust engine does not have) ran the decoder in observation mode:
 - each step drafts 16 tokens (`MtpDecoder.MAX_DRAFTS`) and verifies one (2 rows), so each step commits exactly one
   token, and every output position starts a step;
 - the draft rows come back to the host, which selects each draft as the device argmax does (the lowest shortlist row
@@ -99,10 +99,11 @@ A gate that knew the outcome would draft exactly the drafts the verification acc
 
 With a gated length the draft quanta select with `euhedral_argmax_logprob_bf16`, which returns the shortlist
 argmax and its log-softmax in one pass over the row (`HostLogits.scoreOnDevice`). The host then applies the rule
-between recursion quanta. Gated lengths are greedy decode in tokens and state (`SpeculativeDecodeCudaIntegrationTest`),
-and the replay above reproduces their verification counts exactly.
+between recursion quanta. Gated lengths are greedy decode in tokens and state (`mtp_output_equals_greedy` and
+`mtp_kv_and_gdn_state_equal_greedy_after_run` in `rust/crates/engine/tests/device/mtp.rs` check the MTP path; no automated check
+runs a gated length), and the replay above reproduces their verification counts exactly.
 
-`MtpDraftLengthScreenCudaIntegrationTest` measures lengths in one process:
+The draft length screen (no harness in the Rust engine) measured lengths in one process:
 - every arm generates every prompt, alternating per prompt;
 - each rate is committed tokens over verification, catch-up and drafting time;
 - every arm must generate the same tokens.

@@ -88,7 +88,7 @@ impl ModelConfig {
     pub const SUPPORTED_LAYERS: usize = 64;
 
     /// Refuses a geometry the engine does not run: the dense Qwen text model with 64 layers and at most one MTP
-    /// layer (`CompactWeightLoader.validateConfig`), and the attention and GDN geometry `ExecutionPlan` checks.
+    /// layer, and the attention and GDN geometry the plan checks.
     pub fn check_supported(&self) -> Result<(), PlanError> {
         let unsupported = |why: String| Err(PlanError::Unsupported(why));
         if self.layer_kinds.len() != Self::SUPPORTED_LAYERS

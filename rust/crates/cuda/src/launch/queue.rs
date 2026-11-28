@@ -189,8 +189,7 @@ fn fill_arguments(
     Ok(())
 }
 
-/// The description the native wrapper passes to `cuTensorMapEncodeTiled` for a planned map (`byte_map`,
-/// `nvfp4_linear.c`): bytes, unit element strides, no interleave, 128-byte L2 promotion, no out-of-bounds fill.
+/// The description `cuTensorMapEncodeTiled` is given for a planned map: bytes, unit element strides, no interleave, 128-byte L2 promotion, no out-of-bounds fill.
 pub(crate) fn tiled_map(plan: &TensorMapPlan) -> TiledMap {
     let mut dims = [1; MAX_RANK];
     let mut strides = [0; MAX_RANK - 1];
@@ -349,8 +348,8 @@ mod tests {
         ));
     }
 
-    /// A map as `byte_map` in `nvfp4_linear.c` describes it: bytes, unit element strides, no interleave, 128-byte L2
-    /// promotion, no fill; `dims`, `strides` and `box_dims` as the C arrays hold them.
+    /// A map as the native tile kernel needs it: bytes, unit element strides, no interleave, 128-byte L2
+    /// promotion, no fill; `dims`, `strides` and `box_dims` as the encoder takes them.
     fn c_map(address: u64, dims: &[u64], strides: &[u64], box_dims: &[u32], swizzle: Swizzle) -> TensorMap {
         let mut description = TiledMap {
             address,
@@ -395,7 +394,7 @@ mod tests {
 
     #[test]
     fn the_planned_tile_maps_are_the_bytes_the_native_wrapper_encodes() {
-        // The three maps of `launch_native` (`nvfp4_linear.c`), worked by hand: the activation code planes
+        // The three maps of `launch_native`, worked by hand: the activation code planes
         // (K / 2 bytes, rows, 2 terms; strides K / 2 and K / 2 * rows; box 64 x 128 x 1; 64-byte swizzle), the weight
         // codes (K / 2, outputs; stride K / 2; box 64 x 128; 64-byte swizzle) and the weight scales
         // (K / 16 or K / 32 bytes, outputs; box 16 x 128; no swizzle) at the 256-aligned end of the codes.

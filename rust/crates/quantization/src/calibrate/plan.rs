@@ -11,7 +11,7 @@ use super::manifest::{MANIFEST_FILE, Manifest, RESUME_FILE};
 
 use sha2::{Digest, Sha256};
 
-/// Layers between two checkpoints of the hidden states, as Java's calibration.
+/// Layers between two checkpoints of the hidden states.
 pub const CHECKPOINT_EVERY: usize = 8;
 
 /// The header property naming the run a resume file belongs to.
@@ -31,7 +31,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// A plan of `layers` layers, checkpointing as Java does.
+    /// A plan of `layers` layers.
     pub fn new(layers: usize) -> Plan {
         Plan {
             layers,
@@ -106,8 +106,8 @@ pub fn model_identity(directory: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-/// What names a run: a resume file of another run is not resumed. Java's key (the tokens file, the sequences, the
-/// length, the recipe, act-order and damp) with the model and the NVFP4 search added: a file of a run that rounded
+/// What names a run: a resume file of another run is not resumed. The key holds the tokens file, the sequences, the
+/// length, the recipe, act-order and damp, the model and the NVFP4 search: a file of a run that rounded
 /// differently must not be resumed either.
 pub fn resume_key(parts: &[&str]) -> String {
     parts.join("|")

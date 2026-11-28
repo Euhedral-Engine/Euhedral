@@ -5,7 +5,7 @@ from pathlib import Path
 
 from euhedral_artifacts import tokenizer_section
 
-# The bytes TokenizerSectionTest (core) checks for the same files.
+# The bytes of the section for these files.
 ENCODED = ("000000040000000e746f6b656e697a65722e6a736f6e0000000c7b226d6f64656c223a7b7d7d"
            "00000015746f6b656e697a65725f636f6e6669672e6a736f6e000000027b7d00000013636861745f74656d706c6174652e"
            "6a696e6a610000000a7b7b2022c3a922207d7d000000137370656369616c5f746f6b656e732e6a736f6e000000147b2265"

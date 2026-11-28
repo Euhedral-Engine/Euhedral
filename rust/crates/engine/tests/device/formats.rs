@@ -5,8 +5,7 @@
 //! `gradle.properties`) and the real objects from `euhedral.qwen.rco-artifact`; a test skips with a message when one
 //! is absent (a skipped test passes in a hundredth of a second: read the output with `--nocapture`).
 //!
-//! Trellis objects are synthetic here (random tile words, signs and output scales), as in Java's
-//! `TrellisLinearCudaIntegrationTest`, and the NVFP4 and embedding objects are the RCO artifact's own. The scalar
+//! Trellis objects are synthetic here (random tile words, signs and output scales), and the NVFP4 and embedding objects are the RCO artifact's own. The scalar
 //! reference is reached without the library's process-wide exact-numerics switch (which another test of this binary
 //! would see): the trellis format runs it when built for it, and NVFP4 takes it above 32 rows of a device without the
 //! native route. The switch itself is checked in `formats_oracle`, a binary of its own.
@@ -71,7 +70,7 @@ fn linear_bitwise_matches_reference_oracle() {
     let _card = common::card();
     let Some(rig) = rig() else { return };
     let mut random = Random::new(7);
-    // Mirrors Java's `everyRouteAgreesWithTheScalarReference`: the routes sum in other orders than the scalar
+    // The routes sum in other orders than the scalar
     // reference, so they agree with it within a tolerance, and agree with each other bit for bit where the kernels
     // are the same twins. Tensor-core rows up to 32, 140 target blocks, whole-K from 128 rows, wide blocks from 1024.
     let format = TrellisLinear::new(140, 32, 128, 1024);
@@ -271,8 +270,7 @@ fn nvfp4_launch_shapes_follow_the_route_of_the_shape() {
     let Some(rig) = rig() else { return };
     let Some(mut artifact) = Artifact::open() else { return };
     let mut random = Random::new(3);
-    // The library queues these launches itself, so the geometry is what the route computes for the shape. The
-    // expectations are read from native/src/host/nvfp4_linear.c.
+    // The library queues these launches itself, so the geometry is what the route computes for the shape.
     let (_weights, down) = artifact.plain(&rig.library, "mtp/layer/mlp/down");
     let nvfp4 = Nvfp4Linear::new(&rig.library).with_shape_recording();
     let x = upload(&rig.library, &activations(&mut random, 64, 17408));

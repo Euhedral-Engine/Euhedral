@@ -70,7 +70,7 @@ impl TokenizerFooter {
 /// Where the artifact's content ends: the start of its tokenizer section, or `file_len` when it has none. Payloads
 /// and tables must end here.
 ///
-/// A footer whose body does not fit before it is an error (the Java reader refuses it the same way), which is why
+/// A footer whose body does not fit before it is an error, which is why
 /// this returns a `Result`.
 pub fn content_end(file_len: u64, footer: Option<&TokenizerFooter>) -> Result<u64, EdrlError> {
     let Some(footer) = footer else { return Ok(file_len) };

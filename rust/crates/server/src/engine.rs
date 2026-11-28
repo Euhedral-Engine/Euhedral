@@ -11,7 +11,7 @@ use euhedral_inference_settings::{Auto, Settings};
 
 use crate::{StartError, Started};
 
-/// What the engine's start waits for the engine to load: no limit in practice, as the Java server's start has none (the
+/// What the engine's start waits for the engine to load: no limit in practice (the
 /// operator stops a start that hangs). A bounded value because the wait takes a duration.
 pub const START_LIMIT: Duration = Duration::from_secs(u32::MAX as u64);
 
@@ -26,8 +26,7 @@ fn library_name() -> &'static str {
 
 /// The places the CUDA library may be, in order: `lib/` under `host.native-cache` when that is set; else `lib/` beside
 /// the executable and, when the executable's directory is named `bin` and `share/euhedral_cuda` is a directory beside
-/// it (the bundle: `bin/euhedral-server` with `lib/` beside `bin/`), `lib/` beside that directory. These are the layout
-/// the Java server unpacks its native files into (`lib/`, `share/` and `cuda/` under one root).
+/// it (the bundle: `bin/euhedral-server` with `lib/` beside `bin/`), `lib/` beside that directory. The layout is `lib/`, `share/` and `cuda/` under one root.
 pub fn library_candidates(settings: &Settings, executable: Option<&Path>) -> Vec<PathBuf> {
     let library = |root: &Path| root.join("lib").join(library_name());
     if let Auto::Value(root) = &settings.host.native_cache {

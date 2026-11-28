@@ -1,10 +1,8 @@
 //! Plans the launches of the grouped linears (Q3, Q4 and Q5 values in 64-value groups with FP16 scales) and of the P2E2
-//! compressed Q3 tensors, as the native library's host code (`native/src/host/q3_linear_bf16.c`, `q45_linear.c`,
-//! `q3_mx.c`, `reference.c`) issues them: the same kernels in the same order with the same grid, block, dynamic shared
-//! bytes and argument words.
+//! compressed Q3 tensors: the kernels in order, each with its grid, block, dynamic shared bytes and argument words.
 //!
 //! The functions are pure: shapes and addresses in, a [`Q3Plan`] (at most three launches, no allocation) or a
-//! [`PlanError`] out. A refusal is a status the C entry point returns before it launches anything. The routes are:
+//! [`PlanError`] out. A refusal is returned before anything is launched. The routes are:
 //!
 //! - **1 to 8 rows** (9 to 32 on the token-row twins) on the contiguous decode kernels, every row bit for bit as a
 //!   one-row launch;
@@ -19,19 +17,19 @@ use crate::launch::catalog::{Arguments, KernelId, Launch, find_const};
 use crate::launch::embedding::{align256, p2e2_geometry};
 use crate::launch::{PlanError, advance};
 
-/// The most rows of the contiguous decode kernels (`EUHEDRAL_DECODE_MAX_ROWS`, `decode_shapes.h`).
+/// The most rows of the contiguous decode kernels.
 pub const DECODE_MAX_ROWS: u32 = 8;
 
-/// The most rows of the token-row twins (`EUHEDRAL_DECODE_TOKENS_MAX`, `decode_shapes.h`).
+/// The most rows of the token-row twins.
 pub const DECODE_TOKENS_MAX: u32 = 32;
 
 /// Rows from which a grouped linear takes the FP8 route (`Q3_MX_MIN_ROWS`, `CudaGpuMemory`).
 pub const MX_MIN_ROWS: u32 = DECODE_MAX_ROWS + 1;
 
-/// The most rows of one P2E2 decode launch (`q3_linear_bf16.c`).
+/// The most rows of one P2E2 decode launch.
 const P2E2_ROWS_PER_LAUNCH: u32 = 4;
 
-/// Dynamic shared bytes of the FP8 linear (`Q3MX_SHARED_BYTES`, `q3_mx.c`): three stages of (A hi, A lo, expanded W,
+/// Dynamic shared bytes of the FP8 linear: three stages of (A hi, A lo, expanded W,
 /// 128 FP32 scales).
 pub const MX_SHARED_BYTES: u32 = 3 * (3 * 128 * 64 + 128 * 4);
 
@@ -165,25 +163,23 @@ const MX_LINEAR: [KernelId; 3] = [
 const MX_GATE_UP_SWIGLU: KernelId = find_const("euhedral_q3mx_gate_up_swiglu_128x64");
 const MX_REDUCE: KernelId = find_const("euhedral_q3mx_reduce");
 
-/// The groups of 64 values in a row of `in_features` values, K padded to 128 (`groups`, `q3_linear_bf16.c`).
+/// The groups of 64 values in a row of `in_features` values, K padded to 128.
 const fn q3_groups(in_features: u32) -> u64 {
     (in_features as u64).div_ceil(128) * 128 / 64
 }
 
-/// Byte offset of a Q3 tensor's scale plane: its 24-byte code groups, 256-aligned (`scale_offset`,
-/// `q3_linear_bf16.c`).
+/// Byte offset of a Q3 tensor's scale plane: its 24-byte code groups, 256-aligned.
 pub const fn q3_scale_offset(out_features: u32, in_features: u32) -> u64 {
     align256(out_features as u64 * q3_groups(in_features) * 24)
 }
 
-/// Byte size of a row-split Q3 tensor of `rows` rows of `in_features` values (`euhedral_q3_row_split_size`,
-/// `q3_p2e2_geometry.h`, which is the same size from the other side).
+/// Byte size of a row-split Q3 tensor of `rows` rows of `in_features` values.
 pub const fn q3_byte_size(rows: u32, in_features: u32) -> u64 {
     q3_scale_offset(rows, in_features) + rows as u64 * q3_groups(in_features) * 2
 }
 
 /// Byte size of a Q4 or Q5 tensor, `None` for an `in_features` that is not a multiple of 128 or a size that overflows
-/// (`quantized_byte_size`, `q45_linear.c`): the nibble plane, for Q5 the fifth-bit plane, then the FP16 scales, each
+/// (`quantized_byte_size`): the nibble plane, for Q5 the fifth-bit plane, then the FP16 scales, each
 /// plane 256-aligned.
 pub fn quantized_byte_size(bits: Bits, rows: u32, in_features: u32) -> Option<u64> {
     if bits == Bits::Q3 {
@@ -203,12 +199,12 @@ pub fn quantized_byte_size(bits: Bits, rows: u32, in_features: u32) -> Option<u6
     Some(code_plane + high_plane + rows * groups * 2)
 }
 
-/// Whether the Q3 decode kernels take the shape (`euhedral_q3_decode_shape`, `decode_shapes.h`).
+/// Whether the Q3 decode kernels take the shape.
 pub const fn q3_decode_shape(in_features: u32, out_features: u32) -> bool {
     in_features != 0 && in_features.is_multiple_of(1024) && out_features != 0 && out_features.is_multiple_of(16)
 }
 
-/// Whether the Q4 and Q5 decode kernels take the shape (`euhedral_q45_decode_shape`, `decode_shapes.h`).
+/// Whether the Q4 and Q5 decode kernels take the shape.
 const fn q45_decode_shape(in_features: u32, out_features: u32) -> bool {
     in_features != 0 && in_features.is_multiple_of(1024) && out_features != 0 && out_features.is_multiple_of(8)
 }
@@ -237,7 +233,7 @@ fn nulls(operands: &Q3Operands) -> bool {
         || operands.out_features == 0
 }
 
-/// The launch of the Q3 scalar reference (`euhedral_reference_q3`, `reference.c`).
+/// The launch of the Q3 scalar reference.
 fn q3_reference(operands: &Q3Operands) -> Result<Q3Plan, PlanError> {
     let grid = u64::from(operands.rows) * u64::from(operands.out_features);
     if grid > MAX_GRID {
@@ -260,7 +256,7 @@ fn q3_reference(operands: &Q3Operands) -> Result<Q3Plan, PlanError> {
     )))
 }
 
-/// The launch of the Q4 and Q5 scalar reference (`euhedral_reference_q45`, `reference.c`): the grid is capped at the
+/// The launch of the Q4 and Q5 scalar reference: the grid is capped at the
 /// grid-x limit, the kernel strides.
 fn q45_reference(bits: Bits, operands: &Q3Operands) -> Q3Plan {
     let count = u64::from(operands.rows) * u64::from(operands.out_features);
@@ -305,7 +301,7 @@ fn decode_launch(bits: Bits, operands: &Q3Operands, outputs_per_block: u32) -> L
     Launch::new(kernel, [grid, 1, 1], [128, 1, 1], 0, args)
 }
 
-/// The launch of `euhedral_cuda_linear_q3_bf16` (`q3_linear_bf16.c`): 1 to 8 rows on the contiguous decode kernels, 9
+/// The launch of `linear_q3_bf16`: 1 to 8 rows on the contiguous decode kernels, 9
 /// to 32 on their token-row twin, and under exact numerics or for a shape or an alignment they do not take, the
 /// scalar reference.
 pub fn plan_linear_q3(operands: &Q3Operands, exact_numerics: bool) -> Result<Q3Plan, PlanError> {
@@ -321,7 +317,7 @@ pub fn plan_linear_q3(operands: &Q3Operands, exact_numerics: bool) -> Result<Q3P
     Ok(Q3Plan::single(decode_launch(Bits::Q3, operands, 16)))
 }
 
-/// The launch of `euhedral_cuda_linear_quantized_bf16` (`q45_linear.c`) for a Q4 or Q5 tensor.
+/// The launch of `linear_quantized_bf16` for a Q4 or Q5 tensor.
 pub fn plan_linear_q45(bits: Bits, operands: &Q3Operands, exact_numerics: bool) -> Result<Q3Plan, PlanError> {
     if bits == Bits::Q3 {
         return Err(PlanError::InvalidArgument);
@@ -343,7 +339,7 @@ pub fn plan_linear_q45(bits: Bits, operands: &Q3Operands, exact_numerics: bool) 
     Ok(Q3Plan::single(decode_launch(bits, operands, 8)))
 }
 
-/// The launches of the P2E2 fused decode (`euhedral_cuda_linear_q3_p2e2_decode_bf16`, `q3_linear_bf16.c`): up to four
+/// The launches of the P2E2 fused decode: up to four
 /// rows a launch, each row the one-row result whichever launch computes it. Where the kernels do not run (exact
 /// numerics, more than 8 rows, a shape or alignment they do not take) the refusal is
 /// [`PlanError::RouteUnavailable`] and the caller expands the tensor instead.
@@ -402,7 +398,7 @@ pub fn p2e2_decode_runs(operands: &Q3Operands, exact_numerics: bool) -> bool {
         && q3_decode_shape(operands.in_features, operands.out_features)
 }
 
-/// The launch of `euhedral_cuda_q3_p2e2_expand` (`q3_linear_bf16.c`): rows `first_row..first_row + row_count` of the
+/// The launch of `q3_p2e2_expand`: rows `first_row..first_row + row_count` of the
 /// P2E2 tensor `weights` of `rows` rows become a row-split Q3 tensor of `row_count` rows at `destination`.
 #[allow(clippy::too_many_arguments, reason = "the native entry point's parameter list")]
 pub fn plan_p2e2_expand(
@@ -446,7 +442,7 @@ pub fn plan_p2e2_expand(
     )))
 }
 
-/// The split-K factor of an FP8 linear (`choose_splits`, `q3_mx.c`): one CTA per 128 x 128 output tile fills the
+/// The split-K factor of an FP8 linear: one CTA per 128 x 128 output tile fills the
 /// multiprocessors in whole waves, so a skinny grid leaves some idle in its last wave. Splitting K by `s` multiplies the
 /// CTAs and divides each one's work; the cost is the waves over `s` plus four percent a split for the FP32 partials,
 /// and a split is only taken when it is clearly better. `split_rows`, when not zero, names the weight rows of the whole
@@ -474,7 +470,7 @@ pub fn mx_splits(rows: u32, width: u32, weight_rows: u32, sm_count: u32, split_r
     best
 }
 
-/// The scratch of an FP8 linear (`euhedral_cuda_q3_mx_scratch_bytes`, `q3_mx.c`): the hi plane, the lo plane (`rows` x
+/// The scratch of an FP8 linear: the hi plane, the lo plane (`rows` x
 /// `width` bytes each) and the UE8M0 scales (`rows` x `width` / 32), each 256-aligned, then the split-K partials
 /// (`splits` x `rows` x `weight_rows` floats) when the linear splits. `weight_rows` 0 names no weight and no partials.
 pub fn mx_scratch_bytes(rows: u32, width: u32, weight_rows: u32, sm_count: u32, split_rows: u32) -> u64 {
@@ -658,7 +654,7 @@ pub fn linear_scratch_bytes_upto(
 }
 
 /// The offsets of the planes of a Q4 or Q5 tensor that the FP8 kernel takes: the fifth-bit plane's and the scales'
-/// (`run`, `q3_mx.c`). A Q3 tensor has its codes first.
+/// (`run`). A Q3 tensor has its codes first.
 fn mx_offsets(bits: Bits, weight_rows: u32, width: u32) -> (u64, u64) {
     let groups = u64::from(weight_rows) * u64::from(width / 64);
     match bits {
@@ -674,12 +670,11 @@ fn mx_offsets(bits: Bits, weight_rows: u32, width: u32) -> (u64, u64) {
     }
 }
 
-/// The launches of the FP8 linear (`euhedral_cuda_linear_q3_mx_bf16` and `euhedral_cuda_linear_q45_mx_bf16`,
-/// `q3_mx.c`): the quantization of the activations into `scratch`, the tiled multiply and, when it splits K, the
+/// The launches of the FP8 linear (`linear_q3_mx_bf16` and `linear_q45_mx_bf16`): the quantization of the activations into `scratch`, the tiled multiply and, when it splits K, the
 /// reduction of the partials.
 ///
 /// `sm_count` is the device's multiprocessor count and `split_rows` the whole tensor's weight rows for a chunked run
-/// (0 otherwise). Where the C entry point declines (a shape or alignment it has no kernel for, exact numerics or
+/// (0 otherwise). Where the FP8 route declines (a shape or alignment it has no kernel for, exact numerics or
 /// row-exact execution), the refusal is [`PlanError::RouteUnavailable`] and the caller runs the decode route instead.
 #[allow(clippy::too_many_arguments, reason = "the native entry point's parameter list")]
 pub fn plan_mx(
@@ -705,7 +700,7 @@ pub fn plan_mx(
     )
 }
 
-/// The launches of the paired gate/up FP8 linear with SwiGLU (`euhedral_cuda_q3_mx_gate_up_swiglu_bf16`, `q3_mx.c`):
+/// The launches of the paired gate/up FP8 linear with SwiGLU:
 /// the quantization of the activations, then one kernel that multiplies the gate rows and the up rows (`operands`'
 /// `out_features` is both, gate first) and writes the SwiGLU, half as many values per row. It never splits K, so its
 /// sums come in one order whatever the device, and its scratch holds the activations alone. Declines as
@@ -831,7 +826,7 @@ fn plan_mx_with(
             .pointer(partials),
     ));
     if splits > 1 {
-        // `count` is a 32-bit value in C, as `rows * weight_rows`: the wrap is kept as C has it.
+        // `count` is a 32-bit value, `rows * weight_rows`; a product that wraps wraps.
         let count = rows.wrapping_mul(weight_rows);
         plan.push(Launch::new(
             MX_REDUCE,

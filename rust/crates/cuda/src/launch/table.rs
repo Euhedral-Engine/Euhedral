@@ -1,14 +1,12 @@
-//! The table-driven launches: `euhedral_cuda_linear_launch` (`native/src/host/linear_kernels.c`) and
-//! `euhedral_cuda_qwen4_launch` (`native/src/host/qwen4_ops.c`), which both run
-//! `euhedral_kernel_table_launch` (`native/src/host/kernel_table.c`).
+//! The table-driven launches: those of the shared linear table and of the Flash-Next table.
 //!
 //! The caller of a table launch chooses the geometry; the launch takes its arguments as 8-byte words plus the byte
 //! size (4 or 8) each is declared with, and the host narrows a 4-byte word to `u32`. The function maps a table entry,
 //! a geometry and the words to a [`Launch`] of the catalog's kernel with typed arguments, and refuses what the table
 //! launcher refuses without asking the device. Two refusals need the compiled kernel and stay with the consumer of the
 //! launch: an argument count different from the kernel's parameter count, and a size different from the parameter's
-//! (both `EUHEDRAL_CUDA_INVALID_ARGUMENT` in `euhedral_kernel_table_launch`), and a kernel the device lacks when the planner is told
-//! the device has no architecture target.
+//! (both an invalid argument), and a kernel the device lacks when the planner is told the device has no architecture
+//! target.
 
 use crate::launch::PlanError;
 use crate::launch::catalog::{Arguments, KernelSpec, Launch, MAX_ARGUMENTS, linear_table, lookup, qwen4_table};
@@ -16,9 +14,9 @@ use crate::launch::catalog::{Arguments, KernelSpec, Launch, MAX_ARGUMENTS, linea
 /// The kernel tables a launch can go to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Table {
-    /// The shared linear table (`euhedral_cuda_linear_launch`).
+    /// The shared linear table.
     Linear,
-    /// The Flash-Next table (`euhedral_cuda_qwen4_launch`), which holds the row-exact BF16 GEMMs.
+    /// The Flash-Next table, which holds the row-exact BF16 GEMMs.
     Qwen4,
 }
 
@@ -49,8 +47,7 @@ impl Table {
     }
 }
 
-/// `euhedral_kernel_table_launch` (`kernel_table.c`), as far as the host knows: the launch of entry `kernel` of
-/// `table`, pushed into the sink.
+/// The launch of entry `kernel` of `table`, as far as the host knows, pushed into the sink.
 ///
 /// `architecture_target` is whether the device compiled the architecture-specific modules; the kernel table, which
 /// knows what loaded, supplies it.
@@ -66,7 +63,7 @@ pub fn plan_table_launch(
     let entries = table.entries();
     let [grid_x, grid_y, grid_z] = geometry.grid;
     let [block_x, block_y, block_z] = geometry.block;
-    // euhedral_kernel_table_launch: the index, the arrays, the count (one length here) and every dimension.
+    // The index, the arrays, the count (one length here) and every dimension.
     if kernel < 0
         || kernel as usize >= entries.len()
         || words.len() != sizes.len()
@@ -83,19 +80,19 @@ pub fn plan_table_launch(
     let Some(id) = lookup(entries[kernel as usize].name) else {
         return Err(PlanError::InvalidArgument);
     };
-    // `euhedral_kernel_table_launch` checks that the kernel is loaded before it checks the arguments, so a kernel
+    // The kernel's presence is checked before its arguments, so a kernel
     // the device lacks answers `ROUTE_UNAVAILABLE` whatever the arguments are. The architecture-specific modules
     // exist on a device with the architecture target only.
     if id.spec().architecture_specific() && !architecture_target {
         return Err(PlanError::RouteUnavailable);
     }
-    // `euhedral_kernel_table_launch`: the declared parameter is 4 or 8 bytes, so another size cannot match it.
+    // The declared parameter is 4 or 8 bytes, so another size cannot match it.
     if sizes.iter().any(|&size| size != 4 && size != 8) {
         return Err(PlanError::InvalidArgument);
     }
     let mut args = Arguments::new();
     for (&word, &size) in words.iter().zip(sizes) {
-        // euhedral_kernel_table_launch: a 4-byte argument is the word narrowed to u32.
+        // A 4-byte argument is the word narrowed to u32.
         args = if size == 8 {
             args.u64(word)
         } else {
@@ -112,7 +109,7 @@ pub fn plan_table_launch(
     Ok(())
 }
 
-/// `euhedral_cuda_linear_launch` (`linear_kernels.c`). `architecture_target` is whether the device compiled the
+/// The launch of entry `kernel` of the shared linear table. `architecture_target` is whether the device compiled the
 /// architecture-specific modules; a table kernel of such a module is unavailable without it. The kernel table
 /// supplies it, as the one that knows which modules loaded.
 pub fn plan_linear_launch(
@@ -126,7 +123,7 @@ pub fn plan_linear_launch(
     plan_table_launch(Table::Linear, kernel, geometry, words, sizes, architecture_target, sink)
 }
 
-/// `euhedral_cuda_qwen4_launch` (`qwen4_ops.c`). `architecture_target` is as for [`plan_linear_launch`].
+/// The launch of entry `kernel` of the Flash-Next table. `architecture_target` is as for [`plan_linear_launch`].
 pub fn plan_qwen4_launch(
     kernel: i32,
     geometry: Geometry,
@@ -163,7 +160,7 @@ mod tests {
 
     #[test]
     fn linear_entries_map_to_their_named_kernels() {
-        // The table's order is the ABI (the kernel table in linear_kernels.c): index 4 is the epilogue, 7 the reference, 10 the
+        // The table's order is the ABI (the engine's `LinearKernel` list): index 4 is the epilogue, 7 the reference, 10 the
         // embedding.
         for (index, name) in [
             (0, "euhedral_trellis_prepass"),
@@ -180,10 +177,10 @@ mod tests {
             assert_eq!(launches[0].grid, [3, 2, 1]);
             assert_eq!(launches[0].block, [128, 1, 1]);
             assert_eq!(launches[0].shared_bytes, 4096);
-            // Table kernels are never launched programmatically (euhedral_kernel_table_launch passes no attribute).
+            // Table kernels are never launched programmatically (a table launch carries no attribute).
             assert!(!launches[0].programmatic);
         }
-        // The first, the second and the last entry of the Flash-Next kernel table in qwen4_ops.c.
+        // The first, the second and the last entry of the Flash-Next kernel table.
         for (index, name) in [
             (0, "euhedral_q4_linear_bf16"),
             (1, "euhedral_q4_grouped_rms_norm_bf16"),
@@ -201,7 +198,7 @@ mod tests {
 
     #[test]
     fn words_are_typed_by_size_and_narrowed() {
-        // euhedral_kernel_table_launch: size 8 keeps the word, size 4 is `(uint32_t)word`.
+        // Size 8 keeps the word, size 4 is `(uint32_t)word`.
         let words = [0x1234_5678_9abc_def0, 0x1_2345_6789, f32::to_bits(0.5) as u64, 7];
         let sizes = [8, 4, 4, 8];
         let (result, launches) = plan(Table::Linear, 3, GEOMETRY, &words, &sizes);
@@ -223,7 +220,7 @@ mod tests {
 
     #[test]
     fn the_launcher_refusals() {
-        // euhedral_kernel_table_launch: the argument-count and the index checks.
+        // The argument-count and the index checks.
         for (table, kernel, last_ok) in [(Table::Linear, 11, 10), (Table::Qwen4, 36, 35)] {
             assert_eq!(plan(table, last_ok, GEOMETRY, &[], &[]).0, Ok(()));
             assert_eq!(

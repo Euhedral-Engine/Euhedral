@@ -311,10 +311,10 @@ fn close(label: &str, actual: &[f32], wanted: &[f32]) {
 
 /// The engine library, the math libraries, the device and two lanes' streams.
 fn rig() -> Rig {
-    let path = test_support::gradle_property("euhedral.cuda.library")
+    let path = test_support::test_setting("euhedral.cuda.library")
         .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
     let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
-    let directory = test_support::gradle_property("euhedral.quantization.cuda-libraries")
+    let directory = test_support::test_setting("euhedral.quantization.cuda-libraries")
         .expect("set euhedral.quantization.cuda-libraries (EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES)");
     let math = MathLibraries::load(&PathBuf::from(directory)).expect("the math libraries load");
     let gpu = CudaGpu::open(0).expect("the device opens");

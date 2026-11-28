@@ -54,7 +54,7 @@ impl Fixture {
     }
 }
 
-/// The checkpoint's tokenizer packaged as the artifact's tokenizer section, the way the Java loader reads a
+/// The checkpoint's tokenizer packaged as the artifact's tokenizer section, as a loader reads a
 /// checkpoint directory: the generation config's special-token IDs only.
 fn load(directory: &Path) -> Tokenizer {
     let read = |name: &str| fs::read(directory.join(name)).unwrap_or_else(|_| panic!("the checkpoint has {name}"));

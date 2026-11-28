@@ -1,5 +1,4 @@
-//! Host tests of the NVFP4 planner. Every expected value is worked by hand from `native/src/host/nvfp4_linear.c` (the
-//! line is named where it is used), not taken from the planner.
+//! Host tests of the NVFP4 planner. Every expected value is worked by hand, not taken from the planner.
 
 use super::*;
 
@@ -129,7 +128,7 @@ fn row_edges_of_the_decode_kernels() {
 #[test]
 fn reference_selection() {
     // Exact numerics, an input width that is not a multiple of 128, an output count that is not a multiple of
-    // 16: the reference, grid rows * out, 128 threads, arguments rows, in, out (reference.c).
+    // 16: the reference, grid rows * out, 128 threads, arguments rows, in, out.
     let exact = plan_linear(&operands(1, 128, 16, Nvfp4Layout::Plain), true).unwrap();
     let launch = only(&exact);
     assert_eq!(launch.kernel.name(), "euhedral_nvfp4_reference");
@@ -425,7 +424,7 @@ fn lines_of_the_recorder() {
 #[test]
 fn a_skinny_shape_with_one_split_is_planned_whatever_its_product() {
     // 64 rows over 70 million outputs: rows * out = 4.48e9 does not fit 32 bits. With 256 inputs the skinny kernel has
-    // one split (k_tiles / 2 = 0), and `launch_native` computes the finish count only past that return, so C plans
+    // one split (k_tiles / 2 = 0), and the finish count is computed only past that return, so the plan is
     // the quantize and the skinny launch and nothing else.
     let plan = native(64, 256, 70_000_000, Nvfp4Layout::Plain);
     let [quantize, skinny] = plan.launches() else {

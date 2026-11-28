@@ -101,7 +101,7 @@ pub(super) fn row_exact_bf16(
     })
 }
 
-/// A value as a launch argument or extent: Java's `int`, so a value past 2^31 - 1 is refused as it is there.
+/// A value as a launch argument or extent: a 32-bit signed integer, so a value past 2^31 - 1 is refused.
 pub(super) fn dim(value: u64) -> Result<u32, CudaError> {
     i32::try_from(value)
         .map(i32::unsigned_abs)

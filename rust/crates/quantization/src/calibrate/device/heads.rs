@@ -2,8 +2,8 @@
 //!
 //! Every call is one or a few submissions on the main lane, each walking the batches of sequences as the layer passes
 //! do: a batch's states go up to the batch buffer, a step runs over them, and the pass may write them back. The
-//! Hessians of the final norm's output and of the MTP block's are accumulated in the order Java does, so the rounding
-//! reads the same bits. The rounding itself is the layers': [`round_all`] over one linear.
+//! Hessians of the final norm's output and of the MTP block's are accumulated in a fixed order, so the rounding
+//! reads the same bits on every run. The rounding itself is the layers': [`round_all`] over one linear.
 //!
 //! The MTP block reads each position's hidden state with the next position's token: its input is the stem, the
 //! embedding of the next token and the normed hidden state side by side, `[rows, 2 * hidden]` with `rows = length - 1`.

@@ -6,7 +6,7 @@
 //! lies. [`FixedLayout::pieces`] cuts what the arenas receive into the upload's pieces
 //! ([`crate::residency::loader`]), and [`FixedLayout::resolve`] names every object by the address it has once the load
 //! has ended ([`FixedWeights`]). The shared expert's down projections are widened to the width the block kernels read
-//! ([`padding`]), as Java's `Weights.padSharedDown` does.
+//! ([`padding`]).
 //!
 //! A plan that stages fixed objects through a ring, or pins the n-gram tables, is refused with the object's name: the
 //! upload serves the plans of a device that holds the fixed objects.
@@ -269,7 +269,7 @@ pub struct PadJob {
 
 /// The shared down projections to widen from `width` to `padded` values (`hidden` rows each) and the bytes of the
 /// region the copies go to: one job for each of the `layers` whose tensor is a plain NVFP4 tensor of `hidden` by
-/// `width` (what Java tests by its byte size). None when the width needs no padding.
+/// `width`. None when the width needs no padding.
 pub fn padding(weights: &FixedWeights, layers: u32, hidden: u32, width: u32, padded: u32) -> (Vec<PadJob>, u64) {
     if padded == width {
         return (Vec::new(), 0);

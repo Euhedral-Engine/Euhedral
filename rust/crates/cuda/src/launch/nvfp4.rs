@@ -1,12 +1,11 @@
-//! Plans the launches of the NVFP4 linear kernels (decode, reference and native), as the native library's host code
-//! (`native/src/host/nvfp4_linear.c`, `reference.c`) issues them: the same kernels in the same order with the same grid,
-//! block, dynamic shared bytes and argument words.
+//! Plans the launches of the NVFP4 linear kernels (decode, reference and native): the kernels in order, each with its
+//! grid, block, dynamic shared bytes and argument words.
 //!
 //! The functions are pure: shapes and addresses in, a [`Nvfp4Plan`] (at most three launches, no allocation) or a
-//! [`PlanError`] out. A refusal is a status the C entry point returns before it launches anything.
+//! [`PlanError`] out. A refusal is returned before anything is launched.
 //!
 //! The native tile kernel takes three tensor maps by value as its leading arguments. Its launch carries the parameters
-//! each map is built from ([`TensorMapPlan`], what the C code passes to `cuTensorMapEncodeTiled`) in its
+//! each map is built from ([`TensorMapPlan`], what `cuTensorMapEncodeTiled` is given) in its
 //! [`Arguments`], in front of the words; the queue encodes them when it enqueues the launch.
 
 use crate::DevicePtr;
@@ -14,38 +13,38 @@ use crate::launch::PlanError;
 use crate::launch::catalog::{Arguments, KernelId, Launch, find_const};
 pub use crate::launch::catalog::{TensorMapPlan, TensorMapSwizzle};
 
-/// The most rows of the decode kernels (`EUHEDRAL_DECODE_MAX_ROWS`, `decode_shapes.h`).
+/// The most rows of the decode kernels.
 pub const DECODE_MAX_ROWS: u32 = 8;
 
-/// The most groups of 8 rows of the grouped twins (`DECODE_GROUPS_MAX`, `nvfp4_linear.c`).
+/// The most groups of 8 rows of the grouped twins.
 pub const DECODE_GROUPS_MAX: u32 = 4;
 
 /// Rows from which an NVFP4 linear runs on the native route (`CudaGpuMemory.NVFP4_NATIVE_MIN_ROWS`, the engine's
 /// choice; the native entry point itself takes any row count).
 pub const NATIVE_MIN_ROWS: u32 = 9;
 
-/// The most rows of the native skinny kernels (`SKINNY_MAX_ROWS`, `nvfp4_linear.c`).
+/// The most rows of the native skinny kernels.
 pub const SKINNY_MAX_ROWS: u32 = 64;
 
-/// Output columns of a block of the skinny kernels (`SKINNY_COLUMNS`, `nvfp4_linear.c`).
+/// Output columns of a block of the skinny kernels.
 const SKINNY_COLUMNS: u64 = 64;
 
 /// The blocks the native library splits a skinny launch over K to reach, on a device of `sm_count` streaming
-/// multiprocessors: two per multiprocessor (`skinny_target_ctas`, `nvfp4_linear.c`).
+/// multiprocessors: two per multiprocessor.
 pub const fn skinny_target_ctas(sm_count: u32) -> u64 {
     2 * sm_count as u64
 }
 
-/// Dynamic shared bytes of a tile kernel (`NATIVE_SHARED_BYTES`, `nvfp4_linear.c`).
+/// Dynamic shared bytes of a tile kernel.
 pub const NATIVE_SHARED_BYTES: u32 = 85040;
 
-/// Threads of a tile kernel (`NATIVE_TILE_THREADS`, `nvfp4_linear.c`).
+/// Threads of a tile kernel.
 pub const NATIVE_TILE_THREADS: u32 = 288;
 
-/// Activation terms of the native route: the value and its quantized residual (`NATIVE_TERMS`, `nvfp4_linear.c`).
+/// Activation terms of the native route: the value and its quantized residual.
 const NATIVE_TERMS: u64 = 2;
 
-/// The largest grid-x of a launch (`2147483647`, `reference.c` and `nvfp4_linear.c`).
+/// The largest grid-x of a launch (`2147483647`).
 const MAX_GRID: u64 = 2_147_483_647;
 
 /// How an NVFP4 weight stores its block scales.
@@ -186,7 +185,7 @@ fn align256(value: u64) -> u64 {
     value.div_ceil(256) * 256
 }
 
-/// Byte size of an NVFP4 tensor of `rows` rows of `in_features` values (`nvfp4_size`, `nvfp4_linear.c`).
+/// Byte size of an NVFP4 tensor of `rows` rows of `in_features` values.
 pub fn nvfp4_byte_size(rows: u32, in_features: u32, layout: Nvfp4Layout) -> u64 {
     let sd4 = layout == Nvfp4Layout::Sd4;
     let k = u64::from(in_features).div_ceil(128) * 128;
@@ -195,32 +194,31 @@ pub fn nvfp4_byte_size(rows: u32, in_features: u32, layout: Nvfp4Layout) -> u64 
     align256(scales + rows * k / if sd4 { 32 } else { 16 }) + if sd4 { 20 } else { 4 }
 }
 
-/// The layout a byte size says (`nvfp4_layout`, `nvfp4_linear.c`); `None` when it matches neither.
+/// The layout a byte size says; `None` when it matches neither.
 pub fn nvfp4_layout(rows: u32, in_features: u32, byte_size: u64) -> Option<Nvfp4Layout> {
     [Nvfp4Layout::Plain, Nvfp4Layout::Sd4]
         .into_iter()
         .find(|layout| byte_size == nvfp4_byte_size(rows, in_features, *layout))
 }
 
-/// Whether the decode kernels take 128-multiple inputs and 16-multiple outputs up to 32 rows (`qualified`,
-/// `nvfp4_linear.c`).
+/// Whether the decode kernels take 128-multiple inputs and 16-multiple outputs up to 32 rows.
 fn decode_qualified(rows: u32, in_features: u32, out_features: u32) -> bool {
     rows <= 8 * DECODE_GROUPS_MAX && in_features.is_multiple_of(128) && out_features.is_multiple_of(16)
 }
 
 /// The decode tile of a shape: the 4-warp 32-row tile (`true`) above 5120 inputs when the outputs allow it, else the
-/// 8-warp 16-row tile (`decode_tile`, `nvfp4_linear.c`).
+/// 8-warp 16-row tile.
 pub fn decode_tile(in_features: u32, out_features: u32) -> bool {
     in_features > 5120 && out_features.is_multiple_of(32)
 }
 
-/// Whether the skinny kernels take the shape (`skinny_route`, `nvfp4_linear.c`).
+/// Whether the skinny kernels take the shape.
 pub fn skinny_route(rows: u64, in_features: u64) -> bool {
     rows <= u64::from(SKINNY_MAX_ROWS) && in_features.is_multiple_of(256)
 }
 
 /// K splits of the skinny kernel: enough blocks to keep every streaming multiprocessor reading weights
-/// (`skinny_splits`, `nvfp4_linear.c`); `target_ctas` is [`skinny_target_ctas`].
+/// (`skinny_splits`); `target_ctas` is [`skinny_target_ctas`].
 pub fn skinny_splits(in_features: u64, out_features: u64, target_ctas: u64) -> u64 {
     let tiles = out_features.div_ceil(SKINNY_COLUMNS);
     let k_tiles = in_features / 256;
@@ -228,14 +226,13 @@ pub fn skinny_splits(in_features: u64, out_features: u64, target_ctas: u64) -> u
     splits.max(1)
 }
 
-/// Dynamic shared bytes of a skinny kernel of `rows` rows with `terms` activation terms (`skinny_shared_bytes`,
-/// `nvfp4_linear.c`).
+/// Dynamic shared bytes of a skinny kernel of `rows` rows with `terms` activation terms.
 pub fn skinny_shared_bytes(terms: u64, rows: u64) -> u64 {
     let stage = (terms * rows + SKINNY_COLUMNS) * 160;
     (101_376 / stage).min(4) * stage
 }
 
-/// Bytes of the quantized activations of `rows` rows (`activation_bytes`, `nvfp4_linear.c`): the codes, the
+/// Bytes of the quantized activations of `rows` rows: the codes, the
 /// tile-major scales and one FP32 global per row.
 fn activation_bytes(rows: u64, in_features: u64) -> u64 {
     let k = in_features.div_ceil(128) * 128;
@@ -245,7 +242,7 @@ fn activation_bytes(rows: u64, in_features: u64) -> u64 {
     align256(scales + k / 128 * NATIVE_TERMS * pad * 8) + 4 * rows
 }
 
-/// The scratch one native linear needs (`euhedral_cuda_nvfp4_native_scratch_bytes`, `nvfp4_linear.c`): the
+/// The scratch one native linear needs: the
 /// activations, then, for a skinny launch split over K, FP32 partials. `target_ctas` is [`skinny_target_ctas`].
 pub fn nvfp4_native_scratch_bytes(rows: u64, in_features: u64, out_features: u64, target_ctas: u64) -> u64 {
     let mut bytes = activation_bytes(rows, in_features);
@@ -272,9 +269,8 @@ pub enum Nvfp4Route {
 /// The route of a launch of `rows` rows over a weight of `out_features` by `in_features`.
 ///
 /// `native_available` is whether the device has the native route; the native route is taken from 9 rows, never by a
-/// verification (`row_exact`) and never under `exact_numerics`. The decode and reference part mirrors the router of the
-/// C function `euhedral_cuda_linear_nvfp4_bf16`; the native part is the engine's policy over the C native entry point's
-/// own checks (`launch_native`).
+/// verification (`row_exact`) and never under `exact_numerics`. The native part is the engine's policy over the
+/// native route's own checks.
 pub fn route(
     rows: u32,
     in_features: u32,
@@ -307,7 +303,7 @@ pub fn route(
 }
 
 /// Whether the native route takes the shape: the skinny kernels any multiple of 256 inputs; the tile kernels' tensor
-/// maps need whole scale rows (`launch_native`, `nvfp4_linear.c`).
+/// maps need whole scale rows.
 fn native_accepts(rows: u32, in_features: u32, sd4: bool) -> bool {
     skinny_route(u64::from(rows), u64::from(in_features)) || in_features.is_multiple_of(if sd4 { 512 } else { 256 })
 }
@@ -334,7 +330,7 @@ fn decode_launch(rows: u32, in_features: u32, out_features: u32, layout: Nvfp4La
         .u32(in_features)
         .u32(out_features);
     if rows > DECODE_MAX_ROWS {
-        // Groups of 8 rows (`nvfp4_linear.c`), the rows as a last argument.
+        // Groups of 8 rows, the rows as a last argument.
         let kernel = DECODE_GROUPS[layout.index()][tile as usize][(rows.div_ceil(8) - 2) as usize];
         Launch::new(kernel, [grid, 1, 1], [block, 1, 1], 0, args.u32(rows))
     } else {
@@ -344,7 +340,7 @@ fn decode_launch(rows: u32, in_features: u32, out_features: u32, layout: Nvfp4La
 }
 
 fn reference_launch(rows: u32, in_features: u32, out_features: u32, layout: Nvfp4Layout, at: &Pointers) -> Launch {
-    // `euhedral_reference_nvfp4` (`reference.c`): the grid is capped at the grid-x limit, the kernel strides.
+    // `reference_nvfp4`: the grid is capped at the grid-x limit, the kernel strides.
     let grid = (u64::from(rows) * u64::from(out_features)).min(MAX_GRID) as u32;
     let args = Arguments::new()
         .pointer(at.input)
@@ -356,7 +352,7 @@ fn reference_launch(rows: u32, in_features: u32, out_features: u32, layout: Nvfp
     Launch::new(REFERENCE[layout.index()], [grid, 1, 1], [128, 1, 1], 0, args)
 }
 
-/// The native launches (`launch_native`, `nvfp4_linear.c`) once the checks have passed.
+/// The native launches once the checks have passed.
 fn native_launches(
     rows: u32,
     in_features: u32,
@@ -380,7 +376,7 @@ fn native_launches(
     );
     let mut plan = Nvfp4Plan::single(quantize);
     if skinny_route(rows64, inputs) {
-        // `index`: the 16, 32 or 64 row kernel (`nvfp4_linear.c`).
+        // `index`: the 16, 32 or 64 row kernel.
         let index = if rows <= 16 {
             0
         } else if rows <= 32 {
@@ -409,9 +405,8 @@ fn native_launches(
                 .u32(out_features),
         ));
         if splits > 1 {
-            // `count` is a 32-bit value in C (`launch_native`), computed only here, with at least two splits: a
-            // shape whose product wraps is as wrong in C as here, and with one split no count exists, so there is
-            // no check to make. The wrap is kept as C has it.
+            // `count` is a 32-bit value, computed only here, with at least two splits: with one split no count
+            // exists, so there is no check to make. A product that wraps wraps.
             let count = rows.wrapping_mul(out_features);
             plan.push(Launch::new(
                 FINISH,
@@ -478,7 +473,7 @@ fn native_launches(
     plan
 }
 
-/// The checks every NVFP4 entry point makes first (`prepare`, `nvfp4_linear.c`), up to the layout.
+/// The checks every NVFP4 entry point makes first, up to the layout.
 fn prepare(operands: &Nvfp4Operands) -> Result<Nvfp4Layout, PlanError> {
     let Nvfp4Operands {
         input,
@@ -505,7 +500,7 @@ fn prepare(operands: &Nvfp4Operands) -> Result<Nvfp4Layout, PlanError> {
     Ok(layout)
 }
 
-/// The launch of `euhedral_cuda_linear_nvfp4_bf16` (`nvfp4_linear.c`): 1 to 8 rows on the decode kernels, 9
+/// The launch of `linear_nvfp4_bf16`: 1 to 8 rows on the decode kernels, 9
 /// to 32 on their grouped twins, and under exact numerics or for a shape they do not take, the scalar reference.
 pub fn plan_linear(operands: &Nvfp4Operands, exact_numerics: bool) -> Result<Nvfp4Plan, PlanError> {
     let layout = prepare(operands)?;
@@ -532,11 +527,11 @@ pub fn plan_linear(operands: &Nvfp4Operands, exact_numerics: bool) -> Result<Nvf
     Ok(Nvfp4Plan::single(launch))
 }
 
-/// The launches of `euhedral_cuda_linear_nvfp4_native_bf16` (`nvfp4_linear.c`): the quantization of the
+/// The launches of `linear_nvfp4_native_bf16`: the quantization of the
 /// activations into `scratch`, then the skinny kernel (and its finish when split over K) or the tile kernel.
 ///
 /// `scratch_byte_size` is the scratch's size, and `target_ctas` the blocks a skinny launch splits over K to reach
-/// ([`skinny_target_ctas`] of the device). Where the C entry point declines, the refusal is
+/// ([`skinny_target_ctas`] of the device). Where the native route declines, the refusal is
 /// [`PlanError::RouteUnavailable`] and the caller runs [`plan_linear`] instead.
 pub fn plan_native(
     operands: &Nvfp4Operands,

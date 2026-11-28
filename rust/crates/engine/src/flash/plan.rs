@@ -1,5 +1,4 @@
-//! The nodes and edges of the dense part of a Flash-Next quantum (`ExecutionPlan`'s stage list for the non-diagnostic
-//! shape): the embedding, the n-gram embedding's host roots and its device stage at the layer that holds it, and for
+//! The nodes and edges of the dense part of a Flash-Next quantum: the embedding, the n-gram embedding's host roots and its device stage at the layer that holds it, and for
 //! each layer the block, the layer's mixture of experts and the end injection, then the final mix and the head.
 //!
 //! The nodes are what a session builds a stage for; [`DensePlan::spec`] is the RustEE graph over them. A plan made
@@ -107,8 +106,7 @@ pub struct DensePlan {
 }
 
 impl DensePlan {
-    /// The plan of `config`'s layers. The embedding of n-grams runs at the one layer `config.ple.layers` names, as it
-    /// does in Java; a configuration that names more is refused with the layers.
+    /// The plan of `config`'s layers. The embedding of n-grams runs at the one layer `config.ple.layers` names; a configuration that names more is refused with the layers.
     pub fn from_config(config: &FlashConfig) -> Result<Self, FlashError> {
         Self::build(config, None)
     }

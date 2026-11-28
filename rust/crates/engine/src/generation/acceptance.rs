@@ -123,7 +123,7 @@ mod tests {
         tokens.iter().map(|token| key(*token)).collect()
     }
 
-    /// `SpeculativeAcceptanceTest.resolve`: rows `[t0, d1..]` and the selected token of each row.
+    /// Resolves rows `[t0, d1..]` and the selected token of each row.
     fn resolve(rows: &[u32], selected: &[u32], budget: u32) -> Accepted {
         accept(&rows[1..], &keys(selected), &[EOS], budget)
     }

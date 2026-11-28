@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two DFlash2 drafting-quality reports (DFlash2QualityCudaIntegrationTest).
+"""Compare two DFlash2 drafting-quality reports.
 
 Usage: dflash2_quality.py REFERENCE.jsonl CANDIDATE.jsonl
 

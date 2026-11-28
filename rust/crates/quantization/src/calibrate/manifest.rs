@@ -19,7 +19,7 @@ use super::driver::Then;
 pub const MANIFEST_FILE: &str = "calibration.json";
 /// The resume file's name in the output directory.
 pub const RESUME_FILE: &str = "hidden.bin";
-/// The directory of the output that holds the heads' state files in a trellis run, as Java's: the one directory a
+/// The directory of the output that holds the heads' state files in a trellis run: the one directory a
 /// listed name may be in.
 pub const HEADS_DIRECTORY: &str = "heads";
 /// The suffix of a file being written, before it is renamed over its name.

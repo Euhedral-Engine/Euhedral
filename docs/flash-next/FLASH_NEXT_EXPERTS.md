@@ -118,13 +118,15 @@ experts one after another; an item is `(slot, first, count)` into it.
 
 - `native/tests/test_qwen4_experts.py` (numpy venv): both projections against float64 over the exactly expanded weights, bit equality
   of a pair across work items of 16, 8, 5, 3 and 1 pairs and in reverse order, and the combine order and `zeroFirst`.
-- `ExpertRoutingTest` (CPU): every pair appears once, in its expert's contiguous items that name the expert's slot, each
+- `rust/crates/engine/src/flash/moe/routing/tests.rs` (CPU): every pair appears once, in its expert's contiguous items that name the expert's slot, each
   row's addition list ascends in expert id, padding ids and repeated experts.
-- `ExpertCudaIntegrationTest` (synthetic NVFP4 experts): `act` and `weighted` of every pair against a CPU reference written from
-  upstream; the routed sum equals, bit for bit, the BF16 chain over the kernels' own `weighted` values; results are **bit-identical**
-  for a 70-row chunk whichever order the experts run in and through 1 to 12 slots, in chunks of 7 and 1 rows and in one piece; a
-  512-row skewed chunk (up to 347 pairs per expert) is bit-identical in either order and agrees with the CPU on three rows.
-- `ExpertFixtureCudaIntegrationTest`: real layer-0 experts, records read straight from the artifact into 16 device slots reused
+- `rust/crates/engine/tests/device/flash/moe.rs::expert_stages_over_a_planned_description_match_the_host_reference` (synthetic
+  experts): the expert stages against a host reference. Measured on synthetic NVFP4 experts, and not checked automatically: `act` and
+  `weighted` of every pair against a CPU reference written from upstream; the routed sum equals, bit for bit, the BF16 chain over the
+  kernels' own `weighted` values; results are **bit-identical** for a 70-row chunk whichever order the experts run in and through 1
+  to 12 slots, in chunks of 7 and 1 rows and in one piece; a 512-row skewed chunk (up to 347 pairs per expert) is bit-identical in
+  either order and agrees with the CPU on three rows.
+- Measured, with no automated check: real layer-0 experts, records read straight from the artifact into 16 device slots reused
   from expert to expert, against the upstream fixtures `layer_moe` (`c0` 1 row, `c1` 8 rows, `c2` 64 rows). The upstream
   product is an FP32 matmul over exactly expanded weights, the kernels accumulate in FP32 in another order, so values agree to BF16
   rounding:

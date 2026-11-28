@@ -1,5 +1,5 @@
-//! The storages a stage reads and writes, which the plan orders (`ExecutionPlan.Buffer`, the instruction's input and
-//! output buffers, and the expansion scratch).
+//! The storages a stage reads and writes, which the plan orders (the instruction's input and output
+//! buffers, and the expansion scratch).
 
 use crate::workspace::BufferSlot;
 

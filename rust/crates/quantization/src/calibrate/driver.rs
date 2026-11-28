@@ -1,6 +1,6 @@
 //! The layer loop: the calls of a calibration in their order, each ending in the continuation of the one before.
 //!
-//! Layer `i` runs while layer `i + 1` is read from the checkpoint, as Java's chain does; the two calls end in either
+//! Layer `i` runs while layer `i + 1` is read from the checkpoint: the two calls end in either
 //! order and the later one goes on, so no thread waits for the other. The loop checkpoints after every
 //! [`Plan::checkpoint_every`] layers and, at the end of a run of the whole model, checkpoints the last layer's states
 //! and finishes.
@@ -129,8 +129,7 @@ impl<S: Stages> Run<S> {
     }
 
     /// The last layer of the run ran. A run of the whole model checkpoints the states first (unless it never
-    /// checkpoints), so that a failure of the heads resumes at the heads, not at an earlier layer; Java's last
-    /// checkpoint is before the last layers.
+    /// checkpoints), so that a failure of the heads resumes at the heads, not at an earlier layer.
     fn last_layer_done(self: &Arc<Self>) {
         if self.plan.stops_early() || self.plan.checkpoint_every == 0 {
             return self.end();

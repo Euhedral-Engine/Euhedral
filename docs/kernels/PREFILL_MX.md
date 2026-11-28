@@ -115,7 +115,7 @@ is at most 6 (the CTA needs 32 (G + 2) threads). Smaller grids and larger groups
 
 - `native/tests/test_q3_mx.py` compares the quantizer and the Q3, Q4 and Q5 linears, the split-K linear and the gate/up kernel with
   FP64 on exact products (they agree to the BF16 output rounding); the FA2 test compares the production kernel with the control bitwise.
-- `RelaxedNumericsDriftCudaIntegrationTest` against the exact oracle, `q3` and `q3-compressed` artifacts alike: KL 5.1e-3, hidden relative
+- `euhedral-bench drift` against the exact oracle, `q3` and `q3-compressed` artifacts alike: KL 5.1e-3, hidden relative
   error 6.0e-2, top-1 agreement 0.961 over 8 windows of 48 positions, with no growth by position.
 - The route is deterministic: 60 repeated launches of each kernel variant gave identical bits.
 - The `q3-compressed` artifact reproduces the `q3` artifact bitwise.

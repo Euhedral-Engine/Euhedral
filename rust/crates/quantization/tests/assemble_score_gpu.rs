@@ -46,7 +46,7 @@ const KL: usize = 2;
 const HEADER_BYTES: usize = 20;
 
 fn property(key: &str) -> String {
-    test_support::gradle_property(key).unwrap_or_else(|| panic!("set the property {key}: a device test needs it"))
+    test_support::test_setting(key).unwrap_or_else(|| panic!("set the property {key}: a device test needs it"))
 }
 
 /// The values of every chunk, one run of the engine over `artifact` and `composite`.

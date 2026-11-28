@@ -147,7 +147,7 @@ def nearest_even(values, representable):
 
 
 def reference_row(row: np.ndarray) -> np.ndarray:
-    """core/.../Nvfp4KvReference.represented: H from its definition, float64 rotation, nearest-even choices."""
+    """The represented KV row: H from its definition, float64 rotation, nearest-even choices."""
     rotated = H256 @ row.astype(np.float64)
     for base in range(0, 256, 16):
         maximum = np.abs(rotated[base:base + 16]).max()

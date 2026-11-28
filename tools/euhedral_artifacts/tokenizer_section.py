@@ -1,5 +1,4 @@
-"""The tokenizer an artifact carries after its content, found from a footer at the end of the file (the Java
-`TokenizerSection`, byte for byte). Big-endian:
+"""The tokenizer an artifact carries after its content, found from a footer at the end of the file. Big-endian:
 
     body:   int32 entry count (4), then per entry: int32 name length, UTF-8 name, int32 data length, UTF-8 data,
             in the order tokenizer.json, tokenizer_config.json, chat_template.jinja, special_tokens.json

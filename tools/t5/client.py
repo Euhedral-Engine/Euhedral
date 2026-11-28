@@ -5,8 +5,8 @@ Decision: tokens come from the server (`return_token_ids`), not from re-tokeniza
    reproduce.
 2. The server reshapes the text (reasoning split, tool-call parsing and re-serialization), so the bytes the client
    sees are not the bytes the model emitted.
-3. The engine's tokenizer and template port are already checked against the checkpoint (`QwenTokenizerTest`,
-   `QwenChatTemplateTest` goldens).
+3. The engine's tokenizer and template port are already checked against the checkpoint (`rust/crates/tokenizer/tests/` and
+   `rust/crates/api-protocol/tests/template.rs`).
 4. The ids the model actually conditioned on and produced are exactly what the scorer must use.
 
 Request fields: `model`, `messages`, `max_tokens`, `stream` false, `return_token_ids` true, the decoding fields

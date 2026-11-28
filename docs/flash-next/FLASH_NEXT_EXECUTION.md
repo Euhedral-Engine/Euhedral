@@ -118,8 +118,9 @@ the cache's own copy stream and the acquirer waits for that copy, not for any co
 
 **Exactness.** The expert kernels read NVFP4 weights in place and take BF16 activations at every row count (no FP4 activation
 quantization): the bits of a (token, expert) pair depend only on the token's own activations, never on how many other tokens
-the expert saw, which wave it ran in or what was in the cache. `MoeFixtureCudaIntegrationTest` runs layer 0 with the
-20-slot minimum cache (every chunk evicts) and with 520 slots and requires identical bits.
+the expert saw, which wave it ran in or what was in the cache. Layer 0 was run with the
+20-slot minimum cache (every chunk evicts) and with 520 slots, with identical bits; no automated check repeats that. The expert
+launches are checked against a host reference in `rust/crates/engine/tests/device/flash/moe.rs`.
 
 Kernel contract and measurements of the expert kernels: [FLASH_NEXT_EXPERTS.md](FLASH_NEXT_EXPERTS.md).
 
@@ -147,7 +148,7 @@ when it failed, so a failed step leaves the sequence where it was; closing relea
 token-by-token run would reach), through attention with per-row selection, and through the MoE block in expert waves. Any
 chunking gives the same result up to BF16 noise, because the engine's NVFP4 linears switch kernels at nine rows (activations are
 quantized from nine rows on): the logits of one prompt differ by about 7% to 10% relative RMS between chunkings, the reference's own
-chunk-to-chunk difference being 9%, with the same greedy token (`InvarianceCudaIntegrationTest`). The expert cache is another
+chunk-to-chunk difference being 9%, with the same greedy token (measured; no automated check covers chunk invariance). The expert cache is another
 matter: the experts' kernels are row-exact and independent of what is resident, so a cold cache, a warm cache and the 20-slot
 minimum cache with 10,019 evictions produce identical bits.
 
@@ -171,19 +172,20 @@ branches. A generation is a chain of frames on the lattice, not a loop on a thre
 text and throws the next step's `Admit`; the plan runs one step at a time and a step admitted meanwhile starts when the running one concludes. Cancellation stops the
 running step at its next stage. The runtime owns no executor, pool or thread; prompt tokenization and the host work a request needs
 are frames on the same lattice. The engine therefore needs worker CPUs like the dense model, and a Flash-Next deployment benefits
-from several: the expert reads of one wave run on as many workers as the staging pool allows. Chat completions on the real artifact are covered by `Qwen4ChatCompletionsCudaIntegrationTest`.
+from several: the expert reads of one wave run on as many workers as the staging pool allows. No automated check runs chat completions on the real Flash-Next artifact.
 
 ## End-to-end agreement
 
-`GreedyAgreementCudaIntegrationTest` compares the engine's greedy continuation with the reference's, both reading the KV
+The engine's greedy continuation was compared with the reference's, both reading the KV
 cache through the NVFP4 codec (`tools/flash_next_reference/cli.py greedy`, fixture `rust/resources/fixtures/qwen4/greedy-reference.json`).
 Teacher-forced (the engine fed the reference's tokens) and free-running (the engine fed its own), 72 of 72 positions agree, and the
 engine's tokenisation of every prompt matches the reference tokenizer's. A position where the reference's top two logits are within
-the BF16 noise of the comparison (1.0 logit) is not counted as a disagreement; none of the 72 needed it.
+the BF16 noise of the comparison (1.0 logit) is not counted as a disagreement; none of the 72 needed it. No automated check repeats this comparison: the fixture file is not read by a test, and
+`rust/crates/engine/src/flash/engine/tests.rs` checks only that a short prompt generates the same tokens twice.
 
 ## Measured performance
 
-Measured by `PerformanceCudaIntegrationTest` (`EUHEDRAL_QWEN4_PERF=1`, report in `core/build/qwen4-performance.txt`) on a
+Measured (`euhedral-bench run` reports the same figures) on a
 16 GB GPU with the artifact on a file-backed expert store (52 MiB pinned host memory), a 5120-token context plan, 3547 of 24576
 expert slots resident (9366 MiB), 4190 MiB of fixed weights, and the step uncaptured. The decode figures are at 64 and at 4096
 tokens of context; 16K and 32K were not measured.

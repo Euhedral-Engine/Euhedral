@@ -84,8 +84,7 @@ use crate::state::kv::KvRetained;
 use crate::state::{Flight, SequenceId, SequenceState};
 use crate::workspace::Workspace;
 
-/// Decode quanta that start below this position overlap their launches with the quantum before them
-/// (`Quantum.OVERLAP_MAX_START_POSITION`).
+/// Decode quanta that start below this position overlap their launches with the quantum before them.
 pub(super) const OVERLAP_MAX_START_POSITION: u64 = 1024;
 
 /// Quanta of a greedy request in flight at once: the one running, and the one admitted behind it.

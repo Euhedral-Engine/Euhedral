@@ -3,7 +3,7 @@
 //! output projection.
 //!
 //! The per-sequence state (the convolution history and the recurrent state) is supplied by the caller as device
-//! addresses, as Java's `GdnLayer` reads them from the sequence's state.
+//! addresses.
 
 use euhedral_inference_cuda::DevicePtr;
 use euhedral_inference_edrl::GdnConfig;

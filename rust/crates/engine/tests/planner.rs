@@ -1,14 +1,13 @@
 //! The residency planner on the tensor table of the RCO artifact (`tests/fixtures/rco_table.tsv`: names, shapes and
 //! formats, no payload), with fake device sizes.
 //!
-//! The expected numbers are the Java engine's, worked from `ResidencyPlanner` for the same inputs:
-//! - the resident weights are `deviceNeed` (the sum of the uploaded objects' byte sizes);
-//! - the cache is `kvBytes` (`ResidencyPlanner.java:84`): 16 attention layers x pages x (K plane + V plane), the
+//! The expected numbers are worked by hand from the inputs:
+//! - the resident weights are the sum of the uploaded objects' byte sizes;
+//! - the cache is 16 attention layers x pages x (K plane + V plane), the
 //!   NVFP4 plane of one page being 256 rows x 144 bytes x 4 KV heads;
-//! - the reserve is `RESERVE_BYTES` (`ResidencyPlanner.java:36`), 1280 MiB;
-//! - the trellis scratch is `trellisScratchBytes` (`ResidencyPlanner.java:303`) at 512 rows with
-//!   `TrellisSettings.defaults()` (`TrellisFormat.java:167`);
-//! - the spill is `plan` (`ResidencyPlanner.java:161`): device pages = min(pages, ceil(kvDeviceMinimumTokens / 256)),
+//! - the reserve is 1280 MiB;
+//! - the trellis scratch is taken at 512 rows with the default trellis settings;
+//! - the spill is: device pages = min(pages, ceil(kvDeviceMinimumTokens / 256)),
 //!   host pages = the rest, one device region of the host pages beside the device pages.
 
 #![allow(
@@ -39,13 +38,13 @@ use common::{config, dflash2_config, dflash2_table_without, rco_table, rco_table
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 
-/// The Java numbers for the RCO artifact (see the module comment).
-const JAVA_WEIGHTS_BYTES: u64 = 12_012_811_100;
-const JAVA_KV_131072: u64 = 2_415_919_104;
-const JAVA_KV_32768: u64 = 603_979_776;
-const JAVA_PAGE_BYTES: u64 = 294_912;
-const JAVA_TRELLIS_SCRATCH_512: u64 = 160_669_696;
-/// The Java workspace at 512 rows, which holds one input record; this engine holds two (`INPUT_RECORDS`).
+/// The expected numbers for the RCO artifact (see the module comment).
+const RCO_WEIGHTS_BYTES: u64 = 12_012_811_100;
+const RCO_KV_131072: u64 = 2_415_919_104;
+const RCO_KV_32768: u64 = 603_979_776;
+const RCO_PAGE_BYTES: u64 = 294_912;
+const RCO_TRELLIS_SCRATCH_512: u64 = 160_669_696;
+/// The workspace at 512 rows, which holds one input record; this engine holds two (`INPUT_RECORDS`).
 const WORKSPACE_512: u64 = 172_140_552 + (512 * 4 + 8);
 /// The same for a sequence that drafts 4 tokens a step: each quantum of a step reads a record, 5 in all.
 const WORKSPACE_512_MTP4: u64 = WORKSPACE_512 + 3 * (512 * 4 + 8);
@@ -65,7 +64,7 @@ fn the_fixture_is_the_rco_table() {
     let table = rco_table();
     assert_eq!(table.len(), 1745);
     let sum: u64 = table.entries().iter().map(|entry| entry.bytes()).sum();
-    assert_eq!(sum, JAVA_WEIGHTS_BYTES);
+    assert_eq!(sum, RCO_WEIGHTS_BYTES);
     let config = config();
     let profile = ArtifactProfile::of(&table, &config).unwrap();
     assert_eq!(profile.quantization, Quantization::Trellis);
@@ -79,27 +78,27 @@ fn rco_fits_resident_at_131072_on_16_gib() {
     // Every object the load places is resident; the packed MTP projection became its two halves.
     assert_eq!(
         plan.weights_bytes,
-        JAVA_WEIGHTS_BYTES + 4,
+        RCO_WEIGHTS_BYTES + 4,
         "the halves carry one more trailer than the pack"
     );
     assert_eq!(plan.kv_device_tokens, 131_072);
     assert_eq!(plan.kv_host_tokens, 0);
-    assert_eq!(plan.kv_device_bytes, JAVA_KV_131072);
+    assert_eq!(plan.kv_device_bytes, RCO_KV_131072);
     assert_eq!(plan.kv_host_bytes, 0);
-    assert_eq!(plan.scratch_bytes, JAVA_TRELLIS_SCRATCH_512);
+    assert_eq!(plan.scratch_bytes, RCO_TRELLIS_SCRATCH_512);
     assert_eq!(plan.workspace_bytes, WORKSPACE_512_MTP4);
     assert_eq!(plan.kv_format, KvFormat::Nvfp4);
     assert_eq!(plan.draft_depth, 4);
-    // Java's device need is the weights, the cache, the reserve and the scratch; the arena aligns each object.
+    // The device need is the weights, the cache, the reserve and the scratch; the arena aligns each object.
     assert_eq!(
         plan.device_bytes - plan.arena_bytes,
-        JAVA_KV_131072 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512
+        RCO_KV_131072 + 1280 * MIB + RCO_TRELLIS_SCRATCH_512
     );
     assert_eq!(DEFAULT_RUNTIME_RESERVE_BYTES, 1280 * MIB);
     assert_eq!(
         plan.budget_bytes,
         16 * GIB,
-        "the dense plan's budget is what is free (Java InferenceEngine.deviceBudget); memory.gpu-reserve is not used"
+        "the dense plan's budget is what is free; memory.gpu-reserve is not used"
     );
     assert!(plan.device_bytes <= plan.budget_bytes);
 }
@@ -131,7 +130,7 @@ fn the_arena_holds_every_object_aligned_and_apart() {
     );
     assert_eq!(first.shape, [7168, 5120]);
     assert_eq!(first.bytes, second.bytes);
-    // Java `Nvfp4Layout.byteSize(7168, 5120)`: codes 18350080, scales 2293760, trailer at the next 256, 4 bytes.
+    // The NVFP4 layout of 7168 by 5120: codes 18350080, scales 2293760, trailer at the next 256, 4 bytes.
     assert_eq!(first.bytes, 20_643_844);
     let source = table.get(pack).unwrap();
     assert_eq!(first.file_offset, source.offset());
@@ -180,7 +179,7 @@ fn planner_refuses_when_weights_do_not_fit() {
     let (closest, _) = plan_closest(&config(), &rco_table(), &settings(32_768), inputs(GIB)).unwrap();
     assert!(closest.arena_bytes < arena);
     assert_eq!(weights_needed, closest.arena_bytes + closest.offload.staging_bytes());
-    assert_eq!(state_needed, JAVA_KV_32768 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512);
+    assert_eq!(state_needed, RCO_KV_32768 + 1280 * MIB + RCO_TRELLIS_SCRATCH_512);
     let message = PlanError::DeviceTooSmallWithOffload {
         weights_needed,
         state_needed,
@@ -219,13 +218,13 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
     settings.context.kv_cache_on_gpu_tokens = 32_768;
     let whole = plan_with(&config, &table, &settings, inputs(16 * GIB)).unwrap();
     let arena = whole.arena_bytes;
-    // Java: 512 pages, 128 on the device, 384 in host memory; the host pages are copied through one device region.
-    let region = 384 * JAVA_PAGE_BYTES;
+    // 512 pages, 128 on the device, 384 in host memory; the host pages are copied through one device region.
+    let region = 384 * RCO_PAGE_BYTES;
     let spilled = region * 16;
     assert_eq!(spilled, 1_811_939_328);
-    let kept = JAVA_KV_32768 + region;
-    let need_spilled = arena + kept + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512;
-    let need_whole = arena + JAVA_KV_131072 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512;
+    let kept = RCO_KV_32768 + region;
+    let need_spilled = arena + kept + 1280 * MIB + RCO_TRELLIS_SCRATCH_512;
+    let need_whole = arena + RCO_KV_131072 + 1280 * MIB + RCO_TRELLIS_SCRATCH_512;
     assert!(need_spilled < need_whole);
 
     // Room for the whole cache: nothing spills.
@@ -266,7 +265,7 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
     // A context that already fits in kv-cache-on-gpu-tokens has nothing to spill.
     settings.context.max_tokens = 32_768;
     settings.context.kv_cache_on_gpu_tokens = 65_536;
-    let small_short = arena + JAVA_KV_32768 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512 - 1;
+    let small_short = arena + RCO_KV_32768 + 1280 * MIB + RCO_TRELLIS_SCRATCH_512 - 1;
     let moved = plan_with(&config, &table, &settings, inputs(small_short)).unwrap();
     assert_eq!(moved.kv_host_tokens, 0);
     assert_eq!(moved.offload.host, ["text/token_embedding"]);
@@ -275,8 +274,8 @@ fn kv_spills_beyond_kv_cache_on_gpu_tokens_when_short() {
 #[test]
 fn workspace_sized_for_prefill_chunk() {
     let config = config();
-    // Java `ExecutionPlan.fullBufferSpecs` at 512 rows, the logits at a verification's rows (8), and the input record
-    // of `Workspace.inputByteSize` (the ids padded to 8 bytes, then one position).
+    // The buffers at 512 rows, the logits at a verification's rows (8), and the input record
+    // (the ids padded to 8 bytes, then one position).
     let rows = WorkspaceRows {
         rows: 512,
         logits_rows: 8,
@@ -328,7 +327,7 @@ fn gpu_limit_respected_and_gpu_reserve_not_used_by_the_dense_plan() {
         .unwrap()
         .device_bytes;
 
-    // The plan fits exactly what is free, with no gpu-reserve taken off (Java InferenceEngine.deviceBudget).
+    // The plan fits exactly what is free, with no gpu-reserve taken off (the device budget).
     assert!(
         plan_with(&config, &table, &base, inputs(need))
             .unwrap()
@@ -599,7 +598,7 @@ fn the_first_scratch_region_is_the_larger_of_the_trellis_and_the_native_scratch(
     assert!(native > 0);
     assert!(plan.scratch_bytes >= native);
     // On this artifact the trellis routes' scratch is the larger: the figures of the plan are the ones it always had.
-    assert_eq!(plan.scratch_bytes, JAVA_TRELLIS_SCRATCH_512);
+    assert_eq!(plan.scratch_bytes, RCO_TRELLIS_SCRATCH_512);
 }
 
 #[test]
@@ -682,9 +681,9 @@ fn a_plan_of_one_sequence_is_the_plan_that_knew_none() {
     assert_eq!(one.extra_sequence_bytes, 0);
     assert_eq!(
         one.device_bytes,
-        one.arena_bytes + JAVA_KV_131072 + 1280 * MIB + JAVA_TRELLIS_SCRATCH_512
+        one.arena_bytes + RCO_KV_131072 + 1280 * MIB + RCO_TRELLIS_SCRATCH_512
     );
-    assert_eq!(one.kv_device_bytes, JAVA_KV_131072);
+    assert_eq!(one.kv_device_bytes, RCO_KV_131072);
 }
 
 #[test]
@@ -716,7 +715,7 @@ fn each_sequence_adds_its_cache_and_its_state() {
     assert_eq!(four.scratch_bytes, one.scratch_bytes);
     // Each sequence's cache is the one sequence's.
     assert_eq!(four.kv_device_bytes, one.kv_device_bytes);
-    assert_eq!(four.device_bytes, one.device_bytes + 3 * (JAVA_KV_32768 + extra));
+    assert_eq!(four.device_bytes, one.device_bytes + 3 * (RCO_KV_32768 + extra));
     assert_eq!(four.location_bytes().device, four.device_bytes);
 }
 
@@ -774,7 +773,7 @@ fn the_most_sequences_that_fit_is_found_and_one_more_does_not_fit() {
     let settings = settings(32_768);
     let one = plan_with(&config, &table, &settings, with_sequences(16 * GIB, 1)).unwrap();
     let extra = extra_of(&plan_with(&config, &table, &settings, with_sequences(16 * GIB, 2)).unwrap());
-    let each = JAVA_KV_32768 + extra;
+    let each = RCO_KV_32768 + extra;
     // Room for 5 sequences and a byte short of a sixth.
     let free = one.device_bytes + 4 * each + each - 1;
     assert_eq!(sequences_for(&config, &table, &settings, inputs(free), 1000), Ok(5));
@@ -817,7 +816,7 @@ fn more_sequences_fit_when_each_keeps_part_of_its_cache_on_the_host() {
     let (config, table) = (config(), rco_table());
     let mut whole = settings(131_072);
     let one = plan_with(&config, &table, &whole, with_sequences(16 * GIB, 1)).unwrap();
-    let free = one.device_bytes + 2 * (JAVA_KV_131072 + extra_of(&one));
+    let free = one.device_bytes + 2 * (RCO_KV_131072 + extra_of(&one));
     let on_device = sequences_for(&config, &table, &whole, inputs(free), 16).unwrap();
     whole.context.kv_cache_on_gpu_tokens = 32_768;
     let spilled = sequences_for(&config, &table, &whole, inputs(free), 16).unwrap();
@@ -857,7 +856,7 @@ fn an_explicit_count_is_the_count_and_zero_is_the_most_that_fit() {
     // Limited by the device.
     settings.batching.max_tokens_per_pass = Auto::Auto;
     let one = plan_with(&config, &table, &settings, with_sequences(16 * GIB, 1)).unwrap();
-    let each = JAVA_KV_32768 + extra_of(&one);
+    let each = RCO_KV_32768 + extra_of(&one);
     assert_eq!(
         resolve_sequences(&config, &table, &settings, inputs(one.device_bytes + 2 * each)),
         Ok(3)

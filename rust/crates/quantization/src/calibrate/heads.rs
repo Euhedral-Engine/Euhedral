@@ -1,4 +1,4 @@
-//! What a run of the whole model writes after its layers, in Java's order, over the final hidden states:
+//! What a run of the whole model writes after its layers, in this order, over the final hidden states:
 //! 1. the Hessian of the final hidden states under the final norm (the output head's);
 //! 2. the MTP block: its input projection, then the states it makes (which replace the hidden states), then the MTP
 //!    layer, then the Hessian of the MTP output (the draft head's). `--skip-mtp` leaves it out, and the manifest
@@ -6,10 +6,10 @@
 //! 3. the output head;
 //! 4. the draft head, under the MTP output's Hessian, or the output head's when the MTP block is skipped.
 //!
-//! The MTP layer reads the input projection's output, so the projection comes first, as in Java's code. Each part's
+//! The MTP layer reads the input projection's output, so the projection comes first. Each part's
 //! files are listed in the manifest as soon as the part is sealed, and the resume file is dropped only after the draft
 //! head, the last part, is listed: a part that fails leaves the resume file, whose states are the layers' output, so
-//! the next run starts at these steps again. Java drops its resume file before them and loses that point.
+//! the next run starts at these steps again.
 //!
 //! The calls on the card are [`Heads`]; this sequence is generic over them and never waits, as [`super::driver`].
 
@@ -164,7 +164,7 @@ fn sealed_then<H: Heads>(
     );
 }
 
-/// The heads of a trellis run, in Java's order: the MTP block (written by the trellis writer, whatever `--skip-mtp`
+/// The heads of a trellis run, in order: the MTP block (written by the trellis writer, whatever `--skip-mtp`
 /// says: the checkpoint carries it), the output head's Hessian, the output head and the draft head, both under that
 /// Hessian, then the checkpoint's closing files, and last the resume file's dropping.
 ///

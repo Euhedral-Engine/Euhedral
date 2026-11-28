@@ -1,5 +1,5 @@
-//! The Flash-Next model step as one plan for a row bucket (`ExecutionPlan.rowBuckets` and `Shape`): the dense stages,
-//! the layer's block, its mixture of experts and the end injection for every layer in Java's order, then the final
+//! The Flash-Next model step as one plan for a row bucket: the dense stages,
+//! the layer's block, its mixture of experts and the end injection for every layer in order, then the final
 //! mix and the head. A step runs as a quantum on the graph of its bucket: [`Buckets::bucket_for`] chooses the bucket
 //! of a row count, [`FlashStep`] holds one RustEE graph per bucket, and [`FlashStep::start`] starts a quantum on the
 //! graph of its bucket behind the quantum before it on the workspace.
@@ -9,12 +9,11 @@
 //! the last node, whose marker covers the quantum's device work) of the quantum before it ([`dependencies`]). The
 //! host roots of the n-gram embedding touch only the quantum's own state and need no such edge.
 //!
-//! Departures from Java, with the reason: the step is not captured into a CUDA graph. It has host stages (the
+//! The step is not captured into a CUDA graph. It has host stages (the
 //! expert fetches, the plan that reads the route's copy), a device-completion edge, kernel arguments the host
 //! decides from the route (an expert's pair range, the finish's pair count) and the position as a kernel argument in
-//! the sparse attention, so no one body holds for every quantum of a key; Java's step does not capture either
-//! (`FLASH_NEXT_EXECUTION.md`, "Dynamic boundaries"). Java's decode-only prefetch and group stages and its scratch
-//! chain over the layer stages of 9 or more rows have no node here.
+//! the sparse attention, so no one body holds for every quantum of a key.
+//! There are no decode-only prefetch or group stages and no scratch chain over the layer stages of 9 or more rows.
 
 use std::fmt;
 use std::sync::Arc;
@@ -34,7 +33,7 @@ use crate::stages::Quantum;
 
 const OP: &str = "step";
 
-/// The rows up to which the middle bucket serves (`ExecutionPlan.rowBuckets`).
+/// The rows up to which the middle bucket serves.
 const MIDDLE_BUCKET: u32 = 16;
 
 /// The row buckets of a model, and the width of the MoE block of each.

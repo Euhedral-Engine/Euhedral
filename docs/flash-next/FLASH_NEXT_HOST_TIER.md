@@ -120,7 +120,8 @@ part on the worker that runs it.
 The device cache replaces by S3-FIFO (`ExpertCacheShard`, [FLASH_NEXT_CACHE.md](FLASH_NEXT_CACHE.md)). The layer quotas and the
 global recency order are rejected: on the model's decode the two keep the same experts (a few popular experts per layer dominate,
 and no cyclic pass evicts them), and S3-FIFO keeps records asked for again through a sweep of records asked for once
-(`ExpertCacheShardTest`).
+(`what_was_asked_for_again_survives_what_was_loaded_once` in
+`rust/crates/engine/src/residency/expert_cache/shard_tests.rs`).
 
 ## Telemetry
 

@@ -1,5 +1,5 @@
-//! The host side of the per-layer n-gram embedding: the hashed row ids of the tokens ([`NgramIds`], Java's `NgramIds`),
-//! the table of records the ids address ([`NgramRows`], Java's `NgramStore.gatherRecordsRange`), and the split of one
+//! The host side of the per-layer n-gram embedding: the hashed row ids of the tokens ([`NgramIds`]),
+//! the table of records the ids address ([`NgramRows`]), and the split of one
 //! quantum's gather into parts that are filled apart and joined once all have arrived ([`PartSlots`]).
 
 use std::fmt;
@@ -14,7 +14,7 @@ use euhedral_io::Continuation;
 use crate::flash::FlashError;
 use crate::frames::{Kind, step};
 
-/// The most parts one gather splits into (`Shape.PLE_PARTS`).
+/// The most parts one gather splits into.
 pub const PARTS: usize = 8;
 /// Rows below which a gather is not worth splitting: a part is a frame, and its hop costs more than a few dozen rows
 /// of copying.
@@ -357,7 +357,7 @@ impl NgramRows {
     }
 
     /// Starts reading the records of `ids[range]` and returns at once; `done` runs, as the work of a frame, when the last
-    /// row has been read, with the records, one [`NgramRows::record_bytes`] each in order (`NgramStore.gatherRecordsRange`),
+    /// row has been read, with the records, one [`NgramRows::record_bytes`] each in order,
     /// or the first failure. Every row is its own read, started here: the I/O engine queues what its ring cannot take.
     /// Refuses a row outside the table and a range outside `ids`, starting nothing (`done` is dropped unrun); a range of
     /// no rows ends at once, in this call.

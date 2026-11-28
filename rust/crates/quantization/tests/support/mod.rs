@@ -42,7 +42,7 @@ pub fn device(module: Module, name: &'static str) -> (Device, Arc<Compiled<CudaM
 
 /// The device and each of `modules` compiled, in order, on one lane.
 pub fn device_with(modules_wanted: &[Module], name: &'static str) -> (Device, Vec<Arc<Compiled<CudaModule>>>) {
-    let path = test_support::gradle_property("euhedral.cuda.library")
+    let path = test_support::test_setting("euhedral.cuda.library")
         .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
     let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
     let options = ModuleOptions::beside(&library).expect("the product directory");

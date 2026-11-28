@@ -308,7 +308,7 @@ pub struct CompressedHead {
     _buffers: [DeviceBuffer; 2],
 }
 
-/// A valid compressed stream of `out` rows of `k` (the geometry of `q3_p2e2_geometry.h`): codes of -1, 0 and +1 (no
+/// A valid compressed stream of `out` rows of `k` (the P2E2 geometry): codes of -1, 0 and +1 (no
 /// BIG symbol, so no payload units and every row's base is 0), FP16 scales, and the zero padding words behind the
 /// empty payload; and its expansion, as a plain Q3 weight.
 pub fn compressed_head(rig: &Rig, random: &mut Random, out: usize, k: usize) -> CompressedHead {

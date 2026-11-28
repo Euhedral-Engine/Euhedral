@@ -1,4 +1,4 @@
-//! The hyper-connection of a Flash-Next layer (`HyperConnection.java`): the residual state is `streams` parallel
+//! The hyper-connection of a Flash-Next layer: the residual state is `streams` parallel
 //! streams of `hidden` values per row. A site mixes them down to one stream that a block reads
 //! ([`HyperConnection::mix`]) and injects the block's output back into every stream ([`HyperConnection::inject`]).
 //!
@@ -86,7 +86,7 @@ impl HyperShape {
         }
     }
 
-    /// The operations of the mix of `state` into `mixed` at one site, in Java's order. `exact` is the numerics mode of
+    /// The operations of the mix of `state` into `mixed` at one site. `exact` is the numerics mode of
     /// the lane's kernels.
     pub fn mix(
         &self,

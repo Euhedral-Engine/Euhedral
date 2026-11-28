@@ -1,5 +1,5 @@
-//! The launches of the mixture of experts (`MoeOps` and `ExpertOps`): the router, the shared expert's SwiGLU, the
-//! per-expert gate-up and down kernels, the ordered combine and the finish, with Java's grid, block and argument order.
+//! The launches of the mixture of experts: the router, the shared expert's SwiGLU, the
+//! per-expert gate-up and down kernels, the ordered combine and the finish.
 //! Each refuses what its kernel cannot take, with the value in the message, and returns the [`Launch`] without queueing it.
 
 use euhedral_inference_cuda::DevicePtr;

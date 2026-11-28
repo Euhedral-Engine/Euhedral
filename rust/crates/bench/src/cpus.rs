@@ -25,8 +25,7 @@ pub enum CpuSelection {
 }
 
 impl CpuSelection {
-    /// Parses the `cpus` text: a keyword, or ids and ranges. Each item is trimmed and empty items are skipped, as the
-    /// Java benchmark reads them.
+    /// Parses the `cpus` text: a keyword, or ids and ranges. Each item is trimmed and empty items are skipped.
     pub fn parse(text: &str) -> Result<CpuSelection, ConfigError> {
         match text.trim() {
             "all" => Ok(CpuSelection::All),

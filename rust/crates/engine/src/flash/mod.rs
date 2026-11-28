@@ -2,9 +2,8 @@
 //! block with the Flash-Next convolution, the embedding over the residual streams, and the per-layer n-gram embedding
 //! with its host roots.
 //!
-//! This is the port of `core/.../model/qwen4/{Ops,HyperConnection,GdnLayer,Ple,NgramIds,Stages}.java`. [`ops`] holds the
-//! launches of the Flash-Next kernel table, one function per Java `Ops` entry with the same grid, block and argument
-//! order; [`hyper`], [`gdn`], [`embed`] and [`ple`] are the stages; [`plan`] lays them out as the nodes and edges of one
+//! [`ops`] holds the launches of the Flash-Next kernel table, one function per entry with the kernel's grid, block and
+//! argument order; [`hyper`], [`gdn`], [`embed`] and [`ple`] are the stages; [`plan`] lays them out as the nodes and edges of one
 //! layer. The stages run on the dense [`crate::stages::Quantum`] and its lanes: they read its rows and tokens and hold
 //! the device addresses of their own weights, scratch and state ([`buffers`]), which a session supplies.
 

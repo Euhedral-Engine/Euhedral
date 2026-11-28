@@ -1,5 +1,5 @@
 //! The text a score prints: the mean NLL and KL of a candidate against a reference, with their standard errors and the
-//! tails of the per-position distributions. The layout and the digits are the Java scorer's.
+//! tails of the per-position distributions. The layout and the digits are fixed.
 
 use std::fmt::Write;
 use std::path::Path;

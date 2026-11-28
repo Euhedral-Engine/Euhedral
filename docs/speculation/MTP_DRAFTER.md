@@ -65,7 +65,7 @@ converter's) and BF16 norms; the base artifact's tokenizer is carried.
 ## In the model
 
 NVFP4-Trellis-RCO with the trained drafter, MTP depth 4, greedy, 256 tokens per prompt
-(`MtpDraftLengthScreenCudaIntegrationTest`).
+(a screen the Rust engine has no harness for).
 
 24 drafting prompts (a retired prompt-set tool, about 1K to 5K tokens):
 

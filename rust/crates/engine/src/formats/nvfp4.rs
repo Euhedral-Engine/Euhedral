@@ -1,5 +1,4 @@
-//! NVFP4 linears: the routes of `Nvfp4Format.linear` and `euhedral_cuda_linear_nvfp4_bf16`
-//! (native/src/host/nvfp4_linear.c).
+//! NVFP4 linears: the routes of the decode, reference and native kernels.
 //!
 //! The route is a function of the rows, the shape and the layout (plain or SD4 scale tables), whether the launch is a
 //! verification, and whether the device has the native Blackwell route:

@@ -51,7 +51,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// `value` as a non-negative `u64`, or an error naming `what`: the Java `long` fields are never negative.
+/// `value` as a non-negative `u64`, or an error naming `what`: the format's integer fields are never negative.
 pub(crate) fn non_negative(value: i64, what: &'static str) -> Result<u64, EdrlError> {
     u64::try_from(value).map_err(|_| EdrlError::invalid(format!("{what} range overflows or is negative: {value}")))
 }

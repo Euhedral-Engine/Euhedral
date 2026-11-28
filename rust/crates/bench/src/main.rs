@@ -1,4 +1,4 @@
-//! `euhedral-bench`: measures this engine with the Java benchmark's configuration files and writes rows in its result
+//! `euhedral-bench`: measures this engine with the benchmark's configuration files and writes rows in its result
 //! schema.
 //!
 //! ```text
@@ -47,7 +47,7 @@ const USAGE: &str = "usage:
         [--cuda-library FILE]
   drift --artifact FILE --prefix N --steps N --candidate host-tier|exact [--config YAML] [--cuda-library FILE]
 
-CONFIG.json is a Java benchmark configuration file (see rust/resources/bench/configs); it requires \"artifact\" and \"cudaLibrary\".
+CONFIG.json is a benchmark configuration file (see rust/resources/bench/configs); it requires \"artifact\" and \"cudaLibrary\".
 --fork-id labels this process as one externally launched fork.
 --validate-only checks the configuration and the prompts, prints the plan, and exits without touching the GPU.
 score appends each reference's summary to the results file and, with --values, writes DIR/NAME.values (header of three
@@ -61,7 +61,7 @@ Exit codes: 0 success, 1 a measured row failed or was ineligible (a drift breach
 did not load.
 ";
 
-/// The library the Java configuration files name, relative to the repository root, where the build puts it for this
+/// The library the configuration files name, relative to the repository root, where the build puts it for this
 /// platform; other platforms name the library with `--cuda-library`.
 fn default_cuda_library() -> Option<PathBuf> {
     (consts::OS == "linux" && consts::ARCH == "x86_64")
@@ -266,7 +266,7 @@ fn settings_for(options: &Options, worker_cpus: &ResolvedCpus) -> Result<Setting
     };
     settings.model = model;
     settings.context.max_tokens = options.max_context_tokens;
-    // Always assigned, as the Java benchmark always passes it (a settings file does not win over the configuration).
+    // Always assigned, a settings file does not win over the configuration.
     settings.context.kv_cache_on_gpu_tokens = options.kv_device_minimum_tokens;
     // Off unless the run is of prefix scenarios, which need it (then the settings' own size).
     if !options.uses_prefix_cache() {

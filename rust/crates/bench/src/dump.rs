@@ -1,5 +1,5 @@
 //! The teacher-forced report: the engine is fed the first `prefix` tokens of the benchmark corpus document, then decodes
-//! the next `steps` tokens of it one row at a time, and the logits row of each step is written in the Java quality
+//! the next `steps` tokens of it one row at a time, and the logits row of each step is written in the quality
 //! tool's format (`tools/compare_teacher_forced.py` reads it):
 //!
 //! ```text

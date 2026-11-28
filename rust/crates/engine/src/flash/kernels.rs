@@ -1,4 +1,4 @@
-//! The kernels of the Flash-Next table (`euhedral_cuda_qwen4_launch`, native/src/host/qwen4_ops.c) the dense part, the
+//! The kernels of the Flash-Next table the dense part, the
 //! sparse attention and the mixture of experts launch. The discriminant is the kernel's index in the table, which is its ABI; a test compares
 //! every name with the catalog's.
 
@@ -142,7 +142,7 @@ impl Qwen4Kernel {
         qwen4_table()[self.index() as usize].shared_opt_in_bytes
     }
 
-    /// A launch of this kernel with no dynamic shared memory (Java launches none).
+    /// A launch of this kernel with no dynamic shared memory.
     pub fn launch(self, grid: [u32; 3], block: [u32; 3], args: KernelArguments) -> Launch {
         self.launch_shared(grid, block, 0, args)
     }

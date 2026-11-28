@@ -2,8 +2,7 @@
 //! block. A session allocates one buffer of [`FlashRegions::bytes`] and carves it with [`FlashRegions::over`]; the
 //! scratch of a block is carved from [`FlashRegions::layer_scratch`] with the block's own `carve`.
 //!
-//! Java allocates each region on its own (`Workspace`) and packs the scratch of a block back to back; here every region
-//! and every scratch buffer starts at a multiple of [`ALIGNMENT`], so a BF16 linear's 16-byte alignment holds whatever
+//! Every region and every scratch buffer starts at a multiple of [`ALIGNMENT`], so a BF16 linear's 16-byte alignment holds whatever
 //! the row count and the low rank are (back to back it holds only when each extent is a multiple of 8 values). A
 //! kernel's results do not depend on where its buffers lie.
 

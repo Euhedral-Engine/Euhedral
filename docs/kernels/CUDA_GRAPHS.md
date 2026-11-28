@@ -51,7 +51,7 @@ discarded), behind the scratch's marker, which it records again after itself. Dr
 input projection is NVFP4 and runs on native FP4 tensor cores from 2 rows).
 
 The ordering is not visible to the submission hash. A capture that omitted it computed different drafts (verifications still
-kept the output exact, so only acceptance dropped); `CapturedQuantaCudaIntegrationTest` therefore compares tokens and the
+kept the output exact, so only acceptance dropped); `captured_mtp_equals_uncaptured` (`rust/crates/engine/tests/device/mtp.rs`) therefore compares tokens and the
 accepted drafts of every verification between a capturing runtime and one that submits stage by stage.
 
 **Replay.** Every later quantum with the key is one lattice frame. It launches the graph on the home lane, behind the input

@@ -1,10 +1,8 @@
-//! The result row: schema `euhedral-inference.benchmark-result` version 1, with the field names, the field order and the
-//! null-for-absent convention of the Java benchmark's `BenchmarkResult`, so one reader takes
-//! rows of any run, old or new. Timings are integer nanoseconds and rates are tokens per second; a value is `null` when the
+//! The result row: schema `euhedral-inference.benchmark-result` version 1, with its field names, field order and
+//! null-for-absent convention, so one reader takes rows of any run. Timings are integer nanoseconds and rates are tokens per second; a value is `null` when the
 //! work it describes did not complete.
 //!
-//! A Rust row differs from a Java row in values only: `implementation` is `rust`, and `engine` (free-form in the schema)
-//! describes this engine.
+//! `implementation` is `rust`, and `engine` (free-form in the schema) describes this engine.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -70,8 +68,7 @@ pub struct Fork {
     pub id: Option<String>,
     pub source: String,
     pub pid: Option<u64>,
-    /// The process start, as the field name says in Java (`jvmStartedAt`); this engine has no JVM, the field is the
-    /// process's start.
+    /// The process start (the schema's `jvmStartedAt`).
     pub jvm_started_at: Option<String>,
 }
 
@@ -206,7 +203,7 @@ pub fn civil(seconds: u64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
-/// `time` as Java's `Instant.toString()` prints it: seconds precision, with the fraction in groups of three digits only
+/// `time` as `Instant.toString()` prints it: seconds precision, with the fraction in groups of three digits only
 /// when it is not zero.
 pub fn iso_instant(time: SystemTime) -> String {
     let since = time.duration_since(UNIX_EPOCH).unwrap_or_default();

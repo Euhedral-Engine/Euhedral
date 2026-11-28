@@ -76,7 +76,7 @@ codes then carry about 2.73 bits each, so no lossless layout stores them in much
 `q3-compressed` is therefore converted with calibrated rounding limited to the codes -3..3, which today's P2E2 stores: about 31%
 of its codes are large, and its Q3 tensors take about 88% of their row-split bytes. `q3` keeps the full range, so the two
 artifacts no longer hold the same values. `python3 -m euhedral_artifacts.q3_p2e2 expand` (run in `tools/`) writes the row-split
-artifact with the values a P2E2 artifact holds, which `P2e2CudaIntegrationTest` uses as the bitwise reference.
+artifact with the values a P2E2 artifact holds, which is the bitwise reference of `native/tests/test_q3_p2e2.py` and of `rust/crates/engine/tests/device/formats.rs`.
 
 **The MLP down projections stay row-split.** Limiting the codes to -3..3 costs the most where the P2E2 bytes it buys are
 fewest. Weight-only KL over wikitext-2 against Swift-1.5 BF16 (docs/evaluation/QUALITY.md), measured with unsigned group scales: with every

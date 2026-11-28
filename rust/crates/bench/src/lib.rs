@@ -1,4 +1,4 @@
-//! The benchmark: the Java benchmark's configuration files and result rows, the deterministic prompt corpora
+//! The benchmark: its configuration files and result rows, the deterministic prompt corpora
 //! ([`prompt`]) that reproduce its prompts byte for byte, and the runner that measures this engine on them.
 //!
 //! The quality tools ([`score`], [`drift`]) read a llama.cpp reference (the quantization library's `kld`) or compare two

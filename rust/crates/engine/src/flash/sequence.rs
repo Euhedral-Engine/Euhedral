@@ -1,7 +1,7 @@
 //! The device operations of a stage as data: the order a stage queues them in, which a test reads without a device.
 //!
 //! Most are launches of the Flash-Next table ([`ops`](super::ops)); the NVFP4 linears, the GDN recurrence and the
-//! residual add are the shared kernels Java reaches through `ExecutionGpu`, and the staging copy is the upload of the
+//! residual add are the shared kernels, and the staging copy is the upload of the
 //! gathered n-gram records. The routing's readback and the zero fill of a block no expert computed are the other two.
 
 use euhedral_inference_cuda::{CudaError, DevicePtr, KernelOps, PinnedBuffer};
