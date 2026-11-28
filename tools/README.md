@@ -211,7 +211,7 @@ python3 tools/convert_checkpoint.py --extend $OUT/qwen3_8_27b_nvfp4_compressed.e
 - `dflash2_reference.py`: runs the upstream DFlash2 draft model (z-lab/dflash, unmodified; needs PyTorch, transformers 5.15 and the
   upstream source tree) over fixed inputs and writes every intermediate as fixtures (docs/speculation/DFLASH2.md).
 - `dflash2_compare.py`: per-tensor relative error between two DFlash2 fixture directories (NumPy).
-- `dflash2_quality.py`: compares two drafters' quality records (DFlash2QualityCudaIntegrationTest).
+- `dflash2_quality.py`: compares two drafters' quality records (JSON lines).
 - `render_qwen_chat_template_golden.py`: regenerates `rust/crates/api-protocol/tests/data/qwen-chat-template-golden.json` from the checkpoint chat template (jinja2).
 
 ## Conversation generation

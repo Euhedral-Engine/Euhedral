@@ -184,7 +184,7 @@ Compression is also checked separately from quantization:
 
 | Pair | Result |
 |---|---|
-| `q3-compressed` against the row-split Q3 with the same values (`q3_p2e2 expand`) | lossless: every route's logits are bitwise equal (`P2e2CudaIntegrationTest`) |
+| `q3-compressed` against the row-split Q3 with the same values (`q3_p2e2 expand`) | lossless: the expansion and the decode kernels are bitwise equal to the row-split tensor (`native/tests/test_q3_p2e2.py`, `rust/crates/engine/tests/device/formats.rs`); no automated check compares a whole model's logits across routes |
 | NVFP4-SD4 against `nvfp4`, both converted from Qwen3.8-27B with the same importance matrix (on one fixed document, 1279 scored tokens) | NLL +0.005 ± 0.009, KL 0.037, top-1 agreement 89.8% |
 
 Production kernels are compared with exact scalar kernels on the same weights, over 1,024 forced decode

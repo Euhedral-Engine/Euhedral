@@ -165,7 +165,7 @@ equals the reference exactly (score gap 0).
 ## Measurements
 
 RTX 5070 Ti, CUDA 13.1, layer 3 of the real artifact. The history is built by running the layer over random rows; times are the
-average of repeated runs on the stream, in milliseconds (`QsaTimingCudaIntegrationTest`, `EUHEDRAL_QWEN4_TIMING=1`).
+average of repeated runs on the stream, in milliseconds (no harness in this repository repeats them).
 "block" is one `run` including four projections, the output projection and the retirement wait; the columns are its parts.
 
 | history | rows | block | projections | select (scores, top-k) | attention | o_proj |

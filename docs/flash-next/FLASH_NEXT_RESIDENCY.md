@@ -58,8 +58,8 @@ largest power of two from 512 to 4096, no longer than the context needs (`chunk 
 512-token chunk is at most a tenth of the memory the expert cache would have had. The chunk the plan chose is
 `ResidencyPlan.prefillChunkTokens`; the execution plan's full workspace has that many rows, a session cuts a prompt into
 chunks of that size, and the report prints it. A decode token and a short chunk have workspaces of their own and take nothing from
-it. `ChunkSizeCudaIntegrationTest` runs one prompt in chunks of 512, of 333 and in one chunk, and requires the same greedy
-continuation.
+it. One prompt run in chunks of 512, of 333 and in one chunk gave the same greedy
+continuation (measured; no automated check).
 
 Context has priority. A longer context takes memory from the expert cache first. Only when the cache would fall below its
 minimum (`2 x experts-per-token` = 20 slots: the selected experts of a token and a second set in flight) does a fixed object
@@ -128,8 +128,8 @@ never copied to the device whole. Execution gathers the rows as 96-byte records 
 
 ### Placement matrix
 
-Expert slots by free device memory and maximum context, planned at the real object sizes (`ResidencyPlannerTest`, text mode,
-host with 48 GiB available); `(+N)` is the MiB of fixed objects moved to the host to make room for the minimum cache of 20 slots.
+Expert slots by free device memory and maximum context, planned at the real object sizes (text mode, host with 48 GiB available; the planner's rules are checked by
+`rust/crates/engine/src/residency/flash/tests.rs`, the matrix itself is a measurement); `(+N)` is the MiB of fixed objects moved to the host to make room for the minimum cache of 20 slots.
 Fixed objects that stay resident take 4,190 MiB; the cache holds at most one slot (2.64 MiB) per expert, 24,576.
 
 | free device memory | 4,096 | 16,384 | 32,768 | 65,536 | 131,072 | 262,144 |
@@ -151,8 +151,8 @@ of objects that never move, the staging ring and 20 slots (3 GiB serves 131,072 
 
 ### The GPU of this machine
 
-RTX 5070 Ti, 15,030 MiB free after the CUDA context, host with 48 GiB available (`StorageCudaIntegrationTest`, the real
-artifact):
+RTX 5070 Ti, 15,030 MiB free after the CUDA context, host with 48 GiB available (measured on the real
+artifact; no automated check):
 
 | maximum context | KV | indexer | context and reserve | fixed resident | expert cache | slots |
 |---|---|---|---|---|---|---|
@@ -169,8 +169,8 @@ runs a cache of the minimum 20 slots.
 
 ### Expert transfers
 
-On a real stream (`ExpertCacheCudaIntegrationTest`: 6 banks of 64 experts, 8 slots, records of 2.7 MB): every record read back from the
-device equals the file's bytes and CRC-32; 369 file-backed misses moved 1.00 GB at 8.7 GB/s and 373 arena-backed misses 1.02 GB at 9.3 GB/s,
+On a real stream (6 banks of 64 experts, 8 slots, records of 2.7 MB): every record read back from the
+device equalled the file's bytes and CRC-32 (no automated check reads device bytes back; `rust/crates/engine/src/residency/experts/tests.rs` checks the reads against fakes); 369 file-backed misses moved 1.00 GB at 8.7 GB/s and 373 arena-backed misses 1.02 GB at 9.3 GB/s,
 measured as bytes over the summed start-to-completion times of single 2.7 MB copies, so each includes the retirement latency of its own
 event. Against the real artifact on the load test above, 1,820 misses (5.04 GB) took 0.27 to 0.33 s of summed transfer time, 15 to 18 GB/s.
 These are not peak pipelined rates, which are not measured here; the huge-page arena's 44 GB/s ([NVFP4_RESIDENCY.md](../quantization/NVFP4_RESIDENCY.md))

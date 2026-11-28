@@ -61,7 +61,7 @@ Each trellis linear is a chain of `linear` table kernels inside the existing lin
 
 The prepass outputs fit FP16 with a wide margin: over two calibration sequences, the largest prepass output any of the
 400 linears of a calibrated 3.5 bpw checkpoint meets is 0.44, for inputs up to |x| = 394
-(`native/tests/fixtures/trellis-activation-extremes.json`, `TrellisActivationRangeCudaIntegrationTest`).
+(`native/tests/fixtures/trellis-activation-extremes.json`, `test_fp16_range_recorded_extremes` in `native/tests/test_trellis.py`).
 
 ## Building an artifact
 

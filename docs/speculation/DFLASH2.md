@@ -118,17 +118,18 @@ ring is the smaller of the two that restore without arithmetic.
 
 - `test_dflash.py` (native): each kernel against a NumPy oracle with the reference's rounding points; the convolution, top-16
   and selector bit for bit; the linear's rows identical at 1, 3, 8, 16, 17, 64 and 65 rows.
-- `DFlash2FixtureCudaIntegrationTest`: the engine's intermediates against `tools/dflash2_reference.py` run on the engine's own
+- Measured, with no automated check: the engine's intermediates against `tools/dflash2_reference.py` run on the engine's own
   taps and embedded block rows, with the artifact's NVFP4 output head (FP32 products, as the engine's kernels compute):
   - relative RMS against the BF16 reference: layer 0 below 0.6% (its input norm bit for bit), the last layer below 2%, logits
     1.2%;
   - against the FP32 reference the engine (final hidden 1.7%, logits 1.25%) is as close as the BF16 reference (1.7%, 1.2%);
   - its top-16 sets equal the FP32 reference's, and its proposal equals both references'.
-- `DFlash2SpeculativeDecodeCudaIntegrationTest`: DFlash2 generations equal ordinary greedy decode in tokens and leave the same
-  KV and GDN state bit for bit, for a chat answer, 600 tokens of prose and a code prompt, 160 tokens each.
-- `DFlash2PrefixCacheCudaIntegrationTest`: restored generations equal cold and uncached ones (a restore at a checkpoint, one
-  before a prompt's tail, repeats); the restored ring and target state equal a cold run's bit for bit; a small cache evicts and
-  stays exact; a cancelled generation releases its device state.
+- `dflash2_output_equals_greedy` (`rust/crates/engine/tests/device/dflash2.rs`): DFlash2 generations equal ordinary greedy decode in
+  tokens. No automated check compares the KV and GDN state after a DFlash2 generation. `dflash2_replayed_drafter_graphs_equal_the_eager_run`
+  in the same file checks the captured drafter against the eager one.
+- `a_prefix_hit_restores_the_drafters_rings_and_drafts_as_a_cold_run` (`rust/crates/engine/tests/device/prefix_dflash2.rs`): a
+  restored generation equals a cold one in tokens and verification counts, and the restored drafter rings equal a cold run's. No
+  automated check compares the target state, evicts a small cache or cancels a DFlash2 generation.
 
 ## 6. Measured
 
@@ -162,7 +163,7 @@ Decode tok/s, time to first token, and the speculative step (per verification):
   of the weights the drafter's device memory pushes to the host: at a given context the DFlash2 artifact needs about 0.45-0.55
   GiB more device memory than MTP, so it streams 468 MiB of target projections per verification already at 4K, where MTP
   streams none. At 64K the verification is bound by those copies (1.5 GiB per step, the transfer lane busy 86% of the time).
-- **Accepted drafts** on short chat requests (`DFlash2QualityCudaIntegrationTest`, 8 prompts of under 40 tokens, 7 verified): 3.1
+- **Accepted drafts** on short chat requests (compared by `tools/dflash2_quality.py`; no harness in this repository records them, 8 prompts of under 40 tokens, 7 verified): 3.1
   per verification (4.1 tokens per verification); the corpus above quotes long documents, where it drafts less well.
 
 **Kernel time of one draft block** (Nsight Systems, 64K context, per block; span 2.91 ms): the drafter's NVFP4 projections

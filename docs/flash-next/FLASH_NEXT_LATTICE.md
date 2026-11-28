@@ -133,23 +133,21 @@ tests and measurement; production uses the plain shape.
 
 ## Tests
 
-`LatticeHostTest` (real lattice): host work is frames on an attached source; independent work uses several workers; parked
-continuations occupy no worker; a driver-callback publication runs on a worker; close drains chains and detaches.
-`StageGraphHostStageTest`: host stages, stages completed in place, and deferred stages (what each does to the edges, the lanes and the
-quantum's retirement). `InferenceLakeTest`: sinks attach once and lazily, frames route by hash, completion waits for every admitted
-unit. `JoinTest`: the last arrival publishes the continuation once. `ExpertCacheShardTest`: a lease before its bytes arrive carries the copy's marker, the slot stays
-unevictable until the copy retired, least-recently-used eviction, fences order a refill, shards partition slots and experts.
-`ExpertCacheOwnerTest`: a hit publishes nothing, a miss is a copy and the owner's submit and retire, a request for a full cache waits in the source and is asked again only after a release, requests waiting for the same buffer are asked once per change, a stopped quantum's request is abandoned, a read in parts fans out from
-its first part and joins into the submit, loads in flight together each have a staging buffer and the store pins more when it runs
-out, a fetch that finds every slot pinned changes nothing and succeeds once a release ran, a closed lease reaches the cache only
-through the owner's release frame, failures return the slot and the buffer. `ExpertRoutingTest`: each expert's items are
-contiguous and every row adds its pairs in ascending expert order. `ExpertCudaIntegrationTest`: the result is the same bits
-whatever order the experts run in and however few slots hold them. `FileExpertStoreTest`, `GpuExpertTransferTest`: staging buffers, and one copy stream taking the copies of
-many buffers from many threads. The architecture test also guards that the expert path holds no lock, starts no thread, and has no
-source or sink of its own, queue of work, admission, waves, lane, or lock around the owner's state.
-`ArchitectureTest`: a source guard against private executors, pools, virtual threads, async `CompletableFuture` forms and
-blocking waits in the execution path, and that a step is the shape of a graph (no executor or step machine).
-`Qwen4EngineCudaIntegrationTest`: one lattice worker generates the reference continuation; host work progresses during a generation;
-cancelling in the middle of a prefill leaves no lease, pin or step; closing leaves nothing attached.
-`ModelFixtureCudaIntegrationTest` and `GreedyAgreementCudaIntegrationTest` run the shape against the reference layer by layer
-and token by token.
+All paths are under `rust/crates/engine/`.
+
+- `src/residency/expert_cache/shard_tests.rs`: a lease before its bytes arrive carries the copy's marker, the slot stays
+  unevictable until the copy retired, S3-FIFO eviction, fences order a refill, shards partition slots and experts.
+- `src/residency/expert_cache/cache_tests.rs` (the owner): a hit publishes nothing, a miss is a copy and the owner's submit and
+  retire, a request for a full cache waits in the source and is asked again only after a release, a stopped quantum's request is
+  abandoned, a read in parts fans out from its first part and joins into the submit, a closed lease reaches the cache only through
+  the owner's release frame, failures return the slot and the buffer.
+- `src/residency/experts/tests.rs`: the file store's reads in parts, the staging buffers, and the copy to the device.
+- `src/flash/moe/routing/tests.rs`: each expert's items are contiguous and every row adds its pairs in ascending expert order.
+- `tests/device/flash/moe.rs`: the expert and shared-expert stages against a host reference (device, `#[ignore]`d).
+- `tests/lattice.rs`: the engine's lattice settings, poll and drain modes, and that dropping the owner closes the lakes.
+- `src/flash/engine/tests.rs`: the engine on the real artifact generates the same tokens twice (device, `#[ignore]`d).
+
+The lattice's host work, the `StageGraph` host and deferred stages, the lake's routing and `Join` belong to RustEE and are tested
+there. Three guarantees have no automated check in this repository: that the source holds no private executor, pool, virtual
+thread or blocking wait on the execution path (the lints and review enforce it); that cancelling in the middle of a prefill leaves
+no lease, pin or step; and that the shape agrees with the reference layer by layer and token by token.

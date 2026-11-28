@@ -44,10 +44,11 @@ identical state, bitwise.
   - Q3, Q4 and Q5 linears use multi-row twins of the one-row GEMVs that repeat its FMA sequence per row; NVFP4 linears use the
     tensor-core decode kernels, whose token rows are independent MMA columns ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md)).
 - **Tests:**
-  - `SpeculativeVerifyCudaIntegrationTest`: logits, GDN state and KV after a VERIFY quantum equal
-    sequential decode, bitwise, across the 2048-key attention kernel switch; partial commits with replay.
-  - `SpeculativeDecodeCudaIntegrationTest`: full MTP generation equals greedy decode in tokens and
-    final state, for three prompts (a chat answer, 600 tokens of prose, a Java chat prompt).
+  - `rust/crates/engine/tests/device/mtp.rs`: `mtp_output_equals_greedy` (full MTP generation equals greedy decode in tokens),
+    `mtp_kv_and_gdn_state_equal_greedy_after_run` (the final GDN state and KV), and `captured_mtp_equals_uncaptured` (across the
+    2048-key attention kernel switch). `rust/crates/engine/tests/device/batched.rs::batched_verification_equals_each_sequence_verified_alone`
+    and `batched_segments_commit_only_their_accepted_rows` check a VERIFY quantum's state against sequential decode, with partial
+    commits. No automated check compares the logits of one VERIFY quantum with sequential decode at model level.
   - Native: `test_nvfp4.py` (decode_rows bitwise), `test_nvfp4_native.py` (skinny rows independent
     and deterministic), `test_q3_kernels.py` and `test_q45_kernels.py` (Q3/Q4/Q5 twins bitwise one-row), `test_q3_p2e2.py`
     (P2E2 decode bitwise the contiguous kernel).

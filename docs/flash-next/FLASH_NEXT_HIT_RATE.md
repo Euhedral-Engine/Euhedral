@@ -1,6 +1,6 @@
 # Flash-Next hit rate and allocation
 
-Where the memory goes and what it buys. Screens are `PerformanceCudaIntegrationTest` (prefill 512 and 4096, decode at 64 and
+Where the memory goes and what it buys. Screens are `euhedral-bench run` runs (prefill 512 and 4096, decode at 64 and
 4096 context, cold and warm; 32 workers, the automatic host budget). Measurements on the desktop with a 16 GiB GPU
 (PCIe Gen5 x16), 64 GiB of RAM and the artifact on a Gen4 x4 drive.
 
@@ -162,8 +162,8 @@ names its own expert's slot: no kernel changed, the sums are the same). An exper
 and expert stages and launches when it arrives. Launching each expert on its own is rejected for decode (measurements
 below).
 
-`DecodeAbCudaIntegrationTest` takes two arms of the plan in turn, 16-32 tokens each, on one sequence in one process, so
-that what moves on the machine cancels (`EUHEDRAL_QWEN4_AB=1,0`; variant bit 0 is per-expert launches):
+The A/B screen took two arms of the plan in turn, 16-32 tokens each, on one sequence in one process, so
+that what moves on the machine cancels (variant bit 0 is per-expert launches; the Rust engine has no harness for it):
 
 | run | per-expert launches | grouped | change | pairs ahead |
 |---|---|---|---|---|

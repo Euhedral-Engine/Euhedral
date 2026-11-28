@@ -216,12 +216,13 @@ every staged format: Q3/Q4/Q5 grouped, NVFP4 and NVFP4-SD4 projections (P2E2 is 
   the window.
 
 The disk tier changes no numerics: a disk-backed run computes the same bytes as the same weights staged from host memory
-(`DiskTierCudaIntegrationTest`).
+(`disk_backed_weights_compute_what_host_backed_ones_do` in
+`rust/crates/engine/tests/device/generation.rs`).
 
 ## Where it lives
 
 - `tools/convert_checkpoint.py --quantization nvfp4`: the NVFP4 artifacts, quantized on the GPU by default (`tools/README.md`).
-- Loading: `Nvfp4Layout`, a loader that accepts the vision-free inventory, and `Nvfp4CudaLoadIntegrationTest`.
+- Loading: `Nvfp4Layout`, a loader that accepts the vision-free inventory (the loader's device tests are `rust/crates/engine/tests/device/loader.rs`).
 - Execution: `native/src/nvfp4` (tensor-core decode, 1 to 8 rows) and `native/src/nvfp4_native` ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md)),
   the plan and frame dispatch for NVFP4 weights.
 - Residency: `ArtifactProfile`, `ResidencyPlanner`, `HostWeightSelection`, `WeightStaging`, `WeightTransferFrame`, the transfer

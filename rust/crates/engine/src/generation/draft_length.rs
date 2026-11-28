@@ -93,7 +93,7 @@ impl DraftLength {
 mod tests {
     use super::*;
 
-    /// Drafts a step makes when its drafts carry these log-probabilities (`DraftLengthTest.drafted`).
+    /// Drafts a step makes when its drafts carry these log-probabilities.
     fn drafted(length: &DraftLength, log_probabilities: &[f64]) -> usize {
         let mut drafted = 1;
         let mut sum = log_probabilities[0];
