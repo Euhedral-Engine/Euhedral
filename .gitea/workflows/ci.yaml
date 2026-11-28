@@ -9,11 +9,16 @@
 # run, and the required jobs still report (a group that did not change is skipped, which passes).
 # The land run tests the head that is merged: the target is already in it, so the merge commit has the head's tree.
 # A push to an integration branch (rust/next*) therefore runs no tests; it runs `landed`, which checks that the pushed commit is
-# the merge of a pull request head that had a green land run and has that head's tree. That run is what `rollover promote`
-# needs (require_run = ["ci.yaml"] in .gitea/rollover.toml: the latest run with event push, on the integration branch, for
+# the merge of a pull request head that had a green land run and has that head's tree. A commit already on main passes only
+# when its tree is a tested one (it or a parent with its tree had a green push run: the promoted integration head). A merge
+# commit that `rollover promote` made on main because main had commits the integration branch lacked has a tree no run saw, so
+# `landed` fails there until a pull request is landed; that land run runs every group because main's head is untested (the
+# `changes` step asks `ci-landed.py --tested-tree`), so it tests the tree. The push run is what `rollover promote` needs
+# (require_run = ["ci.yaml"] in .gitea/rollover.toml: the latest run with event push, on the integration branch, for
 # the promoted commit, must be a success; a dispatched run does not count). A push to main starts nothing: promotion
-# moves main to a commit that already passed. ARM and the Intel SDE step stay on GitHub, which runs them for the main pushes
-# that forge-mirror sends; the Windows build of a land run runs there too, dispatched by the `windows` job below.
+# moves main to the integration head that already passed, or to a merge commit that `landed` refuses until a land run tests it.
+# ARM and the Intel SDE step stay on GitHub, which runs them for the main pushes that forge-mirror sends; the Windows build
+# of a land run runs there too, dispatched by the `windows` job below.
 # By hand (workflow_dispatch) every group runs.
 # Sentinels for `pr-land --require-success`: `changes` and `land-guard`. The rules of the triggers are pinned by
 # scripts/lint-ci-triggers.py.
@@ -87,6 +92,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INTEGRATION_BRANCH: ${{ vars.INTEGRATION_BRANCH }}
+          GITEA_TOKEN: ${{ github.token }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -131,6 +139,12 @@ jobs:
           case "$EVENT" in
             pull_request)
               range="origin/main...HEAD"
+              # The commit the groups are diffed from (the merge base) is asked about. If no run tested it (a merge made on
+              # main by a promotion), an empty diff would hide it: run every group. An answer that cannot be had (exit 2)
+              # runs every group too.
+              tested=0
+              python3 scripts/ci-landed.py --tested-tree "$(git merge-base origin/main HEAD)" || tested=$?
+              if [ "$tested" -ne 0 ]; then all=true; fi
               ;;
             push)
               ;;
@@ -164,12 +178,11 @@ jobs:
         uses: ./.gitea/actions/fail-fast
 
   # A push to an integration branch: the commit must be the merge of a pull request head that had a green land run, with
-  # that head's tree (or already be on main, as the branch `rollover promote` starts at main). This is the push run that
-  # `rollover promote` requires.
+  # that head's tree, or a commit on main whose tree is a tested one. This is the push run that `rollover promote` requires.
   landed:
     name: landed
     needs: changes
-    if: github.event_name == 'push' && (github.event_name != 'pull_request' || contains(github.event.changes.added_labels.*.name, 'land'))
+    if: github.event_name == 'push'
     runs-on: arbiter-docker
     env:
       ARBITER_ARGS: "--mem 1G"
@@ -181,7 +194,7 @@ jobs:
       - name: The commit is a landed pull request
         env:
           GITEA_TOKEN: ${{ github.token }}
-          API_URL: ${{ github.server_url }}/api/v1
+          API_URL: ${{ github.api_url }}
           REPOSITORY: ${{ github.repository }}
         run: python3 scripts/ci-landed.py "$GITHUB_SHA"
       # Last step: the first failed job cancels the run (see the action).

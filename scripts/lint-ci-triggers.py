@@ -6,7 +6,9 @@ A workflow file fails when:
     request never posts its required contexts, so it could never land);
   - its `on:` has a `push` to any branch but `rust/next*` (a push to main or an integration branch is not a second test of
     the tree the land run tested);
-  - a job other than `land-guard` has no `if:` that mentions the added label `land`;
+  - a job other than `land-guard` has no `if:` with the added label `land` as a top-level `&&` conjunct (or the whole condition);
+    the conjunct may be `(github.event_name != 'pull_request' || <the label term>)`, which lets a push and a dispatch run;
+    a job that runs only on a push (`github.event_name == 'push'` as such a conjunct) needs no label;
   - it has no `land-guard` job, or its concurrency group does not tell a land run from another label's run, or the whole
     `concurrency:` block is over 200 characters (Gitea keeps it in a varchar(255); a longer one fails the insert of the run).
 Plain text is read, like scripts/lint-workflows.py: no YAML library.
@@ -18,7 +20,9 @@ import re
 import sys
 from pathlib import Path
 
-LAND = "added_labels.*.name, 'land'"
+LAND = "contains(github.event.changes.added_labels.*.name, 'land')"
+PUSH = "github.event_name == 'push'"
+OTHER_EVENT = f"(github.event_name != 'pull_request' || {LAND})"
 GUARD = "land-guard"
 MAX_CONCURRENCY = 200
 
@@ -43,6 +47,44 @@ def sub_block(block, key):
                 end += 1
             return [line] + block[start + 1:end]
     return None
+
+
+def conjuncts(condition):
+    """The parts of an `if:` condition joined by top-level `&&` (a trailing ` #` comment outside quotes is cut off), or None
+    when a top-level `||` makes it an alternative."""
+    parts, depth, quote, start, index = [], 0, None, 0, 0
+    while index < len(condition):
+        char = condition[index]
+        pair = condition[index:index + 2]
+        if quote:
+            quote = None if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or condition[index - 1].isspace()):
+            condition = condition[:index]
+            break
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif depth == 0 and pair == "||":
+            return None
+        elif depth == 0 and pair == "&&":
+            parts.append(condition[start:index].strip())
+            start = index + 2
+            index += 1
+        index += 1
+    parts.append(condition[start:].strip())
+    return parts
+
+
+def gated(line):
+    """Whether the `if:` line requires the label land or a push as a top-level conjunct."""
+    condition = line.partition("if:")[2].strip()
+    if condition.startswith("${{") and condition.endswith("}}"):
+        condition = condition[3:-2].strip()
+    parts = conjuncts(condition)
+    return parts is not None and any(part in (LAND, PUSH, OTHER_EVENT) for part in parts)
 
 
 def lint(text):
@@ -74,8 +116,8 @@ def lint(text):
         if name == GUARD:
             if condition or any(line.startswith("    needs:") for line in block):
                 problems.append(f"{GUARD} must have no `needs:` and no `if:`: it runs on every run")
-        elif LAND not in condition:
-            problems.append(f"job {name} has no `if:` on the added label land")
+        elif not gated(condition):
+            problems.append(f"job {name} has no `if:` with the added label land (or a push) as a top-level && conjunct")
     block = [line for line in (top_block(lines, "concurrency") or []) if line.strip() and not line.lstrip().startswith("#")]
     if LAND not in "\n".join(block):
         problems.append("the concurrency group must tell a land run from another label's run")

@@ -16,13 +16,14 @@ pub mod sd4;
 pub mod state;
 
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use euhedral_gpu::cuda::{CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{Args, Dim3, GpuError, LaneEnqueue, LaneStream, Launch, Stream};
 use euhedral_graph::Completions;
 use euhedral_inference_cuda::math::{Fill, LaneHandles, MathMode, Matrix, Operation, Product, check_info};
-use euhedral_inference_cuda::{CudaError, DevicePtr};
+use euhedral_inference_cuda::{CudaError, DevicePtr, PinnedPool};
 use thiserror::Error;
 
 use crate::chain::{self, ChainError, Next, Parts, Unsettled};
@@ -33,7 +34,9 @@ use crate::gptq::format::{
 use crate::gptq::sd4::{CODES, ENTRIES};
 use crate::gptq::state::{QuantState, StateError};
 use crate::kernels::{Compiled, Module, ModuleError, Modules};
-use crate::memory::{Claims, Device, LaneMemory, Memory, MemoryError, Staged, StepBytes, pinned_bytes, reclaim};
+use crate::memory::{
+    Claims, Device, LaneMemory, Memory, MemoryError, Staged, StagingNeeds, StepBytes, pinned_bytes, reclaim,
+};
 
 /// Why a step could not be started or did not finish.
 #[derive(Debug, Error)]
@@ -415,6 +418,12 @@ struct FactorState {
 }
 
 impl GptqLane {
+    /// Puts the staging of `needs` in the lane's pinned pool ([`LaneMemory::prewarm`]), charging `claims.pinned`. Call
+    /// it before the lane's first step, outside a frame.
+    pub fn prewarm_staging(&self, needs: &StagingNeeds, claims: &mut Claims) -> Result<(), GptqError> {
+        Ok(self.parts.memory.prewarm(needs, &mut claims.pinned)?)
+    }
+
     /// The memory [`factor`](Self::factor) of a `k` by `k` Hessian takes, to be claimed before it. It asks cuSOLVER
     /// for the workspace it needs, which enqueues nothing.
     pub fn factor_bytes(&mut self, k: usize) -> Result<StepBytes, GptqError> {
@@ -423,7 +432,7 @@ impl GptqLane {
         let words = 4 * k;
         Ok(StepBytes {
             device: 4 * k * k + 2 * words + 12 + 4 * u64::try_from(floats.max(1)).unwrap_or(1),
-            pinned: pinned_bytes([words, words, 12]),
+            pinned: pinned_bytes(factor_staging(k)),
         })
     }
 
@@ -629,12 +638,12 @@ impl GptqLane {
         let (rows, k) = (rows as u64, k as u64);
         let mut bytes = StepBytes {
             device: 4,
-            pinned: pinned_bytes([4]),
+            pinned: pinned_bytes(scales_staging(k, false)),
         };
         if format.sd4 {
             let (costs, small) = (8 * (CODES * CODES) as u64, 8 * CODES as u64);
             bytes.device += costs + 2 * small + 8 * k + 4 * self.chunk_rows(k).min(rows) * k;
-            bytes.pinned += pinned_bytes([costs, small, small, 4 * k, 4 * k]);
+            bytes.pinned = pinned_bytes(scales_staging(k, true));
         }
         Ok(bytes)
     }
@@ -895,14 +904,7 @@ impl GptqLane {
         let (n, k, group) = (n as u64, factor.k as u64, format.group as u64);
         let groups = k / group;
         let dead = dead_columns(&factor.importance, &factor.order).len() as u64;
-        let scale_bytes = if format.nvfp4 { 1 } else { 2 };
-        let mut staged = vec![2 * n * k, scale_bytes * n * groups, 4 * k, 4 * k, 4 * k, 4 * k];
-        if dead > 0 {
-            staged.push(4 * dead);
-        }
-        if format.sd4 {
-            staged.push(ENTRIES as u64);
-        }
+        let staged = round_staging(n, k, format, dead);
         let device = 4 * (2 * n * k + n * groups + 2 * n * BLOCK as u64 + n * group) + staged.iter().sum::<u64>();
         StepBytes {
             device,
@@ -1123,6 +1125,132 @@ fn round_choose<Q: LaneEnqueue<Kernel = CudaKernel>>(
     }
 }
 
+/// The staging buffers (bytes) [`GptqLane::factor`] of a `k` by `k` Hessian holds at once.
+fn factor_staging(k: u64) -> [u64; 3] {
+    [4 * k, 4 * k, 12]
+}
+
+/// The staging buffers (bytes) [`GptqLane::tensor_scales`] of `k` columns holds at once; `sd4` adds the table search's.
+fn scales_staging(k: u64, sd4: bool) -> Vec<u64> {
+    let mut staged = vec![4];
+    if sd4 {
+        let (costs, small) = (8 * (CODES * CODES) as u64, 8 * CODES as u64);
+        staged.extend([costs, small, small, 4 * k, 4 * k]);
+    }
+    staged
+}
+
+/// The staging buffers (bytes) [`GptqLane::round`] of `n` rows of `k` columns holds at once, with `dead` dead columns.
+fn round_staging(n: u64, k: u64, format: &Format, dead: u64) -> Vec<u64> {
+    let groups = k / format.group as u64;
+    let scale_bytes = if format.nvfp4 { 1 } else { 2 };
+    let mut staged = vec![2 * n * k, scale_bytes * n * groups, 4 * k, 4 * k, 4 * k, 4 * k];
+    if dead > 0 {
+        staged.push(4 * dead);
+    }
+    if format.sd4 {
+        staged.push(ENTRIES as u64);
+    }
+    staged
+}
+
+/// One buffer of each size class the dead-column staging of a slice of `k` columns can take: 4 bytes for each dead
+/// column, 1 to `k` of them. None when `k` is 0.
+fn dead_staging(k: u64) -> Vec<u64> {
+    let class = |bytes: u64| usize::try_from(bytes).ok().and_then(PinnedPool::class_bytes);
+    let most = k.saturating_mul(4);
+    let mut sizes = Vec::new();
+    if k == 0 {
+        return sizes;
+    }
+    let top = class(most);
+    let mut bytes = 4;
+    loop {
+        match class(bytes) {
+            Some(at) if Some(at) < top => {
+                sizes.push(bytes);
+                bytes = at as u64 + 1;
+            }
+            _ => break,
+        }
+    }
+    sizes.push(most);
+    sizes
+}
+
+/// The steps of an object of `rows` rows and `k` columns in `format`, rounded in slices of `slice_rows` rows: its
+/// factor, its tensor scales (NVFP4) and its slices, the first and the last. Each step lists the staging buffers (bytes)
+/// it holds at once. A slice's dead-column buffer, whose size the factor decides, is listed once in each class it can
+/// take ([`dead_staging`]), so a step lists at least what it holds.
+fn object_steps(rows: u64, k: u64, format: &Format, slice_rows: NonZeroU64) -> Vec<Vec<u64>> {
+    let mut steps = vec![factor_staging(k).to_vec()];
+    if format.nvfp4 {
+        steps.push(scales_staging(k, format.sd4));
+    }
+    let last = rows % slice_rows;
+    for n in [rows.min(slice_rows.get()), last] {
+        if n > 0 {
+            let mut staged = round_staging(n, k, format, 0);
+            staged.extend(dead_staging(k));
+            steps.push(staged);
+        }
+    }
+    steps
+}
+
+/// An object the GPTQ lanes round: `rows` rows of `k` columns, in `format`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectShape {
+    pub rows: u64,
+    pub k: u64,
+    pub format: Format,
+}
+
+/// The most staging one lane holds at once rounding `object` ([`object_steps`]). Refuses an object whose buffers'
+/// sizes do not fit 64 bits, or that no pool class holds.
+fn object_needs(object: &ObjectShape, slice_rows: NonZeroU64) -> Result<StagingNeeds, MemoryError> {
+    let rows = object.rows.min(slice_rows.get());
+    let codes = rows.checked_mul(object.k).and_then(|elements| elements.checked_mul(2));
+    if codes.is_none() || object.k.checked_mul(4).is_none() {
+        return Err(MemoryError::Refused(format!(
+            "an object of {} rows of {} columns is too large to stage",
+            object.rows, object.k
+        )));
+    }
+    if object.format.group == 0 {
+        return Err(MemoryError::Refused(format!(
+            "an object in {} has scale groups of no columns",
+            object.format.name
+        )));
+    }
+    let mut needs = StagingNeeds::new();
+    for step in object_steps(object.rows, object.k, &object.format, slice_rows) {
+        needs.step(step)?;
+    }
+    Ok(needs)
+}
+
+/// The pinned staging the GPTQ lanes hold at most at once rounding `groups` one after another (a layer's objects, or
+/// one head alone), each of `lanes` lanes rounding one object of the group at a time, in slices of `slice_rows` rows:
+/// for each group the [`StagingNeeds::together`] of its objects, and for each class the most any group needs. Each
+/// lane's step holds its staging until the step ends, and a lane starts its next step after. No lanes or no groups need
+/// nothing. Refuses `slice_rows` of 0, an object whose staging no pool class holds, and a format whose scale groups
+/// have no columns.
+pub fn lane_staging(groups: &[Vec<ObjectShape>], lanes: usize, slice_rows: u64) -> Result<StagingNeeds, MemoryError> {
+    let Some(slice_rows) = NonZeroU64::new(slice_rows) else {
+        return Err(MemoryError::Refused("a slice of 0 rows".to_owned()));
+    };
+    let mut needs = StagingNeeds::new();
+    for group in groups {
+        let objects = group
+            .iter()
+            .map(|object| object_needs(object, slice_rows))
+            .collect::<Result<Vec<_>, _>>()?;
+        needs.cover(&StagingNeeds::together(&objects, lanes));
+    }
+    Ok(needs)
+}
+
 fn round_all(
     stream: &mut CudaStream,
     parts: &mut LaneParts,
@@ -1244,4 +1372,205 @@ fn round_collect(
         table: state.table,
     };
     Ok(Step::Done(quant))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
+mod tests {
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::memory::fake::{FakePool, acquire, claim_of, counts};
+    use crate::memory::warm;
+
+    fn nvfp4() -> Format {
+        Format {
+            name: "NVFP4".to_string(),
+            layout: String::new(),
+            group: 16,
+            qmin: 0,
+            qmax: 0,
+            nvfp4: true,
+            sd4: false,
+        }
+    }
+
+    fn sd4() -> Format {
+        Format { sd4: true, ..nvfp4() }
+    }
+
+    fn q3() -> Format {
+        Format {
+            name: "Q3G64_F16S".to_string(),
+            layout: String::new(),
+            group: 64,
+            qmin: -4,
+            qmax: 3,
+            nvfp4: false,
+            sd4: false,
+        }
+    }
+
+    fn object(rows: u64, k: u64, format: Format) -> ObjectShape {
+        ObjectShape { rows, k, format }
+    }
+
+    /// 8 rows of 4096: factor 2 x 16K and 4K; scales 4K; its slice 64K of codes, 4K of scales, 4 x 16K, and a dead
+    /// buffer of 4K, 8K or 16K. Needs 4K: 2, 8K: 1, 16K: 5, 64K: 1.
+    fn a() -> ObjectShape {
+        object(8, 4096, nvfp4())
+    }
+
+    /// 1 row of 4096: its slice 8K of codes, 4K of scales. Needs 4K: 2, 8K: 2, 16K: 5.
+    fn c() -> ObjectShape {
+        object(1, 4096, nvfp4())
+    }
+
+    /// 8 rows of 8192: factor 2 x 32K and 4K; its slice 128K of codes, 4K of scales, 4 x 32K, and a dead buffer of 4K
+    /// to 32K. Needs 4K: 2, 8K: 1, 16K: 1, 32K: 5, 128K: 1.
+    fn d() -> ObjectShape {
+        object(8, 8192, nvfp4())
+    }
+
+    const K4: usize = 4096;
+    const K8: usize = 8192;
+    const K16: usize = 16_384;
+    const K32: usize = 32_768;
+    const K64: usize = 65_536;
+    const K128: usize = 131_072;
+
+    #[test]
+    fn an_object_stages_its_factor_its_scales_and_its_slices_with_every_dead_column_class() {
+        let needs = lane_staging(&[vec![object(100, 4096, nvfp4())]], 1, 16384).unwrap();
+        // Factor: 16384, 16384 and 12 bytes; scales: 4; the slice of 100 rows: 819200, 25600, four of 16384 and a dead
+        // buffer of 4K, 8K or 16K.
+        assert_eq!(
+            counts(&needs),
+            vec![(K4, 1), (K8, 1), (K16, 5), (K32, 1), (1_048_576, 1)]
+        );
+    }
+
+    #[test]
+    fn an_object_of_several_slices_stages_the_whole_slice_and_the_last_one() {
+        let whole = lane_staging(&[vec![object(8, 4096, nvfp4())]], 1, 8).unwrap();
+        let sliced = lane_staging(&[vec![object(20, 4096, nvfp4())]], 1, 8).unwrap();
+        // Slices of 8, 8 and 4 rows: the 8 rows' staging, and the tail's 4 rows of codes, one class below.
+        let mut expected: Vec<usize> = whole.buffers().chain([K32]).collect();
+        expected.sort_unstable();
+        assert_eq!(sliced.buffers().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn the_lanes_of_one_layer_hold_the_largest_counts_of_its_objects_together() {
+        let needs = lane_staging(&[vec![a(), c(), d()]], 2, 8).unwrap();
+        // 4K: 2 + 2; 8K: 2 (c) + 1; 16K: 5 + 5; 32K: 5 (d alone); 64K: 1 (a); 128K: 1 (d).
+        assert_eq!(
+            counts(&needs),
+            vec![(K4, 4), (K8, 3), (K16, 10), (K32, 5), (K64, 1), (K128, 1)]
+        );
+    }
+
+    #[test]
+    fn layers_rounded_one_after_another_need_the_most_any_one_layer_needs() {
+        let needs = lane_staging(&[vec![a(), c()], vec![d(), d()]], 2, 8).unwrap();
+        // The first layer: 4K 4, 8K 3, 16K 10, 64K 1; the second: 4K 4, 8K 2, 16K 2, 32K 10, 128K 2.
+        assert_eq!(
+            counts(&needs),
+            vec![(K4, 4), (K8, 3), (K16, 10), (K32, 10), (K64, 1), (K128, 2)]
+        );
+    }
+
+    #[test]
+    fn lanes_beyond_a_group_objects_hold_nothing_more() {
+        let alone = lane_staging(&[vec![a()]], 3, 8).unwrap();
+        assert_eq!(counts(&alone), vec![(K4, 2), (K8, 1), (K16, 5), (K64, 1)]);
+        assert_eq!(lane_staging(&[vec![a(), d()]], 0, 8).unwrap(), StagingNeeds::new());
+        assert_eq!(lane_staging(&[], 3, 8).unwrap(), StagingNeeds::new());
+    }
+
+    #[test]
+    fn a_class_only_a_head_in_another_format_takes_is_needed() {
+        let alone = lane_staging(&[vec![object(8, 4096, q3())]], 3, 8).unwrap();
+        assert_eq!(counts(&alone), vec![(K4, 2), (K8, 1), (K16, 5), (K64, 1)]);
+        let with_head = lane_staging(&[vec![object(8, 4096, q3())], vec![d()]], 3, 8).unwrap();
+        assert_eq!(
+            counts(&with_head),
+            vec![(K4, 2), (K8, 1), (K16, 5), (K32, 5), (K64, 1), (K128, 1)]
+        );
+    }
+
+    #[test]
+    fn a_slice_of_no_rows_an_object_too_large_to_stage_and_a_format_of_empty_groups_are_refused() {
+        assert!(matches!(lane_staging(&[vec![a()]], 3, 0), Err(MemoryError::Refused(_))));
+        assert!(matches!(
+            lane_staging(&[vec![object(8, u64::MAX / 4, nvfp4())]], 3, 8),
+            Err(MemoryError::Refused(_))
+        ));
+        let mut format = nvfp4();
+        format.group = 0;
+        assert!(matches!(
+            lane_staging(&[vec![object(8, 4096, format)]], 3, 8),
+            Err(MemoryError::Refused(_))
+        ));
+    }
+
+    /// Every staging `object` holds in one of its steps: the factor, the tensor scales and each slice, with no dead
+    /// column or with a dead buffer of each class.
+    fn held_steps(object: &ObjectShape, slice_rows: u64) -> Vec<Vec<u64>> {
+        let k = object.k;
+        let mut steps = vec![factor_staging(k).to_vec()];
+        if object.format.nvfp4 {
+            steps.push(scales_staging(k, object.format.sd4));
+        }
+        let mut first = 0;
+        while first < object.rows {
+            let n = (object.rows - first).min(slice_rows);
+            for dead in [0, 1, k / 4, k / 2, k] {
+                steps.push(round_staging(n, k, &object.format, dead));
+            }
+            first += n;
+        }
+        steps
+    }
+
+    /// Calls `hold` with each holding up to `lanes` lanes make at once, each lane at one step of a different object.
+    fn each_holding(objects: &[Vec<Vec<u64>>], lanes: usize, held: &mut Vec<u64>, hold: &mut impl FnMut(&[u64])) {
+        let Some((first, rest)) = objects.split_first().filter(|_| lanes > 0) else {
+            return hold(held);
+        };
+        for step in first {
+            let at = held.len();
+            held.extend(step);
+            each_holding(rest, lanes - 1, held, hold);
+            held.truncate(at);
+        }
+        each_holding(rest, lanes, held, hold);
+    }
+
+    #[test]
+    fn after_the_warm_every_holding_of_the_lanes_takes_its_buffers_from_the_pool() {
+        let (lanes, slice_rows) = (3, 8);
+        let groups = vec![
+            vec![a(), object(20, 4096, nvfp4()), c(), d()],
+            vec![object(20, 4096, q3()), object(8, 8192, q3())],
+            vec![object(12, 8192, sd4())],
+        ];
+        let needs = lane_staging(&groups, lanes, slice_rows).unwrap();
+        let (_planner, mut claim) = claim_of(needs.bytes());
+        let pool = Rc::new(FakePool::default());
+        warm(&needs, &mut claim, |class| acquire(&pool, class)).unwrap();
+        let warmed = pool.allocated.borrow().len();
+
+        for group in &groups {
+            let steps: Vec<_> = group.iter().map(|object| held_steps(object, slice_rows)).collect();
+            each_holding(&steps, lanes, &mut Vec::new(), &mut |held| {
+                let loans: Vec<_> = held
+                    .iter()
+                    .map(|bytes| acquire(&pool, PinnedPool::class_bytes(*bytes as usize).unwrap()).unwrap())
+                    .collect();
+                assert_eq!(pool.allocated.borrow().len(), warmed, "a holding allocated: {held:?}");
+                drop(loans);
+            });
+        }
+    }
 }

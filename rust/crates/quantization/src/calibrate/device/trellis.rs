@@ -94,6 +94,8 @@ pub(super) struct Opening<'a> {
     pub library: &'a Arc<CudaLibrary>,
     pub objects: &'a Arc<Qwen38Objects>,
     pub lane_pinned: &'a Arc<PinnedPool>,
+    /// Pinned bytes the planner accounts.
+    pub pinned: u64,
     /// Device bytes the planner accounts.
     pub capacity: u64,
     pub settings: &'a Settings,
@@ -199,6 +201,7 @@ pub(super) fn open(opening: Opening<'_>, run: &TrellisRun) -> Result<(Trellis, A
         library,
         objects,
         lane_pinned,
+        pinned,
         capacity,
         settings,
         io,
@@ -246,7 +249,7 @@ pub(super) fn open(opening: Opening<'_>, run: &TrellisRun) -> Result<(Trellis, A
                 pinned: peak.pinned.max(bytes.pinned),
             };
         }
-        let width = width_of(peak, (capacity, held, settings.lane_pinned_bytes), lanes.len())?;
+        let width = width_of(peak, (capacity, held, pinned), lanes.len())?;
         lanes.truncate(width);
     }
     let writer = Exl3Writer::new(
