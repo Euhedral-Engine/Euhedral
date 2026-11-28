@@ -180,7 +180,7 @@ fn ring_rows(runtime: &EngineRuntime, lane: &Arc<Typed>, rows: usize) -> Vec<Vec
     runtime
         .inspect_sequence(move |sequence| {
             let rings = sequence.device.scratch.drafter().expect("the engine drafts");
-            let row_bytes = rings.ring_size() as usize / window;
+            let row_bytes = rings.ring_bytes() as usize / window;
             (0..rings.layers())
                 .flat_map(|layer| [rings.ring_keys(layer), rings.ring_values(layer)])
                 .map(|ring| lane.download(ring, rows * row_bytes))

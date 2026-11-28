@@ -158,11 +158,11 @@ impl Resolve for SequenceAddresses {
             }
             Buffer::DrafterKeys { layer } => {
                 let rings = device.scratch.drafter().filter(|rings| layer < rings.layers())?;
-                within(Some(rings.ring_keys(layer)), rings.ring_size(), offset, bytes)
+                within(Some(rings.ring_keys(layer)), rings.ring_bytes(), offset, bytes)
             }
             Buffer::DrafterValues { layer } => {
                 let rings = device.scratch.drafter().filter(|rings| layer < rings.layers())?;
-                within(Some(rings.ring_values(layer)), rings.ring_size(), offset, bytes)
+                within(Some(rings.ring_values(layer)), rings.ring_bytes(), offset, bytes)
             }
             Buffer::SeedRow => {
                 let rows = &device.scratch.draft()?.seed_rows;

@@ -18,6 +18,7 @@ mod mailbox;
 mod mtp;
 mod order;
 mod pool;
+mod prefix_plan;
 mod request;
 mod sampled;
 mod source;
@@ -604,6 +605,7 @@ fn open_cache(
             .dflash2
             .as_ref()
             .filter(|_| residency.draft_depth > 0 && residency.profile.speculation == ArtifactSpeculation::Dflash2),
+        mtp: residency.draft_depth > 0 && residency.profile.speculation == ArtifactSpeculation::Mtp,
         format: residency.kv_format,
         settings,
         granted: residency.prefix_cache_bytes,

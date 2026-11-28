@@ -12,6 +12,7 @@ use crate::model::dflash2::Dflash2Config;
 use crate::prefix::cache::{CacheParts, PrefixCacheHandle};
 use crate::prefix::copier::{FIRST_COPY_SERIAL, PinnedArena};
 use crate::prefix::layout::CheckpointLayout;
+use crate::prefix::tree::Speculation;
 
 /// What the cache is opened with.
 #[derive(Debug)]
@@ -20,6 +21,8 @@ pub struct CacheSpec<'a> {
     pub config: &'a ModelConfig,
     /// The DFlash2 drafter whose rings the sequences keep, when they draft with it: its checkpoints hold them.
     pub drafter: Option<&'a Dflash2Config>,
+    /// Whether the sequences draft with the MTP layer.
+    pub mtp: bool,
     pub format: KvFormat,
     pub settings: PrefixCacheSettings,
     /// The pinned bytes the memory plan granted the arena; 0 for none.
@@ -95,6 +98,11 @@ fn open_with(spec: CacheSpec<'_>, spawn: Spawn, granted: Option<Claim>) -> Optio
         format: spec.format,
         interval: spec.settings.checkpoint_tokens,
         chunk: spec.chunk,
+        drafting: match (spec.drafter, spec.mtp) {
+            (Some(_), _) => Some(Speculation::Dflash2),
+            (None, true) => Some(Speculation::Mtp),
+            (None, false) => None,
+        },
         piece_bytes: spec.settings.copy_piece_bytes.bytes(),
         first_serial: FIRST_COPY_SERIAL,
     };
