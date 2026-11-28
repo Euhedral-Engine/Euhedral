@@ -2,9 +2,12 @@
 """Check that a commit pushed to an integration branch is a landed pull request.
 
 A pull request is tested once, by the run its label `land` starts, on the head that is then merged with the target already in
-it. The merge commit therefore has the head's tree, and this check proves it: the commit is already on main (the branch
-`rollover promote` starts at main), or it is a merge commit whose second parent had a successful pull request run of ci.yaml
-and has the same tree. A skipped run, another label's run (its `land-guard` fails) and a run of another head do not count.
+it. The merge commit therefore has the head's tree, and this check proves it: the commit is a merge commit whose second parent
+had a successful pull request run of ci.yaml and has the same tree. A commit on main (the branch `rollover promote` starts at
+main) passes only when its tree is a tested one: the commit passes that rule, or it or a parent with its tree had a successful
+run of ci.yaml (a push run of the promoted integration head, or a pull request run). A merge commit that promotion made on main
+has a tree no run saw and fails; landing a pull request (an empty one will do) tests it. A skipped run, another label's run
+(its `land-guard` fails) and a run of another head do not count.
 
 usage: ci-landed.py SHA   (environment: GITEA_TOKEN, API_URL such as http://host/api/v1, REPOSITORY owner/name)
 exit 0: landed, 1: not landed (one line says why), 2: the check could not be made
@@ -19,12 +22,12 @@ import urllib.request
 WORKFLOW = "ci.yaml"
 
 
-def land_run_succeeded(runs, sha):
-    """True when `runs` (the `workflow_runs` of the Actions API) has a successful pull request run of ci.yaml on `sha`."""
+def land_run_succeeded(runs, sha, events=("pull_request",)):
+    """True when `runs` (the `workflow_runs` of the Actions API) has a successful run of ci.yaml on `sha` for one of `events`."""
     return any(
         run.get("head_sha") == sha
         and run.get("path", "").split("@")[0] == WORKFLOW
-        and run.get("event") == "pull_request"
+        and run.get("event") in events
         and run.get("status") == "completed"
         and run.get("conclusion") == "success"
         for run in runs
@@ -32,11 +35,20 @@ def land_run_succeeded(runs, sha):
 
 
 def verdict(sha, on_main, parents, trees, runs_of):
-    """The reason `sha` is not a landed pull request, or None when it is.
+    """The reason `sha` is not a tested tree pushed through a landed pull request, or None when it is.
 
     `parents` are the parent commits of `sha`, `trees(commit)` is a commit's tree and `runs_of(commit)` its Actions runs."""
-    if on_main:
+    reason = merge_verdict(sha, parents, trees, runs_of)
+    if reason is None or not on_main:
+        return reason
+    tested = (sha, *(parent for parent in parents if trees(parent) == trees(sha)))
+    if any(land_run_succeeded(runs_of(commit), commit, ("pull_request", "push")) for commit in tested):
         return None
+    return f"{sha} is on main but its tree was never tested: land a pull request (an empty one will do) to test it"
+
+
+def merge_verdict(sha, parents, trees, runs_of):
+    """The reason `sha` is not the merge of a pull request head with a green land run and its tree, or None."""
     if len(parents) != 2:
         return f"{sha} is not a merge commit (it has {len(parents)} parents) and is not on main"
     head = parents[1]
@@ -69,7 +81,7 @@ def check(sha, is_on_main, parents_of, tree_of, runs_page):
     if reason:
         print(f"::error::{reason}", file=sys.stderr)
         return 1
-    print(f"{sha} is on main or the merge of a pull request head with a green land run")
+    print(f"{sha} is a tested tree: the merge of a pull request head with a green land run, or a commit with a green run")
     return 0
 
 

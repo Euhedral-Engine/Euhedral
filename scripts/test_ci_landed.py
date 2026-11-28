@@ -18,16 +18,13 @@ def run(**fields):
 
 
 def check(runs, merge_tree="t1", head_tree="t1", parents=(BASE, HEAD), on_main=False):
-    trees = {MERGE: merge_tree, HEAD: head_tree}
+    trees = {MERGE: merge_tree, HEAD: head_tree, BASE: "t0"}
     return ci_landed.verdict(MERGE, on_main, list(parents), trees.__getitem__, lambda commit: runs if commit == HEAD else [])
 
 
 class LandedTest(unittest.TestCase):
     def test_the_merge_of_a_head_with_a_green_land_run_and_its_tree_is_landed(self):
         self.assertIsNone(check([run()]))
-
-    def test_a_commit_on_main_is_landed_without_a_run(self):
-        self.assertIsNone(check([], parents=(BASE,), on_main=True))
 
     def test_a_commit_that_is_not_a_merge_is_refused(self):
         self.assertIn("not a merge commit", check([run()], parents=(BASE,)))
@@ -48,6 +45,33 @@ class LandedTest(unittest.TestCase):
 
     def test_a_green_run_among_failed_ones_counts(self):
         self.assertIsNone(check([run(conclusion="failure"), run()]))
+
+
+class OnMainTest(unittest.TestCase):
+    """A commit on main is landed only when its tree is one that a run saw."""
+
+    def on_main(self, runs_by_commit, merge_tree="t1", parents=(BASE, HEAD), trees=None):
+        trees = trees or {MERGE: merge_tree, HEAD: "t1", BASE: "t0"}
+        return ci_landed.verdict(MERGE, True, list(parents), trees.__getitem__, lambda commit: runs_by_commit.get(commit, []))
+
+    def test_a_merge_made_on_main_with_an_untested_tree_is_refused(self):
+        reason = self.on_main({HEAD: [run()], BASE: [run(head_sha=BASE)]}, merge_tree="t9")
+        self.assertIn("never tested", reason)
+
+    def test_a_promoted_head_with_a_green_push_run_is_landed(self):
+        self.assertIsNone(self.on_main({MERGE: [run(head_sha=MERGE, event="push")]}, merge_tree="t9", parents=(BASE,)))
+
+    def test_a_parent_with_the_same_tree_and_a_green_run_is_landed(self):
+        self.assertIsNone(self.on_main({HEAD: [run(event="push")]}, merge_tree="t1"))
+
+    def test_a_parent_with_another_tree_does_not_vouch_for_the_commit(self):
+        self.assertIn("never tested", self.on_main({BASE: [run(head_sha=BASE)]}, merge_tree="t9"))
+
+    def test_a_failed_run_does_not_vouch_for_the_commit(self):
+        self.assertIn("never tested", self.on_main({MERGE: [run(head_sha=MERGE, event="push", conclusion="failure")]}, parents=(BASE,)))
+
+    def test_a_commit_that_is_the_merge_of_a_tested_head_is_landed(self):
+        self.assertIsNone(self.on_main({HEAD: [run()]}))
 
 
 class CheckTest(unittest.TestCase):
