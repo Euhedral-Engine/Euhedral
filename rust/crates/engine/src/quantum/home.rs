@@ -2,7 +2,7 @@
 //!
 //! The plan gives each stage an offset from the quantum's home lane (a chain of lane continuations has one offset;
 //! the branches of a fan-out have different ones). Each quantum has its own home, taken from a hash of its id and the time it starts, so the root of
-//! every quantum does not land on one lane. Only the stage lanes take part: the owner's, the capture and the
+//! every quantum does not land on one lane. Only the stage lanes take part: the owner's and the
 //! transfer lanes are never chosen.
 
 use euhedral_hashing::hasher_api::hash_bytes_with_seed;

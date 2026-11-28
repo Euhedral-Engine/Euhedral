@@ -27,7 +27,7 @@ The MTP layer is a plan view (`ExecutionPlan.mtpDraft`):
 - `mtp.norm`, then the 131,072-row draft head.
 
 The prompt prefills in chunks, each followed by its MTP catch-up (in pieces of at most 128 rows). Speculative decoding applies to
-greedy, unconstrained generations from a fresh sequence (`Session.enableSpeculativeDecoding`).
+greedy, unconstrained generations from a fresh sequence (selected by `speculation.mode`).
 
 **GDN rollback is ReplaySSM.** VERIFY checkpoints the recurrent and convolution state and records each
 row's convolution inputs and α/β. On a partial accept, the next quantum restores the checkpoint and
@@ -47,7 +47,7 @@ identical state, bitwise.
   - `rust/crates/engine/tests/device/mtp.rs`: `mtp_output_equals_greedy` (full MTP generation equals greedy decode in tokens),
     `mtp_kv_and_gdn_state_equal_greedy_after_run` (the final GDN state and KV), and `captured_mtp_equals_uncaptured` (across the
     2048-key attention kernel switch). `rust/crates/engine/tests/device/batched.rs::batched_verification_equals_each_sequence_verified_alone`
-    and `batched_segments_commit_only_their_accepted_rows` check a VERIFY quantum's state against sequential decode, with partial
+    and `batched_segments_commit_only_their_accepted_rows` check a batched VERIFY quantum's state against each sequence verified alone, with partial
     commits. No automated check compares the logits of one VERIFY quantum with sequential decode at model level.
   - Native: `test_nvfp4.py` (decode_rows bitwise), `test_nvfp4_native.py` (skinny rows independent
     and deterministic), `test_q3_kernels.py` and `test_q45_kernels.py` (Q3/Q4/Q5 twins bitwise one-row), `test_q3_p2e2.py`
@@ -76,7 +76,7 @@ Measurement setup:
 - **Prompts:** `promptCorpus: "chat"`, four chat requests with thinking disabled. A 4096-token prompt
   quotes 3964-3970 tokens of a frozen document; a 64-token prompt is a standalone 29-36 token request.
 - **Generation:** 256 tokens; warmup 1, then 4 iterations (one per prompt).
-- **Forks:** 6 paired forks; each fork runs every arm in a fresh JVM, rotating the starting arm.
+- **Forks:** 6 paired forks; each fork runs every arm in a fresh process, rotating the starting arm.
 - **Rate:** per fork, committed decode tokens over decode time across the four prompts. The
   speculative decode window starts at first-token selection, so it includes the prompt's last MTP
   catch-up.

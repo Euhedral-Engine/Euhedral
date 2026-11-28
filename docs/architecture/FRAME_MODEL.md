@@ -16,7 +16,7 @@ body inline, scans for ready work, or walks the graph after the quantum started.
 ## The plan and its stage graphs
 
 `Plan` is built once from the loaded model's weights (`Plan::build`). It owns one list of stages per view
-family (the base model's, and the MTP layer's), each in dependency order with its dependencies and its ordering edges. It is
+family (the base model's, the MTP layer's, and with a DFlash2 drafter its Context and Block lists), each in dependency order with its dependencies and its ordering edges. It is
 never the live scheduler. From a list it makes the `StageGraphSpec` of each view: the stages, each an immutable stage (a
 kernel launch recipe with its weight bindings and its input and output buffer slots), the edges, and the lanes each stage may
 use. A stage implements `Stage<Quantum>` and its launch (`Launch::launch`) makes the kernel launches and copies of one
@@ -90,6 +90,9 @@ state takes only the second edge. An external edge is lock-free: each stage keep
 that was already submitted, or swept when its quantum quiesced, satisfies a late waiter at once. A graph never waits on its
 own previous binding: it is reused only after its quantum retired.
 
+The owner holds the workspace and a sequence's next admission until `Order::retired` tells it that the quantum it waits on
+has retired.
+
 The owner sits in a `Mailbox`, like a sequence's owner: with the claim free (always, with one active sequence) the start runs
 inline in the same turn; otherwise it is a deferred operation which whoever next takes the claim runs, in the order posted.
 Nothing waits. No frame of this path is ordered in the lake: the frames that drive a mailbox are unordered (a random routing
@@ -136,8 +139,9 @@ no stage of the quantum can run again, whether it succeeded, failed, or was canc
 ## Device lanes
 
 CPU scheduling and CUDA ordering are separate. The runtime owns a pool of CUDA streams, its lanes (`LaneSet`). The number of
-stage lanes is the width of the plan's widest graph, the most stages that no edge orders (`Plan::lane_width`); a graph that is
-a chain needs one. The owner's lane, the capture lane and the transfer lane are separate from them. Each quantum has a home
+stage lanes is the width of the plan's widest graph, the most stages that no edge orders (`Plan::fan_out_width`, and `Plan::width(view)` for one view; `Plan::lane_width` asks it
+before a plan exists); a graph that is a chain needs one. The lanes are the stage lanes, then the owner's lane, then the transfer
+lanes, with the staging lane last; the owner's and the transfer lanes are separate from the stage lanes. Each quantum has a home
 lane, chosen from a hash of its id and the time it starts so that the roots of different quanta do not land on one lane
 (`quantum/home.rs`); the home lane prepares the quantum and carries its retirement boundary. A stage chooses its lane each
 time it runs and submits with that lane selected on the submitting thread, whichever Euhedral worker runs it:

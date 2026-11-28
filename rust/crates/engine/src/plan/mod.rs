@@ -2,7 +2,7 @@
 //! captured into.
 //!
 //! [`Plan::build`] makes one list of stages per view family from the model's weights: the base model's (decode,
-//! verification and prefill share the fused topology) and the MTP layer's (draft and catch-up). A list is the
+//! verification and prefill share the fused topology) the MTP layer's (draft and catch-up) and, with a DFlash2 drafter, the drafter's context and block. A list is the
 //! stages in dependency order, with the dependencies and the ordering edges the shared storage and scratch add
 //! ([`hazards`]). From a list the plan makes the [`StageGraphSpec`] of a view, with each stage on the lane the path
 //! policy gives it ([`placement`]), and the stages that run it. The number of lanes the graphs need is the plan's
