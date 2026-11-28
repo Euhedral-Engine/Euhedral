@@ -177,8 +177,8 @@ impl SequenceState {
         plan: &ResidencyPlan,
         kernels: &mut dyn KernelOps,
     ) -> Result<SequenceState, EngineError> {
-        let drafts = plan.draft_depth > 0 && plan.profile.speculation == Speculation::Mtp;
-        let dflash2 = plan.draft_depth > 0 && plan.profile.speculation == Speculation::Dflash2;
+        let drafts = plan.drafts_with() == Speculation::Mtp;
+        let dflash2 = plan.drafts_with() == Speculation::Dflash2;
         let verified_rows = plan.verified_rows();
         let kv = KvCache::new(
             library,

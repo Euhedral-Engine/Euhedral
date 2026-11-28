@@ -71,7 +71,7 @@ use crate::handoff::Handoff;
 use crate::model::ModelConfig;
 use crate::prefix::{
     CopyJob, FIRST_COPY_SERIAL, Hit, NodeId, PrefixCacheHandle, PromptCheckpoints, RestoreError, Restored,
-    SequenceAddresses, Speculation as CheckpointKind, Submit,
+    SequenceAddresses, Submit,
 };
 use crate::quantum::{Executor, StartError};
 use crate::runtime::{Core, Units};
@@ -527,17 +527,6 @@ fn speculating(route: Route, capacity: u64, prompt: usize, max_tokens: usize) ->
         Route::Mtp(depth) => Some(Speculating::new(depth, capacity, prompt, max_tokens)),
         Route::Dflash2(depth) => Some(Speculating::new(depth, capacity, prompt, max_tokens).with_drafter()),
     }
-}
-
-/// The checkpoints a speculative request uses: those that hold the draft's state too, when it drafts: the MTP layer's
-/// cache, or the DFlash2 drafter's rings.
-fn speculative_caching(state: &Speculating) -> Option<CheckpointKind> {
-    let kind = if state.drafter().is_some() {
-        CheckpointKind::Dflash2
-    } else {
-        CheckpointKind::Mtp
-    };
-    state.drafting().then_some(kind)
 }
 
 /// Why a request that asks for its hidden states is refused: it speculates (its drafts' rows are not the rows of the
@@ -1078,7 +1067,7 @@ impl Owner {
         }
         let kind = match &run.mode {
             Mode::Greedy { .. } | Mode::Sampled { .. } => None,
-            Mode::Speculative { state, .. } => speculative_caching(state),
+            Mode::Speculative { state, .. } => state.draft_kind().caching(),
             Mode::Forced { .. } => return,
         };
         let address = Arc::clone(&self.shared.address);
@@ -1371,7 +1360,7 @@ impl Owner {
             Message::Copy(request) => self.admit_copy(*request),
             Message::CopyEnded => self.copies = self.copies.saturating_sub(1),
             Message::Looked(hit) => self.looked(hit),
-            Message::Restored(result) => self.restored(result),
+            Message::Restored(result) => self.restore_answered(result),
             Message::Captured(node) => {
                 if let Some(checkpoints) = self.run.as_mut().and_then(|run| run.checkpoints.as_mut()) {
                     checkpoints.captured(node);
@@ -1485,7 +1474,7 @@ impl Owner {
     }
 
     /// The cache answered the restore.
-    fn restored(&mut self, result: Result<u32, RestoreError>) {
+    fn restore_answered(&mut self, result: Result<u32, RestoreError>) {
         let Some(run) = self.run.as_mut() else { return };
         let Some(checkpoints) = run.checkpoints.as_mut() else {
             return;
@@ -2738,6 +2727,7 @@ mod kill_tests {
 #[cfg(test)]
 mod routing_tests {
     use super::*;
+    use crate::prefix::Speculation as CheckpointKind;
 
     const DEPTH: usize = 6;
 
@@ -2748,7 +2738,7 @@ mod routing_tests {
         let state = speculating(route, 4096, 30, 128).unwrap();
         assert!(state.drafter().is_some());
         assert_eq!(
-            speculative_caching(&state),
+            state.draft_kind().caching(),
             Some(CheckpointKind::Dflash2),
             "the drafter's rings are in the checkpoints"
         );
@@ -2786,7 +2776,7 @@ mod routing_tests {
         );
         let state = speculating(Route::Mtp(3), 4096, 30, 128).unwrap();
         assert!(state.drafter().is_none());
-        assert_eq!(speculative_caching(&state), Some(CheckpointKind::Mtp));
+        assert_eq!(state.draft_kind().caching(), Some(CheckpointKind::Mtp));
     }
 
     #[test]

@@ -130,6 +130,16 @@ impl Placement {
     }
 }
 
+/// The speculation a plan of `draft_depth` drafts with: `speculation` when the depth is above 0, else
+/// [`Speculation::None`].
+pub(crate) fn drafts_with(draft_depth: usize, speculation: Speculation) -> Speculation {
+    if draft_depth > 0 {
+        speculation
+    } else {
+        Speculation::None
+    }
+}
+
 /// The plan: where every object goes, and how much of everything else fits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidencyPlan {
@@ -235,6 +245,12 @@ pub fn forced_rows_of(batching: &BatchingSettings) -> usize {
 }
 
 impl ResidencyPlan {
+    /// The speculation the plan's requests draft with: the profile's when the plan drafts (`draft_depth` above 0),
+    /// else [`Speculation::None`].
+    pub fn drafts_with(&self) -> Speculation {
+        drafts_with(self.draft_depth, self.profile.speculation)
+    }
+
     /// The rows a sequence's verification holds at most: one more than the drafts, or the rows of a forced step when
     /// those are more; 0 when the sequence neither drafts nor forces several rows (it keeps no verification state).
     pub fn verified_rows(&self) -> u64 {
@@ -1221,6 +1237,14 @@ mod tests {
     use euhedral_inference_cuda::launch::q3::{P2E2_EXPAND_LIMIT, linear_scratch_bytes, q3_byte_size};
 
     use super::*;
+
+    #[test]
+    fn a_plan_drafts_with_its_speculation_only_when_its_depth_is_above_zero() {
+        for speculation in [Speculation::None, Speculation::Mtp, Speculation::Dflash2] {
+            assert_eq!(drafts_with(0, speculation), Speculation::None, "{speculation:?}");
+            assert_eq!(drafts_with(3, speculation), speculation, "{speculation:?}");
+        }
+    }
 
     /// The rows of a forced step size nothing unless they ask for more than one, and a pass holds as many of them as
     /// the settings allow.
