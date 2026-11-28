@@ -3,12 +3,12 @@
 //! hand-offs run on the calling thread, so every answer has arrived when a request returns.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use euhedral_graph::Marker;
+use euhedral_graph::{Marker, Sequencer, Ticket};
 use euhedral_inference_cuda::PinnedBuffer;
 use euhedral_inference_settings::KvFormat;
 
@@ -19,6 +19,7 @@ use super::{
 };
 use crate::generation::Spawn;
 use crate::handoff::Handoff;
+use crate::stages::Retirement;
 use crate::state::SequenceId;
 
 pub(super) const FORMAT: KvFormat = KvFormat::Nvfp4;
@@ -1103,4 +1104,65 @@ fn closing_abandons_a_copy_that_does_not_end_within_the_bound() {
     assert_eq!(answer(&captured), rig.cache.root(), "the pending capture was failed");
     assert_eq!(rig.stats().failed, 1);
     drop(job);
+}
+
+type Order = Arc<Sequencer<Arc<Ticket<Retirement>>>>;
+
+/// A sequence's order of conclusion over copies, and how many concluded.
+fn order() -> (Order, Arc<AtomicUsize>) {
+    let concluded = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::clone(&concluded);
+    let order = Sequencer::ordered(move |_: Retirement| {
+        sink.fetch_add(1, Ordering::AcqRel);
+    });
+    (order, concluded)
+}
+
+#[test]
+fn a_split_job_leaves_its_place_with_the_last_group_alone() {
+    let rig = Rig::with(64, 1000);
+    let source = Device::new(FORMAT, 1024);
+    let _captured = rig.capture(&source, &tokens(0, 600), rig.cache.root(), 512, None);
+    let (order, concluded) = order();
+    let copy = order.register();
+    let behind = order.register();
+    let mut groups = rig.next_job().in_place(copy).split();
+    let last = groups.len() - 1;
+    assert!(last > 0);
+    for group in &mut groups[..last] {
+        assert!(group.take_place().is_none(), "a group before the last holds no place");
+    }
+    behind.complete(Retirement::Copy);
+    assert!(
+        concluded.load(Ordering::Acquire) == 0,
+        "the groups before the last did not pass the place"
+    );
+    groups[last]
+        .take_place()
+        .expect("the last group holds the place")
+        .complete(Retirement::Copy);
+    assert_eq!(
+        concluded.load(Ordering::Acquire),
+        2,
+        "the job and the one behind it concluded"
+    );
+}
+
+#[test]
+fn a_job_dropped_without_running_passes_its_place() {
+    let rig = Rig::with(64, 1000);
+    let source = Device::new(FORMAT, 1024);
+    let _captured = rig.capture(&source, &tokens(0, 600), rig.cache.root(), 512, None);
+    let (order, concluded) = order();
+    let copy = order.register();
+    let behind = order.register();
+    let groups = rig.next_job().in_place(copy).split();
+    behind.complete(Retirement::Copy);
+    assert!(concluded.load(Ordering::Acquire) == 0);
+    drop(groups);
+    assert_eq!(
+        concluded.load(Ordering::Acquire),
+        1,
+        "the dropped job's place was passed"
+    );
 }

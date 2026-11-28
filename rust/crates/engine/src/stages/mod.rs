@@ -24,6 +24,7 @@ pub mod gdn;
 pub mod linear;
 pub mod mtp;
 pub mod norm;
+mod retired;
 pub mod sampling;
 pub mod transfer;
 pub mod unmarked;
@@ -37,7 +38,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use euhedral_gpu::cuda::CudaQueue;
 use euhedral_gpu::{GpuError, Lane};
-use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, QuantumOutcome, Stage, StageCx, StageError, Submitted};
+use euhedral_graph::{
+    DeviceQueue, LaneId, LanePool, Marker, QuantumOutcome, Slot, Stage, StageCx, StageError, Submitted,
+};
 use euhedral_inference_cuda::launch::Modes;
 use euhedral_inference_cuda::launch::load::KernelTable;
 use euhedral_inference_cuda::launch::ops::RusteeOps;
@@ -56,6 +59,7 @@ use crate::state::{FlightGuard, KvView, SequenceDevice, SequenceId};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError, input_record_bytes};
 use attention::KvSource;
 use euhedral_inference_settings::KvFormat;
+pub(crate) use retired::{Kept, Retired, Retirement};
 use sampling::{RowReadback, Selection, SelectionLease};
 pub use unmarked::Unmarked;
 
@@ -356,6 +360,8 @@ pub struct Segment {
     /// The lease on `selection` when it came from the sequence's pool: the words are the quantum's until it is
     /// dropped, after its owner read the keys.
     pub(crate) lease: Option<SelectionLease>,
+    /// The segment's place in its sequence's order of conclusion, completed when the quantum retires ([`Quantum::take_places`]).
+    pub(crate) place: Option<Slot<Retirement>>,
     /// The pinned readback the segment's logits row is copied to when the host selects (a sampling request): the
     /// segment then has no selection. The owner's lease on it is held apart from the quantum.
     pub(crate) row_readback: Option<Arc<RowReadback>>,
@@ -396,6 +402,7 @@ impl Segment {
             row_offset: 0,
             selection: None,
             lease: None,
+            place: None,
             row_readback: None,
             draft_token_read: None,
             seeds_draft: false,
@@ -440,6 +447,7 @@ pub struct Part {
     tokens: Vec<u32>,
     selection: Option<Arc<Selection>>,
     lease: Option<SelectionLease>,
+    place: Option<Slot<Retirement>>,
     row_readback: Option<Arc<RowReadback>>,
     draft_token_read: Option<usize>,
     seeds_draft: bool,
@@ -457,6 +465,7 @@ impl Part {
             tokens,
             selection: None,
             lease: None,
+            place: None,
             row_readback: None,
             draft_token_read: None,
             seeds_draft: false,
@@ -957,6 +966,7 @@ impl Quantum {
             segment.row_offset = row_offset;
             segment.selection = part.selection;
             segment.lease = part.lease;
+            segment.place = part.place;
             segment.row_readback = part.row_readback;
             segment.draft_token_read = part.draft_token_read;
             segment.seeds_draft = part.seeds_draft;
@@ -1111,6 +1121,7 @@ impl Quantum {
             tokens,
             selection: segment.selection,
             lease: segment.lease,
+            place: segment.place,
             row_readback: segment.row_readback,
             draft_token_read: segment.draft_token_read,
             seeds_draft: segment.seeds_draft,
@@ -1124,6 +1135,12 @@ impl Quantum {
     /// whichever of them lets go last.
     pub(crate) fn take_leases(&mut self) -> Vec<Option<SelectionLease>> {
         self.segments.iter_mut().map(|segment| segment.lease.take()).collect()
+    }
+
+    /// Takes each segment's place in its sequence's order of conclusion out, in segment order: the frame that ends the
+    /// quantum completes each with that segment's retirement. A place left in the quantum is passed when it drops.
+    pub(crate) fn take_places(&mut self) -> Vec<Option<Slot<Retirement>>> {
+        self.segments.iter_mut().map(|segment| segment.place.take()).collect()
     }
 
     /// Takes each segment's in-flight guard out, in segment order: a pass holds one for each sequence, and each sequence's
@@ -1348,6 +1365,15 @@ impl Quantum {
             let segment = self.segment_mut();
             segment.selection = Some(Arc::clone(lease.selection()));
             segment.lease = Some(lease);
+        }
+        self
+    }
+
+    /// The quantum's place in its sequence's order of conclusion: completed when the quantum retires, passed if it
+    /// drops first.
+    pub(crate) fn with_place(mut self, place: Slot<Retirement>) -> Self {
+        if self.note_single("a place of the quantum") {
+            self.segment_mut().place = Some(place);
         }
         self
     }

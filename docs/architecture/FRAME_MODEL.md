@@ -238,10 +238,14 @@ A quantum that stopped part-way retires behind the work it queued, and its rows 
 A sequence is a sequencer: parallel execution, ordered completion. The sequence's quanta (and its prefix-cache captures and
 restores) are admitted in order and each completes in any order, but they conclude in admission order, through a RustEE
 `Sequencer` (`generation/conclusion.rs`): `Conclusion::admit` offers a place in the order when the owner publishes the
-quantum, the owner completes the quantum's `Slot` when it retires, or lets the slot drop when the quantum never ran, and the
-sequencer concludes the ready prefix, one thread at a time, without a lock. What it concludes lands in a queue only the owner
-reads, so the conclusion itself (commits, the listener, the failure of a request) runs in the owner's turn on state the owner
-alone touches. Cancellation (`CancelHandle`) asks the generation to end at its next quantum boundary: the request ends once
+quantum or the copy, and the place travels with the work (a quantum's segment, a copy job's last group). The frame that
+ends the work completes the place when it retires (the executor's retirement callback is the quantum frame's final step,
+the copier's callback the copy's); work that is dropped without having run drops the place, which passes it. The thread
+that completes the place at the head of the order runs the sequencer's drain and concludes the ready prefix, in admission
+order, without a lock; the conclusion hands each value to the owner's mailbox in that order and never waits. The
+conclusion itself (commits, the listener, the failure of a request) runs in the owner's turn on state the owner alone
+touches, on the completing thread if the claim is free. One order serves a sequence's quanta and copies, so they conclude
+in the order they were submitted, and nothing concludes twice. Cancellation (`CancelHandle`) asks the generation to end at its next quantum boundary: the request ends once
 through its listener as `FinishReason::Cancelled`, and the sequence is free for the next request.
 
 Several quanta of one sequence can be in flight. Edges order their device accesses, including KV appends; conclusions publish

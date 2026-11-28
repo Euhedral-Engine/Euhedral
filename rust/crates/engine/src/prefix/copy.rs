@@ -17,13 +17,14 @@ use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use euhedral_graph::Marker;
+use euhedral_graph::{Marker, Slot};
 use euhedral_inference_cuda::PinnedBuffer;
 use euhedral_inference_settings::KvFormat;
 
 use crate::generation::Address;
 use crate::prefix::Buffer;
 use crate::prefix::cache::{Message, PrefixCache};
+use crate::stages::Retirement;
 use crate::state::SequenceId;
 
 /// Which way a job copies.
@@ -110,6 +111,8 @@ pub struct CopyJob {
     on_failure: Option<Arc<AtomicBool>>,
     /// Whether this group is the job's last, which alone reports.
     closing: bool,
+    /// The job's place in its sequence's order of conclusion, which the last group holds.
+    place: Option<Slot<Retirement>>,
     /// Whether this group has been told how it ended.
     ended: bool,
     /// Why a group of the job failed, once one did: the groups after it copy nothing and the last reports it.
@@ -130,9 +133,22 @@ impl CopyJob {
             group_bytes: link.group_bytes,
             on_failure: link.on_failure,
             closing: true,
+            place: None,
             ended: false,
             failed: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The job with its place in its sequence's order of conclusion: the last group's frame completes it when the job
+    /// ends ([`CopyJob::take_place`]), and a job dropped without having run passes it.
+    pub(crate) fn in_place(mut self, place: Slot<Retirement>) -> CopyJob {
+        self.place = Some(place);
+        self
+    }
+
+    /// The place of the job, if this group is the last and holds it.
+    pub(crate) fn take_place(&mut self) -> Option<Slot<Retirement>> {
+        self.place.take()
     }
 
     /// Cuts the job into the groups it runs in, one frame each, in order: each holds pieces of at most the group size
@@ -166,6 +182,7 @@ impl CopyJob {
                 group_bytes: self.group_bytes,
                 on_failure: self.on_failure.clone(),
                 closing: index == last,
+                place: if index == last { self.place.take() } else { None },
                 ended: false,
                 failed: Arc::clone(&self.failed),
             });

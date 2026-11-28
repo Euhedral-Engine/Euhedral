@@ -24,7 +24,7 @@ use crate::prefix::copy::{CopyJob, Direction, Ended, HostArena, Resolve};
 use crate::prefix::layout::Buffer;
 use crate::quantum::{StartError, Started, no_slot_readers};
 use crate::stages::attention::KvSource;
-use crate::stages::{LaneTable, SequenceRefs, Unmarked, fatal, submit_on};
+use crate::stages::{LaneTable, Retirement, SequenceRefs, Unmarked, fatal, submit_on};
 use crate::state::SequenceId;
 
 /// The first number a copy job takes. A quantum's number counts up from 1, so the jobs' numbers, which count up from
@@ -264,9 +264,12 @@ impl Copier {
                 QuantumOutcome::DeviceFailed { cause } => Ended::Failed(format!("the device failed: {cause}")),
                 QuantumOutcome::Killed => Ended::Cancelled,
             });
-            // Whatever waited for the job's end (see the order) starts now.
+            // Whatever waited for the job's end (see the order) starts now, and the job concludes in its sequence's order.
             if last {
                 ended(serial);
+                if let Some(place) = job.take_place() {
+                    place.complete(Retirement::Copy);
+                }
             }
         })?;
         Ok(Copier { graph })
