@@ -487,11 +487,7 @@ fn drift_command(args: &[String]) -> Result<u8, Failure> {
     if steps < 4 {
         return Err(Failure::Usage("--steps must be at least 4".to_string()));
     }
-    if candidate == Candidate::HostTier && config.is_none() {
-        return Err(Failure::Usage(
-            "the host-tier candidate needs --config, the settings that put layers on the host tier".to_string(),
-        ));
-    }
+    candidate.check_config(config.is_some()).map_err(Failure::Usage)?;
     let Some(library) = library.or_else(default_cuda_library) else {
         return Err(Failure::Usage(
             "drift needs --cuda-library on this platform".to_string(),
@@ -501,8 +497,9 @@ fn drift_command(args: &[String]) -> Result<u8, Failure> {
     // One more forced token than steps: the prefill's own row is step 0 and is not compared.
     let (prefix_ids, forced) = split_document(&tokenizer, prefix, steps + 1)?;
     let first = tool_settings(&artifact, None, prefix + steps + 1)?;
-    // The exact switch is set before the first engine plans and loads, and cleared before the second does: the plan,
-    // the kernel table and the capture decision all read it at start, and exact launches are never captured.
+    // The exact switch never changes while an engine lives: it is set before the first engine starts and cleared
+    // after it shut down, and the readers (the plan, the kernel table, the capture decision) read it per submission
+    // and per quantum. Exact launches are never captured, so no graph crosses the two modes.
     let exact = (candidate == Candidate::ExactNumerics)
         .then(|| ExactNumerics::select(&library))
         .transpose()?;
@@ -523,8 +520,11 @@ fn drift_command(args: &[String]) -> Result<u8, Failure> {
         (runtime, owner) = start_engine(&second, &library)?;
     }
     let started = Instant::now();
+    let ran = collected.is_ok();
     let compared = collected.and_then(|()| drift::compare(&runtime, prefix_ids, forced, &store));
-    eprintln!("drift: second run took {:.1} s", started.elapsed().as_secs_f64());
+    if ran {
+        eprintln!("drift: second run took {:.1} s", started.elapsed().as_secs_f64());
+    }
     shutdown(owner, runtime);
     let summaries = [drift::summarize(&compared?)];
     print!("{}", drift::report(&summaries, &[prefix], candidate));

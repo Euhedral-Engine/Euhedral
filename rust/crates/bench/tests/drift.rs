@@ -210,3 +210,32 @@ fn the_exact_numerics_candidate_is_bounded_not_bitwise() {
         "a breach names the metric, its value and its limit: {found:?}"
     );
 }
+
+#[test]
+fn the_exact_numerics_candidate_breaches_when_the_passes_agree_bitwise() {
+    // Both passes on the same kernels: the switch did not take effect, and equal rows prove nothing.
+    let mut metrics = passing();
+    metrics.iter_mut().for_each(|s| s.bitwise = true);
+    let found = trips(&metrics, Candidate::ExactNumerics);
+    assert!(found.iter().any(|b| b.contains("switch did not reach")), "{found:?}");
+    // One differing step is enough to show the modes differ.
+    metrics[7].bitwise = false;
+    assert!(trips(&metrics, Candidate::ExactNumerics).is_empty());
+}
+
+#[test]
+fn only_the_host_tier_candidate_takes_a_config() {
+    assert!(Candidate::HostTier.check_config(true).is_ok());
+    assert!(
+        Candidate::HostTier
+            .check_config(false)
+            .unwrap_err()
+            .contains("needs --config")
+    );
+    assert!(Candidate::Identical.check_config(false).is_ok());
+    assert!(Candidate::ExactNumerics.check_config(false).is_ok());
+    for candidate in [Candidate::Identical, Candidate::ExactNumerics] {
+        let refusal = candidate.check_config(true).unwrap_err();
+        assert!(refusal.contains("--config is only for the host-tier"), "{refusal}");
+    }
+}

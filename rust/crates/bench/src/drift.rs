@@ -55,6 +55,20 @@ impl Candidate {
             )),
         }
     }
+
+    /// Whether `--config` may be given with this candidate: the host-tier candidate needs it, the others refuse it
+    /// because they run the second pass on the first pass's settings.
+    pub fn check_config(self, config_given: bool) -> Result<(), String> {
+        match (self, config_given) {
+            (Candidate::HostTier, false) => {
+                Err("the host-tier candidate needs --config, the settings that put layers on the host tier".to_string())
+            }
+            (Candidate::Identical | Candidate::ExactNumerics, true) => Err(format!(
+                "--config is only for the host-tier candidate: the {self:?} candidate runs both passes on the same settings"
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// The values of one step, in the order a [`Compare`] stores them.
@@ -337,6 +351,11 @@ pub fn breaches(summaries: &[PrefixSummary], candidate: Candidate) -> Vec<String
         if candidate == Candidate::Identical && !summary.bitwise {
             breaches.push(format!(
                 "position {index}: the identical candidate differs from the first run"
+            ));
+        }
+        if candidate == Candidate::ExactNumerics && summary.bitwise {
+            breaches.push(format!(
+                "position {index}: the production run agrees bitwise with the exact run: the switch did not reach the second engine"
             ));
         }
     }
