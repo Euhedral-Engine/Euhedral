@@ -65,7 +65,7 @@ residual, so it does not change the target's numerics. Verification rows are row
   the DRAFT_CONTEXT quantum that wrote them; a block starts only when it equals the sequence position.
 - Released with the sequence.
 
-**Kernels** (`native/src/dflash/kernels.cu`, `native/src/host/dflash.c`) round where the published PyTorch model rounds:
+**Kernels** (`native/src/dflash/kernels.cu`) round where the published PyTorch model rounds:
 - a BF16 linear on m16n8k16 tensor cores with FP32 accumulation and one rounding; a row's bits do not depend on how many rows the
   call has (both its 16-row and 64-row tilings run the same K order), so context rows computed in a prefill chunk equal those of
   a verification. Outputs up to 1536 wide (the convolution kernel and selector projections) split K over a CTA's four warps,

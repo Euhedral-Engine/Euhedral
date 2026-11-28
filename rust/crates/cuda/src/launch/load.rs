@@ -507,8 +507,8 @@ pub fn load(gpu: &Arc<CudaGpu>, sources: &KernelSources) -> Result<KernelTable, 
             .find(|(module, _)| *module == spec.module)
             .map(|(_, compiled)| compiled);
         let slot = match compiled {
-            // The native library sets each kernel's dynamic shared maximum to the catalog's figure, which the plans' launches
-            // need; RustEE raises the driver's limit to it (0 leaves the default).
+            // RustEE raises the driver's dynamic shared maximum to the catalog's figure, which the plans' launches need
+            // (0 leaves the default).
             Some(Compiled::Module(module)) => match module.kernel_with(
                 spec.name,
                 KernelOptions {

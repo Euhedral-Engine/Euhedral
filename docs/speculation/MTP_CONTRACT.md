@@ -175,7 +175,7 @@ rows with arithmetic identical to that single-row path. Native NVFP4 OMMA cannot
 GEMV: it needs FP4 activations (`kind::mxf4nvf4` only accepts E2M1 × E2M1), and the MXFP8 route quantizes activations too. The multi-row prefill
 attention and GDN kernels also accumulate in a different order from the decode kernels.
 
-**Decision: row-exact verification.** A VERIFY quantum selects row-exact execution (`euhedral_cuda_row_exact_select`). Every
+**Decision: row-exact verification.** A VERIFY quantum selects row-exact execution (the launch planner's `Modes::row_exact`). Every
 operator whose kernel depends on the row count then runs each row through its one-row path:
 - attention, q/k norm and RoPE, residual norms and the GDN recurrence, row by row;
 - Q3, Q4 and Q5 linears through multi-row twins of the one-row GEMV kernels

@@ -17,8 +17,8 @@ A sequence keeps its attention caches in one of two formats, chosen per engine (
 
 Both use the same 256-token pages and page tables. Every attention kernel (append, 32-row and FlashAttention-2 prefill, per-head and
 GQA decode, merge, the verifier's row twins, the `_exact` twins) is one body templated on a cache-format policy (`Nvfp4Kv`,
-`Bf16Kv` in `nvfp4_attention.cuh`), instantiated as `euhedral_attention_*_nvfp4` and `euhedral_attention_*_bf16`; the host picks
-the set by the cache's format (`euhedral_cuda_attention_causal_bf16`, `euhedral_cuda_attention_kv_append_bf16`) and the routes and
+`Bf16Kv` in `nvfp4_attention.cuh`), instantiated as `euhedral_attention_*_nvfp4` and `euhedral_attention_*_bf16`; the launch planner picks
+the set by the cache's format and the routes and
 split counts are the same for both, so every verification row is one-row decode bit for bit in either format. The per-head
 kernels read BF16 rows as FP32. The tensor-core kernels widen them to FP16 tiles: exact from 2^-14 to 65504, saturated to
 +-65504 beyond, so the tiles stay finite. A batched quantum's sequences share one format, and a sequence's capture key carries it.

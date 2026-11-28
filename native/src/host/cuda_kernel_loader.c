@@ -251,63 +251,9 @@ int euhedral_cuda_load_native_kernel(const void* anchor, const char* source_name
     return load_kernel(anchor, source_name, function_name, module, function, architecture);
 }
 
-#include "pdl_registry.h"
-#include "submission.h"
-#include <stdatomic.h>
-#include <stdlib.h>
-#include <string.h>
-
-#ifdef _WIN32
-static __declspec(thread) int pdl_selected;
-#else
-static _Thread_local int pdl_selected;
-#endif
-
+/* The selection the Rust engine mirrors for itself (it plans every launch); the library only returns the previous one. */
 static atomic_int exact_numerics;
 
-int euhedral_cuda_exact_numerics(void) {
-    return atomic_load(&exact_numerics);
-}
-
 int euhedral_cuda_select_exact_numerics(int exact) {
-    int previous = euhedral_cuda_exact_numerics();
-    atomic_store(&exact_numerics, exact != 0);
-    return previous;
-}
-
-/* Row-exact execution for the calling thread (speculative verification): every operator whose kernel
- * changes with the row count runs each row through its single-row path, so a multi-row quantum computes
- * every row bit for bit as one-row decode would at that position. */
-#ifdef _WIN32
-static __declspec(thread) int row_exact_selected;
-#else
-static _Thread_local int row_exact_selected;
-#endif
-
-void euhedral_cuda_row_exact_select(int enabled) {
-    row_exact_selected = enabled != 0;
-}
-
-int euhedral_cuda_row_exact(void) {
-    return row_exact_selected;
-}
-
-/* Decode chains select PDL for the calling thread; every other launch stays ordinary. */
-void euhedral_cuda_pdl_select(int enabled) {
-    pdl_selected = enabled != 0;
-}
-
-void euhedral_cuda_pdl_register(CUfunction function) {
-    euhedral_pdl_registry_add(function);
-}
-
-CUresult euhedral_launch_kernel(CUfunction function, unsigned int grid_x, unsigned int grid_y, unsigned int grid_z,
-        unsigned int block_x, unsigned int block_y, unsigned int block_z, unsigned int shared_bytes,
-        CUstream stream, void** parameters, void** extra) {
-    if (extra != NULL)
-        return cuLaunchKernel(function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream,
-                parameters, extra);
-    const int overlappable = stream != NULL && euhedral_pdl_registry_contains(function);
-    return euhedral_submit_kernel(function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_bytes, stream,
-            parameters, overlappable && pdl_selected, overlappable);
+    return atomic_exchange(&exact_numerics, exact != 0);
 }

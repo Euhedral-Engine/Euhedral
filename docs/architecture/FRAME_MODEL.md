@@ -432,7 +432,7 @@ FP16/MMA and BF16-output tolerance.
 When the full cache and weights do not fit, the planner can move pages beyond `context.kv-cache-on-gpu-tokens` to pinned host memory before offloading weights. Each sequence slot owns host pages per attention layer and one device region shared by those layers. A layer copies its host pages into the region before attention and copies appended rows back afterward; carried-state edges protect region reuse. Prefix checkpoints then stop at the device-page frontier. See [memory architecture](04-memory-architecture.md).
 
 Decode and VERIFY quanta that start below 1024 tokens launch their kernels with CUDA programmatic dependent launch
-(`euhedral_cuda_pdl_select`): every kernel registered for it begins with `griddepcontrol.wait`
+(selected per quantum): every kernel registered for it begins with `griddepcontrol.wait`
 (`native/src/common/pdl.cuh`), so it cannot read a predecessor's output early. It won 12 of 12 paired forks
 (about +1%) at a 64-token context and 10 of 12 at 1024, so longer contexts keep ordinary launches. Quanta replayed from
 captured CUDA graphs ([CUDA_GRAPHS.md](../kernels/CUDA_GRAPHS.md)) carry programmatic edges at every position instead.

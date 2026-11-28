@@ -24,8 +24,7 @@ through helpers it calls:
      .cu file and the quoted includes), honouring namespaces; more than one definition matching a call is a failure. The
      helper is checked against its own pointer parameters. In the kernel, everything up to and including the call's
      arguments is checked against the kernel's: a pointer may be passed bare, but `*position` in the arguments is a use.
-  6. Every kernel the Rust launch catalog registers (`true` entries) must reach the wait, and every kernel the C host
-     code registers that the catalog does not list (C_ONLY below, and the names in host/dflash.c) must too.
+  6. Every kernel the Rust launch catalog registers (`true` entries) must reach the wait.
 
 Known gaps: a type with a __device__ constructor that is declared from a pointer by `T x = T(p)` or in a member
 initialiser is not seen (only `T x(p)` and `T x{p}` are); a pointer reaching a helper through a struct member or a
@@ -33,7 +32,7 @@ reference parameter is not bound; asm blocks other than exit/trap and calls that
 helpers are followed only by name (no overload resolution, no function pointers, no `using namespace`);
 pointers reaching a kernel through __constant__ globals or struct parameters are not tracked; arithmetic arguments like
 `f(p + 1)` to a call are seen as a use, but a pointer hidden in a macro argument is not expanded; a kernel that never calls
-euhedral_pdl_begin() is checked only if the catalog or C_ONLY registers it.
+euhedral_pdl_begin() is checked only if the catalog registers it.
 
 Usage: pdl_wait_check.py [native/src directory] [rust catalog.rs]. Prints one line per violation; exit 1 on any."""
 import pathlib
@@ -46,10 +45,6 @@ CATALOG = ROOT / "rust" / "crates" / "cuda" / "src" / "launch" / "catalog.rs"
 WAIT = "euhedral_pdl_begin"
 # Const pointer parameters that may be read before the wait: model weights, which no kernel writes.
 READ_ONLY = {"weights", "weight_tensor"}
-# Kernels the C host code registers for programmatic launch (host/qwen_layer_ops.c, 170-197) that the Rust catalog
-# lists as false or not at all. The dflash kernels (host/dflash.c, all registered) are read from that file.
-C_ONLY = {"euhedral_gdn_control_fp32", "euhedral_linear_bf16_to_float"}
-DFLASH_HOST = "host/dflash.c"
 KEYWORDS = {"if", "for", "while", "switch", "return", "sizeof", "static_cast", "reinterpret_cast", "const_cast",
             "decltype", "alignof", "defined"}
 TYPE_WORDS = (r"(?:const|unsigned|signed|int|long|short|char|float|double|bool|size_t|u?int(?:8|16|32|64)_t|"
@@ -370,7 +365,7 @@ def registered_names(catalog):
     return [name for name, flag in entries if flag == "true"]
 
 
-def violations(source_root, catalog=None, c_only=None):
+def violations(source_root, catalog=None):
     tree = Tree(source_root)
     problems, with_wait, seen = [], set(), set()
     for unit_path, unit in tree.units.items():
@@ -386,10 +381,7 @@ def violations(source_root, catalog=None, c_only=None):
                 with_wait.update(owners)
                 for message in result:
                     problems.append(f"{path.relative_to(tree.root)}: {', '.join(owners)}: {message}")
-    wanted = set(C_ONLY if c_only is None else c_only) if (tree.root / "host" / "qwen_layer_ops.c").is_file() else set()
-    dflash = tree.root / DFLASH_HOST
-    if dflash.is_file():
-        wanted |= set(re.findall(r'"(euhedral_dflash_\w+)"', read(dflash)))
+    wanted = set()
     if catalog is not None:
         wanted |= set(registered_names(catalog))
     for name in sorted(wanted - with_wait):

@@ -223,9 +223,8 @@ The disk tier changes no numerics: a disk-backed run computes the same bytes as 
 - `tools/convert_checkpoint.py --quantization nvfp4`: the NVFP4 artifacts, quantized on the GPU by default (`tools/README.md`).
 - Loading: `Nvfp4Layout`, a loader that accepts the vision-free inventory, and `Nvfp4CudaLoadIntegrationTest`.
 - Execution: `native/src/nvfp4` (tensor-core decode, 1 to 8 rows) and `native/src/nvfp4_native` ([NVFP4_NATIVE.md](../kernels/NVFP4_NATIVE.md)),
-  `euhedral_cuda_linear_nvfp4_bf16`, `euhedral_cuda_linear_nvfp4_native_bf16` and
-  `euhedral_cuda_nvfp4_native_gate_up_swiglu_bf16`, plan and frame dispatch for NVFP4 weights.
+  the plan and frame dispatch for NVFP4 weights.
 - Residency: `ArtifactProfile`, `ResidencyPlanner`, `HostWeightSelection`, `WeightStaging`, `WeightTransferFrame`, the transfer
   lane in `LanePool`, and `euhedral_cuda_host_weights_malloc`.
 - Disk tier: `model/qwen38/offload` (`DiskWindow`, `DiskReader`, `DiskUse`), `Stages.DiskTransfer`, `StageFrame.abandoned`,
-  and `euhedral_cuda_wait_host_flag` / `euhedral_cuda_write_host_flag`.
+  and the host-mapped flag waits and writes on the stream.
