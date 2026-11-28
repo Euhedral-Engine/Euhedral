@@ -194,11 +194,13 @@ pub fn signal_name(code: u8) -> String {
     }
 }
 
-/// Listens on `port` on every address of the host: both families on one socket where the host has IPv6, else IPv4.
-fn listen(port: u16) -> io::Result<TcpListener> {
-    let bind = |domain: Domain, address: IpAddr| -> io::Result<TcpListener> {
+/// Listens on `host` and `port`, on that address only. The unspecified IPv6 address `::` is every interface: both
+/// families on one socket where the host has IPv6, else IPv4.
+fn listen(host: IpAddr, port: u16) -> io::Result<TcpListener> {
+    let bind = |address: IpAddr| -> io::Result<TcpListener> {
+        let domain = if address.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
         let socket = Socket::new(domain, Type::STREAM, None)?;
-        if address.is_ipv6() {
+        if address.is_ipv6() && address.is_unspecified() {
             socket.set_only_v6(false)?;
         }
         // As the standard library does on Unix; on Windows the option would let another process take the port.
@@ -208,14 +210,17 @@ fn listen(port: u16) -> io::Result<TcpListener> {
         socket.listen(1024)?;
         Ok(socket.into())
     };
+    if host != IpAddr::V6(Ipv6Addr::UNSPECIFIED) {
+        return bind(host);
+    }
     // Windows lets a dual-stack socket take a port another program holds on IPv4 only, so the IPv4 side is tried first
     // (and released at once): the start fails with the same address-in-use error as elsewhere.
     #[cfg(windows)]
-    drop(bind(Domain::IPV4, IpAddr::V4(Ipv4Addr::UNSPECIFIED))?);
-    match bind(Domain::IPV6, IpAddr::V6(Ipv6Addr::UNSPECIFIED)) {
+    drop(bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED))?);
+    match bind(host) {
         Err(error) if error.kind() != io::ErrorKind::AddrInUse => {
             log::info!("listening on IPv6 is not possible ({error}): IPv4 only");
-            bind(Domain::IPV4, IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
         }
         other => other,
     }
@@ -266,10 +271,11 @@ pub fn serve_waiting(
         backend,
         shutdown,
     } = started;
+    let host = settings.server.host;
     let port = settings.server.port;
     let model = backend.model_id().to_owned();
     let config = ApiConfig {
-        address: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+        address: SocketAddr::new(host, port),
         limits: limits(settings, windows),
         backend,
         created_at: now_seconds(),
@@ -279,7 +285,7 @@ pub fn serve_waiting(
     };
     let patience = windows.drain.saturating_add(windows.shutdown);
     let timeout = settings.server.shutdown_timeout;
-    let started = listen(port).and_then(|listener| start_on(&lattice, config, listener));
+    let started = listen(host, port).and_then(|listener| start_on(&lattice, config, listener));
     let server = match started {
         Ok(server) => server,
         Err(error) => {
@@ -353,4 +359,25 @@ pub fn ignored_arguments(args: &[OsString]) -> Vec<String> {
         }
     }
     ignored
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_listener_binds_the_configured_address_only() -> io::Result<()> {
+        let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let bound = listen(host, 0)?.local_addr()?;
+        assert_eq!(bound.ip(), host);
+        assert_ne!(bound.port(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_host_that_cannot_be_bound_is_an_error_not_a_fallback() {
+        // 192.0.2.0/24 is reserved for documentation: no interface owns it.
+        let unowned = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        assert!(listen(unowned, 0).is_err());
+    }
 }

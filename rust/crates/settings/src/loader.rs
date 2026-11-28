@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -348,6 +349,10 @@ fn int<T: TryFrom<i64>>(text: &str, min: i64, max: i64) -> Result<T, String> {
     T::try_from(value).map_err(|_| range())
 }
 
+fn address(text: &str) -> Result<IpAddr, String> {
+    text.parse().map_err(|_| format!("not an IP address: {text}"))
+}
+
 fn decimal(text: &str) -> Result<f32, String> {
     let value: f32 = text.parse().map_err(|_| format!("not a number: {text}"))?;
     if value.is_finite() {
@@ -487,6 +492,7 @@ fn leaves() -> Vec<Leaf> {
         }),
         fixed("sampling.top-k", |s, t| assign!(s.sampling.top_k, int(t, 0, COUNT_MAX))),
         fixed("sampling.top-p", |s, t| assign!(s.sampling.top_p, top_p(t))),
+        fixed("server.host", |s, t| assign!(s.server.host, address(t))),
         fixed("server.port", |s, t| assign!(s.server.port, int(t, 1, 65535))),
         fixed("server.shutdown-timeout", |s, t| {
             assign!(s.server.shutdown_timeout, duration(t, true))

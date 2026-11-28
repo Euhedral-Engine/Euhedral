@@ -3,6 +3,7 @@
 //! A value that is always present has its default here. A value the YAML may leave as `auto` is an [`Auto`]: the
 //! settings crate only represents `auto`; the engine computes the value at run time.
 
+use std::net::{IpAddr, Ipv6Addr};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -125,6 +126,9 @@ impl Default for SamplingSettings {
 /// The HTTP server (`server`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServerSettings {
+    /// The address to listen on; the unspecified IPv6 address `::` listens on every interface, both families where the
+    /// host has IPv6.
+    pub host: IpAddr,
     /// The port to listen on.
     pub port: u16,
     /// How long closing the engine waits for its workers to stop.
@@ -136,6 +140,7 @@ pub struct ServerSettings {
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
+            host: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             port: 1738,
             shutdown_timeout: Duration::from_secs(10),
             requests: RequestSettings::default(),
