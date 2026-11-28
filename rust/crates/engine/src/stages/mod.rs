@@ -62,7 +62,7 @@ use crate::workspace::{BufferSlot, Workspace, WorkspaceError, input_record_bytes
 use attention::KvSource;
 use euhedral_inference_settings::KvFormat;
 #[cfg(feature = "test-oracles")]
-pub use place_probe::PlaceProbe;
+pub use place_probe::{PlaceProbe, ProbePlace};
 pub(crate) use retired::{Kept, Retired, Retirement};
 use sampling::{RowReadback, Selection, SelectionLease};
 pub use unmarked::Unmarked;
@@ -441,6 +441,11 @@ impl Segment {
     }
 }
 
+/// The index of the first segment that holds no place, given whether each does.
+fn first_unplaced(held: impl IntoIterator<Item = bool>) -> Option<usize> {
+    held.into_iter().position(|placed| !placed)
+}
+
 /// One sequence's share of a batch ([`Quantum::batch`]): the rows it verifies, with what its segment of the quantum
 /// reads and writes.
 #[derive(Debug)]
@@ -460,13 +465,6 @@ pub struct Part {
 }
 
 impl Part {
-    /// The part in a place of `probe`'s order.
-    #[cfg(feature = "test-oracles")]
-    pub fn in_probe_place(mut self, probe: &PlaceProbe) -> Self {
-        self.place = Some(probe.place());
-        self
-    }
-
     /// A part of `sequence`: its rows are `tokens`, from `start_position` on, over `refs`.
     pub fn new(refs: SequenceRefs, sequence: SequenceId, start_position: u64, tokens: Vec<u32>) -> Self {
         Self {
@@ -1104,7 +1102,7 @@ impl Quantum {
     }
 
     /// The part of a batch this verification of `sequence` is, which `cancel` (the request's flag) cancels.
-    pub(crate) fn into_part(mut self, sequence: SequenceId, cancel: Arc<AtomicBool>) -> Result<Part, QuantumError> {
+    pub fn into_part(mut self, sequence: SequenceId, cancel: Arc<AtomicBool>) -> Result<Part, QuantumError> {
         self.require_single("a part of a batch")?;
         if self.kind != QuantumKind::Verify {
             return Err(QuantumError::Invalid {
@@ -1148,17 +1146,21 @@ impl Quantum {
         self.segments.iter_mut().map(|segment| segment.lease.take()).collect()
     }
 
-    /// Completes the place of segment `index` alone, as the frame that ends the quantum does; the other segments keep
-    /// theirs. Whether the segment held one.
+    /// The quantum in a place of `probe`'s order, as the owner puts it in its sequence's.
     #[cfg(feature = "test-oracles")]
-    pub fn complete_probe_place(&mut self, index: usize) -> bool {
-        let place = self.segments.get_mut(index).and_then(|segment| segment.place.take());
-        place.map(|place| place.complete(Retirement::Copy)).is_some()
+    pub fn with_probe_place(self, probe: &PlaceProbe) -> Self {
+        self.with_place(probe.place())
     }
 
-    /// Whether each of the quantum's segments is in a place of its sequence's order of conclusion.
-    pub(crate) fn places_held(&self) -> impl Iterator<Item = bool> + '_ {
-        self.segments.iter().map(|segment| segment.place.is_some())
+    /// What the frame that ends the quantum takes out ([`Quantum::take_places`]), each place for the test to complete.
+    #[cfg(feature = "test-oracles")]
+    pub fn take_probe_places(&mut self) -> Vec<ProbePlace> {
+        self.take_places().into_iter().map(ProbePlace::new).collect()
+    }
+
+    /// The first segment that has no place in its sequence's order of conclusion, if any.
+    pub(crate) fn unplaced(&self) -> Option<usize> {
+        first_unplaced(self.segments.iter().map(|segment| segment.place.is_some()))
     }
 
     /// Takes each segment's place in its sequence's order of conclusion out, in segment order: the frame that ends the
@@ -1791,6 +1793,13 @@ pub(crate) use eager;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_segment_without_a_place_is_named() {
+        assert_eq!(first_unplaced([true, true]), None);
+        assert_eq!(first_unplaced([true, false, false]), Some(1));
+        assert_eq!(first_unplaced([false]), Some(0));
+    }
 
     #[test]
     fn the_position_follows_the_token_ids_padded_to_eight_bytes() {

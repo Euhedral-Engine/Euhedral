@@ -1126,7 +1126,11 @@ fn a_split_job_leaves_its_place_with_the_last_group_alone() {
     let (order, concluded) = order();
     let copy = order.register();
     let behind = order.register();
-    let mut groups = rig.next_job().in_place(copy).split();
+    let job = rig.next_job();
+    assert!(!job.has_place(), "a job is made without a place");
+    let job = job.in_place(copy);
+    assert!(job.has_place());
+    let mut groups = job.split();
     let last = groups.len() - 1;
     assert!(last > 0);
     for group in &mut groups[..last] {

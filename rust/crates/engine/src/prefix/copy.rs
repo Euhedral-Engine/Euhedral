@@ -146,6 +146,11 @@ impl CopyJob {
         self
     }
 
+    /// Whether the job has its place in its sequence's order of conclusion.
+    pub(crate) fn has_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The place of the job, if this group is the last and holds it.
     pub(crate) fn take_place(&mut self) -> Option<Slot<Retirement>> {
         self.place.take()

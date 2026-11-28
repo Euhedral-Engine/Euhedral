@@ -144,10 +144,23 @@ impl Launch for Executor {
     fn start(&self, job: Job, kill: Arc<AtomicBool>, after: &[&Started]) -> Result<Started, StartError> {
         match job {
             Job::Quantum(quantum) => {
-                check_placed(quantum.places_held())?;
+                if let Some(segment) = quantum.unplaced() {
+                    return Err(StartError::NoPlace {
+                        serial: quantum.id(),
+                        segment,
+                    });
+                }
                 Executor::start(self, *quantum, kill, after)
             }
-            Job::Copy(copy) => self.start_copy(copy, kill, after),
+            Job::Copy(copy) => {
+                if !copy.has_place() {
+                    return Err(StartError::NoPlace {
+                        serial: copy.serial(),
+                        segment: 0,
+                    });
+                }
+                self.start_copy(copy, kill, after)
+            }
         }
     }
 
@@ -185,24 +198,11 @@ impl Launch for Executor {
         let mut quanta = Vec::with_capacity(members.len());
         for (sequence, job, cancel) in members {
             match job {
-                Job::Quantum(quantum) => {
-                    check_placed(quantum.places_held())?;
-                    quanta.push((sequence, *quantum, cancel));
-                }
+                Job::Quantum(quantum) => quanta.push((sequence, *quantum, cancel)),
                 Job::Copy(_) => return Err(StartError::Batch("a copy job is not part of a pass".to_string())),
             }
         }
         Executor::start_batch(self, quanta, kill, after)
-    }
-}
-
-/// Refuses a quantum one of whose segments has no place in its sequence's order of conclusion: nothing would conclude
-/// it. `held` says, for each segment, whether it has one.
-fn check_placed(held: impl IntoIterator<Item = bool>) -> Result<(), StartError> {
-    if held.into_iter().all(|placed| placed) {
-        Ok(())
-    } else {
-        Err(StartError::NoPlace)
     }
 }
 
@@ -1078,17 +1078,6 @@ mod tests {
 
     use super::*;
     use crate::plan::View;
-
-    #[test]
-    fn a_quantum_with_a_segment_that_has_no_place_is_refused() {
-        assert!(check_placed([true]).is_ok());
-        assert!(check_placed([true, true, true]).is_ok());
-        assert!(matches!(check_placed([false]), Err(StartError::NoPlace)));
-        assert!(
-            matches!(check_placed([true, false, true]), Err(StartError::NoPlace)),
-            "one segment without a place is enough"
-        );
-    }
 
     const A: SequenceId = SequenceId(0);
     const B: SequenceId = SequenceId(1);

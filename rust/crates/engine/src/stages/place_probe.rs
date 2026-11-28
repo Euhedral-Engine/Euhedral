@@ -45,3 +45,23 @@ impl Default for PlaceProbe {
         PlaceProbe::new()
     }
 }
+
+/// A place a quantum's end took out, for the test to complete.
+pub struct ProbePlace(Option<Slot<Retirement>>);
+
+impl fmt::Debug for ProbePlace {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("ProbePlace").finish_non_exhaustive()
+    }
+}
+
+impl ProbePlace {
+    pub(crate) fn new(place: Option<Slot<Retirement>>) -> ProbePlace {
+        ProbePlace(place)
+    }
+
+    /// Completes the place, as the frame that ends the quantum does. Whether there was one.
+    pub fn complete(self) -> bool {
+        self.0.map(|place| place.complete(Retirement::Copy)).is_some()
+    }
+}

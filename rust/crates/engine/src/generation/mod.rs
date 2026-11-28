@@ -91,12 +91,17 @@ fn complete(place: Option<Slot<Retirement>>, retired: Retired) {
     }
 }
 
-/// Completes each segment's place, in segment order, with what `retired` makes of that segment: each place is completed
-/// once, with the value of its own segment. A segment with no place is skipped (it was refused at its start).
-fn complete_each<T: Send + 'static>(places: Vec<Option<Slot<T>>>, mut retired: impl FnMut(usize) -> T) {
-    for (segment, place) in places.into_iter().enumerate() {
+/// Completes each segment's place, in segment order, once, with what `retired` makes of that segment from the item `kept`
+/// holds for it: a segment's item stays its own whatever other segments have no place. A segment with no place is
+/// skipped (it would have been refused at its start).
+fn complete_each<T: Send + 'static, K>(
+    places: Vec<Option<Slot<T>>>,
+    kept: Vec<K>,
+    mut retired: impl FnMut(usize, K) -> T,
+) {
+    for (segment, (place, kept)) in places.into_iter().zip(kept).enumerate() {
         match place {
-            Some(place) => place.complete(retired(segment)),
+            Some(place) => place.complete(retired(segment, kept)),
             None => log::error!("segment {segment} of a pass retired with no place in its sequence's order"),
         }
     }
@@ -414,9 +419,8 @@ impl Generation {
                 let leases = quantum.take_leases();
                 let guards = quantum.take_flights();
                 let batch = Arc::new(quantum);
-                let mut kept = leases.into_iter().zip(guards);
-                complete_each(places, |segment| {
-                    let (lease, guard) = kept.next().unwrap_or_default();
+                let kept: Vec<_> = leases.into_iter().zip(guards).collect();
+                complete_each(places, kept, |segment, (lease, guard)| {
                     Retirement::Quantum(Box::new(Retired::part(&batch, segment, lease, guard, &outcome)))
                 });
             },
@@ -1025,7 +1029,8 @@ mod places {
         let (orders, lists): (Vec<_>, Vec<_>) = (0..3).map(|_| recording()).unzip();
         let places = orders.iter().map(|order| Some(order.admit())).collect();
         let mut asked = Vec::new();
-        complete_each(places, |segment| {
+        let kept = vec![(); 3];
+        complete_each(places, kept, |segment, ()| {
             asked.push(segment);
             10 + segment as u32
         });
@@ -1044,8 +1049,21 @@ mod places {
         let (first, first_list) = recording();
         let (second, second_list) = recording();
         let places = vec![Some(first.admit()), None, Some(second.admit())];
-        complete_each(places, |segment| segment as u32);
+        complete_each(places, vec![(); 3], |segment, ()| segment as u32);
         assert_eq!(seen(&first_list), [0]);
         assert_eq!(seen(&second_list), [2]);
+    }
+
+    #[test]
+    fn a_segment_without_a_place_does_not_shift_the_items_of_the_ones_after_it() {
+        let (orders, lists): (Vec<_>, Vec<_>) = (0..3).map(|_| recording()).unzip();
+        let places = vec![Some(orders[0].admit()), None, Some(orders[2].admit())];
+        let mut got = Vec::new();
+        complete_each(places, vec!["first", "second", "third"], |_, kept| {
+            got.push(kept);
+            0
+        });
+        assert_eq!(got, ["first", "third"], "the third segment got its own item");
+        assert!(seen(&lists[1]).is_empty());
     }
 }
