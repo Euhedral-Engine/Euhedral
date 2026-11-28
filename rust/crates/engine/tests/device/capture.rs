@@ -1620,6 +1620,10 @@ fn the_capture_key_of_the_drafters_context_and_block_quanta_depends_on_rows_and_
 
     // Only the drafter's buffers are reallocated: every other buffer of the sequence keeps its serial.
     let before = key(&mut sequence, QuantumKind::Context, 3, 700).unwrap();
+    assert_eq!(
+        before, three,
+        "without a reallocation a 3-row context keeps its key at any position"
+    );
     let placeholder = light.sequence_around(1024, 1, false, None);
     let held = mem::replace(&mut sequence.device, Arc::clone(&placeholder.device));
     let SequenceDevice { gdn, scratch } = Arc::try_unwrap(held).expect("no quantum holds the sequence's buffers");

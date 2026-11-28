@@ -43,7 +43,7 @@ use super::heads::{run as run_heads, run_trellis};
 use super::hessians::HessianSet;
 use super::manifest::{HEADS_DIRECTORY, Ledger, MANIFEST_FILE, Manifest, RESUME_FILE};
 use super::plan::{Plan, round_order};
-use super::rounding::{Ended, HEAD_ROWS, Linear, RoundSettings, Services, round_all};
+use super::rounding::{Ended, HEAD_ROWS, Linear, RoundSettings, Services, prewarm, round_all};
 use super::{CalibrateError, Stages};
 use crate::checkpoint::CheckpointError;
 use crate::checkpoint::objects::Qwen38Objects;
@@ -435,6 +435,24 @@ impl Calibration {
             io,
             host,
         });
+        // A trellis run's lanes round the heads only; a layer run's lanes find their staging in the pool from the start.
+        if settings.trellis.is_none() {
+            let layers = objects.config.full_attention.len();
+            let mut shapes = Vec::new();
+            for layer in 0..layers {
+                for name in objects
+                    .layer_objects(layer)
+                    .map_err(|error| CalibrateError::failed("the layer's objects", error))?
+                {
+                    let source = objects
+                        .object(&name)
+                        .map_err(|error| CalibrateError::failed(&name, error))?;
+                    shapes.push((name, source.rows, source.columns));
+                }
+            }
+            let per_layer = shapes.len().checked_div(layers).unwrap_or(0);
+            prewarm(&services, &lanes, &shapes, per_layer, settings.lane_pinned_bytes)?;
+        }
         // The device and its lane pools stay open for the lanes' life: the queues hold them weakly.
         forget((gpu, shared, pool));
         let (trellis, trellis_completions) = match trellis {

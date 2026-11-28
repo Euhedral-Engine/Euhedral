@@ -392,6 +392,18 @@ impl StagingNeeds {
         Ok(())
     }
 
+    /// The staging of `lanes` lanes that run their steps at the same time: `lanes` times each class's count.
+    pub fn times(&self, lanes: usize) -> StagingNeeds {
+        StagingNeeds {
+            classes: self
+                .classes
+                .iter()
+                .map(|(class, count)| (*class, count.saturating_mul(lanes)))
+                .filter(|(_, count)| *count > 0)
+                .collect(),
+        }
+    }
+
     /// The pool bytes of every buffer: what a claim for the prewarm must cover.
     pub fn bytes(&self) -> u64 {
         self.classes
@@ -409,7 +421,7 @@ impl StagingNeeds {
 /// Holds one buffer from `acquire` for each of `needs`, then gives them all back together, so that each lives in the
 /// pool afterwards. The buffers' bytes are charged to `claim` for as long as they are held. Allocating a buffer is the
 /// only work `acquire` does; it is called outside any step.
-fn warm<T>(
+pub(crate) fn warm<T>(
     needs: &StagingNeeds,
     claim: &mut Option<Claim>,
     mut acquire: impl FnMut(usize) -> Result<T, MemoryError>,
@@ -543,28 +555,24 @@ impl Staged {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "a test: a failed unwrap is the failure"
-)]
-mod tests {
+pub(crate) mod fake {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
-    use euhedral_memory::{LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope};
+    use euhedral_memory::{Claim, LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope};
 
-    use super::*;
+    use super::MemoryError;
 
     /// A pool of staging buffers that allocates only when it holds none of the class.
     #[derive(Default)]
-    struct FakePool {
-        held: RefCell<Vec<usize>>,
-        allocated: RefCell<Vec<usize>>,
+    pub(crate) struct FakePool {
+        pub(crate) held: RefCell<Vec<usize>>,
+        pub(crate) allocated: RefCell<Vec<usize>>,
     }
 
     /// A loan: dropping it gives the buffer back to the pool.
-    struct Loan {
+    pub(crate) struct Loan {
         pool: Rc<FakePool>,
         class: usize,
     }
@@ -575,7 +583,7 @@ mod tests {
         }
     }
 
-    fn acquire(pool: &Rc<FakePool>, class: usize) -> Result<Loan, MemoryError> {
+    pub(crate) fn acquire(pool: &Rc<FakePool>, class: usize) -> Result<Loan, MemoryError> {
         let mut held = pool.held.borrow_mut();
         match held.iter().position(|have| *have == class) {
             Some(at) => {
@@ -589,7 +597,7 @@ mod tests {
         })
     }
 
-    fn claim_of(bytes: u64) -> (Arc<Planner>, Option<Claim>) {
+    pub(crate) fn claim_of(bytes: u64) -> (Arc<Planner>, Option<Claim>) {
         let planner = Planner::new([LocationSpec {
             kind: LocationKind::HostPinned,
             capacity: 1 << 30,
@@ -601,6 +609,19 @@ mod tests {
             .unwrap();
         (planner, Some(claim))
     }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a test: a failed unwrap is the failure"
+)]
+mod tests {
+    use std::rc::Rc;
+
+    use super::fake::{FakePool, Loan, acquire, claim_of};
+    use super::*;
 
     fn needs_of(steps: &[&[u64]]) -> StagingNeeds {
         let mut needs = StagingNeeds::new();
@@ -621,6 +642,15 @@ mod tests {
         assert_eq!(needs.bytes(), 2 * 4096 + 2 * 8192 + 16384);
         assert_eq!(StagingNeeds::new().bytes(), 0);
         assert_eq!(StagingNeeds::new().buffers().count(), 0);
+    }
+
+    #[test]
+    fn lanes_that_run_together_need_each_class_once_per_lane() {
+        let needs = needs_of(&[&[4096, 4096, 20_000]]);
+        let three = needs.times(3);
+        assert_eq!(three.buffers().count(), 9);
+        assert_eq!(three.bytes(), 3 * needs.bytes());
+        assert_eq!(needs.times(0), StagingNeeds::new());
     }
 
     #[test]

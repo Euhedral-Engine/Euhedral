@@ -1153,9 +1153,28 @@ fn round_staging(n: u64, k: u64, format: &Format, dead: u64) -> Vec<u64> {
     staged
 }
 
-/// Adds to `needs` the staging an object of `rows` rows and `k` columns takes in `format`, rounded in slices of
-/// `slice_rows` rows: its factor, its tensor scales (NVFP4) and its slices, the first and the last. The dead columns
-/// of its Hessian are not known before the factor, so a slice that stages them holds one more buffer than this adds.
+/// The steps of an object of `rows` rows and `k` columns in `format`, rounded in slices of `slice_rows` rows: its
+/// factor, its tensor scales (NVFP4) and its slices, the first and the last. Each step lists the staging buffers (bytes)
+/// it holds at once. Refuses `slice_rows` of 0.
+fn object_steps(rows: u64, k: u64, format: &Format, slice_rows: u64) -> Result<Vec<Vec<u64>>, MemoryError> {
+    if slice_rows == 0 {
+        return Err(MemoryError::Refused("a slice of 0 rows".to_owned()));
+    }
+    let mut steps = vec![factor_staging(k).to_vec()];
+    if format.nvfp4 {
+        steps.push(scales_staging(k, format.sd4));
+    }
+    let last = rows % slice_rows;
+    for n in [rows.min(slice_rows), last] {
+        if n > 0 {
+            steps.push(round_staging(n, k, format, 0));
+        }
+    }
+    Ok(steps)
+}
+
+/// Adds to `needs` the staging of the steps of an object ([`object_steps`]). The dead columns of its Hessian are not
+/// known before the factor, so a slice that stages them holds one more buffer than this adds.
 pub fn object_staging(
     needs: &mut StagingNeeds,
     rows: u64,
@@ -1163,16 +1182,8 @@ pub fn object_staging(
     format: &Format,
     slice_rows: u64,
 ) -> Result<(), MemoryError> {
-    needs.step(factor_staging(k))?;
-    if format.nvfp4 {
-        needs.step(scales_staging(k, format.sd4))?;
-    }
-    let slice_rows = slice_rows.max(1);
-    let last = rows % slice_rows;
-    for n in [rows.min(slice_rows), last] {
-        if n > 0 {
-            needs.step(round_staging(n, k, format, 0))?;
-        }
+    for step in object_steps(rows, k, format, slice_rows)? {
+        needs.step(step)?;
     }
     Ok(())
 }
@@ -1303,7 +1314,13 @@ fn round_collect(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "a test: a failed unwrap is the failure")]
 mod tests {
+    use std::rc::Rc;
+
+    use euhedral_inference_cuda::PinnedPool;
+
     use super::*;
+    use crate::memory::fake::{FakePool, acquire, claim_of};
+    use crate::memory::warm;
 
     fn nvfp4() -> Format {
         Format {
@@ -1337,5 +1354,44 @@ mod tests {
         let mut expected: Vec<usize> = whole.buffers().chain([32768]).collect();
         expected.sort_unstable();
         assert_eq!(sliced.buffers().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn a_slice_of_no_rows_is_refused() {
+        let mut needs = StagingNeeds::new();
+        assert!(matches!(
+            object_staging(&mut needs, 8, 4096, &nvfp4(), 0),
+            Err(MemoryError::Refused(_))
+        ));
+        assert_eq!(needs, StagingNeeds::new());
+    }
+
+    #[test]
+    fn after_the_prewarm_the_first_object_on_every_lane_allocates_nothing() {
+        let lanes = 3;
+        let mut layer = StagingNeeds::new();
+        let mut objects = Vec::new();
+        for (rows, k) in [(4096, 4096), (20, 8192), (8, 4096)] {
+            object_staging(&mut layer, rows, k, &nvfp4(), 8).unwrap();
+            objects.push(object_steps(rows, k, &nvfp4(), 8).unwrap());
+        }
+        let needs = layer.times(lanes);
+        let (_planner, mut claim) = claim_of(needs.bytes());
+        let pool = Rc::new(FakePool::default());
+        warm(&needs, &mut claim, |class| acquire(&pool, class)).unwrap();
+        let warmed = pool.allocated.borrow().len();
+        assert_eq!(warmed, needs.buffers().count());
+
+        // Every lane runs the same step of its object at the same time: the most the pool is asked for at once.
+        for steps in &objects {
+            for step in steps {
+                let loans: Vec<_> = (0..lanes)
+                    .flat_map(|_| step.iter().copied())
+                    .map(|bytes| acquire(&pool, PinnedPool::class_bytes(bytes as usize).unwrap()).unwrap())
+                    .collect();
+                assert_eq!(pool.allocated.borrow().len(), warmed, "a step allocated: {step:?}");
+                drop(loans);
+            }
+        }
     }
 }

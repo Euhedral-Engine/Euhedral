@@ -131,9 +131,6 @@ pub unsafe fn round_all(
     order: Vec<usize>,
     then: Then<Ended>,
 ) {
-    if let Err(error) = prewarm(&services, &lanes, &linears) {
-        return then(Err(error));
-    }
     let names = linears.iter().map(|linear| linear.name.clone()).collect();
     let decoded = linears
         .iter()
@@ -167,25 +164,41 @@ pub unsafe fn round_all(
     }
 }
 
-/// Puts the pinned staging the layer's steps need in the lanes' pool before the first step runs, so that no step
-/// allocates page-locked memory: the pool keeps the buffers, and the layers after the first find them there.
-fn prewarm(services: &Services, lanes: &[GptqLane], linears: &[Linear]) -> Result<(), CalibrateError> {
+/// Puts the pinned staging that `lanes` take rounding `objects` (name, rows, columns; the objects of every layer) in
+/// their shared pool, charging the pool's claim: one set of buffers for each of `width` lanes that run together, where
+/// `width` is the fewer of the lanes and `per_layer`, the objects of one layer. Afterwards no step allocates
+/// page-locked memory. Allocates (waits on the driver): call it before any frame runs. Fails when the staging is more
+/// than `capacity` pool bytes, when the recipe or the planner refuses, or when the pool does.
+pub fn prewarm(
+    services: &Services,
+    lanes: &[GptqLane],
+    objects: &[(String, u64, u64)],
+    per_layer: usize,
+    capacity: u64,
+) -> Result<(), CalibrateError> {
     let Some(lane) = lanes.first() else { return Ok(()) };
-    let mut needs = StagingNeeds::new();
-    for linear in linears {
+    let mut one = StagingNeeds::new();
+    for (name, rows, columns) in objects {
         let format = services
             .settings
             .recipe
-            .format(&linear.name)
-            .map_err(|error| CalibrateError::failed(&linear.name, error))?;
+            .format(name)
+            .map_err(|error| CalibrateError::failed(name, error))?;
         object_staging(
-            &mut needs,
-            linear.rows,
-            linear.columns as u64,
+            &mut one,
+            *rows,
+            *columns,
             &rounded(format),
             services.settings.slice_rows as u64,
         )
         .map_err(|error| CalibrateError::failed("the staging the layer needs", error))?;
+    }
+    let needs = one.times(lanes.len().min(per_layer));
+    if needs.bytes() > capacity {
+        return Err(CalibrateError::Failed(format!(
+            "the lanes' pinned staging takes {} bytes, more than the {capacity} the pool holds",
+            needs.bytes()
+        )));
     }
     let mut claims = claims_for(
         services,
