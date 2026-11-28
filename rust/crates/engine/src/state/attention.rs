@@ -40,18 +40,18 @@ pub struct DrafterBuffers {
 
 impl DrafterBuffers {
     /// Bytes of one layer's ring of keys (or of values): the window's rows of the key/value width, BF16.
-    pub fn ring_bytes(config: &Dflash2Config) -> u64 {
+    pub fn ring_bytes_for(config: &Dflash2Config) -> u64 {
         (config.sliding_window * config.kv_width() * 2) as u64
     }
 
     /// Bytes the buffers hold for `tap_rows` tap rows.
     pub fn bytes(config: &Dflash2Config, tap_rows: u64) -> u64 {
-        tap_rows * config.tap_width() as u64 * 2 + 2 * config.layers as u64 * Self::ring_bytes(config)
+        tap_rows * config.tap_width() as u64 * 2 + 2 * config.layers as u64 * Self::ring_bytes_for(config)
     }
 
     /// Buffers for `tap_rows` tap rows (the most rows one base quantum has). The waiting allocator: startup only.
     pub fn allocate(library: &Arc<CudaLibrary>, config: &Dflash2Config, tap_rows: u64) -> Result<Self, CudaError> {
-        let ring_bytes = Self::ring_bytes(config);
+        let ring_bytes = Self::ring_bytes_for(config);
         let rings = ring_bytes as usize * config.layers;
         Ok(Self {
             taps: DeviceBuffer::alloc(library, tap_rows as usize * config.tap_width() * 2)?,
@@ -79,7 +79,7 @@ impl DrafterBuffers {
     }
 
     /// Bytes of one ring.
-    pub fn ring_size(&self) -> u64 {
+    pub fn ring_bytes(&self) -> u64 {
         self.ring_bytes
     }
 

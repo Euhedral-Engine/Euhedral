@@ -106,7 +106,7 @@ cubin for `sm_<major><minor>a` and only on compute capability 12.x.
   bytes, 16-byte boxes of four K tiles) and look each B scale register (4 E4M3 codes) up in registers just before its MMAs: two `prmt` over the
   table's halves, merged on each index's bit 3.
 
-**Dispatch** (`CudaGpuMemory`, `native/src/host/nvfp4_linear.c`):
+**Dispatch** (`CudaGpuMemory`, the launch planner in `rust/crates/cuda/src/launch`):
 
 | Rows | NVFP4 linear (`linearNvfp4Bf16`) | Paired gate/up + SwiGLU (`nvfp4GateUpSwiGluBf16`) |
 |---|---|---|

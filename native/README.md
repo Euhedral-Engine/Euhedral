@@ -10,34 +10,25 @@ support the target GPU. This native layer does not install or manage NVIDIA driv
 
 ## Source layout
 
-`src/host/` holds the C ABI compiled into the library. It accepts opaque device addresses and knows nothing about Euhedral frames:
+`src/host/` holds the C ABI compiled into the library. It accepts opaque device addresses and knows nothing about Euhedral frames. The Rust
+engine plans and launches every kernel itself (RustEE lanes and graph capture); the library only allocates and copies memory, reports the
+device, compiles the kernel modules with NVRTC and answers what the device can run:
 
 | File | Entry points |
 | --- | --- |
-| `euhedral_cuda.c` | Memory allocation (device, pinned host, huge-page host weights), memory queries, streams, markers and completion events, copies. |
-| `cuda_kernel_loader.c`, `.h` | Compiles an installed CUDA module root once per process with NVRTC and loads it, on a dedicated thread with a large stack (NVRTC overflows a worker thread's). Ordinary modules compile to the device's own cubin (`sm_<major><minor>`); the modules that use arch-specific instructions (`q3_mx`, `nvfp4_native`) compile for `sm_<major><minor>a`. No PTX is left for the driver to JIT. Also holds the thread-local selections: exact numerics, row-exact execution and programmatic dependent launch. |
-| `pdl_registry.c`, `.h` | The set of kernels that may overlap their predecessor (programmatic dependent launch): a lock-free open-addressing set of 1024 slots, 768 usable; a full set refuses and reports on standard error. |
-| `q3_embedding.c` | Q3 row-split and P2E2 embedding gather to BF16 hidden states (rows may be read in place from mapped host memory). |
-| `rms_norm_bf16.c` | Standalone BF16 RMSNorm. |
-| `q3_linear_bf16.c` | Q3 decode (one row and the 2 to 8 row twins) and the P2E2 decode and expansion kernels. |
-| `q45_linear.c` | Q4/Q5 decode (one row and the 2 to 8 row twins). |
-| `nvfp4_linear.c` | NVFP4 decode (plain and SD4 scale-table layouts, 1 to 8 rows on BF16 tensor cores) and the native FP4 tensor-core route. |
-| `dflash.c` | The DFlash2 drafter's operators (docs/speculation/DFLASH2.md). |
-| `q3_mx.c` | The block-scaled MXFP8 route for Q3/Q4/Q5 linears and the paired gate/up SwiGLU region. |
-| `reference.c`, `.h` | The scalar numerical references (Q3, Q4/Q5, NVFP4 plain and SD4): the oracle exact numerics select, and the fallback for shapes no kernel takes. |
-| `qwen_layer_ops.c` | GDN control, convolution, recurrence and gated norm; residual add, residual RMSNorm and SwiGLU; NVFP4 KV append, QK norm/RoPE and attention; greedy argmax; the BF16-to-FP32 linear. |
-| `kernel_table.{c,h}` | The table-generic launcher: loads each entry's module once, discovers every kernel's parameter sizes, checks a launch's argument count and widths against them and launches on the submission stream. Entries name their module root, so a table may span modules. |
-| `qwen4_ops.c` | The Flash-Next (`qwen4_exp`) kernels as a `kernel_table`: `qwen4_kernel_count`/`qwen4_kernel_name` and `qwen4_launch`. |
-| `linear_kernels.c` | The shared `linear` table, the weight formats' own launches: `linear_kernel_count`/`linear_kernel_name` and `linear_launch`, same ABI as the Flash-Next table. |
-| `decode_shapes.h`, `q3_p2e2_geometry.h` | Shape-only dispatch decisions and layout geometry checks (header-only). |
+| `euhedral_cuda.c` | Memory allocation (device, pinned host, huge-page host weights), memory and device queries, the calling thread's selected stream, host-device copies. |
+| `cuda_kernel_loader.c`, `.h` | Compiles an installed CUDA module root once per process with NVRTC and loads it, on a dedicated thread with a large stack (NVRTC overflows a worker thread's). Ordinary modules compile to the device's own cubin (`sm_<major><minor>`); the modules that use arch-specific instructions (`q3_mx`, `nvfp4_native`) compile for `sm_<major><minor>a`. No PTX is left for the driver to JIT. Also holds the exact-numerics selection. |
+| `kernel_table.{c,h}` | A table of kernels: loads each entry's module once and answers whether an entry runs on this device. Entries name their module root, so a table may span modules. |
+| `linear_kernels.c` | The shared `linear` table: `linear_kernel_count`, `linear_kernel_name` and `linear_kernel_available`. |
+| `qwen4_ops.c` | The names of the Flash-Next (`qwen4_exp`) kernels: `qwen4_kernel_name`. |
+| `nvfp4_native.c` | Whether the native FP4 tensor-core route runs on this device, and the scratch one native linear needs. |
+| `q3_mx.c` | Whether the block-scaled MXFP8 route for Q3/Q4/Q5 linears runs on this device. |
 
-Quantized linears dispatch on the row count: 1 to 8 rows run the decode kernels (every row of the twins is bit for bit the one-row
-result), 9 or more rows run the MXFP8 route for Q3/Q4/Q5, and NVFP4 linears from 2 rows run the native FP4 route; exact numerics and
-any shape no kernel takes run the scalar reference. There are no environment variables or options that change this.
+The kernels' dispatch (row-count routes, exact numerics, the scalar references) is the Rust launch planner's (`rust/crates/cuda/src/launch`).
 
 Every other file under `src/` is CUDA source, installed unchanged at the same relative path under
 `share/euhedral_cuda/` next to the library. Each domain folder's `kernels.cu` is the NVRTC module
-root the host loads; its headers are that module's leaves and strategies:
+root the Rust engine loads through NVRTC; its headers are that module's leaves and strategies:
 
 | Folder | Module contents |
 | --- | --- |
@@ -62,24 +53,13 @@ Includes within a folder are relative; includes across folders name the path fro
 (`common/pdl.cuh`, `nvfp4/nvfp4.cuh`), which NVRTC resolves through the installed root.
 
 The exported C API (`include/euhedral_cuda.h`) falls into these groups:
-- memory and transfers: `euhedral_cuda_malloc`/`free`, the stream-ordered `malloc_async`/`free_async`, `host_malloc`/`host_free`, `host_weights_malloc`/`free`/`device_pointer`,
-  `device_memory_info`, the `copy_*` family, `zero_device_memory`, `synchronize`;
-- streams, markers and completion: `stream_create`/`destroy`/`select`/`clear`/`synchronize`/`wait_event`, `completion_event_*`,
-  `completion_notify`;
-- selections: `select_exact_numerics`, `row_exact_select`, `pdl_select`;
-- embedding: `embed_q3`, `embed_q3_p2e2`;
-- norms and elementwise: `rms_norm_bf16`, `rms_norm_unit_offset_bf16`, `residual_add_bf16`, `residual_rms_norm_bf16`, `swiglu_bf16`;
-- linears: `linear_bf16_to_float`, `linear_q3_bf16`, `linear_quantized_bf16` (Q4/Q5), `linear_nvfp4_bf16`, the P2E2 pair
-  `linear_q3_p2e2_decode_bf16` and `q3_p2e2_expand`, the MXFP8 route (`q3_mx_available`, `linear_q3_mx_bf16`,
-  `linear_q45_mx_bf16`, `q3_mx_gate_up_swiglu_bf16`, `q3_mx_scratch_bytes`, `q3_mx_select_split_rows`), the native FP4 route
-  (`nvfp4_native_available`, `linear_nvfp4_native_bf16`, `nvfp4_native_gate_up_swiglu_bf16`, `nvfp4_native_scratch_bytes`) and
-  `linear_q3_reference_bf16`;
-- GDN: `gdn_control_fp32`, `gdn_project_control_fp32`, `gdn_convolution_bf16`, `gdn_recurrence_bf16`, `gdn_gated_rms_norm_bf16`;
-- attention: `attention_kv_append_nvfp4`, `attention_kv_append_bf16`, `attention_qk_norm_rope_bf16`,
-  `attention_causal_nvfp4`, `attention_causal_bf16`;
-- sampling: `argmax_bf16`;
-- Flash-Next: `qwen4_kernel_count`, `qwen4_kernel_name`, `qwen4_launch`;
-- shared linear table: `linear_kernel_count`, `linear_kernel_name`, `linear_launch`.
+- configuration: `set_include_directory` (the CUDA headers NVRTC compiles against), `select_exact_numerics`;
+- memory and transfers: `euhedral_cuda_malloc`/`free`, the stream-ordered `malloc_async`/`free_async`, `host_malloc`/`host_free`,
+  `host_weights_malloc`/`free`/`device_pointer`, `device_memory_info`, `copy_host_to_device`, `copy_device_to_host`, `synchronize`;
+- device: `multiprocessor_count`, `compute_capability`;
+- the calling thread's selected stream: `stream_select`, `stream_clear`;
+- route availability: `nvfp4_native_available`, `nvfp4_native_scratch_bytes`, `q3_mx_available`;
+- kernel tables: `linear_kernel_count`, `linear_kernel_name`, `linear_kernel_available`, `qwen4_kernel_name`.
 
 ## Tests
 
@@ -89,14 +69,13 @@ NumPy. `gpu_harness.py` is the shared harness (NVRTC compilation, module loading
 
 | Test | Covers |
 | --- | --- |
-| `test_pdl_registry.py` | The programmatic-launch registry under a pthread harness (`pdl_registry_harness.c`): threads registering shared keys behind a barrier lose none and double none, and a full registry accepts exactly its limit. The same harness must fail against a copy of the former 64-entry registry (`fixtures/pdl_registry_old.c`). Host only. |
-| `test_pdl_wait.py` | The wait rule of programmatic launch, by source (`pdl_wait_check.py`): every kernel that calls `euhedral_pdl_begin()` does so as a top-level statement before any `return` and before any use (read or write) of a pointer parameter (address arithmetic and `const` model weights excepted), following helpers within the kernel's own translation unit; every kernel the Rust launch catalog or the C host code registers reaches the wait. A structural source parser, not libclang; the gaps are listed in its docstring. Host only, run by the CI `native-package` job. |
+| `test_pdl_wait.py` | The wait rule of programmatic launch, by source (`pdl_wait_check.py`): every kernel that calls `euhedral_pdl_begin()` does so as a top-level statement before any `return` and before any use (read or write) of a pointer parameter (address arithmetic and `const` model weights excepted), following helpers within the kernel's own translation unit; every kernel the Rust launch catalog registers reaches the wait. A structural source parser, not libclang; the gaps are listed in its docstring. Host only, run by the CI `native-package` job. |
 | `test_dflash.py` | The DFlash2 operators against NumPy oracles with the reference's rounding points: convolution, top-16 and selector bit for bit, the linear's rows identical at every row count. |
 | `test_q3_kernels.py` | Q3 reference against FP64, contiguous decode against the reference, the 2 to 8 row twins bit for bit one-row. |
 | `test_q45_kernels.py` | Q4/Q5 reference, contiguous decode, row twins, the capped grid. |
 | `test_q3_conversion.py` | The device-level Q3 scale-conversion contract. |
 | `test_q3_mx.py` | The MXFP8 route: activation quantizer, Q3/Q4/Q5 linears, split-K and the gate/up kernel against FP64 (`sm_12x`). |
-| `test_q3_p2e2.py` | P2E2 decode, expansion and embedding bit for bit against the row-split routes. |
+| `test_q3_p2e2.py` | P2E2 decode, expansion and embedding kernels bit for bit against the row-split routes. |
 | `test_trellis.py` | The NumPy decoder against the golden tiles, device decode bit for bit, the prepass bit for bit, the tensor-core route and the prefill route against float64, n rows bitwise equal to n one-row launches, the scalar reference, and the FP16 range of the prepass (`trellis_reference.py` is the oracle). |
 | `test_nvfp4.py` | NVFP4 decode at both tiles (rows bitwise one-row), the scalar reference, and the SD4 kernels against the plain kernels. |
 | `test_nvfp4_native.py` | The native FP4 route: quantizer, linear, paired gate/up and skinny kernels against FP64, determinism, SD4 (`sm_12x`). |

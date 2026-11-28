@@ -14,12 +14,9 @@ token -> embedding row -> repeated over 4 residual streams
 ## Kernels and the launcher
 
 Flash-Next's operators are many small kernels that differ in their arguments. They live in one NVRTC module
-(`native/src/qwen4/kernels.cu`) behind one native entry point, `euhedral_cuda_qwen4_launch(kernel, grid, block, shared,
-words, sizes, count)`: a table of kernel names in `native/src/host/qwen4_ops.c` and the enum `Kernel` list the same
-names in the same order (a test compares them). The launcher checks the number and width (4 or 8 bytes) of every argument
-against the compiled kernel with `cuFuncGetParamInfo`, so a mismatch between a Rust caller and the CUDA source fails the
-call. Launches go through `euhedral_launch_kernel`, so they are hashed and recorded like every other submission. Adding a
-kernel is a `.cuh`, an entry in the table and the enum, and a typed wrapper in `Ops`.
+(`native/src/qwen4/kernels.cu`), launched by the Rust engine through its launch catalog. The native library lists the kernel
+names (`euhedral_cuda_qwen4_kernel_name`, from `native/src/host/qwen4_ops.c`) in the same order as the enum `Kernel`. Adding a
+kernel is a `.cuh`, an entry in the name table and the enum, and a typed wrapper in `Ops`.
 
 ## Numerics contract
 

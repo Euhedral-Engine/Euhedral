@@ -38,7 +38,7 @@ rounded to BF16.
 1, 2 or 4 groups of K per CTA from a wave model (waves / splits, plus 4% per extra split, taken only when it is at least 8%
 better). Splits write FP32 partials that `euhedral_q3mx_reduce` sums in split order and rounds to BF16. The paired gate/up
 region never splits. A P2E2 tensor too large to expand at once runs in output-row chunks whose results must equal the whole
-tensor's, so the host chooses the split from the whole tensor's rows (`euhedral_cuda_q3_mx_select_split_rows`).
+tensor's, so the launch planner chooses the split from the whole tensor's rows.
 
 **Routing.** From 9 rows (one to eight rows run the decode kernels): Q3 linears, FFN gate/up and down, Q4 and Q5 linears, and the
 GDN input projections, plus the paired gate/up region (`euhedral_q3mx_gate_up_swiglu_128x64`) of the plan's 64-row region view. A

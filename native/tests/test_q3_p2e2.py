@@ -10,10 +10,7 @@ without BIG codes, and realistic and calibrated code distributions.
 import contextlib
 import ctypes as C
 from pathlib import Path
-import shutil
-import subprocess
 import sys
-import tempfile
 import unittest
 
 try:
@@ -35,43 +32,6 @@ if np is not None:
     # The reference encoder (tools/euhedral_artifacts/q3_p2e2.py) needs NumPy.
     sys.path.insert(0, str(ROOT / "tools"))
     from euhedral_artifacts import q3_p2e2 as p2e2
-
-HOST_SOURCE = r'''#include <stdint.h>
-#include <cuda.h>
-#include "cuda_kernel_loader.h"
-#include "euhedral_cuda.h"
-static CUmodule injected_module;
-static int exact;
-void p2e2_test_set_module(uintptr_t handle) { injected_module = (CUmodule)handle; }
-void p2e2_test_set_exact(int value) { exact = value; }
-int euhedral_cuda_bind_thread_context(void) { return EUHEDRAL_CUDA_SUCCESS; }
-int euhedral_cuda_load_kernel(const void* anchor, const char* source_name,
-        const char* function_name, CUmodule* module, CUfunction* function) {
-    (void)anchor; (void)source_name;
-    *module = injected_module;
-    return cuModuleGetFunction(function, injected_module, function_name) == CUDA_SUCCESS
-            ? EUHEDRAL_CUDA_SUCCESS : EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-}
-void* euhedral_cuda_submission_stream(void) { return NULL; }
-void euhedral_cuda_pdl_register(CUfunction function) { (void)function; }
-int euhedral_cuda_exact_numerics(void) { return exact; }
-int euhedral_cuda_select_exact_numerics(int value) { int previous = exact; exact = value; return previous; }
-int euhedral_cuda_row_exact(void) { return 0; }
-CUresult euhedral_launch_kernel(CUfunction function, unsigned int gx, unsigned int gy, unsigned int gz,
-        unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared, CUstream stream,
-        void** parameters, void** extra) {
-    return cuLaunchKernel(function, gx, gy, gz, bx, by, bz, shared, stream, parameters, extra);
-}
-/* The scalar reference is a separate module; this harness only checks routes that never reach it. */
-#include "reference.h"
-int euhedral_reference_q3(const void* input, const void* weights, void* output, uint32_t rows,
-        uint32_t in_features, uint32_t out_features, uint64_t weights_byte_size) {
-    (void)input; (void)weights; (void)output; (void)rows; (void)in_features; (void)out_features;
-    (void)weights_byte_size;
-    return EUHEDRAL_CUDA_KERNEL_UNAVAILABLE;
-}
-#include "q3_linear_bf16.c"
-'''
 
 
 def realistic(rng, rows, k):
@@ -286,90 +246,6 @@ class P2e2KernelTest(unittest.TestCase):
         self.assertEqual(actual, expected)
         row = hidden * 2
         self.assertEqual(expected[5 * row:7 * row], bytes([SENTINEL]) * 2 * row)
-
-
-@unittest.skipIf(UNAVAILABLE is not None, UNAVAILABLE or "")
-class P2e2HostTest(unittest.TestCase):
-    """Host entry points: geometry checks, the route decision and the expansion destination."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.gpu = Gpu(b'#include "q3/kernels.cu"\n')
-        cls.directory = tempfile.TemporaryDirectory()
-        harness = Path(cls.directory.name) / "p2e2_host.c"
-        library = Path(cls.directory.name) / "libp2e2_host.so"
-        harness.write_text(HOST_SOURCE)
-        cuda_root = ROOT / "build/cuda-dev/linux-x64"
-        libdir, runtime = cuda_root / "lib", cuda_root / "runtime"
-        subprocess.run([shutil.which("gcc"), "-shared", "-fPIC", "-pthread", "-O2",
-                        "-I", str(ROOT / "native/include"), "-I", str(ROOT / "native/src/host"),
-                        "-I", str(cuda_root / "include"), "-L", str(libdir), f"-Wl,-rpath,{libdir}:{runtime}",
-                        str(harness), "-lcuda", "-lcudart", "-o", str(library)], check=True, capture_output=True, text=True)
-        cls.host = C.CDLL(str(library))
-        cls.host.p2e2_test_set_module.argtypes = (C.c_size_t,)
-        cls.host.p2e2_test_set_exact.argtypes = (C.c_int,)
-        cls.host.p2e2_test_set_module(cls.gpu.module.value)
-        cls.decode = cls.host.euhedral_cuda_linear_q3_p2e2_decode_bf16
-        cls.decode.argtypes = (C.c_void_p, C.c_void_p, C.c_void_p, C.c_uint, C.c_uint, C.c_uint, C.c_uint64)
-        cls.expand = cls.host.euhedral_cuda_q3_p2e2_expand
-        cls.expand.argtypes = (C.c_void_p, C.c_uint64, C.c_uint, C.c_uint, C.c_uint, C.c_uint, C.c_void_p, C.c_uint64)
-        cls.rng = np.random.default_rng(0x9E2E3)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.gpu.close()
-        cls.directory.cleanup()
-
-    def setUp(self):
-        self.host.p2e2_test_set_exact(0)
-
-    def test_up_to_eight_rows_are_bitwise_the_contiguous_rows_kernels(self):
-        rows, k = 32, 2048
-        source, scale_offset = row_split(adversarial(self.rng, rows, k), self.rng)
-        tensor = p2e2.encode(source, rows, k)
-        with contextlib.ExitStack() as stack:
-            dw = self.gpu.upload(source); stack.callback(self.gpu.free, dw)
-            dc = self.gpu.upload(tensor); stack.callback(self.gpu.free, dc)
-            for m in range(1, 9):
-                with self.subTest(m=m):
-                    x = (self.rng.standard_normal((m, k)).astype(np.float32) * 3.0)
-                    xb = (x.view(np.uint32) >> 16).astype(np.uint16).tobytes()
-                    dx = self.gpu.upload(xb); stack.callback(self.gpu.free, dx)
-                    y0 = self.gpu.zeros(m * rows * 2, fill=SENTINEL); stack.callback(self.gpu.free, y0)
-                    y1 = self.gpu.zeros(m * rows * 2, fill=SENTINEL); stack.callback(self.gpu.free, y1)
-                    name = "euhedral_q3_decode_contiguous" + ("" if m == 1 else f"_rows{m}")
-                    self.gpu.launch(name, rows // 16,
-                                    [C.c_uint64(dx), C.c_uint64(dw), C.c_uint64(y0), C.c_uint(m), C.c_uint(k),
-                                     C.c_uint(rows), C.c_uint64(scale_offset)])
-                    self.assertEqual(self.decode(dx, dc, y1, m, k, rows, len(tensor)), 0)
-                    self.gpu.sync()
-                    self.assertEqual(self.gpu.download(y1, m * rows * 2), self.gpu.download(y0, m * rows * 2))
-
-    def test_routes_and_geometry(self):
-        rows, k = 32, 2048
-        codes = realistic(self.rng, rows, k)
-        source, _ = row_split(codes, self.rng)
-        tensor = p2e2.encode(source, rows, k)
-        with contextlib.ExitStack() as stack:
-            dx = self.gpu.upload(bytes(2 * k * 9)); stack.callback(self.gpu.free, dx)
-            dc = self.gpu.upload(tensor); stack.callback(self.gpu.free, dc)
-            y = self.gpu.zeros(rows * 2 * 9); stack.callback(self.gpu.free, y)
-            out = self.gpu.zeros(len(source)); stack.callback(self.gpu.free, out)
-            self.assertEqual(self.decode(dx, dc, y, 1, k, rows, len(tensor)), 0)
-            self.assertEqual(self.decode(dx, dc, y, 8, k, rows, len(tensor)), 0)
-            self.assertEqual(self.decode(dx, dc, y, 9, k, rows, len(tensor)), -5)
-            payload = p2e2.p2e2_offsets(rows, k)[2]
-            full = payload + 4 * (rows * k // 16 + p2e2.PAYLOAD_PAD_WORDS)
-            self.assertEqual(self.decode(dx, dc, y, 1, k, rows, len(tensor) - 2), -3)
-            self.assertEqual(self.decode(dx, dc, y, 1, k, rows, full + 4), -3)
-            self.assertEqual(self.decode(dx, dc, y, 1, k, rows, payload + 4 * p2e2.PAYLOAD_PAD_WORDS - 4), -3)
-            self.assertEqual(self.decode(dx, dc, y, 1, k + 512, rows, len(tensor)), -3)
-            self.host.p2e2_test_set_exact(1)
-            self.assertEqual(self.decode(dx, dc, y, 1, k, rows, len(tensor)), -5)
-            self.assertEqual(self.expand(dc, len(tensor), rows, k, 0, rows, out, len(source) - 1), -2)
-            self.assertEqual(self.expand(dc, len(tensor), rows, k, rows - 1, 2, out, len(source)), -1)
-            self.assertEqual(self.expand(dc, len(tensor), rows, k, 0, rows, out, len(source)), 0)
-            self.assertEqual(self.gpu.download(out, len(source)), source)
 
 
 if __name__ == "__main__":
