@@ -297,7 +297,7 @@ Every piece of host work a request needs runs as frames on the lattice's workers
   unit has been admitted for `host.idle-release` (0 keeps them attached) the watch detaches both; the next unit attaches a
   fresh set. A frame is published only while a unit it belongs to is admitted, so none is in flight when the sinks go.
 - **Waking a thread outside the lattice per token is expensive.** When a blocked caller drained each token's text from a
-  queue, the wake-up sat between a VERIFY's retirement and the next admission: the median gap after a 4-row VERIFY was 276 us,
+  queue, the wake-up sat between a verify quantum's retirement and the next admission: the median gap after a 4-row verify quantum was 276 us,
   229 us when nothing outside the workers was woken (measured on the earlier host implementation). The benchmark therefore
   drives the asynchronous path, as the server does; the blocking call remains for tests and tools.
 
@@ -361,7 +361,7 @@ by those layers. A layer copies its host pages into the region before attention 
 carried-state edges protect region reuse. Prefix checkpoints then stop at the device-page frontier. See
 [memory architecture](04-memory-architecture.md).
 
-Decode and VERIFY quanta that start below 1024 tokens launch their kernels with CUDA programmatic dependent launch
+Decode and verify quanta that start below 1024 tokens launch their kernels with CUDA programmatic dependent launch
 (selected per quantum): every kernel registered for it begins with `griddepcontrol.wait` (`native/src/common/pdl.cuh`), so
 it cannot read a predecessor's output early. It won 12 of 12 paired forks (about +1%) at a 64-token context and 10 of 12 at
 1024, so longer contexts keep ordinary launches. Quanta replayed from captured CUDA graphs
@@ -464,15 +464,13 @@ medians unless said otherwise.
 Found by that probe and fixed: **the expert cache's fetch retries.** A fetch that found the cache full published itself
 again: 20-25 million frames in a 66 s Flash-Next screen, all routed to the cache owner's one worker, which they kept
 busy; the frames that free the resource (a release, a retirement) waited behind them, 0.4-1 ms in prefill and cold decode.
-The cache's bookkeeping is now a source of the lattice (`residency/expert_cache/source.rs`), polled by the workers like the
-artifact's reads: requests, releases and retirements are records in a lock-free queue, the one worker that polls applies
-them in order, and a request the cache cannot serve waits in the source until something was given back, with nothing
-running again meanwhile. Paired against the retrying fetch (two forks each): fetches that found the cache full 34,000
+The cache's bookkeeping is now a source of the lattice (`residency/expert_cache/source.rs`), attached like the device
+completions: requests, releases, read completions and copy retirements are records posted to its owner, the one worker
+that polls applies them in order, and a request the cache cannot serve waits with its cause and is asked again once per
+change of that cause, with nothing running again meanwhile. Paired against the retrying fetch (two forks each): fetches that found the cache full 34,000
 against 120 a token in a 512-token prefill and 7,400 against 26 in a 4096-token one; the hop from a copy's retirement to its
 application 18-56 us against 8-9; prefill unchanged (113-115 / 494-545 tokens/s); decode at 4096 tokens 61.4 and 60.3 ms
-against 54.3 and 52.0 cold, 44.5 and 47.7 against 39.1 and 38.6 warm; at 64 tokens within noise. A slot owns the load
-object and the load context (its read parts, join, submit, copy, retire and failure frames and its tier directive) from the
-time the cache is made, so a miss, a request and a poll allocate nothing.
+against 54.3 and 52.0 cold, 44.5 and 47.7 against 39.1 and 38.6 warm; at 64 tokens within noise.
 
 Tried and not kept, each against a paired control (differences inside the run-to-run spread of 2-4%):
 
@@ -488,12 +486,13 @@ Known costs this leaves:
 
 - **One owner for the workspace.** The admission (85 us) serializes all sessions' starts on one owner: capacity of about
   11,000 admissions a second, far beyond what one GPU's decode needs.
-- **Per-quantum fingerprints.** A third of the admission is the capture key (`CaptureKey`): the allocation id of every state
-  address, a concurrent-map lookup each. It could be kept in the states instead of recomputed (about 30 us a quantum).
+- **Per-quantum fingerprints.** A third of the admission is the capture key (`CaptureKey`), which holds the allocation identity of
+  every state address the quantum's launches bake in; on the earlier host implementation each was a concurrent-map lookup
+  (about 30 us a quantum). The Rust engine has not been re-measured.
 
 ## No locks on the hot path
 
-Nothing that runs per quantum or per token takes a lock, waits blocking or starts a thread, in either model. State is
+Nothing that runs per quantum or per token takes a lock, waits blocking or starts a thread. State is
 confined by routing every frame that touches it to its owner (the workspace's, the prefix cache's) or by making it a source
 that one poller at a time owns (the expert cache), or behind a mailbox claim that one thread at a time holds. Device
 completions arrive as frames, and order comes from edges and from a sequence's admission order (`Sequencer`). The hot path
