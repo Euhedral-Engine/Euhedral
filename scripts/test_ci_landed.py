@@ -63,11 +63,16 @@ class OnMainTest(unittest.TestCase):
     def test_a_promoted_head_with_a_green_push_run_is_landed(self):
         self.assertIsNone(self.on_main({MERGE: [run(head_sha=MERGE, event="push")]}, merge_tree="t9", parents=(BASE,)))
 
-    def test_a_parent_with_the_same_tree_and_a_green_run_is_landed(self):
-        self.assertIsNone(self.on_main({HEAD: [run(event="push")]}, merge_tree="t1"))
+    def test_a_parent_with_the_same_tree_and_a_green_push_run_is_landed(self):
+        self.assertIsNone(self.on_main({HEAD: [run(event="push")]}, merge_tree="t1", parents=(BASE, HEAD)))
 
     def test_a_parent_with_another_tree_does_not_vouch_for_the_commit(self):
         self.assertIn("never tested", self.on_main({BASE: [run(head_sha=BASE)]}, merge_tree="t9"))
+
+    def test_a_pull_request_or_dispatched_run_does_not_vouch_for_a_commit_on_main(self):
+        for event in ("pull_request", "workflow_dispatch"):
+            runs = {MERGE: [run(head_sha=MERGE, event=event)]}
+            self.assertIn("never tested", self.on_main(runs, parents=(BASE,)), event)
 
     def test_a_failed_run_does_not_vouch_for_the_commit(self):
         self.assertIn("never tested", self.on_main({MERGE: [run(head_sha=MERGE, event="push", conclusion="failure")]}, parents=(BASE,)))
@@ -97,6 +102,27 @@ class IsOnMainTest(unittest.TestCase):
         trees = {MERGE: "t", HEAD: "t"}
         code = ci_landed.check(MERGE, is_on_main, lambda sha: [BASE, HEAD], trees.__getitem__, lambda commit, limit: {"workflow_runs": []})
         self.assertEqual(code, 2)
+
+
+class TestedTreeTest(unittest.TestCase):
+    """The mode that asks whether the head of main is a tested tree: 0 tested, 1 untested, 2 could not be checked."""
+
+    def exit_code(self, runs_by_commit, merge_tree="t9", reply=None):
+        trees = {MERGE: merge_tree, HEAD: "t1", BASE: "t0"}
+        pages = lambda commit, limit: reply or {"workflow_runs": runs_by_commit.get(commit, [])}
+        return ci_landed.check(MERGE, lambda sha: True, lambda sha: [BASE, HEAD], trees.__getitem__, pages, "notice")
+
+    def test_an_untested_merge_made_on_main_is_1(self):
+        self.assertEqual(self.exit_code({HEAD: [run()]}), 1)
+
+    def test_a_head_with_a_green_push_run_is_0(self):
+        self.assertEqual(self.exit_code({MERGE: [run(head_sha=MERGE, event="push")]}), 0)
+
+    def test_the_merge_of_a_green_head_with_its_tree_is_0(self):
+        self.assertEqual(self.exit_code({HEAD: [run()]}, merge_tree="t1"), 0)
+
+    def test_an_unreadable_reply_is_2(self):
+        self.assertEqual(self.exit_code({}, reply={"message": "denied"}), 2)
 
 
 class CheckTest(unittest.TestCase):

@@ -80,6 +80,12 @@ class LintCiTriggersTest(unittest.TestCase):
         ):
             self.assertEqual(len(broken(old, new)), 1, new)
 
+    def test_a_label_term_in_a_trailing_comment_does_not_count(self):
+        land = "contains(github.event.changes.added_labels.*.name, 'land')"
+        self.assertEqual(len(broken("    if: " + land + "\n", "    if: always() # && " + land + "\n")), 1)
+        self.assertEqual(broken("    if: " + land + "\n", "    if: " + land + " # the label\n"), [])
+        self.assertEqual(broken("    if: " + land + "\n", "    if: github.ref != '#x' && " + land + "\n"), [])
+
     def test_a_label_term_in_a_conjunction_passes(self):
         land = "contains(github.event.changes.added_labels.*.name, 'land')"
         self.assertEqual(broken("    if: " + land + "\n", "    if: always() && " + land + "\n"), [])

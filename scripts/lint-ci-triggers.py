@@ -50,7 +50,8 @@ def sub_block(block, key):
 
 
 def conjuncts(condition):
-    """The parts of an `if:` condition joined by top-level `&&`, or None when a top-level `||` makes it an alternative."""
+    """The parts of an `if:` condition joined by top-level `&&` (a trailing ` #` comment outside quotes is cut off), or None
+    when a top-level `||` makes it an alternative."""
     parts, depth, quote, start, index = [], 0, None, 0, 0
     while index < len(condition):
         char = condition[index]
@@ -59,6 +60,9 @@ def conjuncts(condition):
             quote = None if char == quote else quote
         elif char in "'\"":
             quote = char
+        elif char == "#" and (index == 0 or condition[index - 1].isspace()):
+            condition = condition[:index]
+            break
         elif char in "([":
             depth += 1
         elif char in ")]":

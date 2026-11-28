@@ -10,7 +10,8 @@ has a tree no run saw and fails; landing a pull request (an empty one will do) t
 (its `land-guard` fails) and a run of another head do not count.
 
 usage: ci-landed.py SHA   (environment: GITEA_TOKEN, API_URL such as http://host/api/v1, REPOSITORY owner/name)
-exit 0: landed, 1: not landed (one line says why), 2: the check could not be made
+       ci-landed.py --tested-tree SHA   the same rule for a commit of main (the head of main): is its tree a tested one?
+exit 0: landed (tested), 1: not landed (untested; one line says why), 2: the check could not be made
 """
 
 import json
@@ -22,8 +23,9 @@ import urllib.request
 WORKFLOW = "ci.yaml"
 
 
-def land_run_succeeded(runs, sha, events=("pull_request",)):
-    """True when `runs` (the `workflow_runs` of the Actions API) has a successful run of ci.yaml on `sha` for one of `events`."""
+def green_run_on(runs, sha, events=("pull_request",)):
+    """True when `runs` (the `workflow_runs` of the Actions API) has a completed successful run of ci.yaml on `sha` whose event
+    is one of `events` (a dispatched run is never in the default or in either use)."""
     return any(
         run.get("head_sha") == sha
         and run.get("path", "").split("@")[0] == WORKFLOW
@@ -35,16 +37,19 @@ def land_run_succeeded(runs, sha, events=("pull_request",)):
 
 
 def verdict(sha, on_main, parents, trees, runs_of):
-    """The reason `sha` is not a tested tree pushed through a landed pull request, or None when it is.
+    """The reason `sha` is not a tested tree, or None when it is: the merge of a pull request head with a green land run and
+    that head's tree, or (when `on_main`) a commit that, or a same-tree parent that, had a green push run of ci.yaml (the
+    promoted integration head). A pull request run does not vouch for a commit on main: its diff against main may be empty,
+    so it may have run no group.
 
     `parents` are the parent commits of `sha`, `trees(commit)` is a commit's tree and `runs_of(commit)` its Actions runs."""
     reason = merge_verdict(sha, parents, trees, runs_of)
     if reason is None or not on_main:
         return reason
     tested = (sha, *(parent for parent in parents if trees(parent) == trees(sha)))
-    if any(land_run_succeeded(runs_of(commit), commit, ("pull_request", "push")) for commit in tested):
+    if any(green_run_on(runs_of(commit), commit, ("push",)) for commit in tested):
         return None
-    return f"{sha} is on main but its tree was never tested: land a pull request (an empty one will do) to test it"
+    return f"{sha} is on main but its tree was never tested: land a pull request; its CI runs every group because main's head is untested"
 
 
 def merge_verdict(sha, parents, trees, runs_of):
@@ -54,7 +59,7 @@ def merge_verdict(sha, parents, trees, runs_of):
     head = parents[1]
     if trees(sha) != trees(head):
         return f"{sha} does not have the tree of the pull request head {head}: the target moved after the land run"
-    if not land_run_succeeded(runs_of(head), head):
+    if not green_run_on(runs_of(head), head):
         return f"the pull request head {head} has no successful land run of {WORKFLOW}"
     return None
 
@@ -62,7 +67,7 @@ def merge_verdict(sha, parents, trees, runs_of):
 PAGE = 50
 
 
-def check(sha, is_on_main, parents_of, tree_of, runs_page):
+def check(sha, is_on_main, parents_of, tree_of, runs_page, level="error"):
     """Exit code for `sha`: 0 landed, 1 not landed, 2 the check could not be made (a ValueError from a collaborator, or an
     Actions reply that has no `workflow_runs` or is a full page, which may hide the run)."""
     def runs_of(commit):
@@ -79,9 +84,9 @@ def check(sha, is_on_main, parents_of, tree_of, runs_page):
         print(f"::error::the check could not be made: {error}", file=sys.stderr)
         return 2
     if reason:
-        print(f"::error::{reason}", file=sys.stderr)
+        print(f"::{level}::{reason}", file=sys.stderr)
         return 1
-    print(f"{sha} is a tested tree: the merge of a pull request head with a green land run, or a commit with a green run")
+    print(f"{sha} is a tested tree")
     return 0
 
 
@@ -98,7 +103,8 @@ def is_on_main(sha):
 
 
 def main(argv):
-    if len(argv) != 1:
+    main_head = argv[:1] == ["--tested-tree"]
+    if len(argv) != (2 if main_head else 1):
         print(__doc__, file=sys.stderr)
         return 2
     try:
@@ -115,11 +121,12 @@ def main(argv):
             return json.load(response)
 
     return check(
-        argv[0],
-        is_on_main,
+        argv[-1],
+        (lambda sha: True) if main_head else is_on_main,
         lambda sha: git("rev-list", "--parents", "-n", "1", sha).split()[1:],
         lambda commit: git("rev-parse", f"{commit}^{{tree}}"),
         runs_page,
+        "notice" if main_head else "error",
     )
 
 
