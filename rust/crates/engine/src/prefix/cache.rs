@@ -102,6 +102,8 @@ pub enum OpenError {
     Interval,
     #[error("a chunk's checkpoint takes {needed} slots and the arena has {slots}")]
     BaseCapacity { needed: usize, slots: u32 },
+    #[error("the requests' checkpoints hold {kind:?} state, which the layout has no room for")]
+    NoState { kind: Speculation },
     #[error("a chunk's checkpoint that holds {kind:?} state takes {needed} slots and the arena has {slots}")]
     Capacity {
         kind: Speculation,
@@ -284,6 +286,9 @@ impl PrefixCache {
             });
         }
         if let Some(kind) = drafting {
+            if !layout.has_speculation(kind) {
+                return Err(OpenError::NoState { kind });
+            }
             let needed = layout.slots(0, chunk, Some(kind));
             if needed > arena.capacity() as usize {
                 return Err(OpenError::Capacity {

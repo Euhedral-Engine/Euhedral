@@ -1482,17 +1482,9 @@ impl Owner {
         run.carried = retained;
         run.carried_marker = Some(reserved);
         if let Mode::Speculative { state, .. } = &mut run.mode {
-            match resume {
-                // Unless the last row came whole, the draft pairs the hidden row it was restored with and the token at
-                // the position, before the chunks do.
-                Resume::Mtp { whole } => state.resumed_at(position as u32, whole),
-                Resume::Drafter => {
-                    if let Some(drafter) = state.drafter_mut() {
-                        drafter.resumed_at(position);
-                    }
-                }
-                Resume::Nothing => {}
-            }
+            // Unless the MTP layer's last row came whole, the draft pairs the hidden row it was restored with and the
+            // token at the position, before the chunks do.
+            state.restored(position, resume);
         }
         Ok(())
     }

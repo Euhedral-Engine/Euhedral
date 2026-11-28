@@ -808,6 +808,18 @@ fn a_cache_whose_arena_cannot_hold_one_mtp_checkpoint_does_not_open_when_request
 }
 
 #[test]
+fn a_cache_for_requests_that_draft_with_state_the_layout_lacks_does_not_open() {
+    let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
+    let refused = PrefixCacheHandle::open(parts_with(&layout, 64, Some(Speculation::Dflash2)), inline()).err();
+    assert_eq!(
+        refused,
+        Some(OpenError::NoState {
+            kind: Speculation::Dflash2
+        })
+    );
+}
+
+#[test]
 fn a_cache_whose_arena_cannot_hold_one_drafting_checkpoint_does_not_open() {
     let layout = CheckpointLayout::new(&compact(), FORMAT)
         .expect("layout")

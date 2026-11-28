@@ -35,7 +35,7 @@ use euhedral_inference_cuda::DevicePtr;
 
 use super::acceptance::{Accepted, accept, accept_tokens};
 use super::dflash2::{Drafter, DrafterStep};
-use super::prefix_plan::{DraftKind, catch_up_captures};
+use super::prefix_plan::{Carrier, DraftKind, Resume, carrier, catch_up_captures};
 use super::request::{FinishReason, Verification};
 use super::sampled::SampledRows;
 use super::source::{Admission, Flying, Mode, OVERLAP_MAX_START_POSITION, Owner, Role, Run, Step};
@@ -252,6 +252,20 @@ impl Speculating {
         self.resuming = true;
     }
 
+    /// A restore of the checkpoint at `position` left `resume` to set: the MTP layer's catch-up state, or the DFlash2
+    /// drafter's context, which then starts at the position.
+    pub(super) fn restored(&mut self, position: u64, resume: Resume) {
+        match resume {
+            Resume::Mtp { whole } => self.resumed_at(position as u32, whole),
+            Resume::Drafter => {
+                if let Some(drafter) = self.drafter.as_mut() {
+                    drafter.resumed_at(position);
+                }
+            }
+            Resume::Nothing => {}
+        }
+    }
+
     /// The restore that was asked for was refused: the prompt starts from its first row.
     pub(super) fn start_over(&mut self) {
         if let Some(drafter) = self.drafter.as_mut() {
@@ -393,7 +407,8 @@ impl Owner {
             .checkpoints
             .as_ref()
             .is_some_and(|checkpoints| checkpoints.wants(end));
-        let checkpoint = catch_up_captures(wanted, resuming);
+        let checkpoint =
+            carrier(state.draft_kind(), false) == Carrier::DraftUpdate && catch_up_captures(wanted, resuming);
         let admission = Admission {
             role: Role::PromptCatchUp,
             kind: QuantumKind::Draft,
@@ -724,10 +739,63 @@ impl Owner {
 
 #[cfg(test)]
 mod tests {
-    use super::Speculating;
+    use super::{DraftKind, Resume, Speculating};
 
     fn state() -> Speculating {
         Speculating::new(3, 4096, 3000, 64)
+    }
+
+    #[test]
+    fn a_restore_of_the_drafter_starts_its_context_at_the_position_and_leaves_the_mtp_state() {
+        let mut state = Speculating::new(3, 4096, 3000, 64).with_drafter();
+        state.restored(2560, Resume::Drafter);
+        let drafter = state.drafter_mut().unwrap();
+        drafter.tapped(512).unwrap();
+        assert_eq!(drafter.take_context(), Some((2560, 512)));
+        assert_eq!(
+            (state.mtp_position, state.prompt_catch_up, state.resuming),
+            (0, None, false)
+        );
+    }
+
+    #[test]
+    fn a_restore_of_the_mtp_layer_sets_the_catch_up_state_and_not_the_drafters() {
+        let mut state = state();
+        state.restored(2560, Resume::Mtp { whole: false });
+        assert_eq!(
+            (state.mtp_position, state.prompt_catch_up, state.resuming),
+            (2559, Some(1), true)
+        );
+        state.restored(2560, Resume::Mtp { whole: true });
+        assert_eq!(
+            (state.mtp_position, state.prompt_catch_up, state.resuming),
+            (2560, None, false)
+        );
+        assert!(state.drafter().is_none());
+    }
+
+    #[test]
+    fn a_restore_with_nothing_to_set_leaves_the_state_as_it_was() {
+        let mut state = state();
+        state.restored(2560, Resume::Nothing);
+        assert_eq!(
+            (state.mtp_position, state.prompt_catch_up, state.resuming),
+            (0, None, false)
+        );
+    }
+
+    #[test]
+    fn the_kind_of_a_request_follows_its_drafter_and_whether_it_drafts() {
+        assert_eq!(Speculating::new(3, 4096, 3000, 64).draft_kind(), DraftKind::Mtp);
+        assert_eq!(Speculating::new(3, 4096, 3000, 1).draft_kind(), DraftKind::Idle);
+        assert_eq!(Speculating::new(3, 4096, 4096, 64).draft_kind(), DraftKind::Idle);
+        let with = |prompt, max_tokens| {
+            Speculating::new(3, 4096, prompt, max_tokens)
+                .with_drafter()
+                .draft_kind()
+        };
+        assert_eq!(with(3000, 64), DraftKind::Dflash2 { drafting: true });
+        assert_eq!(with(3000, 1), DraftKind::Dflash2 { drafting: false });
     }
 
     #[test]
