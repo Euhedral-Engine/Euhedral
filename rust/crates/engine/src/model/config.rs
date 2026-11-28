@@ -5,6 +5,7 @@ use euhedral_inference_settings::{KvFormat, SpeculationMode};
 
 use crate::error::PlanError;
 use crate::model::dflash2::Dflash2Config;
+use crate::residency::planner::MAX_VERIFIED;
 
 /// What a decoder layer mixes tokens with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,13 +286,14 @@ impl ArtifactProfile {
 
     /// Drafts per verification: the stored MTP depth, else 2 for Q3 and 4 for every other pure artifact; a mixed
     /// artifact must store its depth (`ArtifactProfile.draftLength`). DFlash2 verifies the first 6 of a block's 7
-    /// drafts. Zero without a drafter.
+    /// drafts. At most [`MAX_VERIFIED`], the most drafts one verification checks: a stored depth above it is valid
+    /// metadata, and the plan sizes everything for the depth drafting can use. Zero without a drafter.
     pub fn speculative_depth(&self) -> Result<usize, PlanError> {
         match self.speculation {
             Speculation::None => Ok(0),
             Speculation::Dflash2 => Ok(6),
             Speculation::Mtp => match (self.draft_depth, self.quantization) {
-                (Some(depth), _) => Ok(usize::from(depth)),
+                (Some(depth), _) => Ok(usize::from(depth).min(MAX_VERIFIED as usize)),
                 (None, Quantization::Mixed) => Err(PlanError::Inventory(
                     "a mixed artifact stores no MTP draft depth (a composite can supply one)".to_string(),
                 )),

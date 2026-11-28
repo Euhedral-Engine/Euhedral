@@ -191,7 +191,8 @@ pub struct ResidencyPlan {
     pub rows: WorkspaceRows,
     /// What the projections and the drafter make of the artifact.
     pub profile: ArtifactProfile,
-    /// Drafts per verification (0 without a drafter).
+    /// Drafts per verification (0 without a drafter), at most [`MAX_VERIFIED`]: what every size of the plan's
+    /// verification state is computed from.
     pub draft_depth: usize,
     /// Rows of one step of a teacher-forced run that takes several rows at a time, which every sequence is sized to
     /// verify (`batching.forced-rows`); 0 when the settings ask for none.
@@ -479,14 +480,12 @@ pub fn plan_closest(
             "batching.forced-rows ({forced_rows}) is more than the {chunk} rows of batching.prefill-chunk-tokens"
         )));
     }
-    let verified = (1 + (draft_depth as u64).min(MAX_VERIFIED))
-        .max(DRAFT_LOGITS_ROWS)
-        .max(forced_rows as u64);
+    let verified = (1 + draft_depth as u64).max(DRAFT_LOGITS_ROWS).max(forced_rows as u64);
     // A pass of several sequences' verifications scores every row of every member: its logits rows are the pass's.
     let (pass_rows, pass_parts) = pass_bounds(
         &settings.batching,
         inputs.sequences,
-        (1 + (draft_depth as u64).min(MAX_VERIFIED)).max(forced_rows as u64),
+        (1 + draft_depth as u64).max(forced_rows as u64),
     );
     let pass_logits = if (draft_depth > 0 || forced_rows > 0) && pass_parts > 1 {
         pass_rows as u64

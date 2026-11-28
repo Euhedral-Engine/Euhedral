@@ -230,7 +230,7 @@ impl Generation {
             (Some(token_ids), Some(device)) if residency.draft_depth > 0 && sequence.mtp_kv.is_some() => Some(Drafts {
                 token_ids,
                 device_token_ids: device.ptr,
-                depth: residency.draft_depth.min(MAX_VERIFIED),
+                depth: residency.draft_depth,
             }),
             _ => None,
         };
@@ -257,7 +257,7 @@ impl Generation {
                     );
                     return Err(Box::new((EngineError::Runtime(why), sequence)));
                 }
-                Ok(_) => Some(residency.draft_depth.min(MAX_VERIFIED)),
+                Ok(_) => Some(residency.draft_depth),
                 Err(error) => return Err(Box::new((error, sequence))),
             }
         } else {
