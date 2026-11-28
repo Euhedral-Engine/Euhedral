@@ -22,7 +22,7 @@ use super::schedule::{Schedule, Settled};
 use crate::gptq::format::Format;
 use crate::gptq::state::QuantState;
 use crate::gptq::{DeviceRange, Factor, Finished, GptqLane, Refused, RoundRequest, TensorScales};
-use crate::memory::{Claims, StepBytes};
+use crate::memory::{Claims, StagingNeeds, StepBytes};
 use crate::recipe::{Format as StoredFormat, Recipe};
 use crate::step::idle;
 
@@ -164,6 +164,26 @@ pub unsafe fn round_all(
     }
 }
 
+/// Puts `needs` ([`lane_staging`](crate::gptq::lane_staging)) in the pinned pool `lanes` share, charging the planner's
+/// pinned location while the buffers are acquired: afterwards every class holds at least the buffers `needs` counts.
+/// A step's take of a class can still come back empty while another lane takes or gives back a buffer of the same
+/// class at that moment ([`PinnedPool`](euhedral_inference_cuda::PinnedPool)); that step then allocates one buffer,
+/// which the pool keeps. Allocates (waits on the driver): call it before any frame runs. No lanes warm nothing. Fails
+/// when the planner or the pool refuses.
+pub fn prewarm(services: &Services, lanes: &[GptqLane], needs: &StagingNeeds) -> Result<(), CalibrateError> {
+    let Some(lane) = lanes.first() else { return Ok(()) };
+    let mut claims = claims_for(
+        services,
+        StepBytes {
+            device: 0,
+            pinned: needs.bytes(),
+        },
+        "gptq prewarm",
+    )?;
+    lane.prewarm_staging(needs, &mut claims)
+        .map_err(|error| CalibrateError::failed("the pinned staging prewarm", error))
+}
+
 /// The linears with the decoded weights the round gave back.
 fn ended(shells: Vec<Linear>, settled: Settled<GptqLane, DeviceBuffer>) -> Ended {
     for (shell, buffer) in shells.iter().zip(settled.decoded) {
@@ -255,7 +275,7 @@ impl Object {
 }
 
 /// The format the rounding works in, from the one the recipe stores the object in.
-fn rounded(stored: StoredFormat) -> Format {
+pub(crate) fn rounded(stored: StoredFormat) -> Format {
     Format {
         name: stored.name,
         layout: stored.layout,

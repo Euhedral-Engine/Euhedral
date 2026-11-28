@@ -43,9 +43,9 @@ const FINAL_NORM: &str = "model.language_model.norm.weight";
 const EMBEDDING_NORM: &str = "mtp.pre_fc_norm_embedding.weight";
 const HIDDEN_NORM: &str = "mtp.pre_fc_norm_hidden.weight";
 const MTP_NORM: &str = "mtp.norm.weight";
-const INPUT_PROJECTION: &str = "mtp/input_projection";
+pub(super) const INPUT_PROJECTION: &str = "mtp/input_projection";
 pub(super) const OUTPUT_HEAD: &str = "text/output_head";
-const DRAFT_HEAD: &str = "text/draft_head";
+pub(super) const DRAFT_HEAD: &str = "text/draft_head";
 const I32_BYTES: usize = 4;
 
 /// What the heads keep on the card between their calls.

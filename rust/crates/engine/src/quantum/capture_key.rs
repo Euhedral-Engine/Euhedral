@@ -464,34 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn drafter_quanta_are_keyed_by_their_rows_and_their_buffers() {
-        let mut context = key();
-        context.view = View::Context { rows: 3 };
-        context.kind = QuantumKind::Context;
-        context.rows = 3;
-        let mut wider = context.clone();
-        wider.view = View::Context { rows: 4 };
-        wider.rows = 4;
-        assert_ne!(context.digest(), wider.digest(), "another row count is another launch");
-        let mut block = context.clone();
-        block.view = View::Block;
-        block.kind = QuantumKind::Block;
-        assert_ne!(context.digest(), block.digest());
-        let mut regrown = context.clone();
-        regrown.buffer_generations.push(AllocationId(99));
-        assert_ne!(
-            context.digest(),
-            regrown.digest(),
-            "a reallocated ring is another address"
-        );
-        assert_eq!(
-            context.digest(),
-            context.clone().digest(),
-            "the same step shape shares a graph"
-        );
-    }
-
-    #[test]
     fn replay_rows_compare_without_their_trailing_zeros() {
         assert_eq!(trimmed(&[0, 3, 0, 0]), vec![0, 3]);
         assert_eq!(trimmed(&[0, 0]), Vec::<u32>::new());

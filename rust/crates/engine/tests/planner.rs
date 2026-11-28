@@ -981,3 +981,47 @@ fn with_speculation_none(tokens: u32) -> Settings {
     none.speculation.mode = SpeculationMode::None;
     none
 }
+
+/// The plan of the RCO artifact with a stored draft depth of `depth`, for `sequences` sequences.
+fn plan_of_depth(depth: u8, sequences: usize) -> ResidencyPlan {
+    let mut config = config();
+    config.draft_depth = Some(depth);
+    plan_with(
+        &config,
+        &rco_table(),
+        &settings(8192),
+        with_sequences(64 * GIB, sequences),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_stored_draft_depth_above_what_drafting_uses_sizes_the_plan_like_the_deepest_one_drafting_uses() {
+    let seven = plan_of_depth(7, 3);
+    let sixteen = plan_of_depth(16, 3);
+    assert_eq!(seven.draft_depth, 7);
+    assert_eq!(sixteen.draft_depth, 7);
+    assert_eq!(sixteen.verified_rows(), seven.verified_rows());
+    assert_eq!(sixteen.workspace_bytes, seven.workspace_bytes);
+    assert_eq!(sixteen.extra_sequence_bytes, seven.extra_sequence_bytes);
+    assert_eq!(sixteen.device_bytes, seven.device_bytes);
+    assert_eq!(sixteen.rows, seven.rows);
+    let mut deep = config();
+    deep.draft_depth = Some(16);
+    let profile = ArtifactProfile::of(&rco_table(), &deep).unwrap();
+    assert_eq!(
+        profile.speculative_depth().unwrap(),
+        7,
+        "the artifact's depth is not refused"
+    );
+}
+
+#[test]
+fn a_stored_draft_depth_within_what_drafting_uses_is_unchanged() {
+    for depth in [3u8, 7] {
+        let plan = plan_of_depth(depth, 2);
+        assert_eq!(plan.draft_depth, usize::from(depth));
+        assert_eq!(plan.verified_rows(), 1 + u64::from(depth));
+    }
+    assert!(plan_of_depth(3, 2).workspace_bytes < plan_of_depth(7, 2).workspace_bytes);
+}
