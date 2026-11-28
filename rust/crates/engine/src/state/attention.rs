@@ -9,8 +9,7 @@ use crate::model::ModelConfig;
 use crate::model::dflash2::Dflash2Config;
 use crate::residency::footprint::decode_scratch_bytes;
 
-/// Slots of the draft token buffer: the step's current token and up to 16 drafts
-/// (`AttentionStates.DRAFT_TOKEN_SLOTS`).
+/// Slots of the draft token buffer: the step's current token and up to 16 drafts.
 pub const DRAFT_TOKEN_SLOTS: u64 = 17;
 
 /// What drafting adds to a sequence's scratch.

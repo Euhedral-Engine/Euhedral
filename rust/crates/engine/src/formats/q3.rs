@@ -12,7 +12,7 @@
 //!   expands the tensor into the scratch first and runs the row-split route on the expansion, so the outputs are the
 //!   same bits in every case.
 //! - **A Q3 gate/up projection of 64 rows and more** on the FP8 route runs with the SwiGLU after it as one paired
-//!   launch that never splits K (`GATE_UP_MIN_ROWS`, the rows from which `ExecutionPlan` fuses them): the unpaired
+//!   launch that never splits K (`GATE_UP_MIN_ROWS`, the rows from which the plan fuses them): the unpaired
 //!   route splits K by the tile count against the device's multiprocessors, which sums in another order.
 
 #[cfg(test)]
@@ -28,7 +28,7 @@ use euhedral_inference_edrl::{WeightFormat, WeightLayout};
 use crate::formats::{LinearFormat, LinearMode, ScratchRegion};
 use crate::model::WeightRef;
 
-/// Rows from which a Q3 gate/up projection and its SwiGLU run as one launch (`ExecutionPlan.REGION_MIN_ROWS`).
+/// Rows from which a Q3 gate/up projection and its SwiGLU run as one launch.
 pub const GATE_UP_MIN_ROWS: usize = 64;
 
 /// The Q3, Q4 and Q5 linears of a device.

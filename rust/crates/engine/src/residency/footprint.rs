@@ -1,5 +1,4 @@
-//! What the sequence state costs on the device: the KV pages, the GDN state and the rest of a sequence's buffers
-//! (`ResidencyPlanner.kvBytes`, `SequenceFootprint`, `AttentionKvState.planePageBytes`).
+//! What the sequence state costs on the device: the KV pages, the GDN state and the rest of a sequence's buffers.
 
 use euhedral_inference_settings::KvFormat;
 
@@ -7,7 +6,7 @@ use crate::model::{ModelConfig, Speculation};
 use crate::residency::planner::ResidencyPlan;
 use crate::state::attention::{DRAFT_TOKEN_SLOTS, DrafterBuffers};
 
-/// Tokens in one KV page (`AttentionKvState.PAGE_TOKENS`).
+/// Tokens in one KV page.
 pub const PAGE_TOKENS: u64 = 256;
 
 /// Rows `GdnState.speculative` allocates at least, however few are verified.
@@ -16,14 +15,14 @@ pub const MINIMUM_VERIFY_ROWS: u64 = 8;
 /// The device bytes of one selected row: its 8-byte key.
 const SELECTION_KEY_BYTES: u64 = 8;
 
-/// Most rows of a draft quantum (MTP catch-up) that run on the decode row twins (`AttentionStates.DRAFT_TWIN_ROWS`).
+/// Most rows of a draft quantum (MTP catch-up) that run on the decode row twins.
 pub const DRAFT_TWIN_ROWS: u64 = 8;
 
 /// Split areas of one decode row's attention scratch, and the floats of each (`AttentionStates`).
 const DECODE_SPLITS: u64 = 64;
 const DECODE_SPLIT_FLOATS: u64 = 258;
 
-/// Bytes of one 256-value head row (`KvFormat.headRowBytes`).
+/// Bytes of one 256-value head row.
 pub fn head_row_bytes(format: KvFormat) -> u64 {
     match format {
         KvFormat::Nvfp4 => 144,
@@ -52,7 +51,7 @@ pub fn kv_bytes(config: &ModelConfig, tokens: u64, format: KvFormat) -> u64 {
 }
 
 /// GDN state of every GDN layer (recurrent and convolution), its verification checkpoint and its row buffers at
-/// `verified_rows` rows, at least [`MINIMUM_VERIFY_ROWS`] (`SequenceFootprint.gdnBytes`). With 0 rows there is
+/// `verified_rows` rows, at least [`MINIMUM_VERIFY_ROWS`]. With 0 rows there is
 /// no verification: only the state itself, no checkpoint and no row buffers.
 pub fn gdn_bytes(config: &ModelConfig, verified_rows: u64) -> u64 {
     let layers = config.gdn_layers() as u64;
@@ -80,7 +79,7 @@ pub fn gdn_bytes(config: &ModelConfig, verified_rows: u64) -> u64 {
     layers * (recurrent + convolution + verification)
 }
 
-/// Bytes of the split-KV decode scratch for `rows` rows of `query_heads` heads (`AttentionStates.decodeScratchBytes`).
+/// Bytes of the split-KV decode scratch for `rows` rows of `query_heads` heads.
 pub fn decode_scratch_bytes(query_heads: u64, rows: u64) -> u64 {
     query_heads * rows * DECODE_SPLITS * DECODE_SPLIT_FLOATS * 4
 }

@@ -1,6 +1,6 @@
 //! The residency plan of a Flash-Next model: which objects live on the device for good, which are held on the host
 //! (read in place, or staged through a device ring), which stay unloaded, and how many device bytes are left for the
-//! routed-expert cache (`ResidencyPlanner`, `FLASH_NEXT_RESIDENCY.md`).
+//! routed-expert cache.
 //!
 //! ```text
 //! free device memory

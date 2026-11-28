@@ -1,5 +1,4 @@
-//! The DFlash2 drafter's stages (`Stages.DFlash2`, and the drafter's views of `ExecutionPlan`: `dflash2Context` and
-//! `dflash2Block`).
+//! The DFlash2 drafter's stages: the context and the block views.
 //!
 //! The base model's views tap rows of its hidden state into the sequence's tap buffer ([`DrafterTap`]). A context
 //! quantum turns the committed rows of the taps into keys and values of the drafter's rings ([`DrafterContext`]); a

@@ -33,7 +33,7 @@ use crate::stages::Quantum;
 
 const OP: &str = "step";
 
-/// The rows up to which the middle bucket serves (`ExecutionPlan.rowBuckets`).
+/// The rows up to which the middle bucket serves.
 const MIDDLE_BUCKET: u32 = 16;
 
 /// The row buckets of a model, and the width of the MoE block of each.

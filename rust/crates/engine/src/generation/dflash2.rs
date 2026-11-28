@@ -1,4 +1,4 @@
-//! Speculative decoding with the DFlash2 drafter (`ExecutionPlan.dflash2Context` and `dflash2Block`): the owner's side
+//! Speculative decoding with the DFlash2 drafter: the owner's side
 //! of a speculative request on an artifact whose drafter is DFlash2, beside [`mtp`](super::mtp)'s.
 //!
 //! The drafter reads the base model's hidden rows at its tapped layers. Every base quantum writes the taps of its rows

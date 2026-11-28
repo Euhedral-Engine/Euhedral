@@ -1,11 +1,11 @@
 //! The residency plan: which objects go where on the device, and whether the model, its cache and its working memory
-//! fit the memory the device has (`ResidencyPlanner`).
+//! fit the memory the device has.
 //!
-//! The device budget is what the device has free, at most `memory.gpu-limit` (`InferenceEngine.deviceBudget`; the
-//! dense model does not use `memory.gpu-reserve`). Against it
+//! The device budget is what the device has free, at most `memory.gpu-limit` (the dense
+//! model does not use `memory.gpu-reserve`). Against it
 //! the plan sets the resident weights, the attention cache of a context of `context.max-tokens`, the runtime's own
 //! reserve (the first sequence's state, the execution workspaces, the shared scratch and the kernel modules loaded
-//! after the model: `ResidencyPlanner.RESERVE_BYTES`) and the prefill scratch of the largest trellis object. When
+//! after the model) and the prefill scratch of the largest trellis object. When
 //! those do not fit, the cache pages past `context.kv-cache-on-gpu-tokens` move to pinned host memory, which the
 //! host budget must hold, before anything else is considered. Then weights leave the device
 //! ([`offload`](crate::residency::offload)), the output head last: they are held in pinned host memory or read from
@@ -71,11 +71,11 @@ pub fn auto_runtime_headroom(multiprocessors: Option<u32>) -> u64 {
 /// Device allocations start on this many bytes, like the driver's.
 pub const ARENA_ALIGNMENT: u64 = 256;
 
-/// The rows a draft quantum may have beyond a verification's: the most the decode row twins run
-/// (`AttentionStates.DRAFT_TWIN_ROWS`). The logits of the workspace hold at least this many rows.
+/// The rows a draft quantum may have beyond a verification's: the most the decode row twins run.
+/// The logits of the workspace hold at least this many rows.
 const DRAFT_LOGITS_ROWS: u64 = footprint::DRAFT_TWIN_ROWS;
 
-/// The most drafts one verification checks (`MtpDecoder.MAX_VERIFIED`).
+/// The most drafts one verification checks.
 pub const MAX_VERIFIED: u64 = 7;
 
 /// Where an object's bytes come from in the artifact.
@@ -161,8 +161,7 @@ pub struct ResidencyPlan {
     pub workspace_bytes: u64,
     /// Bytes of the largest linear scratch (the trellis prefill route of the largest object at the chunk's rows).
     pub scratch_bytes: u64,
-    /// Bytes of the scratch of the tensor-core route alone, which a decode-type launch running beside another takes
-    /// (`LinearFormat.decodeScratchBytes`).
+    /// Bytes of the scratch of the tensor-core route alone, which a decode-type launch running beside another takes.
     pub decode_scratch_bytes: u64,
     /// The device bytes the runtime reserves beyond the weights, the cache and the scratch (`memory.runtime-reserve`):
     /// the execution workspace, the decode scratch, the first sequence's state, the MTP layer's cache at the longest
@@ -944,7 +943,7 @@ enum Route {
     TensorCore,
 }
 
-/// The thresholds of the trellis routes (`TrellisSettings.of`): the target blocks are 8 per multiprocessor unless
+/// The thresholds of the trellis routes: the target blocks are 8 per multiprocessor unless
 /// stated.
 fn trellis_thresholds(settings: &Settings, multiprocessors: Option<u32>) -> TrellisThresholds {
     let trellis = settings.kernels.trellis;
@@ -960,7 +959,7 @@ fn trellis_thresholds(settings: &Settings, multiprocessors: Option<u32>) -> Trel
     }
 }
 
-/// The scratch the largest trellis object needs at `rows` (`ResidencyPlanner.trellisScratchBytes`); 0 for an
+/// The scratch the largest trellis object needs at `rows`; 0 for an
 /// artifact with no trellis object. With the device unknown (`widest`), the K split is the widest the shape allows,
 /// which bounds the partials whatever the device.
 fn trellis_scratch(

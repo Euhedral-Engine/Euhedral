@@ -1,5 +1,5 @@
 //! The execution plan: the stage graph of each view of the model, the lanes they run on, and the graphs a quantum is
-//! captured into (`ExecutionPlan`, `Shape`).
+//! captured into.
 //!
 //! [`Plan::build`] makes one list of stages per view family from the model's weights: the base model's (decode,
 //! verification and prefill share the fused topology) and the MTP layer's (draft and catch-up). A list is the

@@ -1,4 +1,4 @@
-//! The ordering edges that a single stream used to provide implicitly (`ExecutionPlan.withStorageHazards`).
+//! The ordering edges that a single stream used to provide implicitly.
 //!
 //! Stages run on different lanes, so a lane's order no longer puts a write after the reads and writes of the same
 //! storage before it. For every storage, each reader is ordered after the last writer, and each writer after the last

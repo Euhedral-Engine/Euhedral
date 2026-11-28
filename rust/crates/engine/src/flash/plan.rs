@@ -1,5 +1,4 @@
-//! The nodes and edges of the dense part of a Flash-Next quantum (`ExecutionPlan`'s stage list for the non-diagnostic
-//! shape): the embedding, the n-gram embedding's host roots and its device stage at the layer that holds it, and for
+//! The nodes and edges of the dense part of a Flash-Next quantum: the embedding, the n-gram embedding's host roots and its device stage at the layer that holds it, and for
 //! each layer the block, the layer's mixture of experts and the end injection, then the final mix and the head.
 //!
 //! The nodes are what a session builds a stage for; [`DensePlan::spec`] is the RustEE graph over them. A plan made

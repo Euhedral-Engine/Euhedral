@@ -6,10 +6,10 @@
 
 use thiserror::Error;
 
-/// Most tokens a step drafts (`MtpDecoder.MAX_DRAFTS`).
+/// Most tokens a step drafts.
 pub const MAX_DRAFTS: usize = 16;
 
-/// Most drafts one verification checks (`MtpDecoder.MAX_VERIFIED`).
+/// Most drafts one verification checks.
 pub const MAX_VERIFIED: usize = 7;
 
 /// A draft length that breaks the rules of [`DraftLength::new`].
