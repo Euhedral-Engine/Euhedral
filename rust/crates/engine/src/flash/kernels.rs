@@ -1,4 +1,4 @@
-//! The kernels of the Flash-Next table (`euhedral_cuda_qwen4_launch`, native/src/host/qwen4_ops.c) the dense part, the
+//! The kernels of the Flash-Next table the dense part, the
 //! sparse attention and the mixture of experts launch. The discriminant is the kernel's index in the table, which is its ABI; a test compares
 //! every name with the catalog's.
 

@@ -1,4 +1,4 @@
-//! Selection (`generation/HostLogits`, `native/src/sampling/argmax.cuh`). A greedy quantum selects on the device: an
+//! Selection. A greedy quantum selects on the device: an
 //! argmax key per logits row, the copy of the keys into pinned memory, and the pass of a drafted token to the next
 //! quantum of its step; no logits row is copied to the host. A quantum of a sampling or teacher-forced request ([`CopyRows`]) copies its
 //! logits row to pinned memory instead, inside its graph, and the host selects from the row.

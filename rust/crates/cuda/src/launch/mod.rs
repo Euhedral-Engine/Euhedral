@@ -18,7 +18,7 @@ use crate::launch::attention::{DEFAULT_FUSED_VERIFY_FROM, FUSED_ROWS};
 use crate::launch::elementwise::DEFAULT_RMS_NORM_DECODE_SLICES;
 use crate::launch::nvfp4::skinny_target_ctas;
 
-/// What the native wrapper rejects: the status the C function would return instead of launching.
+/// What a planner refuses, returned instead of launching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanError {
     /// `EUHEDRAL_CUDA_INVALID_ARGUMENT`.
@@ -31,7 +31,7 @@ pub enum PlanError {
     RouteUnavailable,
 }
 
-/// The thread-local modes the C wrappers read (`euhedral_cuda_row_exact`, `euhedral_cuda_exact_numerics`).
+/// The launch modes: row-exact execution and exact numerics (`row_exact`, `exact_numerics`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Modes {
     /// Every row computes as a one-row launch would.
@@ -40,15 +40,14 @@ pub struct Modes {
     pub exact_numerics: bool,
 }
 
-/// `pointer + bytes` as C computes it: wrapping, never a panic.
+/// `pointer + bytes` wrapping, never a panic.
 pub(crate) fn advance(pointer: DevicePtr, bytes: u64) -> DevicePtr {
     // SAFETY: the address is only carried into a launch's arguments, never dereferenced on the host.
     unsafe { DevicePtr::from_raw(pointer.get().wrapping_add(bytes)) }
 }
 
 /// The launch choices that depend on the card: sized from the device, or measured on one card and set by the
-/// operator. The native library's own copy of these values (`euhedral_cuda_set_dispatch`, not bound in `sys`) is never
-/// set from Rust: every Rust launch is planned here and goes through `RusteeOps`, not through the library's wrappers.
+/// operator. Every launch is planned here and goes through `RusteeOps`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dispatch {
     /// Streaming multiprocessors of the device; the skinny NVFP4 kernel's K split aims for two blocks per one.

@@ -271,8 +271,7 @@ fn nvfp4_launch_shapes_follow_the_route_of_the_shape() {
     let Some(rig) = rig() else { return };
     let Some(mut artifact) = Artifact::open() else { return };
     let mut random = Random::new(3);
-    // The library queues these launches itself, so the geometry is what the route computes for the shape. The
-    // expectations are read from native/src/host/nvfp4_linear.c.
+    // The library queues these launches itself, so the geometry is what the route computes for the shape.
     let (_weights, down) = artifact.plain(&rig.library, "mtp/layer/mlp/down");
     let nvfp4 = Nvfp4Linear::new(&rig.library).with_shape_recording();
     let x = upload(&rig.library, &activations(&mut random, 64, 17408));

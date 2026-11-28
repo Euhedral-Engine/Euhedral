@@ -174,7 +174,7 @@ fn fused_from(table: &[u32; FUSED_ROWS], rows: u64) -> u64 {
     }
 }
 
-/// What the host dispatch of decode attention (`attention_causal` in `qwen_layer_ops.c`) bakes into its launches for a
+/// What the dispatch of decode attention bakes into its launches for a
 /// quantum of `rows` rows at `start`, which attends over `start + 1` to `start + rows` keys, packed as
 /// `fused << 16 | below << 8 | above`:
 /// - the split counts: rows below 2048 keys split into 48-key spans, those from 2048 keys (query-head groups up to
@@ -398,7 +398,7 @@ mod tests {
         }
     }
 
-    /// The thresholds of `fused_from` in `qwen_layer_ops.c` and the tiles of rows x 6 query heads per KV head.
+    /// The fused-kernel thresholds and the tiles of rows x 6 query heads per KV head.
     #[test]
     fn the_fused_verifier_choice_flips_at_its_thresholds_for_two_to_eight_rows() {
         let thresholds = [

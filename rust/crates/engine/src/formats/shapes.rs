@@ -173,7 +173,7 @@ impl ShapeRecorder {
     }
 }
 
-/// The kernels of the shared linear table (`LinearKernel`, native/src/host/linear_kernels.c). The declaration order is
+/// The kernels of the shared linear table (`LinearKernel`). The declaration order is
 /// the native table's order, which is its ABI; a GPU test compares the names with the library's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinearKernel {

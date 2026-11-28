@@ -1,6 +1,5 @@
 //! Grouped linears: Q3, Q4 and Q5 values in 64-value groups with FP16 scales, and Q3 entropy coded as P2E2 (the routes
-//! of `GroupedLinearFormat` and `P2e2Format`, which the native entry points in `q3_linear_bf16.c`, `q45_linear.c` and
-//! `q3_mx.c` serve).
+//! of `GroupedLinearFormat` and `P2e2Format`).
 //!
 //! The route is a function of the rows, the shape and the layout:
 //!

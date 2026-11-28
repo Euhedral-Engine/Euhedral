@@ -37,7 +37,7 @@ const PREPASS_BLOCK_COLUMNS: u64 = 512;
 /// Columns per block of the epilogue: one 128-column block per warp, four warps.
 const EPILOGUE_BLOCK_COLUMNS: u64 = 512;
 
-/// Rows per block of the whole-K GEMM (`kSplitRows`, native/src/trellis/mma.cuh).
+/// Rows per block of the whole-K GEMM (`kSplitRows`).
 const WHOLE_K_ROW_BLOCK: u64 = 32;
 
 /// Rows per block of the wide whole-K GEMM (`kSplitRows64`).

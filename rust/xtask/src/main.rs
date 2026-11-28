@@ -99,8 +99,7 @@ fn bindings(check: bool) -> Result<(), String> {
 /// Runs bindgen over the public header into `output`.
 ///
 /// Every declared function must be exported by the library (`--dynamic-link-require-all`), so a library that lacks one
-/// fails to load with the symbol's name. The allowlist leaves out `euhedral_cuda_submission_stream`, which is declared
-/// for the library's own sources and is not exported.
+/// fails to load with the symbol's name.
 fn generate(root: &Path, output: &Path) -> Result<(), String> {
     require_bindgen_version()?;
     let allowlist = read_allowlist(root)?;
