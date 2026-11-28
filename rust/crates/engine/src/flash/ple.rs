@@ -226,10 +226,9 @@ pub struct PleShape {
 
 impl PleShape {
     /// The embedding of the rows `ids` addresses in `table`, convolved over `taps` rows at `dilation`. The heads, the
-    /// row width and the record size are those of the id function and the store, so the two cannot disagree (Java's
-    /// constructor refuses "the id function and the store disagree"). Refuses a width that is not the heads' rows
+    /// row width and the record size are those of the id function and the store, so the two cannot disagree. Refuses a width that is not the heads' rows
     /// concatenated.
-    #[allow(clippy::too_many_arguments, reason = "the sizes Java's constructor takes")]
+    #[allow(clippy::too_many_arguments, reason = "the sizes of the id function and the store")]
     pub fn new(
         hidden: u32,
         streams: u32,
@@ -384,7 +383,7 @@ impl PleApply {
         })
     }
 
-    /// The operations after the records are on the device, in Java's order, ending with the add into the streams.
+    /// The operations after the records are on the device, ending with the add into the streams.
     pub fn ops(&self, rows: u32) -> Result<OpList<'static>, FlashError> {
         let shape = &self.shape;
         let weights = &self.weights;

@@ -38,7 +38,7 @@ fn invalid(what: &'static str, value: impl ToString, rule: &'static str) -> Sett
     }
 }
 
-/// The settings of a run: Java's `DrafterTraining.Settings` without its paths.
+/// The settings of a run, without its paths.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     /// The drafts unrolled.
@@ -81,8 +81,8 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Refuses a setting the run cannot work with. Java refused only the first three rules; the others it met as a crash
-    /// (a held-out set of none, depths past its statistics) or a run that never ended (no epochs).
+    /// Refuses a setting the run cannot work with, such as a held-out set of none, depths past its statistics or no
+    /// epochs.
     pub fn check(&self) -> Result<(), SettingsError> {
         if !(1..=MOST_DEPTHS).contains(&self.depths) {
             return Err(invalid("--depths", self.depths, "1 to 16 drafts"));
@@ -155,8 +155,8 @@ pub fn windows(length: u32, prompt: u32, settings: &Settings) -> Vec<Window> {
     out
 }
 
-/// The training sequences in the order of `epoch`: Java's Fisher-Yates over `java.util.Random`, so that an epoch's order
-/// follows from its number.
+/// The training sequences in the order of `epoch`: a Fisher-Yates shuffle over a `java.util.Random`-compatible
+/// generator, so that an epoch's order follows from its number.
 pub fn shuffled(training: &[usize], epoch: u32) -> Vec<usize> {
     let mut order = training.to_vec();
     let mut random = Random::new(SHUFFLE_SEED + i64::from(epoch));

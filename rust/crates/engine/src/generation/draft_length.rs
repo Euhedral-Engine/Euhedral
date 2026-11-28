@@ -105,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_length_matches_java_table() {
+    fn draft_length_follows_the_confidence_table() {
         // A fixed length ignores confidence.
         let four = DraftLength::fixed(4).unwrap();
         assert!(!four.gated());

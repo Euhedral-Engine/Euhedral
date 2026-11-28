@@ -295,7 +295,7 @@ fn buffers_of(quantum: &Quantum) -> Result<&DrafterBuffers, StageError> {
 }
 
 /// Copies the rows of the base model's hidden state after tapped layer `tap` into the sequence's tap buffer, at the
-/// tap's columns (Java's tap stage, which copies after the next layer's input norm).
+/// tap's columns (it copies after the next layer's input norm).
 #[derive(Clone, Debug)]
 pub struct DrafterTap {
     tap: usize,

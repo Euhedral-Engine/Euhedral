@@ -1,4 +1,4 @@
-//! The raw-text word prompt, generator `euhedral-words-v1` (Java `PromptMaterial`).
+//! The raw-text word prompt, generator `euhedral-words-v1`.
 //!
 //! The text is a space-separated sequence of words drawn from [`WORDS`] by `SplittableRandom(seed)`. The longest word
 //! prefix whose token count does not exceed the target is kept; single punctuation suffixes are then tried to reach the
@@ -12,7 +12,7 @@ use euhedral_inference_quantization::java_random::SplittableRandom;
 
 pub const GENERATOR: &str = "euhedral-words-v1";
 
-/// The seed the Java benchmark uses unless its configuration names another.
+/// The seed used unless its configuration names another.
 pub const DEFAULT_SEED: u64 = 20_260_925;
 
 pub const WORDS: [&str; 64] = [

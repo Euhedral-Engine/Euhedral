@@ -43,8 +43,7 @@ use selection::{Movable, Selection, offload_rank, read_in_place, select};
 pub use state::{PREFILL_CHUNK_TOKENS, SequenceState};
 
 /// What `memory.runtime-reserve: auto` means for a Flash-Next plan: the CUDA context, kernel modules and graph pools
-/// that exist beside the model (about 0.9 GiB measured on the dense model's engine), Java's `RESERVE_BYTES` for this
-/// model. An explicit `memory.runtime-reserve` replaces it; `memory.gpu-reserve` is kept free on top.
+/// that exist beside the model (about 0.9 GiB measured on the dense model's engine). An explicit `memory.runtime-reserve` replaces it; `memory.gpu-reserve` is kept free on top.
 pub const DEFAULT_RUNTIME_RESERVE_BYTES: u64 = 1024 << 20;
 
 /// The largest prefill chunk the plan makes room for.

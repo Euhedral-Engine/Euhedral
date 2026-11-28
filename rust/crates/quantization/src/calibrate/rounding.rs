@@ -26,7 +26,7 @@ use crate::memory::{Claims, StepBytes};
 use crate::recipe::{Format as StoredFormat, Recipe};
 use crate::step::idle;
 
-/// Rows of a linear one rounding step takes, as Java's: the factor and the tensor scales are shared by the slices.
+/// Rows of a linear one rounding step takes: the factor and the tensor scales are shared by the slices.
 pub const HEAD_ROWS: usize = 16384;
 
 /// How the linears are rounded.

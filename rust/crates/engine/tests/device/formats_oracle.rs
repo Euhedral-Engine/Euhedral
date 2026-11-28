@@ -110,7 +110,7 @@ fn trellis_follows_the_switch(rig: &Rig) {
     let mut random = Random::new(13);
     let object = synthetic_trellis(&rig.library, &mut random, 512, 1024, 56, &[128, 512]);
     let x = upload(&rig.library, &activations(&mut random, 8, 1024));
-    // A format that was not built for the reference follows the library's selection, as Java's does.
+    // A format that was not built for the reference follows the library's selection.
     let production = TrellisLinear::new(140, 32, 128, 1024);
     let oracle = TrellisLinear::new(140, 32, 128, 1024).with_exact_numerics();
     let run = |format: &TrellisLinear| rig.linear(format, &object.weight, &x, 0, 1024, 512, 8, PLAIN);

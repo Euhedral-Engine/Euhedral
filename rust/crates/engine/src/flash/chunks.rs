@@ -1,4 +1,4 @@
-//! How a prompt is cut into the quanta of its prefill (`Session.java`, the prompt loop): full chunks of the planner's
+//! How a prompt is cut into the quanta of its prefill (the prompt loop): full chunks of the planner's
 //! prefill chunk first, the remainder last. Only the last chunk scores its final row; the others run for their state
 //! alone.
 

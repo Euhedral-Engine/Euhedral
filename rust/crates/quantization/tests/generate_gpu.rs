@@ -38,7 +38,7 @@ const WAIT: Duration = Duration::from_secs(20 * 60);
 const MAX_TOKENS: u32 = 12;
 
 fn property(key: &str) -> String {
-    test_support::gradle_property(key).unwrap_or_else(|| panic!("set the property {key}: a device test needs it"))
+    test_support::test_setting(key).unwrap_or_else(|| panic!("set the property {key}: a device test needs it"))
 }
 
 /// Collects the tokens of one generation.

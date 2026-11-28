@@ -652,7 +652,7 @@ impl VariantPlan {
         }
         // Each chain of lane continuations has one lane offset, fixed here, so the one lane a stage is allowed is the
         // lane RustEE's graph puts it on: it never picks a branch's lane at random, and the branches of a fan-out do
-        // not share one. A root is at offset 0, the quantum's home lane, as Java's graph does.
+        // not share one. A root is at offset 0, the quantum's home lane.
         let chain = placement::chain_lanes(compute_edges, self.width);
         match &self.compute {
             None => {

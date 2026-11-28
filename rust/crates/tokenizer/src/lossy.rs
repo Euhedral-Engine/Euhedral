@@ -1,9 +1,9 @@
-//! Lossy UTF-8 decoding with the replacement rules of Java's `new String(bytes, UTF_8)`.
+//! Lossy UTF-8 decoding with the replacement rules of the JDK's `new String(bytes, UTF_8)`.
 //!
 //! Rust's [`String::from_utf8_lossy`] replaces the maximal invalid prefix of a sequence, and so does the JDK, with one
 //! difference: the JDK treats a surrogate encoding (lead byte `ED` followed by `A0..=BF`) as one malformed unit,
 //! replacing the two bytes `ED xx`, or all three of `ED xx yy` when `yy` is a continuation byte, with a single U+FFFD.
-//! Streamed text must match the Java engine character for character, so every lossy decode goes through here.
+//! Streamed text must follow the JDK rule character for character, so every lossy decode goes through here.
 
 use std::str;
 

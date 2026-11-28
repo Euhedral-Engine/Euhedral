@@ -1,5 +1,5 @@
 //! `cargo xtask native` and `cargo xtask native-verify`: the CUDA library of each product in
-//! `native/native-products.json`, built without Gradle.
+//! `native/native-products.json`.
 //!
 //! `native [--product <id>] [--force-download]` resolves the CUDA inputs of a product (the installed toolkit named by
 //! `CUDA_HOME` or `CUDA_PATH` for the host's own product, otherwise the pinned redistributables downloaded into a
@@ -71,7 +71,7 @@ struct Component {
     sha256: String,
 }
 
-/// `native/native-products.json`, less what only the Java build reads.
+/// The parts of `native/native-products.json` that this command reads.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Manifest {

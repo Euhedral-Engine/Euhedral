@@ -402,10 +402,7 @@ fn a_plan_stops_at_the_smaller_of_its_layers_and_its_stop_and_checkpoints_never_
     assert!(plan.checkpoint_due(8));
     assert!(!plan.checkpoint_due(16), "the end is not checkpointed");
     assert!(!plan.checkpoint_due(7));
-    assert!(
-        plan.checkpoint_due(0),
-        "nothing done is a multiple of every count, as Java's loop never asks it"
-    );
+    assert!(plan.checkpoint_due(0), "nothing done is a multiple of every count");
     plan.checkpoint_every = 0;
     assert!(!plan.checkpoint_due(8), "no interval checkpoints nothing");
     assert!(!Plan::new(8).checkpoint_due(8));

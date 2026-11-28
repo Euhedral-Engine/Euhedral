@@ -1,5 +1,4 @@
-//! The stage lists of the plan's views, in the order and with the dependencies of Java's views
-//! (`ExecutionPlan.fullModel` rewritten by `prefillView` for the base model's views, `mtpDraft` for the MTP layer's),
+//! The stage lists of the plan's views, in their order and with their dependencies,
 //! and the stages that run them.
 //!
 //! The base views are the fused form every executed view uses: the rounded residual add and the next RMSNorm in one

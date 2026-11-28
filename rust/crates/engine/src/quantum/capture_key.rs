@@ -1,10 +1,9 @@
 //! The key of a captured graph: everything its submissions bake in.
 //!
 //! A graph repeats the launches of one quantum, so it can serve another only when every launch parameter that is not
-//! read from device memory is the same. Java's key (`Quantum.captureKey` with `CaptureFingerprint`) holds the kind,
-//! rows, logits, selection, draft seed and token slots, the split counts of decode attention, and a fingerprint of the
-//! workspace and the sequence's device allocations, each with its allocation's identity. This key holds the same, and
-//! what the Rust engine bakes in beyond it: the allocation serials of the page tables (a table the cache outgrew is
+//! read from device memory is the same. The key holds the kind, rows, logits, selection, draft seed and token slots, the split counts of decode
+//! attention, and a fingerprint of the workspace and the sequence's device allocations, each with its allocation's
+//! identity, and the allocation serials of the page tables (a table the cache outgrew is
 //! another allocation), the host pages the staging copies span, and the rows each GDN layer replays first.
 
 use euhedral_hashing::hasher_api::hash_bytes_with_seed;

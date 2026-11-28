@@ -1,4 +1,4 @@
-//! The configuration: every Java benchmark configuration file parses, and what this engine cannot do is refused with
+//! The configuration: every benchmark configuration file parses, and what this engine cannot do is refused with
 //! the reason.
 
 #![allow(
@@ -54,7 +54,7 @@ fn parses_java_benchmark_configs() {
     }
     assert!(seen > 0, "the repository has configuration files");
 
-    // Values of two of them, as Java reads them.
+    // Values of two of them.
     let smoke = Options::load(&configs_dir().join("smoke.json"), UNIX_EPOCH).unwrap();
     let names: Vec<String> = smoke.scenarios.iter().map(Scenario::name).collect();
     assert_eq!(names, ["prefill-32", "first-token-32", "decode-32-32"]);

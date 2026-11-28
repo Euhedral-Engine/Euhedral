@@ -154,7 +154,8 @@ impl TokenizerJson {
         self.check_library_only_settings()
     }
 
-    /// The library honours settings that Java's loader ignores, so a file that sets one would encode differently.
+    /// Refuses a file that sets what only the `tokenizers` library honours (dropout, affixes, truncation, padding and so
+    /// on): it would encode differently from the section's tokenizer.
     fn check_library_only_settings(&self) -> Result<(), TokenizerError> {
         let model = &self.model;
         if model.dropout.is_some() {

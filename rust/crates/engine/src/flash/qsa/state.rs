@@ -8,7 +8,7 @@
 //! leaves the committed state intact. Block keys at or past the committed length are overwritten by the next chunk, so
 //! they need no undoing.
 //!
-//! Java mutates this state inside `QsaLayer.run`; here the state belongs to the sequence's owner, which calls
+//! The state belongs to the sequence's owner, which calls
 //! [`QsaState::begin_chunk`] when it builds a chunk's operations and [`QsaState::commit`] or [`QsaState::discard`]
 //! once the quantum retired, and the body is a function of the [`ChunkAt`](crate::flash::block::ChunkAt) it is
 //! handed.

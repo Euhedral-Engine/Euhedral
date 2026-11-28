@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare teacher-forced logits reports (TeacherForcedQualityCudaIntegrationTest).
+"""Compare teacher-forced logits reports.
 
 Usage: compare_teacher_forced.py REFERENCE.bin CANDIDATE.bin [CANDIDATE.bin ...]
 

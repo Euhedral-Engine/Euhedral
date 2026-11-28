@@ -21,7 +21,7 @@ from typing import Any
 from euhedral_artifacts.edrl import align_up, fail
 from euhedral_artifacts.nvfp4 import nvfp4_offsets
 
-# Component groups; the ordinals are the artifact's `group` field (ComponentGroup in the Java reader).
+# Component groups; the ordinals are the artifact's `group` field.
 GROUPS = (
     "fixed-text",
     "routed-expert",

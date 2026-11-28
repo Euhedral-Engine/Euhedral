@@ -153,7 +153,7 @@ fn the_scratch_buffers_do_not_overlap_and_fit_the_reported_size() {
         copy.sort_unstable();
         copy
     };
-    assert_eq!(starts, sorted, "the buffers follow Java's order");
+    assert_eq!(starts, sorted, "the buffers follow the order of the layout");
     starts.sort_unstable();
     assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(scratch.beta.get() + f32_bytes(rows, 4) <= 0x400000 + body.shape.scratch_bytes(rows));

@@ -1,4 +1,4 @@
-//! The owner of a Flash-Next sequence's generation (`Session.java`, the prompt and decode loops): it cuts the prompt
+//! The owner of a Flash-Next sequence's generation: it cuts the prompt
 //! into chunks, starts one quantum at a time through a [`Stepper`], and on each retirement commits the quantum's rows,
 //! selects the next token (on the device for a greedy request without a constraint, on the host otherwise, through
 //! [`TokenSampler`] and [`TokenConstraint`] as the dense path does) and reports it to the listener.
@@ -9,7 +9,7 @@
 //! until the request ends, when its outcome waits in [`Turn::take_finished`] to be told once the claim is free.
 //!
 //! One quantum is in flight at a time: the next chunk, and the token the decode feeds, depend on the one before it.
-//! Departure from Java, which runs a prompt as one graph of chunks: each chunk is its own quantum, started at the
+//! Each chunk of a prompt is its own quantum, started at the
 //! retirement of the one before.
 
 use std::collections::VecDeque;

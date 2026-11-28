@@ -21,7 +21,7 @@ use crate::sizes::{ByteSize, parse_duration};
 
 const PREFIX: &str = "EUHEDRAL_";
 
-/// The largest count a key accepts: the same bound the Java engine puts on its `int` settings, so one file serves both.
+/// The largest count a key accepts: the largest signed 32-bit value.
 const COUNT_MAX: i64 = i32::MAX as i64;
 /// The most slices of a one-row RMS norm: they become a launch grid's y extent, which the device limits to 65535.
 const MAX_RMS_NORM_SLICES: i64 = 65535;

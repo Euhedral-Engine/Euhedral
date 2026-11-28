@@ -23,7 +23,7 @@ use euhedral_inference_quantization::kernels::{Module, ModuleOptions, Modules};
 #[test]
 #[ignore = "needs a GPU and the bundled NVRTC"]
 fn every_module_compiles_and_every_listed_kernel_resolves() {
-    let path = test_support::gradle_property("euhedral.cuda.library")
+    let path = test_support::test_setting("euhedral.cuda.library")
         .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
     let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
     let options = ModuleOptions::beside(&library).expect("the product directory");

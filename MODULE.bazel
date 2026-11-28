@@ -1,4 +1,4 @@
-# Euhedral's Bazel build of the Rust workspace in rust/ (Java and Zig stay on Gradle). Versions are the table in forge's
+# Euhedral's Bazel build of the Rust workspace in rust/. Versions are the table in forge's
 # build/module/MODULE.bazel (forge build/CONTRACTS.md C4); forge's check-repo.sh checks the bazel_dep versions below.
 module(
     name = "euhedral_euhedral",

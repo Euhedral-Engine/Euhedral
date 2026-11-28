@@ -138,10 +138,7 @@ fn default_library() -> Option<PathBuf> {
 }
 
 /// The line of the log: the seconds since the run began, then the message.
-#[allow(
-    clippy::print_stderr,
-    reason = "a binary's progress log, as the Java command prints it"
-)]
+#[allow(clippy::print_stderr, reason = "a binary's progress log")]
 fn logger() -> Log {
     let started = Instant::now();
     Arc::new(move |line| eprintln!("[{:7.0} s] {line}", started.elapsed().as_secs_f64()))

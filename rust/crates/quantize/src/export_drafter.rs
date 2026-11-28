@@ -1,5 +1,5 @@
 //! The `export-drafter` command: the base artifact with its MTP layer replaced by a trained drafter's (from
-//! `--parameters`, the `best.bin` of `train-drafter`) or by the checkpoint's own MTP weights. As in Java, `--model`,
+//! `--parameters`, the `best.bin` of `train-drafter`) or by the checkpoint's own MTP weights. `--model`,
 //! `--artifact` and `--out` are required and `--parameters` is not; `--config` names the settings file, as for
 //! `assemble`.
 

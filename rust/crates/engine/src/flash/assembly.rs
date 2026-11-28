@@ -1,5 +1,5 @@
 //! The stages of a Flash-Next model, resolved by name: where each tensor of the artifact goes into the stages of the
-//! step (`Weights.java` and `Session.java`'s construction of the stages).
+//! step.
 //!
 //! Building them is two steps because the regions the stages share are sized by what the stages need:
 //! 1. [`Blueprint::new`] reads the weights by name and builds everything that does not lie in the regions (the bodies
@@ -79,7 +79,7 @@ pub fn sequence_spec(config: &FlashConfig, max_tokens: u32) -> Result<SequenceSp
     })
 }
 
-/// The ids of the n-gram embedding, from the configuration (`NgramIds` in Java's session).
+/// The ids of the n-gram embedding, from the configuration.
 pub fn ngram_ids(config: &FlashConfig) -> Result<NgramIds, FlashError> {
     let ngram = &config.ngram;
     NgramIds::new(
@@ -93,7 +93,7 @@ pub fn ngram_ids(config: &FlashConfig) -> Result<NgramIds, FlashError> {
 }
 
 fn epsilon(config: &FlashConfig) -> f32 {
-    // Java's `(float) config.rmsNormEps`.
+    // The kernels take the epsilon as an `f32`.
     config.text.rms_norm_epsilon as f32
 }
 

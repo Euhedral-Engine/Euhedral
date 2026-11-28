@@ -50,9 +50,9 @@ const PINNED: LocationId = LocationId(1);
 
 /// The rig, or a panic naming the missing setting: a device test that skips is no check.
 pub fn rig(settings: GptqSettings) -> Rig {
-    let library = test_support::gradle_property("euhedral.cuda.library")
+    let library = test_support::test_setting("euhedral.cuda.library")
         .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY)");
-    let directory = test_support::gradle_property("euhedral.quantization.cuda-libraries")
+    let directory = test_support::test_setting("euhedral.quantization.cuda-libraries")
         .expect("set euhedral.quantization.cuda-libraries (EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES)");
     let library = CudaLibrary::load(&PathBuf::from(library)).expect("the CUDA library loads");
     let math = MathLibraries::load(&PathBuf::from(directory)).expect("the math libraries load");

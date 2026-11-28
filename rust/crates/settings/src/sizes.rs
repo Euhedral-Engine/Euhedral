@@ -39,7 +39,7 @@ impl ByteSize {
         if digits.is_empty() {
             return Err(format!("not a size (whole number, optional B/KiB/MiB/GiB/TiB): {text}"));
         }
-        // The same limits as the Java engine, so one file serves both: a size fits in a signed 64-bit count of bytes.
+        // A size fits in a signed 64-bit count of bytes.
         let value: u64 = digits
             .parse::<i64>()
             .map_err(|_| format!("number too large: {text}"))?
@@ -69,7 +69,7 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
     if digits.is_empty() {
         return Err(invalid());
     }
-    // The same limits as the Java engine: the count and the seconds it makes fit in a signed 64-bit integer.
+    // The count and the seconds it makes fit in a signed 64-bit integer.
     let value: i64 = digits.parse().map_err(|_| format!("number too large: {text}"))?;
     let too_large = || format!("duration too large: {text}");
     let seconds = |factor: i64| {

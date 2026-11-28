@@ -85,8 +85,8 @@ impl View {
     }
 }
 
-/// A stage graph of the plan. Decode and verification up to eight rows share their topology and their scratch rules,
-/// as Java's one decode view does; they differ in the rows their selection reads.
+/// A stage graph of the plan. Decode and verification up to eight rows share their topology and their scratch rules;
+/// they differ in the rows their selection reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Variant {
     Decode,

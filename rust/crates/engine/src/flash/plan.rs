@@ -107,8 +107,7 @@ pub struct DensePlan {
 }
 
 impl DensePlan {
-    /// The plan of `config`'s layers. The embedding of n-grams runs at the one layer `config.ple.layers` names, as it
-    /// does in Java; a configuration that names more is refused with the layers.
+    /// The plan of `config`'s layers. The embedding of n-grams runs at the one layer `config.ple.layers` names; a configuration that names more is refused with the layers.
     pub fn from_config(config: &FlashConfig) -> Result<Self, FlashError> {
         Self::build(config, None)
     }

@@ -1,5 +1,5 @@
-//! The launches of the sparse attention's kernels (`QsaOps`): the same kernel, grid, block, shared bytes and argument
-//! order as Java, with the geometry each kernel is written for checked where Java checks it. Each returns the
+//! The launches of the sparse attention's kernels: the same kernel, grid, block, shared bytes and argument
+//! order, with the geometry each kernel is written for checked. Each returns the
 //! [`Launch`] and queues nothing, as the dense part's [`ops`](crate::flash::ops) do. A launch that has nothing to do
 //! (no block completed) returns `None`.
 

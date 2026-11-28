@@ -1,8 +1,8 @@
-//! Deterministic benchmark prompts, byte for byte the ones the Java benchmark builds.
+//! Deterministic benchmark prompts, the same bytes on every build.
 //!
 //! A prompt is a text of a stated token budget plus the IDs the session encodes for it. Two generators exist:
 //! [`words`] (`euhedral-words-v1`, raw text) and [`chat`] (`euhedral-chat-v2`, chat-templated instructions that quote
-//! a frozen document). `sha256` is the digest of the UTF-8 text, as the Java benchmark reports it in `promptSha256`.
+//! a frozen document). `sha256` is the digest of the UTF-8 text, as a result row reports it in `promptSha256`.
 
 pub mod chat;
 pub mod words;
@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 pub struct Prompt {
     pub text: String,
     pub ids: Vec<u32>,
-    /// Lower-case hex, as Java's `promptSha256`.
+    /// Lower-case hex.
     pub sha256: String,
 }
 
@@ -79,8 +79,7 @@ impl PromptCorpus {
     }
 
     /// Every prompt of one target, in iteration order. `seed` picks the words (the chat corpus is fixed and ignores
-    /// it). A chat target is refused when any task's standalone prompt is above it, where Java's
-    /// `Prerequisites.check` refuses it, whichever iteration would have run that task.
+    /// it). A chat target is refused when any task's standalone prompt is above it, whichever iteration would have run that task.
     pub fn prompts(self, target_tokens: usize, seed: u64, tok: &Tokenizer) -> Result<Vec<Prompt>, PromptError> {
         let mut count = counter(tok);
         let built = match self {

@@ -3,8 +3,7 @@
 //! history, the KV pages ([`KvCache`]) and, on the host, the position and the n-gram context.
 //!
 //! The device state is one allocation carved by [`SequenceLayout`]: the stages of a step hold its addresses from the
-//! day they are built, so the sequence's state lives as long as the engine and a request resets it (Java allocates a
-//! `Sequence` per request and binds it to the call). [`Tracker`] is the host side of the lifecycle and has no device:
+//! day they are built, so the sequence's state lives as long as the engine and a request resets it. [`Tracker`] is the host side of the lifecycle and has no device:
 //! a chunk is begun, then committed once its quantum has retired or discarded when it failed, and the position and
 //! the context advance only on a commit, so a failed chunk leaves them as they were. One chunk is in flight at a
 //! time. [`SequenceState`] adds the device: it reserves the KV pages of a chunk and hands the chunk's placement (the

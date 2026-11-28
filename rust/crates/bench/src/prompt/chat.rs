@@ -1,9 +1,9 @@
-//! The chat prompt corpus, generator `euhedral-chat-v2` (Java `ChatPromptCorpus`).
+//! The chat prompt corpus, generator `euhedral-chat-v2`.
 //!
 //! Real instructions in the model's chat template with thinking disabled, so generation behaves like a served request.
 //! A target gets one prompt per task. When it leaves room, a prompt quotes the longest paragraph-aligned prefix of a
 //! frozen document that keeps it within the target, and its task refers to that document; otherwise it carries a
-//! standalone task. The document is the Java benchmark's resource, a snapshot of repository documents and sources of
+//! standalone task. The document is a snapshot of repository documents and sources of
 //! about 60K tokens, so 16K and 32K prompts are real long contexts. The token count is at most the target. Every task
 //! asks for long-form output.
 
@@ -34,10 +34,10 @@ const STANDALONE_TASKS: [&str; TASKS] = [
     "Write a short story about a lighthouse keeper who finds a message in a bottle.",
 ];
 
-/// The frozen document, read from the Java benchmark's resources so the two engines quote the same text.
+/// The frozen document, read from the benchmark's resources.
 pub const DOCUMENT: &str = include_str!("../../../../resources/bench/chat-corpus-v1-document.md");
 
-/// Builds every task's prompt text for `target_tokens`, in task order, as Java's `ChatPromptCorpus.build` does: the
+/// Builds every task's prompt text for `target_tokens`, in task order: the
 /// target is refused when any task's standalone prompt is above it, not only the one an iteration runs.
 pub fn build_all<C>(target_tokens: usize, count: C) -> Result<Vec<Built>, PromptError>
 where
@@ -117,7 +117,7 @@ where
     }
 }
 
-/// The document's paragraphs as Java's `split("\n\n")` yields them: trailing empty ones are dropped.
+/// The document's paragraphs as `split("\n\n")` yields them: trailing empty ones are dropped.
 fn paragraphs(document: &str) -> Vec<&str> {
     let mut paragraphs: Vec<&str> = document.split("\n\n").collect();
     while paragraphs.len() > 1 && paragraphs.last() == Some(&"") {
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn a_target_between_the_shortest_and_the_longest_standalone_prompt_is_refused_whole() {
-        // Java builds all four tasks and throws when any standalone prompt is above the target.
+        // All four tasks are built, and the target is refused when any standalone prompt is above it.
         let words: Vec<usize> = STANDALONE_TASKS
             .iter()
             .map(|task| count(&chat(None, task)).unwrap())

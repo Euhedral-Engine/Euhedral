@@ -142,7 +142,7 @@ impl Qwen4Kernel {
         qwen4_table()[self.index() as usize].shared_opt_in_bytes
     }
 
-    /// A launch of this kernel with no dynamic shared memory (Java launches none).
+    /// A launch of this kernel with no dynamic shared memory.
     pub fn launch(self, grid: [u32; 3], block: [u32; 3], args: KernelArguments) -> Launch {
         self.launch_shared(grid, block, 0, args)
     }

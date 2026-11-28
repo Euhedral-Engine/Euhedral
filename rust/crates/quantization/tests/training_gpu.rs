@@ -54,7 +54,7 @@ impl Deref for Rig {
 }
 
 fn rig() -> Rig {
-    let directory = test_support::gradle_property("euhedral.quantization.cuda-libraries")
+    let directory = test_support::test_setting("euhedral.quantization.cuda-libraries")
         .expect("set euhedral.quantization.cuda-libraries (EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES)");
     let math = MathLibraries::load(&PathBuf::from(directory)).expect("the math libraries load");
     let (device, compiled) = device(Module::Train, "train");

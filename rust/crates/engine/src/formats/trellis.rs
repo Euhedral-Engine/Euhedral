@@ -185,7 +185,7 @@ impl TrellisLinear {
     }
 
     /// [`TrellisLinear::plan`] with `exact` deciding whether the scalar reference runs: the format's own flag, or the
-    /// library's process-wide selection that Java's `gpu.exactNumerics()` reads.
+    /// library's process-wide selection.
     #[allow(clippy::too_many_arguments, reason = "plan's arguments and the exact selection")]
     fn plan_with(
         &self,
@@ -222,7 +222,7 @@ impl TrellisLinear {
 
     /// Whether the device has the block-scaled FP8 kernels, asked of the library once.
     ///
-    /// Java asks for the one kernel the launch would take (`TRELLIS_MMA_ROWS_FP8` below `wide-block-min-tokens`
+    /// The launch takes one of two kernels (`TRELLIS_MMA_ROWS_FP8` below `wide-block-min-tokens`
     /// rows, `TRELLIS_MMA_ROWS64_FP8` from there). Both live in the one architecture-specific module
     /// (`trellis_fp8/kernels.cu`, sm_12xa), so a device has both or neither; asking for both makes the answer
     /// independent of the rows and cacheable, and the two never differ.

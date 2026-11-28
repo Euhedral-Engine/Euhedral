@@ -7,7 +7,7 @@
 //!
 //! Keys: `euhedral.cuda.library`, `euhedral.quantization.cuda-libraries`, `euhedral.quantization.checkpoint` (BF16)
 //! and `euhedral.quantization.calibration-tokens`, then the source of `suh`: `euhedral.trellis.checkpoint` (a finished
-//! trellis checkpoint holding `<linear>.suh`, as the Java test reads) or, when that is not set,
+//! trellis checkpoint holding `<linear>.suh`) or, when that is not set,
 //! `euhedral.qwen.rco-artifact` (an artifact holding `<object>.suh` and `<object>.segments`, one `suh` row per
 //! segment). `euhedral.trellis.extremes.sequences` (default 2) sequences run. The test skips when a key is missing.
 //! The builtins library of NVRTC must be on `LD_LIBRARY_PATH`.
@@ -307,8 +307,8 @@ fn prepass_outputs_fit_fp16() {
         return;
     };
     let from_checkpoint =
-        test_support::gradle_property("euhedral.trellis.checkpoint").is_some_and(|set| Path::new(&set) == trellis);
-    let sequences = test_support::gradle_property("euhedral.trellis.extremes.sequences")
+        test_support::test_setting("euhedral.trellis.checkpoint").is_some_and(|set| Path::new(&set) == trellis);
+    let sequences = test_support::test_setting("euhedral.trellis.extremes.sequences")
         .map_or(DEFAULT_SEQUENCES, |text| {
             text.parse().expect("euhedral.trellis.extremes.sequences is a count")
         });
@@ -339,7 +339,7 @@ fn prepass_outputs_fit_fp16() {
     );
     rig.finish();
 
-    if let Some(report) = test_support::gradle_property("euhedral.trellis.extremes.report") {
+    if let Some(report) = test_support::test_setting("euhedral.trellis.extremes.report") {
         let path = PathBuf::from(report);
         create_dir_all(path.parent().unwrap()).unwrap();
         write(&path, report_json(&found)).unwrap();

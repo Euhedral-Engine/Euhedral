@@ -37,7 +37,7 @@ use crate::residency::scratch::{
 };
 use crate::workspace::{self, WorkspaceRows};
 
-/// What `memory.runtime-reserve: auto` means: Java's `ResidencyPlanner.RESERVE_BYTES`. The reserve is everything
+/// What `memory.runtime-reserve: auto` means. The reserve is everything
 /// outside the weights and the cache that one running sequence needs on the device: its GDN state, the execution
 /// workspaces, the shared scratch and the kernel modules the first launches compile.
 pub const DEFAULT_RUNTIME_RESERVE_BYTES: u64 = 1280 << 20;

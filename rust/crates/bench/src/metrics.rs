@@ -1,12 +1,11 @@
 //! Converts the boundaries of one generation into a row's work, timings and throughput. Every duration comes from its own
-//! pair of boundaries, as in the Java benchmark; the boundaries are the engine's listener events, taken on a worker the
+//! pair of boundaries; the boundaries are the engine's listener events, taken on a worker the
 //! moment the owner finds the event.
 //!
 //! - `tokenization`: generate entry to prompt encoded.
 //! - `prefill`: admission of the first prefill quantum to retirement of the last; excludes tokenization and the first
 //!   token. Rate: prompt tokens prefilled. The engine selects the first token with a device argmax inside the last
-//!   prefill quantum, so this window includes that selection (and `firstTokenSample` is about 0); the Java session selects
-//!   on the host after its last prefill quantum, outside this window.
+//!   prefill quantum, so this window includes that selection (and `firstTokenSample` is about 0).
 //! - `firstTokenSample`: retirement of the last prefill quantum to the first token found.
 //! - `timeToFirstToken`: entry to the first token found (tokenization, prefill, selection).
 //! - `decode`: **the first token found to the last token found.** Excludes the first token (it comes from prefill) and

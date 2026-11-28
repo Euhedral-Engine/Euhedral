@@ -1,5 +1,5 @@
-//! The host side of the per-layer n-gram embedding: the hashed row ids of the tokens ([`NgramIds`], Java's `NgramIds`),
-//! the table of records the ids address ([`NgramRows`], Java's `NgramStore.gatherRecordsRange`), and the split of one
+//! The host side of the per-layer n-gram embedding: the hashed row ids of the tokens ([`NgramIds`]),
+//! the table of records the ids address ([`NgramRows`]), and the split of one
 //! quantum's gather into parts that are filled apart and joined once all have arrived ([`PartSlots`]).
 
 use std::fmt;

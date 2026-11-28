@@ -1,5 +1,5 @@
-//! The `run` configuration: the Java benchmark's JSON file (`rust/resources/bench/configs/*.json`), read with the same field names,
-//! defaults and checks. Unknown fields are rejected, as Java rejects them, except `tokenizer`, which older files carry and
+//! The `run` configuration: the benchmark's JSON file (`rust/resources/bench/configs/*.json`): its field names,
+//! defaults and checks. Unknown fields are rejected, except `tokenizer`, which older files carry and
 //! the Rust benchmark ignores (it reads the tokenizer from the artifact).
 //!
 //! `generation` is `greedy` (the default; `temperature`, `topK` and `topP` are refused) or `sample` (temperature 0.7,
@@ -92,7 +92,7 @@ pub struct Scenario {
 }
 
 impl Scenario {
-    /// The Java benchmark's default suite.
+    /// The default suite.
     pub fn default_suite() -> Vec<Scenario> {
         [
             (ScenarioKind::Prefill, 32, 0),
@@ -112,7 +112,7 @@ impl Scenario {
         .collect()
     }
 
-    /// A scenario, checked as Java's constructor checks it.
+    /// A scenario, checked on construction.
     pub fn new(
         kind: ScenarioKind,
         target_prompt_tokens: usize,
@@ -326,7 +326,7 @@ struct RawGeneration {
 }
 
 impl RawGeneration {
-    /// The sampling the section asks for, checked as the Java benchmark checks it.
+    /// The sampling the section asks for, checked on construction.
     fn sampling(&self) -> Result<SamplingConfig, ConfigError> {
         let seed = self.seed.unwrap_or(1) as u64;
         let refused = |error: SamplingError| ConfigError::Invalid(error.to_string());

@@ -121,11 +121,11 @@ struct Model {
 
 fn model() -> Model {
     let checkpoint = PathBuf::from(
-        test_support::gradle_property("euhedral.quantization.checkpoint")
+        test_support::test_setting("euhedral.quantization.checkpoint")
             .expect("set euhedral.quantization.checkpoint (EUHEDRAL_TEST_QUANTIZATION_CHECKPOINT)"),
     );
     let fixture = PathBuf::from(
-        test_support::gradle_property("euhedral.quantization.forward-fixture")
+        test_support::test_setting("euhedral.quantization.forward-fixture")
             .expect("set euhedral.quantization.forward-fixture (EUHEDRAL_TEST_QUANTIZATION_FORWARD_FIXTURE)"),
     );
     let io = AsyncIo::open().unwrap();

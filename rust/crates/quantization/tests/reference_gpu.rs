@@ -33,7 +33,7 @@ const TEXT: &str = "The quick brown fox jumps over the lazy dog while the river 
     dog sleeps by the door, and the night settles slowly over the fields, the hills and the quiet road to town.";
 
 fn property(key: &str) -> String {
-    test_support::gradle_property(key).unwrap_or_else(|| panic!("set the property {key}: a device test needs it"))
+    test_support::test_setting(key).unwrap_or_else(|| panic!("set the property {key}: a device test needs it"))
 }
 
 fn run(runtime: &Arc<EngineRuntime>, out: &Path, tokens: &[Vec<u32>], options: Options) -> Written {
