@@ -37,7 +37,24 @@ pub enum Candidate {
     /// The engine as configured (host-backed layers computed by the CPU): bounded error, not equality.
     HostTier,
     /// The first run's configuration again: the runs must agree bitwise.
-    Exact,
+    Identical,
+    /// The first run on the exact reference kernels, the second on the production kernels, both with the same
+    /// settings: bounded error, not equality.
+    ExactNumerics,
+}
+
+impl Candidate {
+    /// The candidate the command line names, or the refusal sentence naming the accepted names.
+    pub fn parse(name: &str) -> Result<Candidate, String> {
+        match name {
+            "host-tier" => Ok(Candidate::HostTier),
+            "identical" => Ok(Candidate::Identical),
+            "exact-numerics" => Ok(Candidate::ExactNumerics),
+            other => Err(format!(
+                "--candidate is host-tier, identical or exact-numerics, not {other}"
+            )),
+        }
+    }
 }
 
 /// The values of one step, in the order a [`Compare`] stores them.
@@ -298,8 +315,8 @@ fn median(values: &[f64]) -> f64 {
 }
 
 /// The thresholds `summaries` (one per starting position) breach, as sentences; none means the candidate passes. The
-/// hidden-state bounds apply to the median over the starting positions: a wrong kernel raises every position. `Exact`
-/// must also agree bitwise at every step.
+/// hidden-state bounds apply to the median over the starting positions: a wrong kernel raises every position. `Identical`
+/// must also agree bitwise at every step; the other candidates are bounded.
 pub fn breaches(summaries: &[PrefixSummary], candidate: Candidate) -> Vec<String> {
     let mut breaches = Vec::new();
     for (index, summary) in summaries.iter().enumerate() {
@@ -317,9 +334,9 @@ pub fn breaches(summaries: &[PrefixSummary], candidate: Candidate) -> Vec<String
                 100.0 * MAX_DECIDED_FLIPS
             ));
         }
-        if candidate == Candidate::Exact && !summary.bitwise {
+        if candidate == Candidate::Identical && !summary.bitwise {
             breaches.push(format!(
-                "position {index}: the exact candidate differs from the first run"
+                "position {index}: the identical candidate differs from the first run"
             ));
         }
     }

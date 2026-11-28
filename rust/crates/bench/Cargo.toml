@@ -16,6 +16,7 @@ euhedral-graph.workspace = true
 euhedral-hardware-utils.workspace = true
 euhedral-hashing.workspace = true
 euhedral-io.workspace = true
+euhedral-inference-cuda = { path = "../cuda", features = ["test-oracles"] }
 euhedral-inference-edrl = { path = "../edrl" }
 euhedral-inference-engine = { path = "../engine" }
 euhedral-inference-quantization = { path = "../quantization" }

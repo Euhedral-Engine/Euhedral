@@ -6,7 +6,7 @@
 //! dump --artifact FILE --prefix N --steps N --out FILE [--cuda-library FILE]
 //! score --artifact FILE --results FILE (--reference R.kld --name NAME)... [--values DIR] [--config YAML]
 //!       [--cuda-library FILE]
-//! drift --artifact FILE --prefix N --steps N --candidate host-tier|exact [--config YAML] [--cuda-library FILE]
+//! drift --artifact FILE --prefix N --steps N --candidate host-tier|identical|exact-numerics [--config YAML] [--cuda-library FILE]
 //! ```
 //!
 //! Exit codes: 0 success, 1 a measured row failed or was ineligible, 2 usage or configuration, 3 the engine did not load.
@@ -36,6 +36,7 @@ use euhedral_inference_bench::result::{Fork, ResultWriter, SUCCESS, iso_instant,
 use euhedral_inference_bench::run::{self, Context, prepare, provenance, run_id};
 use euhedral_inference_bench::score::{score, summary_lines, values_bytes};
 use euhedral_inference_bench::tools::{append_text, open_record_files, read_references, tool_settings};
+use euhedral_inference_cuda::CudaLibrary;
 use euhedral_inference_engine::{EngineRuntime, RuntimeOwner};
 use euhedral_inference_quantization::kld::KldError;
 use euhedral_inference_settings::{ByteSize, ModelSettings, Settings, load_file, process_env};
@@ -45,7 +46,7 @@ const USAGE: &str = "usage:
   dump --artifact FILE --prefix N --steps N --out FILE [--cuda-library FILE]
   score --artifact FILE --results FILE (--reference R.kld --name NAME)... [--values DIR] [--config YAML]
         [--cuda-library FILE]
-  drift --artifact FILE --prefix N --steps N --candidate host-tier|exact [--config YAML] [--cuda-library FILE]
+  drift --artifact FILE --prefix N --steps N --candidate host-tier|identical|exact-numerics [--config YAML] [--cuda-library FILE]
 
 CONFIG.json is a benchmark configuration file (see rust/resources/bench/configs); it requires \"artifact\" and \"cudaLibrary\".
 --fork-id labels this process as one externally launched fork.
@@ -55,7 +56,8 @@ little-endian i32, then float64 nll, reference nll, kl, agree, probability diffe
 decodes the forced tokens one row at a time, which gives the rows a verification of up to 8 tokens gives.
 drift decodes PREFIX + STEPS forced tokens of the corpus document twice and compares the runs: the first on the
 engine's default settings (all layers on the GPU), the second on --config (required for host-tier; the same settings
-again for exact, which must agree bitwise). It exits 1 on a breach: mean KL >= 1e-2; more than 2% of steps flip top-1
+again for identical, which must agree bitwise; for exact-numerics the first run is on the exact reference kernels and
+the second on the production kernels, same settings). It exits 1 on a breach: mean KL >= 1e-2; more than 2% of steps flip top-1
 with a lead above 0.25; median peak 32-step hidden error >= 12%; median late/early hidden error above 1.5.
 Exit codes: 0 success, 1 a measured row failed or was ineligible (a drift breach), 2 usage or configuration, 3 the engine
 did not load.
@@ -425,6 +427,32 @@ fn score_command(args: &[String]) -> Result<u8, Failure> {
     outcome
 }
 
+/// Exact numerics selected for the process while it lives; the previous selection comes back when it drops. Holds the
+/// library open so the selection survives the engines that start and stop under it.
+struct ExactNumerics {
+    library: Arc<CudaLibrary>,
+    previous: bool,
+}
+
+impl ExactNumerics {
+    fn select(library: &Path) -> Result<ExactNumerics, Failure> {
+        let library = CudaLibrary::load(library).map_err(|error| Failure::NotLoaded(error.to_string()))?;
+        let previous = library.exact_numerics_for_tests(true);
+        Ok(ExactNumerics { library, previous })
+    }
+
+    /// Switches the process to the production kernels; the next engine to start uses them.
+    fn release(&self) {
+        self.library.exact_numerics_for_tests(false);
+    }
+}
+
+impl Drop for ExactNumerics {
+    fn drop(&mut self) {
+        self.library.exact_numerics_for_tests(self.previous);
+    }
+}
+
 fn drift_command(args: &[String]) -> Result<u8, Failure> {
     let (mut artifact, mut config, mut library, mut candidate) = (None, None, None, None);
     let (mut prefix, mut steps) = (None, None);
@@ -446,15 +474,7 @@ fn drift_command(args: &[String]) -> Result<u8, Failure> {
             "--prefix" => prefix = Some(number(value("--prefix")?, "--prefix")?),
             "--steps" => steps = Some(number(value("--steps")?, "--steps")?),
             "--candidate" => {
-                candidate = Some(match value("--candidate")?.as_str() {
-                    "host-tier" => Candidate::HostTier,
-                    "exact" => Candidate::Exact,
-                    other => {
-                        return Err(Failure::Usage(format!(
-                            "--candidate is host-tier or exact, not {other}"
-                        )));
-                    }
-                });
+                candidate = Some(Candidate::parse(&value("--candidate")?).map_err(Failure::Usage)?);
             }
             other => return Err(Failure::Usage(format!("unknown drift option {other}"))),
         }
@@ -481,9 +501,19 @@ fn drift_command(args: &[String]) -> Result<u8, Failure> {
     // One more forced token than steps: the prefill's own row is step 0 and is not compared.
     let (prefix_ids, forced) = split_document(&tokenizer, prefix, steps + 1)?;
     let first = tool_settings(&artifact, None, prefix + steps + 1)?;
+    // The exact switch is set before the first engine plans and loads, and cleared before the second does: the plan,
+    // the kernel table and the capture decision all read it at start, and exact launches are never captured.
+    let exact = (candidate == Candidate::ExactNumerics)
+        .then(|| ExactNumerics::select(&library))
+        .transpose()?;
     let (mut runtime, mut owner) = start_engine(&first, &library)?;
     let store = Arc::new(RowStore::new(steps + 1));
     let collected = drift::collect(&runtime, prefix_ids.clone(), forced.clone(), &store);
+    if let (Ok(()), Some(exact)) = (&collected, &exact) {
+        shutdown(owner, runtime);
+        exact.release();
+        (runtime, owner) = start_engine(&first, &library)?;
+    }
     if let (Ok(()), Candidate::HostTier) = (&collected, candidate) {
         // The second sequence runs on its own settings: the first engine is gone before the second loads.
         shutdown(owner, runtime);

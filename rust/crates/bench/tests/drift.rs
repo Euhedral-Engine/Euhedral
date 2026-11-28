@@ -121,12 +121,16 @@ fn the_hidden_bounds_are_medians_over_the_positions() {
 }
 
 #[test]
-fn the_exact_candidate_must_agree_bitwise() {
+fn the_identical_candidate_must_agree_bitwise() {
     let mut metrics = passing();
     metrics.iter_mut().for_each(|s| s.bitwise = true);
-    assert!(trips(&metrics, Candidate::Exact).is_empty());
+    assert!(trips(&metrics, Candidate::Identical).is_empty());
     metrics[300].bitwise = false;
-    assert!(trips(&metrics, Candidate::Exact).iter().any(|b| b.contains("differs")));
+    assert!(
+        trips(&metrics, Candidate::Identical)
+            .iter()
+            .any(|b| b.contains("differs"))
+    );
     // The host-tier candidate is bounded, not equal.
     assert!(trips(&metrics, Candidate::HostTier).is_empty());
 }
@@ -178,4 +182,31 @@ fn a_hidden_state_that_is_not_a_number_is_a_breach() {
     let found = trips(&metrics, Candidate::HostTier);
     assert!(found.iter().any(|b| b.contains("peak window")), "{found:?}");
     assert!(found.iter().any(|b| b.contains("growth")), "{found:?}");
+}
+
+#[test]
+fn candidate_names_parse_and_unknown_names_are_refused() {
+    assert_eq!(Candidate::parse("host-tier"), Ok(Candidate::HostTier));
+    assert_eq!(Candidate::parse("identical"), Ok(Candidate::Identical));
+    assert_eq!(Candidate::parse("exact-numerics"), Ok(Candidate::ExactNumerics));
+    let refusal = Candidate::parse("exact").unwrap_err();
+    assert!(
+        refusal.contains("host-tier, identical or exact-numerics") && refusal.contains("not exact"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn the_exact_numerics_candidate_is_bounded_not_bitwise() {
+    // Relaxed kernels differ from the exact ones, so rows that are not bitwise equal are within bounds.
+    assert!(trips(&passing(), Candidate::ExactNumerics).is_empty());
+    let mut high_kl = passing();
+    high_kl.iter_mut().for_each(|s| s.kl = 2.0e-2);
+    let found = trips(&high_kl, Candidate::ExactNumerics);
+    assert!(
+        found
+            .iter()
+            .any(|b| b.contains("mean KL") && b.contains("2.000e-2") && b.contains("1e-2")),
+        "a breach names the metric, its value and its limit: {found:?}"
+    );
 }
