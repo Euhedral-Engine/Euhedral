@@ -504,6 +504,7 @@ dependencies = [
  "euhedral-graph",
  "euhedral-hardware-utils",
  "euhedral-hashing",
+ "euhedral-inference-cuda",
  "euhedral-inference-edrl",
  "euhedral-inference-engine",
  "euhedral-inference-quantization",

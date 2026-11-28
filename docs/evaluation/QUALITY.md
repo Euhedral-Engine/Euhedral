@@ -275,8 +275,11 @@ python3 tools/compare_teacher_forced.py nvfp4.bin nvfp4_compressed.bin
 ## Route drift
 
 `euhedral-bench drift` decodes the same forced tokens of the corpus document twice, once on the engine's default settings
-(every layer on the GPU) and once on the settings of `--config` (`--candidate host-tier`), or on the same settings again
-(`--candidate exact`, whose rows must agree bitwise). It reports per-step hidden-state error, KL and top-1 agreement
+(every layer on the GPU) and once on the settings of `--config` (`--candidate host-tier`), on the same settings again
+(`--candidate identical`, whose rows must agree bitwise), or on the same settings with the exact reference kernels for
+the first run and the production kernels for the second (`--candidate exact-numerics`: the check that a relaxed
+kernel's accumulation order stays within the model's sensitivity floor; it runs on the CUDA library only, loads the
+engine twice, and is bounded, not bitwise, because the relaxed kernels differ by design). It reports per-step hidden-state error, KL and top-1 agreement
 against the first run:
 
 ```bash

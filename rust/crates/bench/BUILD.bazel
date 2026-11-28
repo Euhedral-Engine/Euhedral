@@ -24,6 +24,7 @@ rust_library(
     crate_name = "euhedral_inference_bench",
     crate_root = "src/lib.rs",
     deps = [
+        "//rust/crates/cuda:euhedral_inference_cuda",
         "//rust/crates/edrl:euhedral_inference_edrl",
         "//rust/crates/engine:euhedral_inference_engine",
         "//rust/crates/quantization:euhedral_inference_quantization",
@@ -77,6 +78,7 @@ rust_binary(
     crate_root = "src/main.rs",
     deps = [
         ":euhedral_inference_bench",
+        "//rust/crates/cuda:euhedral_inference_cuda",
         "//rust/crates/edrl:euhedral_inference_edrl",
         "//rust/crates/engine:euhedral_inference_engine",
         "//rust/crates/quantization:euhedral_inference_quantization",
@@ -148,6 +150,7 @@ rust_test(
     ],
     deps = [
         ":euhedral_inference_bench",
+        "//rust/crates/cuda:euhedral_inference_cuda",
         "//rust/crates/edrl:euhedral_inference_edrl",
         "//rust/crates/engine:euhedral_inference_engine",
         "//rust/crates/quantization:euhedral_inference_quantization",
@@ -211,6 +214,7 @@ rust_test(
     ],
     deps = [
         ":euhedral_inference_bench",
+        "//rust/crates/cuda:euhedral_inference_cuda",
         "//rust/crates/edrl:euhedral_inference_edrl",
         "//rust/crates/engine:euhedral_inference_engine",
         "//rust/crates/quantization:euhedral_inference_quantization",
@@ -274,6 +278,7 @@ rust_test(
     ],
     deps = [
         ":euhedral_inference_bench",
+        "//rust/crates/cuda:euhedral_inference_cuda",
         "//rust/crates/edrl:euhedral_inference_edrl",
         "//rust/crates/engine:euhedral_inference_engine",
         "//rust/crates/quantization:euhedral_inference_quantization",
@@ -337,6 +342,7 @@ rust_test(
     ],
     deps = [
         ":euhedral_inference_bench",
+        "//rust/crates/cuda:euhedral_inference_cuda",
         "//rust/crates/edrl:euhedral_inference_edrl",
         "//rust/crates/engine:euhedral_inference_engine",
         "//rust/crates/quantization:euhedral_inference_quantization",
@@ -400,6 +406,7 @@ rust_test(
     ],
     deps = [
         ":euhedral_inference_bench",
+        "//rust/crates/cuda:euhedral_inference_cuda",
         "//rust/crates/edrl:euhedral_inference_edrl",
         "//rust/crates/engine:euhedral_inference_engine",
         "//rust/crates/quantization:euhedral_inference_quantization",
