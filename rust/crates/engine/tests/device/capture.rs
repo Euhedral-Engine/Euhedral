@@ -49,6 +49,7 @@ use euhedral_inference_cuda::{CudaError, CudaLibrary, DeviceBuffer, LaneOps, Pin
 use euhedral_inference_engine::Handoff;
 use euhedral_inference_engine::formats::{Nvfp4Linear, TrellisLinear};
 use euhedral_inference_engine::lattice_config;
+use euhedral_inference_engine::model::dflash2::Dflash2Config;
 use euhedral_inference_engine::model::{
     LayerIndex, LayerKind, MTP_ATTENTION_PACK, ModelConfig, Residence, Role, WeightRef, object_key,
 };
@@ -60,7 +61,7 @@ use euhedral_inference_engine::stages::sampling::{RowReadback, SelectedRows, Sel
 use euhedral_inference_engine::stages::{
     DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Quantum, QuantumKind, SequenceRefs,
 };
-use euhedral_inference_engine::state::attention::AttentionScratch;
+use euhedral_inference_engine::state::attention::{AttentionScratch, DrafterBuffers};
 use euhedral_inference_engine::state::gdn::GdnStates;
 use euhedral_inference_engine::state::kv::{KvCache, KvRetained};
 use euhedral_inference_engine::state::released::ReleasedBuffers;
@@ -1055,6 +1056,17 @@ impl Light {
 
     /// A sequence, with an MTP cache of one layer when `mtp`.
     fn sequence_with(&self, kv_tokens: u64, layers: usize, mtp: bool) -> SequenceState {
+        self.sequence_around(kv_tokens, layers, mtp, None)
+    }
+
+    /// As [`Light::sequence_with`], with the DFlash2 drafter's buffers when `drafter` is given.
+    fn sequence_around(
+        &self,
+        kv_tokens: u64,
+        layers: usize,
+        mtp: bool,
+        drafter: Option<DrafterBuffers>,
+    ) -> SequenceState {
         let (gdn, _) = self.on_lane(|lane| GdnStates::allocate(&self.library, &self.config, 8, lane));
         let kv = KvCache::new(
             &self.library,
@@ -1066,7 +1078,10 @@ impl Light {
             0,
         )
         .unwrap();
-        let scratch = AttentionScratch::allocate(&self.library, &self.config, 8, true, 16).unwrap();
+        let mut scratch = AttentionScratch::allocate(&self.library, &self.config, 8, true, 16).unwrap();
+        if let Some(drafter) = drafter {
+            scratch = scratch.with_drafter(drafter);
+        }
         let mtp_kv = mtp.then(|| {
             KvCache::new(
                 &self.library,
@@ -1125,6 +1140,21 @@ impl Light {
         start: u64,
         row_exact_mode: bool,
     ) -> Quantum {
+        self.bare_quantum_in(&self.workspace, sequence, source, kind, rows, start, row_exact_mode)
+    }
+
+    /// As [`Light::bare_quantum`], over `workspace`.
+    #[allow(clippy::too_many_arguments, reason = "the arguments of a quantum's construction")]
+    fn bare_quantum_in(
+        &self,
+        workspace: &Arc<Workspace>,
+        sequence: &mut SequenceState,
+        source: KvSource,
+        kind: QuantumKind,
+        rows: usize,
+        start: u64,
+        row_exact_mode: bool,
+    ) -> Quantum {
         let mut retained = KvRetained::default();
         let cache = match source {
             KvSource::Base => &mut sequence.kv,
@@ -1136,7 +1166,7 @@ impl Light {
             kind,
             rows,
             InputRecordRef::new(start),
-            Arc::clone(&self.workspace),
+            Arc::clone(workspace),
             sequence.refs(source).unwrap(),
             SubmitMode {
                 pdl: false,
@@ -1518,4 +1548,88 @@ fn the_capture_key_of_each_kind_of_quantum_is_pinned() {
     let draft = light.bare_quantum(&mut sequence, KvSource::Mtp, QuantumKind::Draft, 1, 51, false);
     let draft = draft.with_selection_lease(sequence.selections.acquire().unwrap());
     assert!(draft.capture_key().is_none());
+}
+
+/// A small drafter: its rings hold 64 rows of 64 values.
+fn drafter_config() -> Dflash2Config {
+    Dflash2Config {
+        layers: 2,
+        hidden: 64,
+        intermediate: 64,
+        heads: 1,
+        kv_heads: 4,
+        head_dim: 16,
+        block_size: 8,
+        mask_token: 0,
+        conv_kernel: 2,
+        conv_group: 16,
+        selector_top_k: 16,
+        selector_rank: 16,
+        sliding_window: 64,
+        vocab: 1024,
+        eps: 1e-6,
+        theta: 1e7,
+        taps: vec![1, 3],
+    }
+}
+
+/// The key of the drafter's context and block quanta: a context of up to 8 rows and a block have a key, the key does
+/// not depend on the position, it depends on the rows and on the drafter's buffers, and a context of 9 rows has none.
+#[test]
+#[ignore = "needs a GPU and the native library"]
+fn the_capture_key_of_the_drafters_context_and_block_quanta_depends_on_rows_and_buffers_not_on_position() {
+    let Some(light) = light() else { return };
+    let drafter = drafter_config();
+    let buffers = || DrafterBuffers::allocate(&light.library, &drafter, 8).unwrap();
+    let mut sequence = light.sequence_around(1024, 1, false, Some(buffers()));
+    // A workspace of more rows than a captured quantum has, to build the context that is not captured.
+    let rows = WorkspaceRows {
+        rows: 16,
+        logits_rows: 8,
+    };
+    let workspace = Arc::new(Workspace::allocate(&light.library, &light.config, rows, &[]).unwrap());
+    // Each quantum starts where the cache's frontier is: the cache is advanced to `start` first, row by row.
+    let key = |sequence: &mut SequenceState, kind, rows: usize, start| {
+        light.advance(sequence, KvSource::Base, start);
+        let quantum = light.bare_quantum_in(&workspace, sequence, KvSource::Base, kind, rows, start, false);
+        let key = quantum.capture_key();
+        drop(quantum);
+        sequence.kv.commit(rows as u64).unwrap();
+        key
+    };
+
+    let three = key(&mut sequence, QuantumKind::Context, 3, 100).expect("a context of 3 rows has a key");
+    assert_eq!(
+        key(&mut sequence, QuantumKind::Context, 3, 300),
+        Some(three.clone()),
+        "the position is not in a context's key"
+    );
+    let four = key(&mut sequence, QuantumKind::Context, 4, 310).expect("a context of 4 rows has a key");
+    assert_ne!(three, four, "another row count is another key");
+    assert!(
+        key(&mut sequence, QuantumKind::Context, 9, 320).is_none(),
+        "a context of 9 rows is not captured"
+    );
+
+    let block = key(&mut sequence, QuantumKind::Block, 8, 400).expect("a block has a key");
+    assert_eq!(
+        key(&mut sequence, QuantumKind::Block, 8, 600),
+        Some(block),
+        "the position is not in a block's key"
+    );
+
+    // Only the drafter's buffers are reallocated: every other buffer of the sequence keeps its serial.
+    let before = key(&mut sequence, QuantumKind::Context, 3, 700).unwrap();
+    let placeholder = light.sequence_around(1024, 1, false, None);
+    let held = mem::replace(&mut sequence.device, Arc::clone(&placeholder.device));
+    let SequenceDevice { gdn, scratch } = Arc::try_unwrap(held).expect("no quantum holds the sequence's buffers");
+    sequence.device = Arc::new(SequenceDevice {
+        gdn,
+        scratch: scratch.with_drafter(buffers()),
+    });
+    let after = key(&mut sequence, QuantumKind::Context, 3, 800).unwrap();
+    assert_ne!(
+        before, after,
+        "reallocated drafter buffers are another key (before at 700, after at 800)"
+    );
 }
