@@ -60,9 +60,9 @@ callback, which runs once, on a worker, after the quantum's device work complete
 A request's sequence has an owner (`generation/source.rs`): one `Owner` holds everything the sequence changes between quanta,
 its caches' frontiers, the graphs it recorded, the quanta in flight and what the request produced. The owner sits in a
 `Mailbox` (`generation/mailbox.rs`) whose claim one thread at a time holds. A frame that has something to tell the owner (a
-quantum retired, a logits row arrived, a parked quantum's lane work ran) posts a message and then drives the mailbox: it runs
+quantum concluded, a logits row arrived, a parked quantum's lane work ran) posts a message and then drives the mailbox: it runs
 a turn of the owner on its own thread if the claim is free, and the holder of the claim sees the message if it is not.
-Nothing polls the owner and nothing waits for it. A turn takes in what arrived, concludes the quanta that retired, admits the
+Nothing polls the owner and nothing waits for it. A turn takes in what arrived, concludes the quanta in admission order, admits the
 next ones and ends the request; the outcome is told to the caller after the claim is released.
 
 Admission of a quantum is small:
@@ -213,7 +213,7 @@ callback per quantum, not one per kernel.
 
 The generation is an ouroboros. State and frame generation sit at the top: the sequence's owner admits a quantum into a graph.
 Execution sits at the bottom: the stages and the device. The completion at the bottom throws a message back to the top: the
-retired quantum's message to the owner's mailbox starts a turn that concludes it, samples the next token and admits the next
+retired quantum's conclusion, posted to the owner's mailbox, starts a turn that samples the next token and admits the next
 quantum (or ends the request). Nothing waits on a future between the two. A greedy request keeps two quanta in flight, so the
 device runs the next step behind the one that is retiring.
 
@@ -237,11 +237,12 @@ A quantum that stopped part-way retires behind the work it queued, and its rows 
 
 A sequence is a sequencer: parallel execution, ordered completion. The sequence's quanta (and its prefix-cache captures and
 restores) are admitted in order and each completes in any order, but they conclude in admission order, through a RustEE
-`Sequencer` (`generation/conclusion.rs`): `Conclusion::admit` offers a place in the order when the owner publishes the
-quantum, the owner completes the quantum's `Slot` when it retires, or lets the slot drop when the quantum never ran, and the
-sequencer concludes the ready prefix, one thread at a time, without a lock. What it concludes lands in a queue only the owner
-reads, so the conclusion itself (commits, the listener, the failure of a request) runs in the owner's turn on state the owner
-alone touches. Cancellation (`CancelHandle`) asks the generation to end at its next quantum boundary: the request ends once
+`Sequencer` (`generation/conclusion.rs`): the owner takes a place in the order when it publishes the work, and the place
+travels with the work. The frame that retires the work completes its place; work dropped before it ran passes it. The thread
+that completes the place at the head of the order concludes the ready prefix, in admission order, and hands each conclusion
+to the owner's mailbox without waiting. The conclusion (commits, the listener, the failure of a request) runs in the owner's
+turn, on state the owner alone touches. One order serves a sequence's quanta and copies: they conclude in the order they were
+submitted, and none concludes twice. Cancellation (`CancelHandle`) asks the generation to end at its next quantum boundary: the request ends once
 through its listener as `FinishReason::Cancelled`, and the sequence is free for the next request.
 
 Several quanta of one sequence can be in flight. Edges order their device accesses, including KV appends; conclusions publish
@@ -420,7 +421,7 @@ represented-NVFP4 tolerance for decode attention.
 Relaxed numerics: every kernel above whose numerics differ from its exact counterpart (contiguous Q3/Q4/Q5 decode, the MXFP8 and
 native FP4 prefill routes, the one-row residual norm, the prefill attention softmax sum, the column-owned GDN recurrence, the
 contiguous and GQA decode attention) is replaced by the exact kernel under exact numerics, and
-`euhedral-bench drift` ([QUALITY.md](../evaluation/QUALITY.md)) does not compare the two: it runs the artifact on all-GPU settings and then on the host-tier settings (or on the same settings again, which must agree bitwise). A check of exact against relaxed numerics end to end is not automated. The Q3 artifact's relaxed numerics measure a hidden-state
+`euhedral-bench drift --candidate exact-numerics` ([QUALITY.md](../evaluation/QUALITY.md)) compares the two end to end: the same forced tokens on the exact kernels, then on the production kernels, bounded by the drift thresholds. The Q3 artifact's relaxed numerics measure a hidden-state
 relative error of 6.0e-2, KL 5.1e-3 and top-1 agreement 0.961 over 8 windows of 48 positions, with no growth by position
 ([PREFILL_MX.md](../kernels/PREFILL_MX.md)); a single one-ulp perturbation (the decode attention merge order) gives about 5.4% and KL 2.6e-3,
 so the combined error stays at the model's sensitivity floor: one-ulp BF16 differences settle at this level in the 64-layer

@@ -9,9 +9,10 @@
 //! [`Generation::generate`](super::Generation::generate) claims the owner to start a request, and offers one frame to
 //! the `stages` lake for the first turn to run on a worker.
 //!
-//! What arrives is a [`Message`] in the owner's inbox: a quantum that retired (the executor's retirement callback posts
-//! it), the host's selection of a sampled row, and the running of the work a parked quantum waited for on the owner's
-//! lane. Nothing waits for them.
+//! What arrives is a [`Message`] in the owner's inbox: a quantum or a copy that concluded (the sequence's order of
+//! conclusion, a [`Conclusion`], posts it, in admission order, when the retirement of the work completes its place),
+//! the host's selection of a sampled row, and the running of the work a parked quantum waited for on the owner's lane.
+//! Nothing waits for them.
 //!
 //! **The chain.** A greedy request keeps two quanta in flight. The one admitted behind another runs behind it on the
 //! device (the graph's external edge waits for its sink), and takes its token id from the selection the earlier one
@@ -50,7 +51,7 @@ use std::time::{Duration, Instant};
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, Single};
 use euhedral_gpu::Ran;
-use euhedral_graph::{Marker, QuantumOutcome, Slot};
+use euhedral_graph::{Marker, QuantumOutcome};
 use euhedral_inference_cuda::{DevicePtr, SubmitMode};
 
 use super::conclusion::Conclusion;
@@ -77,9 +78,10 @@ use crate::quantum::{Executor, StartError};
 use crate::runtime::{Core, Units};
 use crate::sampling::{SamplingConfig, SamplingError, TokenSampler};
 use crate::stages::attention::KvSource;
-use crate::stages::sampling::{RowReadbackLease, Selection, SelectionLease};
-use crate::stages::{InputRecordRef, Outcome, Quantum, QuantumError, QuantumKind, SequenceRefs, SubmitError};
-use crate::state::FlightGuard;
+use crate::stages::sampling::{RowReadbackLease, Selection};
+use crate::stages::{
+    InputRecordRef, Kept, Quantum, QuantumError, QuantumKind, Retired, Retirement, SequenceRefs, SubmitError,
+};
 use crate::state::kv::KvRetained;
 use crate::state::{Flight, SequenceId, SequenceState};
 use crate::workspace::Workspace;
@@ -96,8 +98,8 @@ const ALTERNATING_RECORDS: u64 = 2;
 
 /// What an owner is told.
 pub(crate) enum Message {
-    /// A quantum retired.
-    Retired(Box<Retired>),
+    /// A quantum retired and every quantum admitted before it concluded: it concludes now.
+    Concluded(Box<Retired>),
     /// The hidden rows of a quantum reached pinned memory.
     HiddenCopied(Box<HiddenRows>),
     /// The sink of a hidden request is free again: a delivery to it ended.
@@ -112,8 +114,8 @@ pub(crate) enum Message {
     StartFailed(Box<StartFailed>),
     /// A prefix-cache copy job of this sequence to admit (see [`copy_submit`]).
     Copy(Box<CopyRequest>),
-    /// A copy job of this sequence ended and was reported.
-    CopyEnded,
+    /// A copy job of this sequence ended and every quantum or copy admitted before it concluded.
+    CopyConcluded,
     /// The prefix cache answered the lookup of the request's prompt.
     Looked(Option<Hit>),
     /// The prefix cache answered the restore of the request's hit.
@@ -148,7 +150,7 @@ fn copy_submit(address: Arc<Address<Owner>>, kill: Arc<AtomicBool>, purpose: Pur
 impl fmt::Debug for Message {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Message::Retired(_) => formatter.write_str("Message::Retired"),
+            Message::Concluded(_) => formatter.write_str("Message::Concluded"),
             Message::HiddenCopied(rows) => write!(formatter, "Message::HiddenCopied(position {})", rows.first_position),
             Message::HiddenDelivered(_) => formatter.write_str("Message::HiddenDelivered"),
             Message::Sampled(sampled) => write!(formatter, "Message::Sampled(step {})", sampled.step),
@@ -156,106 +158,10 @@ impl fmt::Debug for Message {
             Message::Reaped => formatter.write_str("Message::Reaped"),
             Message::StartFailed(failed) => write!(formatter, "Message::StartFailed({})", failed.serial),
             Message::Copy(_) => formatter.write_str("Message::Copy"),
-            Message::CopyEnded => formatter.write_str("Message::CopyEnded"),
+            Message::CopyConcluded => formatter.write_str("Message::CopyConcluded"),
             Message::Looked(hit) => write!(formatter, "Message::Looked({})", hit.as_ref().map_or(0, Hit::position)),
             Message::Restored(result) => write!(formatter, "Message::Restored({result:?})"),
             Message::Captured(_) => formatter.write_str("Message::Captured"),
-        }
-    }
-}
-
-/// What an owner keeps of a retired quantum until the work queued on its lane has run.
-pub(crate) enum Kept {
-    /// A quantum of the sequence alone.
-    Whole(Box<Quantum>),
-    /// A pass of several sequences, which every member's owner keeps (the last to let go frees its input record), and the
-    /// selection lease of this member's part.
-    Part {
-        batch: Arc<Quantum>,
-        _lease: Option<SelectionLease>,
-        /// The part's count in flight on its sequence, which is its own: the sequence settles when this part is let go
-        /// of, whatever the other members do.
-        _flight: Option<FlightGuard>,
-    },
-}
-
-impl Kept {
-    /// The marker of the upload of the quantum's input record.
-    fn prepared(&self) -> Option<Marker> {
-        match self {
-            Kept::Whole(quantum) => quantum.prepared,
-            Kept::Part { batch, .. } => batch.prepared,
-        }
-    }
-}
-
-/// A retired quantum (or this sequence's part of a pass) and how it ended for this sequence.
-pub(crate) struct Retired {
-    /// The number of the quantum that ran, which for a part is the pass's.
-    pub(crate) serial: u64,
-    pub(crate) start: u64,
-    pub(crate) kind: QuantumKind,
-    pub(crate) rows: usize,
-    /// The rows of the quantum this sequence commits when it completed.
-    pub(crate) committed: usize,
-    pub(crate) ran: Option<Ran>,
-    /// Whether the quantum is a pass of several sequences, which the owner of the workspace was told retired before this.
-    pub(crate) pass: bool,
-    pub(crate) kept: Kept,
-    pub(crate) outcome: QuantumOutcome,
-}
-
-impl Retired {
-    /// A quantum of one sequence that retired.
-    pub(crate) fn whole(quantum: Quantum, outcome: QuantumOutcome) -> Retired {
-        Retired {
-            serial: quantum.id(),
-            start: quantum.start_position(),
-            kind: quantum.kind(),
-            rows: quantum.rows(),
-            committed: quantum.rows(),
-            ran: quantum.graph_run(),
-            pass: false,
-            kept: Kept::Whole(Box::new(quantum)),
-            outcome,
-        }
-    }
-
-    /// Segment `segment` of the pass `batch` that retired as `outcome`: how it ended for its own sequence (a member that
-    /// was cancelled concludes cancelled, whatever the pass did), with the lease its owner gives back.
-    pub(crate) fn part(
-        batch: &Arc<Quantum>,
-        segment: usize,
-        lease: Option<SelectionLease>,
-        flight: Option<FlightGuard>,
-        outcome: &QuantumOutcome,
-    ) -> Retired {
-        let concluded = match batch.conclusion_for(segment, outcome) {
-            Ok(Outcome::Completed) => QuantumOutcome::Completed,
-            Ok(Outcome::Cancelled) => QuantumOutcome::Killed,
-            Ok(Outcome::Failed(cause)) => QuantumOutcome::DeviceFailed { cause },
-            Err(error) => QuantumOutcome::DeviceFailed {
-                cause: error.to_string(),
-            },
-        };
-        let (start, rows) = batch
-            .segments()
-            .get(segment)
-            .map_or((0, 0), |part| (part.start_position(), part.rows()));
-        Retired {
-            serial: batch.id(),
-            start,
-            kind: batch.kind(),
-            rows,
-            committed: batch.committed_rows(segment).unwrap_or(0),
-            ran: None,
-            pass: true,
-            kept: Kept::Part {
-                batch: Arc::clone(batch),
-                _lease: lease,
-                _flight: flight,
-            },
-            outcome: concluded,
         }
     }
 }
@@ -587,12 +493,9 @@ pub(super) struct Flying {
     pub(super) admitted: Instant,
     /// Set to stop the quantum when the request stops while it is in flight.
     pub(super) kill: Arc<AtomicBool>,
-    /// When the owner found it retired.
+    /// When the quantum retired.
     pub(super) retired_at: Option<Instant>,
     pub(super) retired: Option<Retired>,
-    /// Its place in the request's conclusion order, completed with the quantum when it retires. Dropped with the
-    /// quantum when it never ran, which passes the place.
-    slot: Option<Slot<Flying>>,
     /// The marker of the reservation made for the quantum on the owner's lane: what `retained` is held for when the
     /// quantum never starts.
     pub(super) reserved: Marker,
@@ -632,10 +535,10 @@ pub(super) struct Run {
     pub(super) decodes: usize,
     /// Tokens selected and reported, or rows handed to the sink.
     pub(super) generated: usize,
-    /// The quanta admitted that have not retired, oldest first. A quantum that retires leaves for `conclusion`.
+    /// The quanta admitted whose conclusion has not arrived, oldest first.
     pub(super) in_flight: VecDeque<Flying>,
-    /// The order the quanta conclude in, which is the order they were admitted in.
-    conclusion: Conclusion<Flying>,
+    /// The quanta that retired and are to conclude, in the order the sequence's [`Conclusion`] delivered them.
+    concluding: VecDeque<Flying>,
     /// Whether the workspace's owner holds the last quantum admitted, which the next one is chained behind. Held only
     /// while another quantum may follow: a quantum retires only when its references are dropped.
     pub(super) chain: bool,
@@ -670,9 +573,9 @@ pub(super) struct Run {
 }
 
 impl Run {
-    /// The quanta admitted that have not concluded: in flight, or retired and waiting for the ones before them.
+    /// The quanta admitted that have not concluded: in flight, or delivered and not yet concluded.
     pub(super) fn flying(&self) -> usize {
-        self.conclusion.pending()
+        self.in_flight.len() + self.concluding.len()
     }
 
     /// The next step to admit, or `None` once the request has no more (or has been told to stop).
@@ -870,6 +773,8 @@ pub(crate) struct Owner {
     /// The prefix cache's copy jobs of this sequence admitted and not yet ended. The sequence's lease is not returned,
     /// and the owner is not idle, while one is in flight: a capture reads the sequence's state and a restore writes it.
     copies: usize,
+    /// The order the sequence's quanta and copy jobs conclude in: the order they were admitted in.
+    conclusion: Conclusion<Retirement>,
 }
 
 impl fmt::Debug for Owner {
@@ -892,6 +797,13 @@ impl Owner {
     ) -> Owner {
         let address = Arc::clone(&shared.address);
         sequence.on_settled(move || address.post(Message::Reaped));
+        let concluded = Arc::clone(&shared.address);
+        let conclusion = Conclusion::new(move |retirement| {
+            concluded.post(match retirement {
+                Retirement::Quantum(retired) => Message::Concluded(retired),
+                Retirement::Copy => Message::CopyConcluded,
+            });
+        });
         Owner {
             shared,
             id,
@@ -904,6 +816,7 @@ impl Owner {
             watch: None,
             sample_steps: 0,
             copies: 0,
+            conclusion,
         }
     }
 
@@ -1189,7 +1102,7 @@ impl Owner {
             decodes: 0,
             generated: 0,
             in_flight: VecDeque::new(),
-            conclusion: Conclusion::new(),
+            concluding: VecDeque::new(),
             chain: false,
             sequence: self.id,
             shared: Arc::clone(&self.shared),
@@ -1297,7 +1210,7 @@ impl Owner {
         );
         let cached_prompt_tokens = run.cached_prompt_tokens();
         mem::forget(mem::take(&mut run.in_flight));
-        mem::forget(run.conclusion);
+        mem::forget(mem::take(&mut run.concluding));
         mem::forget(mem::take(&mut run.carried));
         // The quanta can no longer be accounted for, so a next request on this sequence could race them: it is not given back.
         mem::forget(run.lease);
@@ -1317,7 +1230,7 @@ impl Owner {
 
     fn receive(&mut self, message: Message) {
         match message {
-            Message::Retired(retired) => {
+            Message::Concluded(retired) => {
                 let retired = *retired;
                 // A quantum the workspace waited for is done: the owner of the workspace starts what waits. A pass was
                 // told to it before the members' owners were.
@@ -1332,11 +1245,11 @@ impl Owner {
                 });
                 match waiting {
                     Some(mut flying) => {
-                        flying.retired_at = Some(Instant::now());
+                        flying.retired_at = Some(retired.at);
                         flying.retired = Some(retired);
-                        // Concludes with the quanta admitted before it once they retired: see `conclude`.
-                        if let Some(slot) = flying.slot.take() {
-                            slot.complete(flying);
+                        // The conclusion delivers in admission order: see `conclude`.
+                        if let Some(run) = self.run.as_mut() {
+                            run.concluding.push_back(flying);
                         }
                     }
                     None => {
@@ -1357,7 +1270,7 @@ impl Owner {
             Message::Reaped => {}
             Message::StartFailed(failed) => self.start_failed(*failed),
             Message::Copy(request) => self.admit_copy(*request),
-            Message::CopyEnded => self.copies = self.copies.saturating_sub(1),
+            Message::CopyConcluded => self.copies = self.copies.saturating_sub(1),
             Message::Looked(hit) => self.looked(hit),
             Message::Restored(result) => self.restore_answered(result),
             Message::Captured(node) => {
@@ -1540,6 +1453,7 @@ impl Owner {
             Purpose::Capture => run.next_step(chunk).is_some(),
         };
         self.copies += 1;
+        let job = job.in_place(self.conclusion.admit());
         if let Err(error) = shared.order.admit(self.id, &shared.executor, job, kill, false, more) {
             self.copies -= 1;
             log::error!("a prefix-cache copy did not start: {error}");
@@ -1809,14 +1723,14 @@ impl Owner {
         }
     }
 
-    /// Concludes the quanta that retired, oldest first: commits their rows, reads their tokens, tells the listener.
+    /// Concludes the quanta whose conclusion arrived, oldest first: commits their rows, reads their tokens, tells the listener.
     fn conclude(&mut self) {
         loop {
             // Also the turn's one look when nothing retired; a cancel from a listener's call ends the reports of the
             // quanta that retired behind it.
             self.observe_cancel();
             let Some(run) = self.run.as_mut() else { return };
-            let Some(mut flying) = run.conclusion.next() else {
+            let Some(mut flying) = run.concluding.pop_front() else {
                 return;
             };
             let Some(retired) = flying.retired.take() else {
@@ -2448,7 +2362,8 @@ impl Owner {
         let admitted = Instant::now();
         let id = quantum.id();
 
-        let slot = run.conclusion.admit();
+        let place = self.conclusion.admit();
+        quantum = quantum.with_place(place);
         run.in_flight.push_back(Flying {
             id,
             role,
@@ -2463,7 +2378,6 @@ impl Owner {
             kill: Arc::clone(&kill),
             retired_at: None,
             retired: None,
-            slot: Some(slot),
             reserved,
             checkpoint: false,
         });

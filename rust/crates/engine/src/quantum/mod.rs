@@ -815,6 +815,8 @@ pub enum StartError {
     Withdrawn,
     #[error("the quantum's disk reads were refused: {0}")]
     Disk(String),
+    #[error("segment {segment} of quantum {serial} has no place in its sequence's order of conclusion")]
+    NoPlace { serial: u64, segment: usize },
 }
 
 /// The tier a quantum's reads were registered with, and the ledger of what they owe it.
@@ -1043,6 +1045,13 @@ impl Executor {
             row_exact: true,
         };
         let batch = Quantum::batch(parts, workspace, mode, config, lanes)?.with_input_record(record);
+        // What the carriers made: a segment that lost its place would never conclude.
+        if let Some(segment) = batch.unplaced() {
+            return Err(StartError::NoPlace {
+                serial: batch.id(),
+                segment,
+            });
+        }
         self.start(batch, kill, after)
     }
 

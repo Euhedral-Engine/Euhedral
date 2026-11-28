@@ -121,12 +121,16 @@ fn the_hidden_bounds_are_medians_over_the_positions() {
 }
 
 #[test]
-fn the_exact_candidate_must_agree_bitwise() {
+fn the_identical_candidate_must_agree_bitwise() {
     let mut metrics = passing();
     metrics.iter_mut().for_each(|s| s.bitwise = true);
-    assert!(trips(&metrics, Candidate::Exact).is_empty());
+    assert!(trips(&metrics, Candidate::Identical).is_empty());
     metrics[300].bitwise = false;
-    assert!(trips(&metrics, Candidate::Exact).iter().any(|b| b.contains("differs")));
+    assert!(
+        trips(&metrics, Candidate::Identical)
+            .iter()
+            .any(|b| b.contains("differs"))
+    );
     // The host-tier candidate is bounded, not equal.
     assert!(trips(&metrics, Candidate::HostTier).is_empty());
 }
@@ -178,4 +182,60 @@ fn a_hidden_state_that_is_not_a_number_is_a_breach() {
     let found = trips(&metrics, Candidate::HostTier);
     assert!(found.iter().any(|b| b.contains("peak window")), "{found:?}");
     assert!(found.iter().any(|b| b.contains("growth")), "{found:?}");
+}
+
+#[test]
+fn candidate_names_parse_and_unknown_names_are_refused() {
+    assert_eq!(Candidate::parse("host-tier"), Ok(Candidate::HostTier));
+    assert_eq!(Candidate::parse("identical"), Ok(Candidate::Identical));
+    assert_eq!(Candidate::parse("exact-numerics"), Ok(Candidate::ExactNumerics));
+    let refusal = Candidate::parse("exact").unwrap_err();
+    assert!(
+        refusal.contains("host-tier, identical or exact-numerics") && refusal.contains("not exact"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn the_exact_numerics_candidate_is_bounded_not_bitwise() {
+    // Relaxed kernels differ from the exact ones, so rows that are not bitwise equal are within bounds.
+    assert!(trips(&passing(), Candidate::ExactNumerics).is_empty());
+    let mut high_kl = passing();
+    high_kl.iter_mut().for_each(|s| s.kl = 2.0e-2);
+    let found = trips(&high_kl, Candidate::ExactNumerics);
+    assert!(
+        found
+            .iter()
+            .any(|b| b.contains("mean KL") && b.contains("2.000e-2") && b.contains("1e-2")),
+        "a breach names the metric, its value and its limit: {found:?}"
+    );
+}
+
+#[test]
+fn the_exact_numerics_candidate_breaches_when_the_passes_agree_bitwise() {
+    // Both passes on the same kernels: the switch did not take effect, and equal rows prove nothing.
+    let mut metrics = passing();
+    metrics.iter_mut().for_each(|s| s.bitwise = true);
+    let found = trips(&metrics, Candidate::ExactNumerics);
+    assert!(found.iter().any(|b| b.contains("switch did not reach")), "{found:?}");
+    // One differing step is enough to show the modes differ.
+    metrics[7].bitwise = false;
+    assert!(trips(&metrics, Candidate::ExactNumerics).is_empty());
+}
+
+#[test]
+fn only_the_host_tier_candidate_takes_a_config() {
+    assert!(Candidate::HostTier.check_config(true).is_ok());
+    assert!(
+        Candidate::HostTier
+            .check_config(false)
+            .unwrap_err()
+            .contains("needs --config")
+    );
+    assert!(Candidate::Identical.check_config(false).is_ok());
+    assert!(Candidate::ExactNumerics.check_config(false).is_ok());
+    for candidate in [Candidate::Identical, Candidate::ExactNumerics] {
+        let refusal = candidate.check_config(true).unwrap_err();
+        assert!(refusal.contains("--config is only for the host-tier"), "{refusal}");
+    }
 }

@@ -59,8 +59,8 @@ use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
 use euhedral_inference_engine::stages::sampling::token_of;
 use euhedral_inference_engine::stages::{
-    DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Outcome as Conclusion, Part, Quantum, QuantumError,
-    QuantumKind, SequenceRefs,
+    DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Outcome as Conclusion, Part, PlaceProbe, Quantum,
+    QuantumError, QuantumKind, SequenceRefs,
 };
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
@@ -1361,6 +1361,63 @@ fn each_member_of_a_batch_holds_its_own_count_in_flight() {
     drop(kept_by_second);
     assert_eq!(second.sequence.in_flight(), 0);
     drop((keep_a, keep_b));
+    first.close(&world);
+    second.close(&world);
+    world.close();
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn each_part_of_a_batch_keeps_its_own_sequences_place() {
+    let _light = common::light();
+    let Some(world) = World::open() else { return };
+    let mode = SubmitMode {
+        pdl: false,
+        row_exact: true,
+    };
+    let mut first = prefilled(&world, 300);
+    let mut second = prefilled(&world, 411);
+    let (orders_a, orders_b) = (PlaceProbe::new(), PlaceProbe::new());
+    // The owner's path: each verification takes a place in its sequence's order, becomes a part and joins the batch.
+    let built_a = first.build(&world, Step::Verify { rows: 2, commit: 2 });
+    let built_b = second.build(&world, Step::Verify { rows: 2, commit: 2 });
+    let cancel = || Arc::new(AtomicBool::new(false));
+    let a = built_a
+        .quantum
+        .with_probe_place(&orders_a)
+        .into_part(SequenceId(0), cancel())
+        .unwrap();
+    let b = built_b
+        .quantum
+        .with_probe_place(&orders_b)
+        .into_part(SequenceId(1), cancel())
+        .unwrap();
+    let mut quantum = Quantum::batch(
+        vec![a, b],
+        Arc::clone(&world.workspace),
+        mode,
+        Arc::clone(&world.config),
+        world.table.clone(),
+    )
+    .unwrap();
+    // The frame that ends the batch takes every segment's place out and completes each: the second's alone, then the
+    // first's.
+    let mut places = quantum.take_probe_places();
+    assert_eq!(places.len(), 2);
+    assert!(places.pop().unwrap().complete());
+    assert_eq!(
+        (orders_a.concluded(), orders_b.concluded()),
+        (0, 1),
+        "the second part's place is the second's"
+    );
+    assert!(places.pop().unwrap().complete());
+    assert_eq!((orders_a.concluded(), orders_b.concluded()), (1, 1));
+    assert!(
+        quantum.take_probe_places().into_iter().all(|place| !place.complete()),
+        "the places left the batch once"
+    );
+    drop(quantum);
+    drop((built_a.retained, built_b.retained));
     first.close(&world);
     second.close(&world);
     world.close();

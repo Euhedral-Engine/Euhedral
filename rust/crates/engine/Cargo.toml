@@ -7,8 +7,9 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-# `Executor::check_replay_for_tests`: the C library's check mode over a quantum's stages. Enabled for the crate's own
-# tests by the dev-dependency on itself.
+# `Executor::check_replay_for_tests`: the C library's check mode over a quantum's stages; `PlaceProbe`, and the quantum's
+# probe places, which let a test hold a batch's places to their sequences. Enabled for the crate's own tests by the
+# dev-dependency on itself.
 test-oracles = ["euhedral-inference-cuda/test-oracles"]
 
 [dependencies]
