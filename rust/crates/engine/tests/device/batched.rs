@@ -59,8 +59,8 @@ use euhedral_inference_engine::stages::attention::KvSource;
 use euhedral_inference_engine::stages::sampling::SelectionPool;
 use euhedral_inference_engine::stages::sampling::token_of;
 use euhedral_inference_engine::stages::{
-    DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Outcome as Conclusion, Part, Quantum, QuantumError,
-    QuantumKind, SequenceRefs,
+    DraftSeed, DraftTokenWrite, InputRecordRef, LaneTable, Outcome as Conclusion, Part, PlaceProbe, Quantum,
+    QuantumError, QuantumKind, SequenceRefs,
 };
 use euhedral_inference_engine::state::attention::AttentionScratch;
 use euhedral_inference_engine::state::gdn::GdnStates;
@@ -1360,6 +1360,48 @@ fn each_member_of_a_batch_holds_its_own_count_in_flight() {
     assert_eq!(second.sequence.in_flight(), 1, "the second still holds its own");
     drop(kept_by_second);
     assert_eq!(second.sequence.in_flight(), 0);
+    drop((keep_a, keep_b));
+    first.close(&world);
+    second.close(&world);
+    world.close();
+}
+
+#[test]
+#[ignore = "needs a GPU, the native library and the RCO artifact"]
+fn each_part_of_a_batch_keeps_its_own_sequences_place() {
+    let _light = common::light();
+    let Some(world) = World::open() else { return };
+    let mode = SubmitMode {
+        pdl: false,
+        row_exact: true,
+    };
+    let mut first = prefilled(&world, 300);
+    let mut second = prefilled(&world, 411);
+    let (a, keep_a, _) = first.part(&world, 0, &Member::all(2));
+    let (b, keep_b, _) = second.part(&world, 1, &Member::all(2));
+    let (orders_a, orders_b) = (PlaceProbe::new(), PlaceProbe::new());
+    let mut quantum = Quantum::batch(
+        vec![a.in_probe_place(&orders_a), b.in_probe_place(&orders_b)],
+        Arc::clone(&world.workspace),
+        mode,
+        Arc::clone(&world.config),
+        world.table.clone(),
+    )
+    .unwrap();
+    // The frame that ends the batch completes each segment's place: the second's alone, then the first's.
+    assert!(quantum.complete_probe_place(1));
+    assert_eq!(
+        (orders_a.concluded(), orders_b.concluded()),
+        (0, 1),
+        "the second part's place is the second's"
+    );
+    assert!(quantum.complete_probe_place(0));
+    assert_eq!((orders_a.concluded(), orders_b.concluded()), (1, 1));
+    assert!(
+        !quantum.complete_probe_place(0) && !quantum.complete_probe_place(1),
+        "a place is completed once"
+    );
+    drop(quantum);
     drop((keep_a, keep_b));
     first.close(&world);
     second.close(&world);

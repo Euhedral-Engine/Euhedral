@@ -815,6 +815,8 @@ pub enum StartError {
     Withdrawn,
     #[error("the quantum's disk reads were refused: {0}")]
     Disk(String),
+    #[error("the quantum has no place in its sequence's order of conclusion")]
+    NoPlace,
 }
 
 /// The tier a quantum's reads were registered with, and the ledger of what they owe it.

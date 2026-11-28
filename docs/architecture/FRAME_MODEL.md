@@ -62,7 +62,7 @@ its caches' frontiers, the graphs it recorded, the quanta in flight and what the
 `Mailbox` (`generation/mailbox.rs`) whose claim one thread at a time holds. A frame that has something to tell the owner (a
 quantum concluded, a logits row arrived, a parked quantum's lane work ran) posts a message and then drives the mailbox: it runs
 a turn of the owner on its own thread if the claim is free, and the holder of the claim sees the message if it is not.
-Nothing polls the owner and nothing waits for it. A turn takes in what arrived, concludes the quanta that concluded, admits the
+Nothing polls the owner and nothing waits for it. A turn takes in what arrived, concludes the quanta in admission order, admits the
 next ones and ends the request; the outcome is told to the caller after the claim is released.
 
 Admission of a quantum is small:

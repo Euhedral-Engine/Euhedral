@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn a_conclusion_runs_on_the_thread_that_completed_the_head_and_a_completion_during_it_is_left_to_it() {
+    fn a_completion_during_a_conclusion_is_left_to_the_running_drain() {
         // The conclusion of the first value completes the third place, which is behind the second: that completion
         // finds the drain busy and leaves its value to the drain that is running.
         let list = Arc::new(Mutex::new(Vec::new()));

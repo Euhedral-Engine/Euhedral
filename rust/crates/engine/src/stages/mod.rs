@@ -24,6 +24,8 @@ pub mod gdn;
 pub mod linear;
 pub mod mtp;
 pub mod norm;
+#[cfg(feature = "test-oracles")]
+mod place_probe;
 mod retired;
 pub mod sampling;
 pub mod transfer;
@@ -59,6 +61,8 @@ use crate::state::{FlightGuard, KvView, SequenceDevice, SequenceId};
 use crate::workspace::{BufferSlot, Workspace, WorkspaceError, input_record_bytes};
 use attention::KvSource;
 use euhedral_inference_settings::KvFormat;
+#[cfg(feature = "test-oracles")]
+pub use place_probe::PlaceProbe;
 pub(crate) use retired::{Kept, Retired, Retirement};
 use sampling::{RowReadback, Selection, SelectionLease};
 pub use unmarked::Unmarked;
@@ -456,6 +460,13 @@ pub struct Part {
 }
 
 impl Part {
+    /// The part in a place of `probe`'s order.
+    #[cfg(feature = "test-oracles")]
+    pub fn in_probe_place(mut self, probe: &PlaceProbe) -> Self {
+        self.place = Some(probe.place());
+        self
+    }
+
     /// A part of `sequence`: its rows are `tokens`, from `start_position` on, over `refs`.
     pub fn new(refs: SequenceRefs, sequence: SequenceId, start_position: u64, tokens: Vec<u32>) -> Self {
         Self {
@@ -1135,6 +1146,19 @@ impl Quantum {
     /// whichever of them lets go last.
     pub(crate) fn take_leases(&mut self) -> Vec<Option<SelectionLease>> {
         self.segments.iter_mut().map(|segment| segment.lease.take()).collect()
+    }
+
+    /// Completes the place of segment `index` alone, as the frame that ends the quantum does; the other segments keep
+    /// theirs. Whether the segment held one.
+    #[cfg(feature = "test-oracles")]
+    pub fn complete_probe_place(&mut self, index: usize) -> bool {
+        let place = self.segments.get_mut(index).and_then(|segment| segment.place.take());
+        place.map(|place| place.complete(Retirement::Copy)).is_some()
+    }
+
+    /// Whether each of the quantum's segments is in a place of its sequence's order of conclusion.
+    pub(crate) fn places_held(&self) -> impl Iterator<Item = bool> + '_ {
+        self.segments.iter().map(|segment| segment.place.is_some())
     }
 
     /// Takes each segment's place in its sequence's order of conclusion out, in segment order: the frame that ends the

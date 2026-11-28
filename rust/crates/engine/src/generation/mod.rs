@@ -80,7 +80,7 @@ use source::{Audience, Drafts, Message, Owner, Rejected, Shared, StartFailed};
 pub use teacher_forced::LogitsSink;
 
 /// Completes `place` with the quantum that retired, which concludes once the quanta admitted before it did. A quantum
-/// admitted with no place is dropped.
+/// is refused at its start without a place, so a missing one is a fault, logged.
 fn complete(place: Option<Slot<Retirement>>, retired: Retired) {
     match place {
         Some(place) => place.complete(Retirement::Quantum(Box::new(retired))),
@@ -88,6 +88,17 @@ fn complete(place: Option<Slot<Retirement>>, retired: Retired) {
             "a {:?} quantum retired with no place in its sequence's order",
             retired.kind
         ),
+    }
+}
+
+/// Completes each segment's place, in segment order, with what `retired` makes of that segment: each place is completed
+/// once, with the value of its own segment. A segment with no place is skipped (it was refused at its start).
+fn complete_each<T: Send + 'static>(places: Vec<Option<Slot<T>>>, mut retired: impl FnMut(usize) -> T) {
+    for (segment, place) in places.into_iter().enumerate() {
+        match place {
+            Some(place) => place.complete(retired(segment)),
+            None => log::error!("segment {segment} of a pass retired with no place in its sequence's order"),
+        }
     }
 }
 
@@ -403,9 +414,11 @@ impl Generation {
                 let leases = quantum.take_leases();
                 let guards = quantum.take_flights();
                 let batch = Arc::new(quantum);
-                for (segment, ((place, lease), guard)) in places.into_iter().zip(leases).zip(guards).enumerate() {
-                    complete(place, Retired::part(&batch, segment, lease, guard, &outcome));
-                }
+                let mut kept = leases.into_iter().zip(guards);
+                complete_each(places, |segment| {
+                    let (lease, guard) = kept.next().unwrap_or_default();
+                    Retirement::Quantum(Box::new(Retired::part(&batch, segment, lease, guard, &outcome)))
+                });
             },
         )
         .map_err(|error| EngineError::Runtime(format!("the stage graphs: {error:?}")))?
@@ -420,8 +433,7 @@ impl Generation {
         // The sequence's own transfer lane (sequences share them when there are fewer lanes than sequences), so that
         // one sequence's restore does not wait behind another's capture on a lane they would not share.
         let lane = core.transfer_lane_id(sequence.0 % core.copy_lanes(residency.offload.staging.is_some()));
-        // A copy job that ended tells the order, as a quantum's retirement does (what waits behind it starts); the job
-        // concludes in the sequence's order through its place.
+        // The workspace's order is told when a copy job ends, so that what waits behind it may start.
         let ended = Box::new(move |serial| order.retired(sequence, serial));
         let copier = Copier::new(&runtime, core.lane_table().clone(), lane, sequence, ended)
             .map_err(|error| EngineError::Runtime(format!("the prefix cache's copy graph: {error:?}")))?;
@@ -981,5 +993,59 @@ mod tests {
         closing.store(true, Ordering::SeqCst);
         assert!(unless_closing(&closing, Some(&mut owner)).is_none());
         assert!(unless_closing::<i32>(&closing, None).is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the recording fake is shared between the test and the function each order calls"
+)]
+mod places {
+    use std::sync::Mutex;
+
+    use super::conclusion::Conclusion;
+    use super::*;
+
+    /// A sequence's order whose conclusions land in a list, in the order they concluded.
+    fn recording() -> (Conclusion<u32>, Arc<Mutex<Vec<u32>>>) {
+        let concluded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&concluded);
+        let order = Conclusion::new(move |value| sink.lock().unwrap_or_else(|p| p.into_inner()).push(value));
+        (order, concluded)
+    }
+
+    fn seen(list: &Arc<Mutex<Vec<u32>>>) -> Vec<u32> {
+        list.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    #[test]
+    fn each_segment_completes_its_own_sequences_place_once_in_segment_order() {
+        let (orders, lists): (Vec<_>, Vec<_>) = (0..3).map(|_| recording()).unzip();
+        let places = orders.iter().map(|order| Some(order.admit())).collect();
+        let mut asked = Vec::new();
+        complete_each(places, |segment| {
+            asked.push(segment);
+            10 + segment as u32
+        });
+        assert_eq!(asked, [0, 1, 2], "each segment is asked for once, in order");
+        for (segment, list) in lists.iter().enumerate() {
+            assert_eq!(
+                seen(list),
+                [10 + segment as u32],
+                "sequence {segment} concluded its own segment, once"
+            );
+        }
+    }
+
+    #[test]
+    fn a_segment_without_a_place_leaves_the_others_to_conclude() {
+        let (first, first_list) = recording();
+        let (second, second_list) = recording();
+        let places = vec![Some(first.admit()), None, Some(second.admit())];
+        complete_each(places, |segment| segment as u32);
+        assert_eq!(seen(&first_list), [0]);
+        assert_eq!(seen(&second_list), [2]);
     }
 }
