@@ -39,8 +39,8 @@ prompt skip all but the last chunk, whatever the prompt's length.
 ## Why checkpoints sit on the chunk grid
 
 Prefill state depends on how the prompt was split into chunks. The same 1536 tokens prefilled in chunks of other sizes
-leave different bits in almost every buffer (`PrefillPartitionCudaIntegrationTest`, 192 buffers: every GDN buffer and
-every full KV page; qwen3_8_27b_q3):
+leave different bits in almost every buffer (measured over 192 buffers, every GDN buffer and
+every full KV page, on qwen3_8_27b_q3; no automated check reproduces it):
 
 | Chunk size | Buffers that differ from the 512-token partition |
 |---|---|
@@ -52,7 +52,7 @@ every full KV page; qwen3_8_27b_q3):
 | 1536 | 190 |
 
 A sequence restored at a multiple of 512 prefills the rest in the chunks a cold run uses, so it ends with the state a
-cold run has, buffer for buffer (`PrefixCacheCudaIntegrationTest`), and the tokens it samples are the cold run's. A
+cold run has, buffer for buffer, and the tokens it samples are the cold run's (the tokens are checked by `rust/crates/engine/tests/device/prefix_restore.rs`; the buffer-for-buffer equality has no automated check). A
 checkpoint at any other position would continue in other chunks. That rules out the two checkpoints that look natural,
 the state at the end of a prompt and the state at the end of a generation, whenever they fall off the chunk grid: the
 prompt's end is stored only when its length is a multiple of the interval, and the state after a generation (decode
@@ -102,7 +102,7 @@ before `p - 1` do not depend on what follows.
 
 The recomputed row is the one place a restored sequence is not a cold run's: it is computed in a one-row quantum where a
 cold run computed it inside a chunk's catch-up, and its bits differ. Compared after a 5000-token prompt restored at 4608
-(`PrefixCacheCudaIntegrationTest`, 419 buffers: the base state and the 19 full MTP pages), the one buffer that differs is
+(419 buffers: the base state and the 19 full MTP pages; no automated check reproduces it), the one buffer that differs is
 the MTP page holding row 4607. The row only seeds drafts, so it can change which drafts a verification accepts; the tokens
 are the verifier's, and equal the cold run's.
 

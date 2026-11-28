@@ -430,17 +430,17 @@ fn a_checkpoint_larger_than_the_arena_is_skipped_and_counted() {
 #[test]
 fn a_full_arena_evicts_the_least_recently_used_checkpoint() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
-    let one = layout.slots(0, 256, None) as u32;
+    let one = layout.slots(0, CHUNK, None) as u32;
     let rig = Rig::new(2 * one);
     let source = Device::new(FORMAT, 1024);
-    let (a, b, c): (Vec<u32>, Vec<u32>, Vec<u32>) = (tokens(0, 300), tokens(1000, 300), tokens(2000, 300));
+    let (a, b, c): (Vec<u32>, Vec<u32>, Vec<u32>) = (tokens(0, 600), tokens(1000, 600), tokens(2000, 600));
     for prompt in [&a, &b] {
-        let captured = rig.capture(&source, prompt, rig.cache.root(), 256, None);
+        let captured = rig.capture(&source, prompt, rig.cache.root(), CHUNK, None);
         rig.run_all(&source);
         assert_ne!(answer(&captured), rig.cache.root());
     }
     drop(rig.lookup(&a, None).expect("a is cached"));
-    let third = rig.capture(&source, &c, rig.cache.root(), 256, None);
+    let third = rig.capture(&source, &c, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     assert_ne!(answer(&third), rig.cache.root());
     assert!(rig.lookup(&b, None).is_none(), "b was the least recently used");
@@ -454,16 +454,16 @@ fn a_pinned_checkpoint_is_not_evicted_and_a_released_one_is() {
     let one = layout.slots(0, CHUNK, None) as u32;
     let rig = Rig::new(one);
     let source = Device::new(FORMAT, 1024);
-    let (a, b) = (tokens(0, 300), tokens(1000, 300));
-    let first = rig.capture(&source, &a, rig.cache.root(), 256, None);
+    let (a, b) = (tokens(0, 600), tokens(1000, 600));
+    let first = rig.capture(&source, &a, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     answer(&first);
     let hit = rig.lookup(&a, None).expect("hit");
-    let refused = rig.capture(&source, &b, rig.cache.root(), 256, None);
+    let refused = rig.capture(&source, &b, rig.cache.root(), CHUNK, None);
     assert_eq!(answer(&refused), rig.cache.root());
     assert_eq!(rig.stats().skipped, 1, "the only checkpoint is pinned");
     drop(hit);
-    let stored = rig.capture(&source, &b, rig.cache.root(), 256, None);
+    let stored = rig.capture(&source, &b, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     assert_ne!(answer(&stored), rig.cache.root(), "the dropped hit let it go");
     assert!(rig.lookup(&a, None).is_none());
@@ -480,7 +480,7 @@ fn a_closed_cache_stores_and_restores_nothing() {
     let hit = rig.lookup(&prompt, None).expect("hit");
     assert!(rig.cache.close(Duration::from_secs(5)));
     assert!(rig.lookup(&prompt, None).is_none());
-    let captured = rig.capture(&source, &prompt, rig.cache.root(), 256, None);
+    let captured = rig.capture(&source, &prompt, rig.cache.root(), CHUNK, None);
     assert_eq!(answer(&captured), rig.cache.root());
     assert_eq!(rig.queued(), 0);
     let restored = rig.restore(hit, &source, None, &Arc::new(AtomicBool::new(false)));
@@ -497,7 +497,7 @@ fn a_cache_neither_stores_nor_restores_another_formats_state() {
     rig.run_all(&source);
     answer(&first);
     let other = Device::new(KvFormat::Bf16, 1024);
-    let stored = rig.capture(&other, &prompt, rig.cache.root(), 256, None);
+    let stored = rig.capture(&other, &prompt, rig.cache.root(), CHUNK, None);
     assert_eq!(answer(&stored), rig.cache.root());
     assert_eq!(rig.queued(), 0);
     let hit = rig.lookup(&prompt, None).expect("hit");
@@ -520,15 +520,15 @@ fn a_cancel_before_the_copies_unpins_without_an_error_or_a_job() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
     let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
-    let (a, b) = (tokens(0, 300), tokens(1000, 300));
-    let first = rig.capture(&source, &a, rig.cache.root(), 256, None);
+    let (a, b) = (tokens(0, 600), tokens(1000, 600));
+    let first = rig.capture(&source, &a, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     answer(&first);
     let hit = rig.lookup(&a, None).expect("hit");
     let restored = rig.restore(hit, &source, None, &Arc::new(AtomicBool::new(true)));
     assert_eq!(answer(&restored), Err(RestoreError::Cancelled));
     assert_eq!(rig.queued(), 0);
-    let stored = rig.capture(&source, &b, rig.cache.root(), 256, None);
+    let stored = rig.capture(&source, &b, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     assert_ne!(answer(&stored), rig.cache.root(), "the pin is gone");
 }
@@ -538,8 +538,8 @@ fn a_cancel_while_the_copies_run_unpins_and_is_not_counted_as_a_restore() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
     let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
-    let (a, b) = (tokens(0, 300), tokens(1000, 300));
-    let first = rig.capture(&source, &a, rig.cache.root(), 256, None);
+    let (a, b) = (tokens(0, 600), tokens(1000, 600));
+    let first = rig.capture(&source, &a, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     answer(&first);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -550,7 +550,7 @@ fn a_cancel_while_the_copies_run_unpins_and_is_not_counted_as_a_restore() {
     rig.run_all(&target);
     assert_eq!(answer(&restored), Err(RestoreError::Cancelled));
     assert_eq!(rig.stats().restores, 0);
-    let stored = rig.capture(&source, &b, rig.cache.root(), 256, None);
+    let stored = rig.capture(&source, &b, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     assert_ne!(answer(&stored), rig.cache.root(), "the pin is gone");
 }
@@ -560,8 +560,8 @@ fn a_restore_whose_copy_fails_unpins_and_answers() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
     let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
-    let (a, b) = (tokens(0, 300), tokens(1000, 300));
-    let first = rig.capture(&source, &a, rig.cache.root(), 256, None);
+    let (a, b) = (tokens(0, 600), tokens(1000, 600));
+    let first = rig.capture(&source, &a, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     answer(&first);
     let restored = rig.restore(
@@ -576,7 +576,7 @@ fn a_restore_whose_copy_fails_unpins_and_answers() {
         Err(RestoreError::Copy("the lane failed".to_string()))
     );
     assert_eq!(rig.stats().restores, 0);
-    let stored = rig.capture(&source, &b, rig.cache.root(), 256, None);
+    let stored = rig.capture(&source, &b, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     assert_ne!(answer(&stored), rig.cache.root());
 }
@@ -626,11 +626,11 @@ fn a_hit_that_is_dropped_unpins() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
     let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
-    let first = rig.capture(&source, &tokens(0, 300), rig.cache.root(), 256, None);
+    let first = rig.capture(&source, &tokens(0, 600), rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     answer(&first);
-    drop(rig.lookup(&tokens(0, 300), None).expect("hit"));
-    let stored = rig.capture(&source, &tokens(1000, 300), rig.cache.root(), 256, None);
+    drop(rig.lookup(&tokens(0, 600), None).expect("hit"));
+    let stored = rig.capture(&source, &tokens(1000, 600), rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     assert_ne!(answer(&stored), rig.cache.root());
 }
@@ -913,8 +913,8 @@ fn a_restore_into_pages_that_are_not_reserved_is_refused_without_a_job() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
     let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
-    let prompt = tokens(0, 300);
-    let first = rig.capture(&source, &prompt, rig.cache.root(), 256, None);
+    let prompt = tokens(0, 600);
+    let first = rig.capture(&source, &prompt, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     answer(&first);
     let short = Device::new(FORMAT, 100);
@@ -924,11 +924,11 @@ fn a_restore_into_pages_that_are_not_reserved_is_refused_without_a_job() {
         answer(&restored),
         Err(RestoreError::Unreserved {
             rows: 100,
-            position: 256
+            position: 512
         })
     );
     assert_eq!(rig.queued(), 0);
-    let other = rig.capture(&source, &tokens(1000, 300), rig.cache.root(), 256, None);
+    let other = rig.capture(&source, &tokens(1000, 600), rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     assert_ne!(answer(&other), rig.cache.root(), "the refusal unpinned the match");
 }
@@ -971,8 +971,8 @@ fn a_restores_match_stays_pinned_until_its_job_ended() {
     let layout = CheckpointLayout::new(&compact(), FORMAT).expect("layout");
     let rig = Rig::new(layout.slots(0, CHUNK, None) as u32);
     let source = Device::new(FORMAT, 1024);
-    let (a, b) = (tokens(0, 300), tokens(1000, 300));
-    let first = rig.capture(&source, &a, rig.cache.root(), 256, None);
+    let (a, b) = (tokens(0, 600), tokens(1000, 600));
+    let first = rig.capture(&source, &a, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     answer(&first);
     let target = Device::new(FORMAT, 1024);
@@ -980,7 +980,7 @@ fn a_restores_match_stays_pinned_until_its_job_ended() {
     let restored = rig.restore(hit, &target, None, &Arc::new(AtomicBool::new(false)));
     // The job is built and submitted but has not run: its slots are still being read.
     let job = rig.next_job();
-    let refused = rig.capture(&source, &b, rig.cache.root(), 256, None);
+    let refused = rig.capture(&source, &b, rig.cache.root(), CHUNK, None);
     assert_eq!(
         answer(&refused),
         rig.cache.root(),
@@ -989,8 +989,8 @@ fn a_restores_match_stays_pinned_until_its_job_ended() {
     assert_eq!(rig.stats().skipped, 1);
     assert_eq!(rig.stats().evictions, 0);
     rig.run(job, &target);
-    assert_eq!(answer(&restored), Ok(256));
-    let stored = rig.capture(&source, &b, rig.cache.root(), 256, None);
+    assert_eq!(answer(&restored), Ok(512));
+    let stored = rig.capture(&source, &b, rig.cache.root(), CHUNK, None);
     rig.run_all(&source);
     assert_ne!(answer(&stored), rig.cache.root(), "the ended job let it go");
 }

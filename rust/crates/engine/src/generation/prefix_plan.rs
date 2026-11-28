@@ -3,6 +3,7 @@
 
 use super::mtp::Speculating;
 use super::source::Step;
+use crate::prefix::Speculation as CheckpointKind;
 
 /// How a request drafts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,9 +19,18 @@ pub(super) enum DraftKind {
 }
 
 impl DraftKind {
+    /// The kind of draft state the request's checkpoints hold beside the base state; `None` when it does not draft.
+    pub(super) fn caching(self) -> Option<CheckpointKind> {
+        match self {
+            DraftKind::Mtp => Some(CheckpointKind::Mtp),
+            DraftKind::Dflash2 { drafting: true } => Some(CheckpointKind::Dflash2),
+            DraftKind::Plain | DraftKind::Idle | DraftKind::Dflash2 { drafting: false } => None,
+        }
+    }
+
     /// Whether the checkpoints hold the draft's state.
     fn drafting(self) -> bool {
-        matches!(self, DraftKind::Mtp | DraftKind::Dflash2 { drafting: true })
+        self.caching().is_some()
     }
 }
 
@@ -95,6 +105,18 @@ mod tests {
 
     const DRAFTING: [DraftKind; 2] = [DraftKind::Mtp, DraftKind::Dflash2 { drafting: true }];
     const NOT_DRAFTING: [DraftKind; 2] = [DraftKind::Idle, DraftKind::Dflash2 { drafting: false }];
+
+    #[test]
+    fn a_request_caches_the_draft_state_of_the_kind_it_drafts_with_and_none_otherwise() {
+        assert_eq!(DraftKind::Mtp.caching(), Some(CheckpointKind::Mtp));
+        assert_eq!(
+            DraftKind::Dflash2 { drafting: true }.caching(),
+            Some(CheckpointKind::Dflash2)
+        );
+        for kind in NOT_DRAFTING.into_iter().chain([DraftKind::Plain]) {
+            assert_eq!(kind.caching(), None, "{kind:?}");
+        }
+    }
 
     #[test]
     fn a_plain_request_captures_every_chunk_after_its_prefill() {

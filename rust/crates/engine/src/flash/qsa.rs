@@ -58,7 +58,7 @@ pub struct QsaShape {
 impl QsaShape {
     /// The layer of `attention` and `qsa` over `hidden` values for sequences of up to `max_tokens` positions, with
     /// the norm's `epsilon`. `score_bytes` bounds the scores scratch (a tile of rows times the blocks they see); it is
-    /// raised to hold one row of a sequence of `max_tokens`, as Java does. Refuses what the kernels are not written
+    /// raised to hold one row of a sequence of `max_tokens`. Refuses what the kernels are not written
     /// for.
     pub fn new(
         hidden: u32,

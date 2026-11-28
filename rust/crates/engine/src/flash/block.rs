@@ -1,6 +1,6 @@
-//! The layer's nodes around its block (`Stages.Attention` with `whole`, `Stages.EndInject` and the mix of `Stages.Head`).
+//! The layer's nodes around its block.
 //!
-//! A [`BlockStage`] is Java's BLOCK: the mix of the streams for the block, the block, the injection of its output into
+//! A [`BlockStage`] is the mix of the streams for the block, the block, the injection of its output into
 //! the streams, and the mix that feeds the MoE block, as one stage. The block is a [`BlockBody`]: GDN is
 //! [`super::gdn::GdnBody`]; sparse attention supplies its own. [`EndInject`] injects what the MoE block wrote, and
 //! [`FinalMix`] mixes the last row for the output head.
@@ -152,7 +152,7 @@ fn rows_of(quantum: &Quantum, regions: &FlashRegions) -> Result<u32, StageError>
     Ok(rows)
 }
 
-/// The mix for the block, the block, its injection, and the mix for the MoE block (Java's BLOCK stage).
+/// The mix for the block, the block, its injection, and the mix for the MoE block.
 #[derive(Debug)]
 pub struct BlockStage {
     hyper: HyperShape,

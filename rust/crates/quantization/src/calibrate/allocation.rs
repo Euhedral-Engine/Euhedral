@@ -2,7 +2,7 @@
 //!
 //! The allocation of `exl3::allocation` can name a rate the kernels do not have (1, 7 or 8 bits), and the Viterbi
 //! scratch must hold one tile of the largest rate the run rounds at (the MTP block's included). Both are refused here,
-//! as Java's `allocateTrellis` and `TrellisRounding` do, so a run that cannot finish is refused before it starts.
+//! so a run that cannot finish is refused before it starts.
 
 use std::collections::HashMap;
 

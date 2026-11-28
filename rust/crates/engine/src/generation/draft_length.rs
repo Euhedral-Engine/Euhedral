@@ -6,10 +6,10 @@
 
 use thiserror::Error;
 
-/// Most tokens a step drafts (`MtpDecoder.MAX_DRAFTS`).
+/// Most tokens a step drafts.
 pub const MAX_DRAFTS: usize = 16;
 
-/// Most drafts one verification checks (`MtpDecoder.MAX_VERIFIED`).
+/// Most drafts one verification checks.
 pub const MAX_VERIFIED: usize = 7;
 
 /// A draft length that breaks the rules of [`DraftLength::new`].
@@ -27,7 +27,7 @@ pub enum DraftLengthError {
 ///
 /// The engine runs the fixed length of the artifact's depth ([`DraftLength::fixed`]), which its chained step admits
 /// whole. A gated length (`least < most`) needs the host between the drafts and the draft head's log-probabilities;
-/// it is ported here and not wired into the engine yet.
+/// it is not wired into the engine yet.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DraftLength {
     least: usize,
@@ -93,7 +93,7 @@ impl DraftLength {
 mod tests {
     use super::*;
 
-    /// Drafts a step makes when its drafts carry these log-probabilities (`DraftLengthTest.drafted`).
+    /// Drafts a step makes when its drafts carry these log-probabilities.
     fn drafted(length: &DraftLength, log_probabilities: &[f64]) -> usize {
         let mut drafted = 1;
         let mut sum = log_probabilities[0];
@@ -105,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_length_matches_java_table() {
+    fn draft_length_follows_the_confidence_table() {
         // A fixed length ignores confidence.
         let four = DraftLength::fixed(4).unwrap();
         assert!(!four.gated());

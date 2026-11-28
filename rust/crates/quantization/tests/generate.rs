@@ -234,7 +234,7 @@ fn a_sequence_whose_hidden_is_not_a_row_for_each_run_token_is_refused_and_writes
     assert!(files(directory.path()).iter().all(Vec::is_empty));
 }
 
-/// The greedy-or-sampled draw as Java states it, computed here with unsigned arithmetic on the 64-bit FNV-1a hash.
+/// The greedy-or-sampled draw, computed here with unsigned arithmetic on the 64-bit FNV-1a hash.
 #[test]
 fn the_kind_of_answer_follows_the_hash_of_the_prompt_id() {
     assert_eq!(seed(""), 0xcbf2_9ce4_8422_2325);
@@ -627,7 +627,7 @@ fn a_run_with_no_prompts_ends_at_once_having_written_nothing() {
 }
 
 /// A tool reaches the template as the prompts file writes it: a bare function, keys in the record's order, extra
-/// keys and a description that is not text, printed as Python's `json.dumps` prints them, as Java prints its tool map.
+/// keys and a description that is not text, printed as Python's `json.dumps` prints them.
 #[test]
 fn a_tool_is_printed_into_the_prompt_as_written() {
     use euhedral_inference_api_protocol::template::{TemplateOptions, render_tool_objects};

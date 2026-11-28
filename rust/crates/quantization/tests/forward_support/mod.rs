@@ -42,9 +42,9 @@ pub struct Rig {
 
 /// The rig, or a panic naming the missing setting: a device test that skips is no check.
 pub fn rig() -> Rig {
-    let path = test_support::gradle_property("euhedral.cuda.library")
+    let path = test_support::test_setting("euhedral.cuda.library")
         .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
-    let math_directory = test_support::gradle_property("euhedral.quantization.cuda-libraries").expect(
+    let math_directory = test_support::test_setting("euhedral.quantization.cuda-libraries").expect(
         "set euhedral.quantization.cuda-libraries (EUHEDRAL_TEST_QUANTIZATION_CUDA_LIBRARIES) to the math libraries",
     );
     let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");

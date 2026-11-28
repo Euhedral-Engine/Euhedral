@@ -359,7 +359,7 @@ impl Iteration<'_> {
         recorder.tokens.reserve(requested + 1);
         recorder.quanta.reserve(requested + prompt.ids.len() / 256 + 4);
 
-        // Tokenization is part of the timed generation, as it is in the Java session.
+        // Tokenization is part of the timed generation.
         let ids = match self.tokenizer.encode_with_model_special_tokens(&prompt.text) {
             Ok(mut ids) => {
                 if let (Some(salt), Some(first)) = (salt, ids.first_mut()) {
@@ -413,7 +413,7 @@ impl Iteration<'_> {
         {
             outcome.status = result::FAILED;
             outcome.reason = Some("prompt_token_count_mismatch".to_string());
-            // As Java keeps the timings of this failure; a failed row reports no rate.
+            // The timings of this failure are kept; a failed row reports no rate.
             outcome.throughput = None;
         }
         // A cold request that restored a prefix, or a repeat that restored none, did not measure what its name says.

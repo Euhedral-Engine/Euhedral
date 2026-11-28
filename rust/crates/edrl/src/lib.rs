@@ -14,8 +14,7 @@
 //! tells which reader a file needs, and [`ExpectedInventory`] proves its tables hold exactly the objects its
 //! configuration implies.
 //!
-//! The reference is the Java reader (`ArtifactReader`, `ArtifactCodec`, `TokenizerSection`): every check it makes is
-//! made here, on the same bytes. All integers are big-endian, except the payloads: the trellis `.segments`
+//! Every check of the format is made on the bytes as they are. All integers are big-endian, except the payloads: the trellis `.segments`
 //! companion holds little-endian `int32` values (see [`TrellisCompanions`]).
 
 mod error;

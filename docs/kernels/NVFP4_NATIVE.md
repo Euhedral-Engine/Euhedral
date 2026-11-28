@@ -196,7 +196,7 @@ One to eight BF16 token rows run `nvfp4::decode_rows<M>` (`native/src/nvfp4/nvfp
 - Warps split K into 128-value chunks (chunk c on warp c mod W) and sum in warp order. The tile is a function of the shape
   (`decode_tile`): `_w8` (16 rows per CTA, 8 warps) for K up to 5120, `_w4` (32 rows per CTA, 4 warps) above. One-row and
   multi-row calls on a tensor therefore share their summation order.
-- Teacher-forced on the SD4 artifact (`TeacherForcedQualityCudaIntegrationTest`, 2048 tokens after 512) the mean NLL is 2.2286
+- Teacher-forced on the SD4 artifact (`euhedral-bench dump`, 2048 tokens after 512) the mean NLL is 2.2286
   nats; the FP32 FMA GEMV (rejected below) measured 2.2281 on the same tokens (paired dNLL +0.0005 ± 0.0022, KL 0.0036).
 
 **Operator times** (us; SD4, random weights rotated past L2, CUDA events, 30 launches):
@@ -284,7 +284,7 @@ included):
   2.5e-3 of the output range).
 - Against the BF16-activation result, two terms give a linear output relative RMS error of 0.88% (activation quantization 0.87%).
 
-**Model level** (`RelaxedNumericsDriftCudaIntegrationTest`, NVFP4 artifact, executed objects):
+**Model level** (`euhedral-bench drift`, NVFP4 artifact, executed objects):
 - Teacher-forced against the exact-numerics oracle. Native changes prefill only, because decode runs the same decode kernels in
   both arms. "Floor" = native off: only the relaxed-order kernels differ. Exact against exact is bitwise zero.
 

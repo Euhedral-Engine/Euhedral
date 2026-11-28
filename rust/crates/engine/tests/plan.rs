@@ -1,8 +1,7 @@
 //! The execution plan on the tensor table of the RCO artifact (`tests/fixtures/rco_table.tsv`): the stage lists of
 //! its views, their edges, scratch regions and lanes, without a device.
 //!
-//! The expected orders are worked by hand from `ExecutionPlan.fullModel` rewritten by `prefillView` (the fused decode
-//! and prefill views) and from `ExecutionPlan.mtpDraft` (the unfused MTP views).
+//! The expected orders are worked by hand: the fused decode and prefill views, and the unfused MTP views.
 
 #![allow(
     clippy::unwrap_used,

@@ -1,4 +1,4 @@
-//! Long-horizon drift of a candidate numeric route against the all-GPU route (`RelaxedNumericsDriftCudaIntegrationTest`):
+//! Long-horizon drift of a candidate numeric route against the all-GPU route:
 //! the same forced tokens are decoded twice, and each step compares the second run's final hidden state and logits row
 //! with the first's.
 //!

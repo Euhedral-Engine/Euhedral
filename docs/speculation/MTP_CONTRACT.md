@@ -190,5 +190,5 @@ Row-exact execution declines the block-scaled MXFP8 route and the native FP4 rou
 accumulation differ from the GEMV. There is no second numerics mode for verification: a verifier on native FP4 kernels would
 change every generated text ([MTP_VERIFIER.md](MTP_VERIFIER.md)).
 
-This is tested bitwise, on tokens and on GDN and KV state, by `SpeculativeVerifyCudaIntegrationTest` and
-`SpeculativeDecodeCudaIntegrationTest`. Results are in [MTP_SPECULATIVE.md](MTP_SPECULATIVE.md).
+This is tested bitwise, on tokens and on GDN and KV state, by `mtp_output_equals_greedy` and
+`mtp_kv_and_gdn_state_equal_greedy_after_run` (`rust/crates/engine/tests/device/mtp.rs`). Results are in [MTP_SPECULATIVE.md](MTP_SPECULATIVE.md).

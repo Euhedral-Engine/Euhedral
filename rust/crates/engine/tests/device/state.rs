@@ -296,11 +296,7 @@ fn gdn_state_is_zeroed_and_as_large_as_the_planner_says() {
     let mut convolution = vec![0xFFu8; state.convolution().bytes()];
     state.convolution().copy_to_host(0, &mut convolution).unwrap();
     assert!(convolution.iter().all(|byte| *byte == 0));
-    assert_eq!(
-        state.speculative().unwrap().capacity,
-        8,
-        "at least 8 rows, as the Java state allocates"
-    );
+    assert_eq!(state.speculative().unwrap().capacity, 8, "at least 8 rows");
     let used = before - library.free_bytes().unwrap();
     assert!(used >= states.device_bytes(), "{used} < {}", states.device_bytes());
 

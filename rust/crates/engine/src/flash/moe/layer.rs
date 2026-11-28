@@ -19,8 +19,8 @@ use crate::flash::sequence::{Op, OpList};
 use crate::flash::{FlashError, Weight};
 use crate::formats::shapes::Launch;
 
-/// The rows from which the shared expert's down projection reads the activations padded to a multiple of 256 values
-/// (`MoeLayer.PREFILL_ROWS`): fewer rows take the unpadded weight.
+/// The rows from which the shared expert's down projection reads the activations padded to a multiple of 256 values:
+/// fewer rows take the unpadded weight.
 pub const PREFILL_ROWS: u32 = 8;
 
 const BF16: u64 = 2;
@@ -294,7 +294,7 @@ impl MoeLayer {
         ])
     }
 
-    /// The shared expert and its gate for `rows` rows (`MoeLayer.submitShared`).
+    /// The shared expert and its gate for `rows` rows.
     pub fn shared_ops(&self, rows: u32, exact: bool) -> Result<OpList<'static>, FlashError> {
         let (shape, weights, scratch) = (&self.shape, &self.weights, &self.scratch);
         let (hidden, inter) = (shape.hidden(), shape.shared_inter);
@@ -398,7 +398,7 @@ impl MoeLayer {
     }
 
     /// The ordered sum of the block's experts' outputs, combined with the shared expert's gated output into the block's
-    /// output (`MoeLayer.submitFinish`). A block that kept no pair has no expert output: the sum is zero.
+    /// output. A block that kept no pair has no expert output: the sum is zero.
     pub fn finish_ops(&self, rows: u32, pairs: u32) -> Result<OpList<'static>, FlashError> {
         let (layout, scratch, geometry) = (&self.shape.layout, &self.scratch, &self.shape.geometry);
         let hidden = self.shape.hidden();

@@ -1,16 +1,15 @@
-//! The views of the execution plan: which stage graph a quantum of a kind and a row count runs
-//! (`ExecutionPlan.forExecution`).
+//! The views of the execution plan: which stage graph a quantum of a kind and a row count runs.
 
 use crate::stages::QuantumKind;
 
 /// Most rows a quantum runs on the decode kernels, which read quantized weights in place without scratch; a draft
-/// quantum of more rows is a catch-up (`ExecutionPlan.DECODE_MAX_ROWS`).
+/// quantum of more rows is a catch-up.
 pub const DECODE_MAX_ROWS: usize = 8;
 
 /// Rows of the DFlash2 drafter's block: the anchor and the mask rows.
 pub const BLOCK_ROWS: usize = 8;
 
-/// Most rows of a quantum that is captured into a CUDA graph (`Quantum.MAX_CAPTURED_ROWS`).
+/// Most rows of a quantum that is captured into a CUDA graph.
 pub const MAX_CAPTURED_ROWS: usize = 8;
 
 /// The view a quantum runs.
@@ -85,8 +84,8 @@ impl View {
     }
 }
 
-/// A stage graph of the plan. Decode and verification up to eight rows share their topology and their scratch rules,
-/// as Java's one decode view does; they differ in the rows their selection reads.
+/// A stage graph of the plan. Decode and verification up to eight rows share their topology and their scratch rules;
+/// they differ in the rows their selection reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Variant {
     Decode,
@@ -154,7 +153,7 @@ impl Variant {
     }
 
     /// Whether the variant runs beside decode on the tensor-core routes only, which gives the value/z projection its
-    /// own scratch region (`Shape.scratchRegion`).
+    /// own scratch region.
     pub(crate) fn decode_type(self) -> bool {
         matches!(
             self,

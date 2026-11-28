@@ -46,7 +46,9 @@ The plan now pads each layer's shared down projection to 768 input columns on th
 scales: every product they add is exactly 0; 53 MiB, reserved by the residency planner), and a prefill's SwiGLU writes
 its activation in rows of 768 with zero padding (`euhedral_q4_swiglu_padded_bf16`), so the native kernels take it.
 Decode keeps the unpadded weights and kernels. On the exact route the padded projection is bit for bit the unpadded one;
-on the native route it is within 0.86% relative RMS of it (`SharedDownPaddingCudaIntegrationTest`), and the MoE
+on the native route it is within 0.86% relative RMS of it (measured; `shared_swiglu_and_finish_match_the_host_reference_with_and_without_routed_pairs` in
+`rust/crates/engine/tests/device/flash/moe.rs` checks the padded SwiGLU against a host reference, and no automated check compares the
+padded projection with the unpadded one), and the MoE
 fixtures' shared expert within 5e-5 to 1.5e-2 of upstream.
 
 | scenario | before | after |
@@ -63,7 +65,7 @@ down (10,240 to 320) and up (320 to 10,240) projections, two each per layer, at 
 (about 7.5 and 4.5 TFLOPS on FP32 FMAs). `euhedral_q4_linear_tc_*` run them on m16n8k16 tensor cores (dflash's scheme:
 K split in four for outputs up to 1536 wide, chosen by the shape alone; one or four row tiles of 16 per weight load,
 which never change a row's bits). Their results differ from the FP32 kernel's in summation order only: 4e-6 to 8e-5
-relative RMS on the model's shapes (`LinearTensorCoreCudaIntegrationTest`).
+relative RMS on the model's shapes (measured; no automated check).
 
 They run for 9 rows and more. At one row an MMA uses one of its 16 rows, and the FP32 kernel is faster on most decode
 shapes (profiled per launch: hyper-connection down 19.1 against 29.0 us, router 6.0 against 7.4 us, output head 1.49

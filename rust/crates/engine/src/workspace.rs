@@ -2,8 +2,7 @@
 //!
 //! Nothing grows while quanta run: a quantum that needs more rows than the workspace holds is refused when it is
 //! admitted. Two views of one slot may alias only where the plan's edges order their users; that ordering belongs to
-//! the stage graph, not to this crate. The slots are `ExecutionPlan.Buffer`'s, the sizes those of
-//! `SharedWorkspace` and `Workspace.slotBytes`: every slot holds the widest use any view of the plan makes of it, at
+//! the stage graph, not to this crate. Every slot holds the widest use any view of the plan makes of it, at
 //! the workspace's rows.
 
 use std::sync::Arc;
@@ -31,7 +30,7 @@ impl Element {
     }
 }
 
-/// A named buffer of the execution plan (`ExecutionPlan.Buffer`) the pilot's views use, and the input record.
+/// A named buffer of the execution plan the pilot's views use, and the input record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BufferSlot {
     HiddenState,
@@ -100,7 +99,7 @@ impl BufferSlot {
     }
 
     /// The width in elements of one row of the slot, and the element, for `config`: the widest use any view makes
-    /// of it (`ExecutionPlan.fullBufferSpecs`). `None` for the input record, which is not rows of one width.
+    /// of it. `None` for the input record, which is not rows of one width.
     pub fn row(self, config: &ModelConfig) -> Option<(u64, Element)> {
         let hidden = config.hidden_size as u64;
         let intermediate = config.intermediate_size as u64;

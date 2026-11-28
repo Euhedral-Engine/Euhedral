@@ -1,5 +1,5 @@
 //! The `assemble` command: a mixed artifact from calibrated source artifacts and an allocation, written on the host
-//! runtime. As in Java, a successful run prints nothing.
+//! runtime. A successful run prints nothing.
 
 use std::ffi::OsString;
 use std::path::PathBuf;

@@ -3,7 +3,7 @@
 //! prefill leaves, and the request produces the tokens and the verifications of a cold run. `#[ignore]`d; it loads the
 //! 16 GB artifact, so run it alone in a memory-capped scope, with the CUDA library named by `euhedral.cuda.library` and
 //! the artifact by `euhedral.qwen.dflash2-artifact` (`EUHEDRAL_TEST_QWEN_DFLASH2_ARTIFACT`); it skips without them.
-//! Both comparisons are self-comparisons, with no Java golden.
+//! Both comparisons are self-comparisons, with no recorded golden.
 
 #![allow(
     clippy::unwrap_used,

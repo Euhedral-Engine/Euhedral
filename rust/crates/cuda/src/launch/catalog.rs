@@ -5,7 +5,7 @@
 //! its [`KernelId`], its index in [`KERNELS`]. The fields are what the native library does for the kernel today: the
 //! name it registers, the source it compiles from, the architecture-specific compile target of that source, the
 //! dynamic shared memory it sets as the function's maximum, and whether it registers the kernel for programmatic
-//! dependent launch (`euhedral_cuda_pdl_register`).
+//! dependent launch (`pdl_register`).
 //!
 //! The families are the ones the Rust engine calls (`ops.rs`), the Flash-Next MoE kernels among them (the router, the
 //! shared expert's SwiGLU, and the expert gate-up, down and combine kernels, which the layer's MoE stages launch). The
@@ -77,9 +77,9 @@ impl Module {
 /// The group a kernel belongs to; the family files plan one group each (the two tables share one file).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
-    /// The shared linear table (`euhedral_cuda_linear_launch`).
+    /// The shared linear table.
     LinearTable,
-    /// The Flash-Next table (`euhedral_cuda_qwen4_launch`).
+    /// The Flash-Next table.
     Qwen4Table,
     /// Residual, SwiGLU, RMS norm, argmax and selected token.
     Elementwise,
@@ -227,13 +227,13 @@ pub fn qwen4_table() -> &'static [KernelSpec] {
 /// Every kernel the Rust engine launches.
 pub static KERNELS: [KernelSpec; SPECS.len()] = SPECS;
 
-/// `native/src/host/linear_kernels.c:7-24`.
+/// The number of entries of the shared linear table.
 const LINEAR_TABLE_LEN: usize = 11;
-/// `native/src/host/qwen4_ops.c:12-50`.
+/// The number of entries of the Flash-Next table.
 const QWEN4_TABLE_LEN: usize = 36;
 
-/// The dynamic shared memory of `euhedral_dflash_attention_tc_bf16`: the expression of `ATTENTION_SHARED_BYTES`
-/// (`native/src/host/dflash.c:27`), whose terms are the kernel's `attentionShared` layout (`dflash/kernels.cu`): 32
+/// The dynamic shared memory of `euhedral_dflash_attention_tc_bf16`: the expression of the kernel's
+/// shared size, whose terms are the kernel's `attentionShared` layout (`dflash/kernels.cu`): 32
 /// score rows of 276 floats, the two BF16 probability planes of 32 rows by 280, the 16 rows of 136 BF16 values, and
 /// 64 floats of row maxima and sums. A name, not the expression, in the table: `native/tests/pdl_wait_check.py`
 /// reads each entry's size as one word.
@@ -1159,8 +1159,7 @@ const SPECS: [KernelSpec; 203] = [
     spec(Family::Dflash, "euhedral_dflash_select_bf16", Module::Dflash, 0, true),
 ];
 
-/// The parameters of one tensor map, as the C code passes them to `cuTensorMapEncodeTiled` (`byte_map`,
-/// `nvfp4_linear.c`). Every map is over bytes (`UINT8`) with unit element strides, no interleave, 128-byte L2
+/// The parameters of one tensor map, as `cuTensorMapEncodeTiled` takes them. Every map is over bytes (`UINT8`) with unit element strides, no interleave, 128-byte L2
 /// promotion and no out-of-bounds fill; those do not vary and are not fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TensorMapPlan {
@@ -1391,28 +1390,26 @@ mod tests {
     fn catalog_pdl_set_equals_the_native_registrations() {
         // The registrations of the native library, for the kernels the Rust engine launches, by name.
         let mut registered: BTreeSet<String> = BTreeSet::new();
-        // qwen_layer_ops.c:170-185 (`initialize`), the lines in the comments.
         for name in [
-            "euhedral_argmax_bf16",                      // :172
-            "euhedral_argmax_logprob_bf16",              // :173
-            "euhedral_selected_token",                   // :174
-            "euhedral_gdn_project_control_fp32",         // :175
-            "euhedral_residual_rms_norm_bf16",           // :176
-            "euhedral_residual_rms_norm_row_bf16",       // :177
-            "euhedral_gdn_convolution_bf16",             // :178
-            "euhedral_gdn_recurrence_bf16",              // :179
-            "euhedral_gdn_recurrence_c8_bf16",           // :180
-            "euhedral_gdn_gated_rms_norm_bf16",          // :181
-            "euhedral_residual_add_bf16",                // :182
-            "euhedral_swiglu_bf16",                      // :183
-            "euhedral_attention_qk_norm_rope_bf16",      // :184
-            "euhedral_attention_qk_norm_rope_rows_bf16", // :185
+            "euhedral_argmax_bf16",
+            "euhedral_argmax_logprob_bf16",
+            "euhedral_selected_token",
+            "euhedral_gdn_project_control_fp32",
+            "euhedral_residual_rms_norm_bf16",
+            "euhedral_residual_rms_norm_row_bf16",
+            "euhedral_gdn_convolution_bf16",
+            "euhedral_gdn_recurrence_bf16",
+            "euhedral_gdn_recurrence_c8_bf16",
+            "euhedral_gdn_gated_rms_norm_bf16",
+            "euhedral_residual_add_bf16",
+            "euhedral_swiglu_bf16",
+            "euhedral_attention_qk_norm_rope_bf16",
+            "euhedral_attention_qk_norm_rope_rows_bf16",
         ] {
             registered.insert(name.to_string());
         }
-        // qwen_layer_ops.c:186-198, once per cache format: append (:188), decode, decode_exact, decode_gqa, merge,
-        // decode_rows, decode_gqa_rows, merge_rows (:189-195), and the fused kernels of 2 to 6 tiles (:196-197), which
-        // only nvfp4 has (bf16's are NULL and skipped).
+        // Once per cache format: append, decode, decode_exact, decode_gqa, merge, decode_rows, decode_gqa_rows,
+        // merge_rows, and the fused kernels of 2 to 6 tiles, which only nvfp4 has.
         for format in ["nvfp4", "bf16"] {
             for pattern in [
                 "kv_append_F",
@@ -1430,9 +1427,8 @@ mod tests {
         for tiles in 2..=6 {
             registered.insert(format!("euhedral_attention_decode_gqa_nvfp4_fused{tiles}"));
         }
-        // rms_norm_bf16.c:22.
         registered.insert("euhedral_rms_norm_bf16".to_string());
-        // nvfp4_linear.c:44 (rows 1 to 8) and :51 (groups 2 to 4), every layout and tile.
+        // Rows 1 to 8 and groups 2 to 4, every layout and tile.
         for layout in ["", "_sd4"] {
             for tile in ["w8", "w4"] {
                 for rows in 1..=8 {
@@ -1443,7 +1439,7 @@ mod tests {
                 }
             }
         }
-        // q3_linear_bf16.c:`initialize`: the one-row decode kernel, its 2 to 8 row twins and the token-row twin, and the
+        // The one-row decode kernel, its 2 to 8 row twins and the token-row twin, and the
         // P2E2 decode kernels of 1 to 4 rows (the expansion is not registered).
         registered.insert("euhedral_q3_decode_contiguous".to_string());
         registered.insert("euhedral_q3_decode_contiguous_tokens".to_string());
@@ -1454,7 +1450,7 @@ mod tests {
         for rows in 2..=4 {
             registered.insert(format!("euhedral_q3_p2e2_decode_rows{rows}"));
         }
-        // q45_linear.c:`initialize`, for Q4 and Q5.
+        // Q4 and Q5.
         for bits in [4, 5] {
             registered.insert(format!("euhedral_q{bits}_decode_contiguous"));
             registered.insert(format!("euhedral_q{bits}_decode_contiguous_tokens"));
@@ -1462,7 +1458,7 @@ mod tests {
                 registered.insert(format!("euhedral_q{bits}_decode_contiguous_rows{rows}"));
             }
         }
-        // dflash.c:`initialize`: every drafter kernel.
+        // Every drafter kernel.
         for name in [
             "linear",
             "linear_rows",
@@ -1481,8 +1477,8 @@ mod tests {
         ] {
             registered.insert(format!("euhedral_dflash_{name}_bf16"));
         }
-        // Registered natively and not launched by the Rust engine, so not in the catalog: qwen_layer_ops.c:170
-        // (`euhedral_linear_bf16_to_float`) and :171 (`euhedral_gdn_control_fp32`).
+        // Registered natively and not launched by the Rust engine, so not in the catalog:
+        // `euhedral_linear_bf16_to_float` and `euhedral_gdn_control_fp32`.
         for name in ["euhedral_linear_bf16_to_float", "euhedral_gdn_control_fp32"] {
             assert_eq!(lookup(name), None);
         }
@@ -1497,8 +1493,8 @@ mod tests {
 
     #[test]
     fn the_linear_table_entries_are_the_native_table_in_order() {
-        // native/src/host/linear_kernels.c:7-24, which `LinearKernel::ALL` in the engine lists in the same order
-        // (`crates/engine/src/formats/shapes.rs:204`; the engine's `catalog` test compares them directly).
+        // The native table, which `LinearKernel::ALL` in the engine lists in the same order (the engine's
+        // `catalog` test compares them directly).
         let names = [
             "euhedral_trellis_prepass",
             "euhedral_trellis_mma",
@@ -1515,7 +1511,7 @@ mod tests {
         let table: Vec<&str> = linear_table().iter().map(|kernel| kernel.name).collect();
         assert_eq!(table, names);
         assert!(linear_table().iter().all(|kernel| kernel.family == Family::LinearTable));
-        // :18 the reference's opt-in, :20-21 the FP8 module.
+        // The reference's opt-in, and the FP8 module.
         assert_eq!(
             kernel!("euhedral_trellis_reference").spec().shared_opt_in_bytes,
             4 * 17408
@@ -1531,7 +1527,7 @@ mod tests {
 
     #[test]
     fn the_qwen4_table_entries_are_the_native_table_in_order() {
-        // native/src/host/qwen4_ops.c:12-50, in order.
+        // The Flash-Next table, in order.
         let names = [
             "linear_bf16",
             "grouped_rms_norm_bf16",
@@ -1578,7 +1574,7 @@ mod tests {
             assert_eq!(kernel.module, Module::Qwen4);
             assert!(!kernel.pdl_registered);
         }
-        // :32, one unit's three warps.
+        // One unit's three warps.
         assert_eq!(kernel!("euhedral_q4_qsa_attention").spec().shared_opt_in_bytes, 28224);
     }
 
@@ -1597,7 +1593,6 @@ mod tests {
 
     #[test]
     fn the_opt_in_shared_bytes_are_the_native_ones() {
-        // qwen_layer_ops.c:50 and :101.
         assert_eq!(
             kernel!("euhedral_attention_prefill_fa2_nvfp4")
                 .spec()
@@ -1610,7 +1605,7 @@ mod tests {
                 .shared_opt_in_bytes,
             67584
         );
-        // qwen_layer_ops.c:61-63 (`fused_shared_bytes`) for 2 and 6 tiles, set at :110.
+        // The fused kernels for 2 and 6 tiles.
         assert_eq!(
             kernel!("euhedral_attention_decode_gqa_nvfp4_fused2")
                 .spec()
@@ -1623,13 +1618,13 @@ mod tests {
                 .shared_opt_in_bytes,
             47392
         );
-        // nvfp4_linear.c:152 (`NATIVE_SHARED_BYTES`) and `skinny_shared_bytes` (:159-162, set at :208-209) for 16, 32 and 64 rows with two terms.
+        // The native tile kernel, and the skinny kernels for 16, 32 and 64 rows with two terms.
         assert_eq!(
             kernel!("euhedral_nvfp4n_linear_128x128").spec().shared_opt_in_bytes,
             85040
         );
         assert_eq!(kernel!("euhedral_nvfp4n_skinny_16").spec().shared_opt_in_bytes, 61440);
-        // dflash.c `ATTENTION_SHARED_BYTES`.
+        // The drafter's attention kernel.
         assert_eq!(
             kernel!("euhedral_dflash_attention_tc_bf16").spec().shared_opt_in_bytes,
             75776
@@ -1641,7 +1636,7 @@ mod tests {
         assert_eq!(kernel!("euhedral_nvfp4n_skinny_64").spec().shared_opt_in_bytes, 92160);
         // Everything else sets none.
         let with: usize = KERNELS.iter().filter(|kernel| kernel.shared_opt_in_bytes != 0).count();
-        // The three FP8 prefill linears of Q3, Q4 and Q5 (`Q3MX_SHARED_BYTES`, `q3_mx.c`).
+        // The three FP8 prefill linears of Q3, Q4 and Q5.
         assert_eq!(
             kernel!("euhedral_q3mx_linear_128x128").spec().shared_opt_in_bytes,
             75264

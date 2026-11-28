@@ -14,7 +14,7 @@ fn reads_as_absent(text: &str) -> bool {
     text.chars().all(|character| character <= ' ') || text.trim() == "null"
 }
 
-/// The text without the leading and trailing characters of at most U+0020, as Java's `String.trim` does.
+/// The text without the leading and trailing characters of at most U+0020.
 fn trimmed(text: &str) -> &str {
     text.trim_matches(|character: char| character <= ' ')
 }

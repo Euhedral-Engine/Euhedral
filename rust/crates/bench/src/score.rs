@@ -1,5 +1,4 @@
-//! Teacher-forced scoring against a llama.cpp reference (`docs/evaluation/QUALITY.md`): the Java scorer's scheme on this
-//! engine.
+//! Teacher-forced scoring against a llama.cpp reference (`docs/evaluation/QUALITY.md`): the scoring scheme of the quality tools.
 //!
 //! Each chunk of N reference tokens is forced on a fresh sequence: a prefill of N / 2 + 1 tokens, then the forced
 //! tokens one row at a time, so that step k's logits row predicts the token the reference's record k does. The rows
@@ -216,7 +215,7 @@ pub fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[below] + (position - below as f64) * (sorted[above] - sorted[below])
 }
 
-/// The summary of one reference, in the Java scorer's text: a comment line, the chunk line, the column titles, the
+/// The summary of one reference, in the scorer's text: a comment line, the chunk line, the column titles, the
 /// reference's own mean NLL and perplexity, and the artifact's row (mean NLL, perplexity, dNLL and its standard error, KL
 /// and its standard error, top-1 agreement, then the KL median, p95, p99 and maximum, the top-1 standard error, and the
 /// mean, RMS, p1 and p99 of the probability difference).
@@ -251,7 +250,7 @@ pub fn summary_lines(
     let rms = (dp.iter().map(|value| value * value).sum::<f64>() / n as f64).sqrt();
     let mean_nll = mean(&nll, 0, n);
     let reference_mean = mean(&reference_nll, 0, n);
-    // The Java scorer prints its timestamp to the second.
+    // The timestamp prints to the second.
     let seconds = when.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
     let when = UNIX_EPOCH + Duration::from_secs(seconds);
     let mut text = format!(

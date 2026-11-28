@@ -10,10 +10,10 @@
 //! the trellis format and writes the exl3 checkpoint to `--out`, with the output head and the draft head, rounded with
 //! the recipe, in `--out/heads`; `--viterbi-scratch-mib` and `--write-buffer-mib` size the rounding and the writer.
 //! The rates the allocation gives, and the Viterbi scratch, are checked before anything is touched, and the rate and the
-//! allocation are part of what names the run. The MTP block is written whatever `--skip-mtp` says in Java, so this
+//! allocation are part of what names the run. The MTP block is written whatever `--skip-mtp` says, so this
 //! build refuses `--skip-mtp` with the trellis format instead.
 //!
-//! A run of every layer then rounds, as Java does, the MTP block (unless `--skip-mtp`), `mtp/input_projection`, the
+//! A run of every layer then rounds the MTP block (unless `--skip-mtp`), `mtp/input_projection`, the
 //! output head and the draft head, and lists each in the manifest as it is written; the resume file is dropped after
 //! the last. The draft head keeps the rows of the output head that `text/draft_head_token_ids` of the artifact named
 //! by `--draft-ids-from` select, so a run of every layer needs that flag. A run of fewer layers than the model's stops
@@ -45,7 +45,7 @@ use euhedral_inference_settings::{load_for_tool, process_env};
 use crate::rig::Rig;
 use crate::{EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, Outcome};
 
-/// Java's defaults and caps.
+/// The defaults and caps.
 const DEFAULT_DAMP: f32 = 0.01;
 const DEFAULT_BATCH: usize = 8;
 const DEFAULT_LAYERS: usize = 64;
@@ -91,7 +91,7 @@ const TRELLIS_KEY_FIELDS: [&str; 15] = [
 ];
 /// The trellis options, which need `--format trellis`.
 const TRELLIS_OPTIONS: [&str; 3] = ["--bits", "--viterbi-scratch-mib", "--write-buffer-mib"];
-/// Java's defaults and the cap of the writer's buffer (its bytes fit an `int`).
+/// The defaults and the cap of the writer's buffer (its bytes fit an `int`).
 const DEFAULT_VITERBI_MIB: u64 = 256;
 const DEFAULT_WRITE_BUFFER_MIB: u64 = 16;
 const MOST_WRITE_BUFFER_MIB: u64 = 1023;
@@ -131,9 +131,9 @@ pub(crate) struct Flags {
     pub config: Option<PathBuf>,
     pub library: Option<PathBuf>,
     pub math_directory: Option<PathBuf>,
-    /// Linears rounded at once (Java's `--rounding-lanes`); none takes the default.
+    /// Linears rounded at once (`--rounding-lanes`); none takes the default.
     pub rounding_lanes: Option<usize>,
-    /// Device MiB left for what the planner does not account (Java's `--memory-reserve-mib`); none sizes it from the
+    /// Device MiB left for what the planner does not account (`--memory-reserve-mib`); none sizes it from the
     /// card.
     pub memory_reserve_mib: Option<u64>,
     /// Pinned MiB the layers are read into.
@@ -409,8 +409,7 @@ fn mib_bytes(flag: &str, mib: u64) -> Result<u64, String> {
         .ok_or_else(|| format!("{flag} {mib} is too many bytes"))
 }
 
-/// The plan of a run of the model's `model_layers` layers that rounds `requested` of them, as Java's `--layers` is a
-/// count: a count at or above the model's makes a run of the whole model, which finishes; a smaller one stops early.
+/// The plan of a run of the model's `model_layers` layers that rounds `requested` of them: a count at or above the model's makes a run of the whole model, which finishes; a smaller one stops early.
 pub(crate) fn plan_for(requested: usize, model_layers: usize) -> Plan {
     let mut plan = Plan::new(model_layers);
     plan.stop_after = requested;
@@ -503,8 +502,7 @@ enum Ended {
     AlreadyComplete,
 }
 
-/// The path of the artifact the draft head's ids are read from. Every run needs it, whatever `--layers` is, as Java's
-/// does: the ids are in the resume key, so that a start with other ids is not a resume of the run.
+/// The path of the artifact the draft head's ids are read from. Every run needs it, whatever `--layers` is: the ids are in the resume key, so that a start with other ids is not a resume of the run.
 fn draft_ids_flag(flags: &Flags) -> Result<&Path, String> {
     flags
         .draft_ids_from

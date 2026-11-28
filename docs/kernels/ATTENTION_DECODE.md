@@ -80,8 +80,10 @@ consumer warps (online softmax, P hi/lo and the PV chain of one query tile). Up 
 registers, 43 KiB of shared memory); T = 5 and 6 run one.
 
 Every query column is computed by the operations of the one-row kernel at its row's length, in the same order, so the partials are
-bit for bit the row twin's and verification stays exact (`test_fused_verifier_rows_equal_row_twins_bitwise`, and
-`SpeculativeVerifyCudaIntegrationTest` at 4100 keys with 5 rows and 9000 keys with 4). That needs the rows to share one split
+bit for bit the row twin's and verification stays exact (`test_fused_verifier_rows_equal_row_twins_bitwise` in
+`native/tests/test_attention_nvfp4.py`: 2 to 8 rows from starts of 2042 to 40001 keys, across the 2048-key switch and the split
+boundaries; the model-level verification is checked by `mtp_kv_and_gdn_state_equal_greedy_after_run` in
+`rust/crates/engine/tests/device/mtp.rs`). That needs the rows to share one split
 partition: a split spans whole 16-key tiles (`split_span`), so the partition of 64 splits changes only where the length crosses a
 multiple of 1024 keys. The fused kernel serves the rows that share the last row's partition; the row twin, launched after it,
 serves the rest (in the rare step that crosses a multiple of 1024) and returns at once for the others.
@@ -118,8 +120,9 @@ ones) copy every reserved host page in and the last two back, so what they queue
 which is in the capture fingerprint; prompt chunks copy only the pages they reach and write. Prefix-cache checkpoints stop
 at the device share.
 
-Greedy output is bit for bit that of the same engine with every page on the device (`HostKvPagesCudaIntegrationTest`:
-a 3000-token prompt over 1024 device tokens, decode, MTP verification and drafting).
+Greedy output is bit for bit that of the same engine with every page on the device (measured on a 3000-token prompt over 1024 device
+tokens, decode, MTP verification and drafting; no automated check compares the outputs. `host_pages_are_read_and_written_through_the_device_region`
+in `rust/crates/engine/tests/device/state.rs` checks the page transfers).
 
 NVFP4-Trellis-RCO, 32K chat prompt, MTP depth 4, every weight on the GPU, by the cache share kept on it:
 

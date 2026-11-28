@@ -3,7 +3,7 @@
 //!
 //! [`RusteeOps`] is what a stage launches through when the kernels run on RustEE: the handle a lane's `submit` lends, the
 //! [`KernelTable`] that [`load`](super::load::load) made, and the [`Modes`] the native library keeps per thread
-//! (row-exact, exact numerics). A planner's refusal is the status the C wrapper would have returned
+//! (row-exact, exact numerics). A planner's refusal is a status
 //! ([`CudaError::Call`] with the library's code, so a caller that treats `ROUTE_UNAVAILABLE` as "take another route"
 //! still can); a kernel the device lacks, or a launch RustEE refuses, is [`CudaError::Argument`] with the reason. Neither
 //! falls back to the native library.

@@ -30,7 +30,7 @@ use euhedral_inference_settings::Settings;
 use euhedral_io::AsyncIo;
 
 /// BF16 0.0078125 (2^-7), the bits the input is filled with: a normal, nonzero value, so the launches read real values
-/// and not denormals or zeros. (Java fills with the same bits.)
+/// and not denormals or zeros.
 const BF16_INPUT_FILL: u16 = 0x3C00;
 /// One gate copy moves this many bytes each way.
 const GATE_CHUNK_BYTES: usize = 64 << 20;

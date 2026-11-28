@@ -397,7 +397,7 @@ fn storage(reader: &mut Reader<'_>) -> Result<(TensorDataType, WeightFormat, Wei
     ))
 }
 
-/// Whether `bytes` is the size the layout gives for `shape`, as the Java `checkFixedObject`.
+/// Whether `bytes` is the size the layout gives for `shape`.
 fn check_object(
     name: &str,
     shape: &[u64],

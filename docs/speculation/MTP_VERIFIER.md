@@ -114,7 +114,7 @@ rows, every row computed exactly as the one-row launch at its position:
 **Exactness.**
 - **Native test** (`test_attention_nvfp4.py`): every row is bitwise one-row decode for M = 2, 3, 4, 5 and 8, at starts 40, 253,
   1500, 2042 and 3000 (pages, partial pages, the 2048-key switch). A wrong split count fails it.
-- **In-model:** `SpeculativeVerifyCudaIntegrationTest` and `SpeculativeDecodeCudaIntegrationTest` (MTP_SPECULATIVE §2).
+- **In-model:** the `mtp.rs` and `batched.rs` device tests (MTP_SPECULATIVE §2).
 - **Gate:** output hashes are identical to the non-speculative arm's (Q3 216 rows, NVFP4 197).
 
 ## Exact linear twins

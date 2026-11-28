@@ -186,7 +186,7 @@ fn close(label: &str, actual: f64, wanted: f64) {
 #[test]
 #[ignore = "needs a GPU and the bundled NVRTC"]
 fn rows_match_the_host_arithmetic_and_a_reused_lane_leaves_nothing_behind() {
-    let path = test_support::gradle_property("euhedral.cuda.library")
+    let path = test_support::test_setting("euhedral.cuda.library")
         .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
     let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
     let gpu = CudaGpu::open(0).expect("the device opens");

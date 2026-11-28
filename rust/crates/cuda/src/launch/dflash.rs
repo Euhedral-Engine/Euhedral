@@ -1,8 +1,7 @@
-//! The DFlash2 drafter's launches: the host dispatch of `native/src/host/dflash.c`, as plain functions from a shape to
-//! the launches the C wrapper would issue.
+//! The DFlash2 drafter's launches: plain functions from a shape to the launches that run it.
 //!
-//! Each function pushes its [`Launch`]es into the caller's sink and allocates nothing. Where the C wrapper returns an
-//! error status the function returns the matching [`PlanError`].
+//! Each function pushes its [`Launch`]es into the caller's sink and allocates nothing. A shape the kernels refuse
+//! returns the matching [`PlanError`].
 
 use crate::DevicePtr;
 use crate::kernel;
@@ -37,7 +36,7 @@ const LINEAR_SPLIT_MAX_OUTPUTS: u32 = 1536;
 /// The only head dimension the kernels serve.
 const HEAD_DIM: u32 = 128;
 
-/// The shape of `euhedral_cuda_dflash_linear_bf16`.
+/// The shape of `dflash_linear_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct LinearShape {
     pub input: DevicePtr,
@@ -48,7 +47,7 @@ pub struct LinearShape {
     pub out_features: u32,
 }
 
-/// `euhedral_cuda_dflash_linear_bf16`: one launch. Up to 16 rows stream the weights once; more rows reuse each weight
+/// `dflash_linear_bf16`: one launch. Up to 16 rows stream the weights once; more rows reuse each weight
 /// load over 64 rows. Outputs up to 1536 wide split K in four, in both; each row gets the same bits either way.
 pub fn plan_linear(shape: &LinearShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
@@ -82,7 +81,7 @@ pub fn plan_linear(shape: &LinearShape, sink: &mut impl FnMut(Launch)) -> Result
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_dflash_rms_norm_bf16`.
+/// The shape of `dflash_rms_norm_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct RmsNormShape {
     pub input: DevicePtr,
@@ -93,7 +92,7 @@ pub struct RmsNormShape {
     pub epsilon: f32,
 }
 
-/// `euhedral_cuda_dflash_rms_norm_bf16`: one launch, a block per row.
+/// `dflash_rms_norm_bf16`: one launch, a block per row.
 pub fn plan_rms_norm(shape: &RmsNormShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.input.is_null()
@@ -115,7 +114,7 @@ pub fn plan_rms_norm(shape: &RmsNormShape, sink: &mut impl FnMut(Launch)) -> Res
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_dflash_conv_bf16`.
+/// The shape of `dflash_conv_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct ConvShape {
     pub input: DevicePtr,
@@ -130,7 +129,7 @@ pub struct ConvShape {
     pub part: u32,
 }
 
-/// `euhedral_cuda_dflash_conv_bf16`: one launch over every element.
+/// `dflash_conv_bf16`: one launch over every element.
 pub fn plan_conv(shape: &ConvShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.input.is_null()
@@ -170,7 +169,7 @@ pub fn plan_conv(shape: &ConvShape, sink: &mut impl FnMut(Launch)) -> Result<(),
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_dflash_context_kv_bf16`.
+/// The shape of `dflash_context_kv_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct ContextKvShape {
     pub kv: DevicePtr,
@@ -187,7 +186,7 @@ pub struct ContextKvShape {
     pub theta: f32,
 }
 
-/// `euhedral_cuda_dflash_context_kv_bf16`: one launch, a block per row and head. More rows than the window would write
+/// `dflash_context_kv_bf16`: one launch, a block per row and head. More rows than the window would write
 /// a ring slot twice in one launch, so they are refused.
 pub fn plan_context_kv(shape: &ContextKvShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
@@ -224,7 +223,7 @@ pub fn plan_context_kv(shape: &ContextKvShape, sink: &mut impl FnMut(Launch)) ->
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_dflash_block_qk_bf16`.
+/// The shape of `dflash_block_qk_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockQkShape {
     pub query: DevicePtr,
@@ -242,7 +241,7 @@ pub struct BlockQkShape {
     pub theta: f32,
 }
 
-/// `euhedral_cuda_dflash_block_qk_bf16`: one launch, a block per row and (query or key) head.
+/// `dflash_block_qk_bf16`: one launch, a block per row and (query or key) head.
 pub fn plan_block_qk(shape: &BlockQkShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.query.is_null()
@@ -281,7 +280,7 @@ pub fn plan_block_qk(shape: &BlockQkShape, sink: &mut impl FnMut(Launch)) -> Res
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_dflash_attention_bf16`.
+/// The shape of `dflash_attention_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct AttentionShape {
     pub query: DevicePtr,
@@ -300,7 +299,7 @@ pub struct AttentionShape {
     pub head_dim: u32,
 }
 
-/// `euhedral_cuda_dflash_attention_bf16`: the attention over the ring and the block, then the merge of the key splits.
+/// `dflash_attention_bf16`: the attention over the ring and the block, then the merge of the key splits.
 /// A key-value head serves at most four query heads, and all the queries of a block (rows times that) at most 32.
 pub fn plan_attention(shape: &AttentionShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
@@ -353,7 +352,7 @@ pub fn plan_attention(shape: &AttentionShape, sink: &mut impl FnMut(Launch)) -> 
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_dflash_swiglu_bf16`.
+/// The shape of `dflash_swiglu_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct SwigluShape {
     pub gate_up: DevicePtr,
@@ -362,7 +361,7 @@ pub struct SwigluShape {
     pub intermediate: u32,
 }
 
-/// `euhedral_cuda_dflash_swiglu_bf16`: one launch over every element.
+/// `dflash_swiglu_bf16`: one launch over every element.
 pub fn plan_swiglu(shape: &SwigluShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.gate_up.is_null() || s.output.is_null() || s.rows == 0 || s.intermediate == 0 {
@@ -387,13 +386,13 @@ pub fn plan_swiglu(shape: &SwigluShape, sink: &mut impl FnMut(Launch)) -> Result
     Ok(())
 }
 
-/// The bytes of scratch the top-k of `rows` rows needs (`euhedral_cuda_dflash_topk_scratch_bytes`): each slice's
+/// The bytes of scratch the top-k of `rows` rows needs (`dflash_topk_scratch_bytes`): each slice's
 /// candidates, as 4-byte values and 4-byte indices.
 pub const fn topk_scratch_bytes(rows: u32) -> u64 {
     rows as u64 * TOPK_SPLITS as u64 * TOPK_WIDTH as u64 * 8
 }
 
-/// The shape of `euhedral_cuda_dflash_topk_bf16`.
+/// The shape of `dflash_topk_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct TopkShape {
     pub logits: DevicePtr,
@@ -407,7 +406,7 @@ pub struct TopkShape {
     pub scratch: DevicePtr,
 }
 
-/// `euhedral_cuda_dflash_topk_bf16`: each slice of every row keeps its top 16, then each row's candidates merge.
+/// `dflash_topk_bf16`: each slice of every row keeps its top 16, then each row's candidates merge.
 pub fn plan_topk(shape: &TopkShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.logits.is_null()
@@ -446,7 +445,7 @@ pub fn plan_topk(shape: &TopkShape, sink: &mut impl FnMut(Launch)) -> Result<(),
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_dflash_select_bf16`.
+/// The shape of `dflash_select_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct SelectShape {
     pub hidden: DevicePtr,
@@ -464,7 +463,7 @@ pub struct SelectShape {
     pub scores: DevicePtr,
 }
 
-/// `euhedral_cuda_dflash_select_bf16`: one block chooses every position's token in order.
+/// `dflash_select_bf16`: one block chooses every position's token in order.
 pub fn plan_select(shape: &SelectShape, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     let s = shape;
     if s.hidden.is_null()
@@ -527,7 +526,7 @@ mod tests {
 
     #[test]
     fn linear_picks_the_kernel_by_output_width_and_row_count() {
-        // dflash.c: up to 1536 outputs split K (tile of 8 outputs), wider ones do not (tile of 32); up to 16 rows take
+        // up to 1536 outputs split K (tile of 8 outputs), wider ones do not (tile of 32); up to 16 rows take
         // the streaming kernel, more the 64-row kernel.
         for (rows, outputs, kernel, grid) in [
             (7, 1024, kernel!("euhedral_dflash_linear_split_bf16"), [128, 1, 1]),

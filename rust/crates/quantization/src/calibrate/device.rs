@@ -78,11 +78,11 @@ const STATES_CHUNK: usize = 256 << 20;
 /// FP32 bytes of a Hessian element.
 const FP32_BYTES: usize = 4;
 
-/// Java's default dampening.
+/// The default dampening.
 pub const DEFAULT_DAMP: f32 = 0.01;
-/// Java's default sequences at once.
+/// The default sequences at once.
 pub const DEFAULT_BATCH: usize = 8;
-/// Rounding lanes: Java's `ROUNDING_FRAMES`.
+/// Rounding lanes.
 pub const ROUNDING_LANES: usize = 3;
 /// Device bytes the planner leaves for what it does not account: the layer, its Hessians, its decoded weights and the
 /// libraries' workspaces.

@@ -1,6 +1,6 @@
 //! The pipeline over the card: the layer forward on a main lane, one sequence per slot lane.
 //!
-//! The batch's rows travel as in Java: the hidden states of every sequence rest in pinned host memory, a batch is
+//! The batch's rows travel as follows: the hidden states of every sequence rest in pinned host memory, a batch is
 //! copied to a device buffer on the main lane, run, and copied back when the pass writes. A slot's lane waits, on the
 //! device, for the main lane's marker after the head; the main lane waits for every slot lane's marker before the
 //! tail. Nothing waits on the host: the pass ends in a frame the lanes' completions emit behind the last marker.
@@ -376,7 +376,7 @@ pub struct Parts {
 
 /// The pipelined layer forward: layers in order, up to a batch of sequences in flight, no host wait.
 ///
-/// Java's `ForwardPipeline`. A pass of a layer over every sequence is a chain of frames on the lake: a start that
+/// A pass of a layer over every sequence is a chain of frames on the lake: a start that
 /// copies a batch in and runs the head on the main lane, one frame per sequence on its own lane behind the head, a
 /// finish that runs the tail behind every sequence and copies the batch back, the next batch's start, and the end
 /// that the lanes' completions emit once the last marker is reached.
@@ -387,8 +387,8 @@ pub struct ForwardPipeline {
 }
 
 impl ForwardPipeline {
-    /// A pipeline of `slots` sequences in flight. Makes the sequences' states on the main lane, as Java's constructor
-    /// does (the first call waits for pinned memory when the pool is cold).
+    /// A pipeline of `slots` sequences in flight. Makes the sequences' states on the main lane
+    /// (the first call waits for pinned memory when the pool is cold).
     pub fn new(parts: Parts) -> Result<Self, ForwardError> {
         let Parts {
             mut forward,

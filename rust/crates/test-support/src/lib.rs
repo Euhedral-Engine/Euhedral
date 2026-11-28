@@ -2,11 +2,11 @@
 //!
 //! Tests that need a model artifact, a tokenizer directory or another machine-specific path never hard-code it. They
 //! ask for a `euhedral.*` key, which is looked up in three places, in this order: the environment, the Rust-owned
-//! settings file, and Gradle's `gradle.properties`, the file the Java tests already read.
+//! settings file, and `gradle.properties` in the Gradle user home, where a machine's settings may already live.
 //!
 //! The settings file is the path in `EUHEDRAL_TEST_CONFIG` if that is set, else
 //! `$XDG_CONFIG_HOME/euhedral/test.properties`, else `~/.config/euhedral/test.properties`. It uses the `key=value`
-//! format of `gradle.properties`.
+//! properties format, as `gradle.properties` does.
 //!
 //! For the key `euhedral.qwen.artifact` the environment variable is `EUHEDRAL_TEST_QWEN_ARTIFACT`: the `euhedral.`
 //! prefix is dropped, the rest is upper-cased, and `.` and `-` become `_`.
@@ -20,23 +20,23 @@ const ENV_PREFIX: &str = "EUHEDRAL_TEST_";
 const CONFIG_VARIABLE: &str = "EUHEDRAL_TEST_CONFIG";
 
 /// The value of a `euhedral.*` key: the environment variable `EUHEDRAL_TEST_<KEY>` first, then the settings file (see
-/// the crate docs), then the Gradle user home's `gradle.properties` (`GRADLE_USER_HOME`, else `~/.gradle`).
+/// the crate docs), then `gradle.properties` in the Gradle user home (`GRADLE_USER_HOME`, else `~/.gradle`).
 #[allow(
     clippy::disallowed_methods,
     reason = "single reader of the environment: this test helper resolves machine settings for tests"
 )]
-pub fn gradle_property(key: &str) -> Option<String> {
+pub fn test_setting(key: &str) -> Option<String> {
     let environment = |name: &str| env::var(name).ok();
     let settings = settings_file(environment, home_dir());
     lookup(key, environment, settings.as_deref(), gradle_user_home().as_deref())
 }
 
-/// Like [`gradle_property`], but prints a skip line and returns `None` when the key is absent or names a path that does not exist, so a test can
+/// Like [`test_setting`], but prints a skip line and returns `None` when the key is absent or names a path that does not exist, so a test can
 /// `let Some(path) = require_property(key) else { return };`. libtest captures the line from a passing test; run
 /// with `--nocapture` to see it.
 #[allow(clippy::print_stdout, reason = "the skip line is this helper's output")]
 pub fn require_property(key: &str) -> Option<String> {
-    let Some(value) = gradle_property(key) else {
+    let Some(value) = test_setting(key) else {
         println!(
             "skipped: set {} or {key} in ~/.config/euhedral/test.properties",
             env_name(key)
@@ -94,7 +94,7 @@ fn settings_file(environment: impl Fn(&str) -> Option<String>, home: Option<Path
     Some(home?.join(".config").join("euhedral").join("test.properties"))
 }
 
-/// The value of `key` in the Java properties file at `path`; a missing or unreadable file has no keys.
+/// The value of `key` in the properties file at `path`; a missing or unreadable file has no keys.
 #[allow(
     clippy::disallowed_methods,
     reason = "no-wait, blocking I/O: a test helper reads a properties file"
@@ -124,7 +124,7 @@ fn gradle_user_home() -> Option<PathBuf> {
     Some(home_dir()?.join(".gradle"))
 }
 
-/// The value of `key` in Java `.properties` text, unescaped the way Java reads it (`C:\\models` is `C:\models`).
+/// The value of `key` in `.properties` text, unescaped as that format defines it (`C:\\models` is `C:\models`).
 fn properties_value(text: &str, key: &str) -> Option<String> {
     java_properties::read(text.as_bytes()).ok()?.remove(key)
 }
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn gradle_property_reads_env_then_file() {
+    fn test_setting_reads_env_then_file() {
         let home = tempfile::tempdir().unwrap();
         fs::write(
             home.path().join("gradle.properties"),

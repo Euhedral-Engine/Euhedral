@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Screens MTP speculation policies offline on a drafting-confidence report (MtpDraftConfidenceCudaIntegrationTest).
+"""Screens MTP speculation policies offline on a drafting-confidence report.
 
 Usage: mtp_loop_screen.py REPORT.jsonl [--policies]
 

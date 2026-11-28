@@ -1,5 +1,4 @@
-//! The DFlash2 drafter's stages (`Stages.DFlash2`, and the drafter's views of `ExecutionPlan`: `dflash2Context` and
-//! `dflash2Block`).
+//! The DFlash2 drafter's stages: the context and the block views.
 //!
 //! The base model's views tap rows of its hidden state into the sequence's tap buffer ([`DrafterTap`]). A context
 //! quantum turns the committed rows of the taps into keys and values of the drafter's rings ([`DrafterContext`]); a
@@ -295,7 +294,7 @@ fn buffers_of(quantum: &Quantum) -> Result<&DrafterBuffers, StageError> {
 }
 
 /// Copies the rows of the base model's hidden state after tapped layer `tap` into the sequence's tap buffer, at the
-/// tap's columns (Java's tap stage, which copies after the next layer's input norm).
+/// tap's columns (it copies after the next layer's input norm).
 #[derive(Clone, Debug)]
 pub struct DrafterTap {
     tap: usize,

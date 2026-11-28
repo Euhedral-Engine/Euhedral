@@ -1,5 +1,5 @@
-//! The launches of the Flash-Next kernel table, one function per entry of Java's `Ops` (and of `GdnLayer.Qwen4GdnOps`):
-//! the same kernel, grid, block and argument order. Each refuses a zero extent, as Java refuses a non-positive one, and
+//! The launches of the Flash-Next kernel table, one function per entry,
+//! with the kernel's grid, block and argument order. Each refuses a zero extent and
 //! the alignment its kernel reads with; the value is in the message.
 //!
 //! A function returns the [`Launch`] and queues nothing: what a test records is what the device runs.
@@ -280,7 +280,7 @@ pub fn ple_gate(
 }
 
 /// The dilated depthwise convolution of the PLE over its history rows (`Ops.pleConv`).
-#[allow(clippy::too_many_arguments, reason = "the kernel's own arguments, in Java's order")]
+#[allow(clippy::too_many_arguments, reason = "the kernel's own arguments, in its order")]
 pub fn ple_conv(
     normed: DevicePtr,
     gated: DevicePtr,
@@ -373,7 +373,7 @@ pub fn gdn_conv(
 }
 
 /// The decay and update gates of the recurrence from the `a` and `b` projections (`Qwen4GdnOps.control`).
-#[allow(clippy::too_many_arguments, reason = "the kernel's own arguments, in Java's order")]
+#[allow(clippy::too_many_arguments, reason = "the kernel's own arguments, in its order")]
 pub fn gdn_control(
     a: DevicePtr,
     b: DevicePtr,
@@ -404,7 +404,7 @@ pub fn gdn_control(
 
 /// The gate applied to the recurrence's output, normed per head (`Qwen4GdnOps.gatedNorm`): `activation` 0 is SiLU, 1 is
 /// sigmoid.
-#[allow(clippy::too_many_arguments, reason = "the kernel's own arguments, in Java's order")]
+#[allow(clippy::too_many_arguments, reason = "the kernel's own arguments, in its order")]
 pub fn gdn_gated_norm(
     core: DevicePtr,
     z: DevicePtr,

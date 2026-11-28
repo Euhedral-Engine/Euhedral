@@ -1,5 +1,4 @@
-//! Host tests of the grouped-linear planner. Every expected value is worked by hand from
-//! `native/src/host/q3_linear_bf16.c`, `q45_linear.c` and `q3_mx.c`, not taken from the planner.
+//! Host tests of the grouped-linear planner. Every expected value is worked by hand, not taken from the planner.
 
 use super::*;
 

@@ -2,7 +2,7 @@ use crate::error::EdrlError;
 use crate::header::MAX_COUNT;
 use crate::reader::Reader;
 
-/// The most draft tokens per step an artifact may record (`MtpDecoder.MAX_DRAFTS`).
+/// The most draft tokens per step an artifact may record.
 pub const MAX_DRAFT_DEPTH: u8 = 16;
 
 pub(crate) const MAX_STRING_BYTES: usize = 1 << 20;

@@ -48,7 +48,7 @@ fn every_catalog_kernel_resolves_with_the_parameters_a_plan_passes() {
         return;
     }
     let gpu = CudaGpu::open(0).expect("the device opens through RustEE");
-    let cache = test_support::gradle_property("euhedral.kernel.cache").map(|directory| {
+    let cache = test_support::test_setting("euhedral.kernel.cache").map(|directory| {
         let cache = PathBuf::from(directory).join("kernel-module-cache");
         create_dir_all(&cache).expect("the cache directory");
         cache

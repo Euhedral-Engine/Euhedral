@@ -51,7 +51,7 @@ use crate::trellis::{
     plan_normalise_hessian,
 };
 
-/// Java's seed of the MTP block's linears.
+/// The seed of the MTP block's linears.
 const MTP_SEED: u64 = 64;
 /// The most linears a layer has: full attention's four and the MLP's three.
 const MOST_LINEARS: usize = 7;
@@ -849,7 +849,7 @@ impl Heads for TrellisDeviceHeads {
         self.heads.observe(then);
     }
 
-    /// Rounds the MTP block's eight linears without a Hessian, as Java does, and has the writer write them.
+    /// Rounds the MTP block's eight linears without a Hessian and has the writer write them.
     fn mtp(&self, then: Then<Vec<String>>) {
         let inner = Arc::clone(&self.inner);
         read_tensors(

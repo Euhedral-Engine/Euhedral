@@ -3,8 +3,7 @@
 #include "common/pdl.cuh"
 #include "nvfp4/scale_table.cuh"
 
-// NVFP4 weights (WeightFormat.NVFP4, row-split-k128-v1; Nvfp4Layout.java,
-// docs/kernels/NVFP4_NATIVE.md). Rows of K values, K padded to
+// NVFP4 weights (row-split-k128-v1; docs/kernels/NVFP4_NATIVE.md). Rows of K values, K padded to
 // 128: E2M1 codes two per byte with the even K in the low nibble, then a 256-aligned plane of one
 // E4M3 scale per 16 values, then a 256-aligned FP32 global scale. A weight is
 // e2m1(code) * e4m3(scale) * global.

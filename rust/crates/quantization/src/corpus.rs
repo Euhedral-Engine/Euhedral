@@ -9,7 +9,7 @@
 //! - `index.jsonl`: one line per sequence, written after its rows: its id, first token and first hidden row, token
 //!   count, prompt length and whether its answer was sampled (otherwise greedy, its labels its tokens).
 //!
-//! The format is the one the Java tools write and read. A corpus whose labels were not kept is greedy throughout:
+//! The format is line-oriented JSON. A corpus whose labels were not kept is greedy throughout:
 //! opening it for writing makes its labels its tokens. A corpus left with rows beyond its index (a stopped run) is cut
 //! back to the index.
 //!
@@ -75,8 +75,8 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-/// The id as a JSON string body: the quote and the backslash escaped as the Java tools do, and the control
-/// characters too, which they leave as they are and so write a line no reader accepts.
+/// The id as a JSON string body: the quote and the backslash escaped, and the control
+/// characters too.
 fn escape(id: &str) -> String {
     let mut text = String::with_capacity(id.len());
     for c in id.chars() {

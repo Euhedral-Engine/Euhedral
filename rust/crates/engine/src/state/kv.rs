@@ -1,5 +1,4 @@
-//! The attention cache: pages of key and value rows per full-attention layer, in the sequence's [`KvFormat`]
-//! (`AttentionKvState`).
+//! The attention cache: pages of key and value rows per full-attention layer, in the sequence's [`KvFormat`].
 //!
 //! A page holds 256 token rows of every KV head, a K plane then a V plane, and never moves. A layer's page table is a
 //! device array of raw page addresses (the K planes, then the V planes), grown by doubling; the attention kernels
@@ -41,8 +40,7 @@ use super::released::ReleasedBuffers;
 use crate::residency::footprint::{PAGE_TOKENS, plane_page_bytes};
 
 /// Rows of the quanta whose host page copies depend only on the reservation: decode, verification and draft quanta,
-/// which append at the end of the reserved rows and touch at most its last two pages
-/// (`AttentionKvState.STAGED_TAIL_ROWS`).
+/// which append at the end of the reserved rows and touch at most its last two pages.
 pub const STAGED_TAIL_ROWS: u64 = 8;
 
 /// Why a cache refused a request.

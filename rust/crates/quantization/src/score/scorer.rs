@@ -297,7 +297,7 @@ mod tests {
     #[test]
     #[ignore = "needs a GPU and the bundled NVRTC"]
     fn rows_from_two_threads_all_land_through_one_lane_and_a_failed_group_poisons_it() {
-        let path = test_support::gradle_property("euhedral.cuda.library")
+        let path = test_support::test_setting("euhedral.cuda.library")
             .expect("set euhedral.cuda.library (EUHEDRAL_TEST_CUDA_LIBRARY) to the engine library");
         let library = CudaLibrary::load(&PathBuf::from(path)).expect("the CUDA library loads");
         let gpu = open_device(&library).expect("the device opens");

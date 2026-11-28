@@ -1,13 +1,9 @@
-//! The attention launches: the host dispatch of the native library's attention wrappers
-//! (`native/src/host/qwen_layer_ops.c`), as plain functions from a shape to the launches the wrapper would issue, in
-//! its order, with its grids, blocks, dynamic shared bytes and arguments.
+//! The attention launches: plain functions from a shape to the launches that run it, in order, with their grids,
+//! blocks, dynamic shared bytes and arguments.
 //!
-//! Each function pushes its [`Launch`]es into the caller's sink as it plans them and allocates nothing. Where the C
-//! wrapper returns an error status the function returns the matching [`PlanError`]; launches already pushed stay
-//! pushed, as the C wrapper's earlier launches stay issued. The thread-local modes of the C library (row-exact
-//! execution, exact numerics) are explicit values in [`Modes`].
-//!
-//! The thresholds and tables are the C constants, ported verbatim; each names its C line.
+//! Each function pushes its [`Launch`]es into the caller's sink as it plans them and allocates nothing. A shape the
+//! kernels refuse returns the matching [`PlanError`]; launches already pushed stay pushed. Row-exact execution and exact
+//! numerics are explicit values in [`Modes`].
 
 use crate::DevicePtr;
 use crate::kernel;
@@ -21,7 +17,7 @@ pub enum CacheFormat {
     Bf16,
 }
 
-/// The attention kernels over one cache format (`struct attention_kernels`, `qwen_layer_ops.c:53-58`).
+/// The attention kernels over one cache format (`struct attention_kernels`).
 struct Kernels {
     append: KernelId,
     prefill: KernelId,
@@ -86,12 +82,12 @@ impl CacheFormat {
 const QK_NORM_ROPE: KernelId = kernel!("euhedral_attention_qk_norm_rope_bf16");
 const QK_NORM_ROPE_ROWS: KernelId = kernel!("euhedral_attention_qk_norm_rope_rows_bf16");
 
-/// `FA2_SHARED_BYTES`, `qwen_layer_ops.c:50`.
+/// The dynamic shared bytes of the FA2 prefill kernel.
 const FA2_SHARED_BYTES: u32 = 67584;
-/// The only head dimension the kernels serve (`head_dim == 256` checks, `qwen_layer_ops.c:630,689,748`).
+/// The only head dimension the kernels serve (`head_dim == 256` checks).
 const HEAD_DIM: u32 = 256;
 
-/// `fused_shared_bytes`, `qwen_layer_ops.c:61-63`: two FP16 V tiles, the scores and probabilities of each query tile,
+/// Two FP16 V tiles, the scores and probabilities of each query tile,
 /// four raw K and V tiles, the pair table and the mbarriers.
 const fn fused_shared_bytes(tiles: u32) -> u32 {
     2 * 16 * 264 * 2 + tiles * 1024 + tiles * 768 + 2 * 4 * 16 * 144 + 1024 + 8 * (12 + 4 * tiles)
@@ -114,7 +110,7 @@ fn launch(kernel: KernelId, grid: [u32; 3], block: u32, shared_bytes: u32, args:
     Launch::new(kernel, grid, [block, 1, 1], shared_bytes, args)
 }
 
-/// The shape of `euhedral_cuda_attention_kv_append_{nvfp4,bf16}` (`qwen_layer_ops.c:523,537`).
+/// The shape of `attention_kv_append_{nvfp4,bf16}`.
 #[derive(Clone, Copy, Debug)]
 pub struct AppendShape {
     pub query_key: DevicePtr,
@@ -129,7 +125,7 @@ pub struct AppendShape {
     pub start_position: u64,
 }
 
-/// `kv_append`, `qwen_layer_ops.c:552-582`: one launch.
+/// One launch.
 pub fn plan_kv_append(
     format: CacheFormat,
     shape: &AppendShape,
@@ -164,13 +160,12 @@ pub fn plan_kv_append(
         .u32(s.query_width)
         .u32(s.key_value_width)
         .pointer(s.position);
-    // qwen_layer_ops.c:581.
     let grid = (count / 256).div_ceil(4) as u32;
     sink(launch(format.kernels().append, [grid, 1, 1], 128, 0, args));
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_attention_qk_norm_rope_bf16` (`qwen_layer_ops.c:589`).
+/// The shape of `attention_qk_norm_rope_bf16`.
 #[derive(Clone, Copy, Debug)]
 pub struct RopeShape {
     pub query_key: DevicePtr,
@@ -188,7 +183,7 @@ pub struct RopeShape {
     pub rope_theta: f64,
 }
 
-/// `qk_norm_rope`, `qwen_layer_ops.c:609-654`. The thread's modes are `modes`.
+/// The QK norm and RoPE launch. The launch modes are `modes`.
 pub fn plan_qk_norm_rope(shape: &RopeShape, modes: Modes, sink: &mut impl FnMut(Launch)) -> Result<(), PlanError> {
     plan_rope(shape, 0, modes, sink)
 }
@@ -202,7 +197,7 @@ fn plan_rope(
     let s = shape;
     let row_exact = modes.row_exact;
     let row_exact_heads = s.rows > 1 && row_exact;
-    // qwen_layer_ops.c:617-627: past u32 blocks, one row at a time.
+    // past u32 blocks, one row at a time.
     if row_exact_heads
         && !s.query_key.is_null()
         && !s.output.is_null()
@@ -262,7 +257,7 @@ fn plan_rope(
         .u64(position_offset)
         .f32(s.epsilon)
         .f64(s.rope_theta);
-    // qwen_layer_ops.c:650-653: a single row keeps one CTA per head; from two rows one CTA per row.
+    // a single row keeps one CTA per head; from two rows one CTA per row.
     if s.rows > 1 && !row_exact_heads {
         sink(launch(QK_NORM_ROPE_ROWS, [s.rows, 1, 1], 256, 0, args));
     } else {
@@ -271,7 +266,7 @@ fn plan_rope(
     Ok(())
 }
 
-/// The shape of `euhedral_cuda_attention_causal_{nvfp4,bf16}` (`qwen_layer_ops.c:661,670`).
+/// The shape of `attention_causal_{nvfp4,bf16}`.
 #[derive(Clone, Copy, Debug)]
 pub struct CausalShape {
     pub query_key: DevicePtr,
@@ -291,7 +286,7 @@ pub struct CausalShape {
     pub start: u64,
 }
 
-/// `attention_causal`, `qwen_layer_ops.c:681-813`, with the public wrappers' position check (`:665,674`).
+/// Causal attention over one cache format, with the position check.
 pub fn plan_causal(
     format: CacheFormat,
     shape: &CausalShape,
@@ -328,7 +323,7 @@ fn plan_causal_at(
     let rows = s.rows;
     let pointers =
         !s.query_key.is_null() && !s.gate.is_null() && !s.keys.is_null() && !s.values.is_null() && !s.output.is_null();
-    // qwen_layer_ops.c:688-691: the row twins.
+    // the row twins.
     if rows > 1
         && (modes.row_exact || rows <= 8)
         && pointers
@@ -347,7 +342,7 @@ fn plan_causal_at(
         plan_row_twins(kernels, s, fused_from, sink);
         return Ok(());
     }
-    // qwen_layer_ops.c:736-746: row-exact: one-row decode per row, pointers advanced by the row's byte widths.
+    // row-exact: one-row decode per row, pointers advanced by the row's byte widths.
     if rows > 1 && modes.row_exact && !s.query_key.is_null() && !s.gate.is_null() && !s.output.is_null() {
         let width = (u64::from(s.query_heads) + u64::from(s.key_heads)) * u64::from(s.head_dim) * 2;
         let out = u64::from(s.query_heads) * u64::from(s.head_dim) * 2;
@@ -396,20 +391,17 @@ fn plan_causal_at(
     Ok(())
 }
 
-/// `qwen_layer_ops.c:700-734`: row j is one-row decode at position `start + j`, all rows in one launch each for
+/// Row j is one-row decode at position `start + j`, all rows in one launch each for
 /// decode, the fused verifier, GQA decode and merge.
 fn plan_row_twins(kernels: &Kernels, s: &CausalShape, fused_from: &[u32; FUSED_ROWS], sink: &mut impl FnMut(Launch)) {
     let rows = s.rows;
     let (query_heads, key_heads) = (s.query_heads, s.key_heads);
     let group = query_heads / key_heads;
-    // :701
     let from = if group <= 8 { 2048 } else { u32::MAX };
-    // :703-704
     let first = (s.start as u32).wrapping_add(1);
     let last = (s.start as u32).wrapping_add(rows);
     let row_stride = u64::from(query_heads) * 64 * 258;
     if first < from {
-        // :708-709
         let below = if last < from { last } else { from - 1 };
         let splits = (below.wrapping_add(47) / 48).min(64);
         let args = Arguments::new()
@@ -431,9 +423,8 @@ fn plan_row_twins(kernels: &Kernels, s: &CausalShape, fused_from: &[u32; FUSED_R
         ));
     }
     if last >= from {
-        // :715-716
         let splits = (last.wrapping_add(31) / 32).min(64);
-        // :719-720: the fused kernel serves the rows that share the last row's split partition.
+        // the fused kernel serves the rows that share the last row's split partition.
         let tiles = (rows.wrapping_mul(group).wrapping_add(7) / 8).max(2);
         let fused_kernel = match kernels.fused {
             Some(fused) if tiles <= 6 && last >= fused_from_keys(fused_from, rows) => Some(fused[(tiles - 2) as usize]),
@@ -479,7 +470,6 @@ fn plan_row_twins(kernels: &Kernels, s: &CausalShape, fused_from: &[u32; FUSED_R
             args,
         ));
     }
-    // :732-733
     let args = Arguments::new()
         .pointer(s.gate)
         .pointer(s.output)
@@ -492,7 +482,7 @@ fn plan_row_twins(kernels: &Kernels, s: &CausalShape, fused_from: &[u32; FUSED_R
     sink(launch(kernels.merge_rows, [query_heads, rows, 1], 128, 0, args));
 }
 
-/// `qwen_layer_ops.c:758-775`: more than one row, not served by the twins.
+/// More than one row, not served by the twins.
 fn plan_prefill(kernels: &Kernels, s: &CausalShape, grid: u32, exact: bool, sink: &mut impl FnMut(Launch)) {
     let args = Arguments::new()
         .pointer(s.query_key)
@@ -507,9 +497,8 @@ fn plan_prefill(kernels: &Kernels, s: &CausalShape, grid: u32, exact: bool, sink
         .u32(s.cache_length)
         .u64(s.start);
     let group = s.query_heads / s.key_heads;
-    // :767-768: the FlashAttention-2 leaf where its grid carries enough work (machine-measured, see the C comment).
+    // The FlashAttention-2 leaf where its grid carries enough work (machine-measured).
     if !exact && (1..=6).contains(&group) && (s.rows >= 512 || (s.rows >= 128 && u64::from(s.cache_length) >= 2048)) {
-        // :769-771
         let fa2_grid = u64::from(s.rows).div_ceil(16) * u64::from(s.key_heads);
         if fa2_grid <= u64::from(u32::MAX) {
             sink(launch(
@@ -522,22 +511,20 @@ fn plan_prefill(kernels: &Kernels, s: &CausalShape, grid: u32, exact: bool, sink
             return;
         }
     }
-    // :773-774
     let kernel = if exact { kernels.prefill_exact } else { kernels.prefill };
     sink(launch(kernel, [grid, 1, 1], 128, 0, args));
 }
 
-/// `qwen_layer_ops.c:776-811`: one row, the decode kernel then the merge.
+/// One row, the decode kernel then the merge.
 fn plan_decode(kernels: &Kernels, s: &CausalShape, position_offset: u64, exact: bool, sink: &mut impl FnMut(Launch)) {
-    // :780-782: each CTA scans about 48 keys.
+    // each CTA scans about 48 keys.
     let length = (s.start as u32).wrapping_add(1);
-    // The sums are u64 in C (:781, :798), so the count does not wrap near u32::MAX keys.
+    // The sums are u64, so the count does not wrap near u32::MAX keys.
     let mut splits = (u64::from(length) + 47).div_euclid(48).min(64) as u32;
-    // :791-792
     let mut decode = if exact { kernels.decode_exact } else { kernels.decode };
     let mut grid = s.query_heads.wrapping_mul(splits);
     let mut block = 128;
-    // :796-803: relaxed numerics from 2048 keys: one three-warp tensor-core CTA per (KV head, 32-key split).
+    // relaxed numerics from 2048 keys: one three-warp tensor-core CTA per (KV head, 32-key split).
     let group = s.query_heads / s.key_heads;
     if !exact && length >= 2048 && group <= 8 {
         splits = (u64::from(length) + 31).div_euclid(32).min(64) as u32;
@@ -560,7 +547,6 @@ fn plan_decode(kernels: &Kernels, s: &CausalShape, position_offset: u64, exact: 
         .pointer(s.scratch)
         .u32(splits);
     sink(launch(decode, [grid, 1, 1], block, 0, args));
-    // :788, 806
     let merge = Arguments::new()
         .pointer(s.gate)
         .pointer(s.output)
@@ -648,11 +634,11 @@ mod tests {
         launch.args.sizes().to_vec()
     }
 
-    // ---- one-row decode (qwen_layer_ops.c:776-811) ----
+    // ---- one-row decode ----
 
     #[test]
     fn decode_split_count_follows_48_keys_per_split() {
-        // :780-782: length = start + 1, splits = ceil(length / 48) <= 64; decode grid = query_heads * splits.
+        // length = start + 1, splits = ceil(length / 48) <= 64; decode grid = query_heads * splits.
         for (start, splits) in [(0u64, 1u32), (47, 1), (48, 2), (95, 2), (96, 3), (2045, 43)] {
             let plan = nvfp4(&shape(1, start), RELAXED);
             assert_eq!(
@@ -671,7 +657,7 @@ mod tests {
 
     #[test]
     fn decode_splits_cap_at_64() {
-        // 64 * 48 = 3072 keys fill the cap; one more key stays at 64. Group 9 never takes the GQA kernel (:797).
+        // 64 * 48 = 3072 keys fill the cap; one more key stays at 64. Group 9 never takes the GQA kernel.
         let wide = |start| with_group(shape(1, start), 36, 4);
         let at = nvfp4(&wide(3071), RELAXED);
         assert_eq!(at[0].grid, [36 * 64, 1, 1]);
@@ -686,7 +672,7 @@ mod tests {
 
     #[test]
     fn decode_gqa_starts_at_2048_keys() {
-        // :797: relaxed, length >= 2048, group <= 8: the GQA kernel, kv_heads * ceil(length / 32) (<= 64), 96 threads.
+        // relaxed, length >= 2048, group <= 8: the GQA kernel, kv_heads * ceil(length / 32) (<= 64), 96 threads.
         let below = nvfp4(&shape(1, 2046), RELAXED); // length 2047
         assert_eq!(names(&below)[0], "euhedral_attention_decode_nvfp4");
         assert_eq!(below[0].grid, [24 * 43, 1, 1]); // ceil(2047 / 48) = 43
@@ -707,7 +693,7 @@ mod tests {
 
     #[test]
     fn decode_gqa_group_limit_and_exact_numerics() {
-        // Group 8 is served, group 9 is not (:797); exact numerics never take it and use the exact kernel (:791).
+        // Group 8 is served, group 9 is not; exact numerics never take it and use the exact kernel.
         let eight = nvfp4(&with_group(shape(1, 5000), 32, 4), RELAXED);
         assert_eq!(names(&eight)[0], "euhedral_attention_decode_gqa_nvfp4");
         let nine = nvfp4(&with_group(shape(1, 5000), 36, 4), RELAXED);
@@ -730,14 +716,14 @@ mod tests {
 
     #[test]
     fn decode_arguments_are_the_native_parameter_list() {
-        // :786-788: 5 pointers, rows, query_heads, key_heads, head_dim, position pointer, offset u64, scratch, splits.
+        // 5 pointers, rows, query_heads, key_heads, head_dim, position pointer, offset u64, scratch, splits.
         let plan = nvfp4(&shape(1, 47), RELAXED);
         assert_eq!(
             words(&plan[0]),
             [QK, GATE, KEYS, VALUES, OUT, 1, 24, 4, 256, POSITION, 0, SCRATCH, 1]
         );
         assert_eq!(sizes(&plan[0]), [8, 8, 8, 8, 8, 4, 4, 4, 4, 8, 8, 8, 4]);
-        // :788: gate, output, scratch, query_heads, key_heads, splits.
+        // gate, output, scratch, query_heads, key_heads, splits.
         assert_eq!(words(&plan[1]), [GATE, OUT, SCRATCH, 24, 4, 1]);
         assert_eq!(sizes(&plan[1]), [8, 8, 8, 4, 4, 4]);
     }
@@ -750,7 +736,7 @@ mod tests {
         let mut s = shape(1, 5);
         s.position = DevicePtr::NULL;
         assert_eq!(causal(CacheFormat::Nvfp4, &s, RELAXED), Err(PlanError::InvalidArgument));
-        // start must be below the cache length (:749).
+        // start must be below the cache length.
         let mut s = shape(1, 10);
         s.cache_length = 10;
         assert_eq!(causal(CacheFormat::Nvfp4, &s, RELAXED), Err(PlanError::InvalidArgument));
@@ -758,7 +744,7 @@ mod tests {
         assert!(causal(CacheFormat::Nvfp4, &s, RELAXED).is_ok());
     }
 
-    // ---- prefill (qwen_layer_ops.c:758-775) ----
+    // ---- prefill ----
 
     fn prefill(rows: u32, cache: u32, query_heads: u32, key_heads: u32, modes: Modes) -> Launch {
         let mut s = with_group(shape(rows, 0), query_heads, key_heads);
@@ -771,7 +757,7 @@ mod tests {
 
     #[test]
     fn prefill_tile_grid_is_32_rows_per_query_head() {
-        // :751: ceil(rows / 32) * query_heads, 128 threads, no shared memory.
+        // ceil(rows / 32) * query_heads, 128 threads, no shared memory.
         for (rows, tiles) in [(2u32, 1u32), (32, 1), (33, 2), (64, 2), (65, 3), (127, 4)] {
             let launch = prefill(rows, 4096, 24, 4, RELAXED);
             assert_eq!(
@@ -787,7 +773,7 @@ mod tests {
         let exact = prefill(40, 4096, 24, 4, EXACT);
         assert_eq!(exact.kernel.name(), "euhedral_attention_prefill32_nvfp4_exact");
         assert_eq!(exact.grid, [48, 1, 1]);
-        // :759-760: 5 pointers, rows, query_heads, key_heads, head_dim, cache_length, then start as u64.
+        // 5 pointers, rows, query_heads, key_heads, head_dim, cache_length, then start as u64.
         let launch = prefill(40, 4096, 24, 4, RELAXED);
         assert_eq!(words(&launch), [QK, GATE, KEYS, VALUES, OUT, 40, 24, 4, 256, 4096, 0]);
         assert_eq!(sizes(&launch), [8, 8, 8, 8, 8, 4, 4, 4, 4, 4, 8]);
@@ -795,10 +781,10 @@ mod tests {
 
     #[test]
     fn fa2_takes_512_rows_or_128_rows_over_2048_keys() {
-        // :767-768. 512 rows: any cache; 128..511 rows: cache_length >= 2048.
+        // 512 rows: any cache; 128..511 rows: cache_length >= 2048.
         let at = prefill(512, 512, 24, 4, RELAXED);
         assert_eq!(at.kernel.name(), "euhedral_attention_prefill_fa2_nvfp4");
-        // :769-771: ceil(512 / 16) * kv_heads CTAs of 32 * (group + 2) threads, 67584 shared bytes.
+        // ceil(512 / 16) * kv_heads CTAs of 32 * (group + 2) threads, 67584 shared bytes.
         assert_eq!(at.grid, [32 * 4, 1, 1]);
         assert_eq!(at.block, [32 * 8, 1, 1]);
         assert_eq!(at.shared_bytes, 67584);
@@ -830,7 +816,7 @@ mod tests {
 
     #[test]
     fn fa2_group_limits_and_exact_numerics() {
-        // Group 1..=6 only (:767); the block is 32 * (group + 2).
+        // Group 1..=6 only; the block is 32 * (group + 2).
         let one = prefill(512, 512, 4, 4, RELAXED);
         assert_eq!(one.kernel.name(), "euhedral_attention_prefill_fa2_nvfp4");
         assert_eq!(one.block, [96, 1, 1]);
@@ -856,11 +842,11 @@ mod tests {
     fn prefill_validation() {
         let mut s = shape(512, 1000);
         s.scratch = DevicePtr::NULL;
-        s.cache_length = 1511; // rows > cache_length - start (:749)
+        s.cache_length = 1511; // rows > cache_length - start
         assert_eq!(causal(CacheFormat::Nvfp4, &s, RELAXED), Err(PlanError::InvalidArgument));
         s.cache_length = 1512;
         assert!(causal(CacheFormat::Nvfp4, &s, RELAXED).is_ok());
-        // :752: query_heads * 64 past u32.
+        // query_heads * 64 past u32.
         let mut huge = shape(2, 0);
         huge.scratch = DevicePtr::NULL;
         huge.query_heads = 1 << 26;
@@ -868,11 +854,11 @@ mod tests {
         assert_eq!(causal(CacheFormat::Nvfp4, &huge, RELAXED), Err(PlanError::SizeOverflow));
     }
 
-    // ---- the row twins (qwen_layer_ops.c:688-734) ----
+    // ---- the row twins ----
 
     #[test]
     fn twins_serve_up_to_eight_rows_with_scratch() {
-        // :688: rows <= 8 with scratch, not exact; rows 9 falls to prefill, no scratch falls to prefill.
+        // rows <= 8 with scratch, not exact; rows 9 falls to prefill, no scratch falls to prefill.
         for rows in 2..=8u32 {
             let plan = nvfp4(&shape(rows, 100), RELAXED);
             assert_eq!(
@@ -893,7 +879,7 @@ mod tests {
         let mut bare = shape(4, 100);
         bare.scratch = DevicePtr::NULL;
         assert_eq!(names(&nvfp4(&bare, RELAXED)), ["euhedral_attention_prefill32_nvfp4"]);
-        // Exact numerics leave the twins (:691).
+        // Exact numerics leave the twins.
         assert_eq!(
             names(&nvfp4(&shape(4, 100), EXACT)),
             ["euhedral_attention_prefill32_nvfp4_exact"]
@@ -902,7 +888,7 @@ mod tests {
 
     #[test]
     fn twin_below_2048_keys() {
-        // rows 2, start 100: first 101, last 102 < from 2048 (:701-713). below = last, splits = ceil(102 / 48) = 3.
+        // rows 2, start 100: first 101, last 102 < from 2048. below = last, splits = ceil(102 / 48) = 3.
         let plan = nvfp4(&shape(2, 100), RELAXED);
         assert_eq!(plan.len(), 2);
         let stride = 24u64 * 64 * 258;
@@ -915,7 +901,7 @@ mod tests {
             [QK, KEYS, VALUES, 24, 4, POSITION, SCRATCH, stride, 2048]
         );
         assert_eq!(sizes(&plan[0]), [8, 8, 8, 4, 4, 8, 8, 8, 4]);
-        // :732: gate, output, scratch, query_heads, key_heads, position, row_stride, from.
+        // gate, output, scratch, query_heads, key_heads, position, row_stride, from.
         assert_eq!(words(&plan[1]), [GATE, OUT, SCRATCH, 24, 4, POSITION, stride, 2048]);
         assert_eq!(sizes(&plan[1]), [8, 8, 8, 4, 4, 8, 8, 4]);
         assert_eq!(plan[1].block, [128, 1, 1]);
@@ -923,14 +909,14 @@ mod tests {
 
     #[test]
     fn twin_decode_rows_split_boundaries() {
-        // :708-709: below = min(last, 2047); splits = ceil(below / 48) <= 64. 48 splits hold 2304 keys, so the 2047
+        // below = min(last, 2047); splits = ceil(below / 48) <= 64. 48 splits hold 2304 keys, so the 2047
         // cap gives 43. Rows 3, start 45: last 48 -> 1 split; start 46: last 49 -> 2.
         assert_eq!(nvfp4(&shape(3, 45), RELAXED)[0].grid, [24, 3, 1]);
         assert_eq!(nvfp4(&shape(3, 46), RELAXED)[0].grid, [48, 3, 1]);
         // Last row exactly at 2047: no GQA part, 43 splits.
         assert_eq!(nvfp4(&shape(3, 2044), RELAXED).len(), 2);
         assert_eq!(nvfp4(&shape(3, 2044), RELAXED)[0].grid, [24 * 43, 3, 1]);
-        // Group 9 keeps the per-head kernel for every key (from = u32::MAX, :701): 64 splits well past 3072 keys.
+        // Group 9 keeps the per-head kernel for every key (from = u32::MAX): 64 splits well past 3072 keys.
         let wide = nvfp4(&with_group(shape(2, 5000), 36, 4), RELAXED);
         assert_eq!(
             names(&wide),
@@ -948,8 +934,8 @@ mod tests {
 
     #[test]
     fn twin_crossing_2048_runs_decode_then_gqa_then_merge() {
-        // rows 4, start 2045: first 2046 < 2048 <= last 2049. decode_rows below = 2047 -> 43 splits (:708);
-        // GQA splits = ceil(2049 / 32) = 65 -> 64 (:715-716). tiles = (4 * 6 + 7) / 8 = 3; fused_from(4) = 4096 > 2049.
+        // rows 4, start 2045: first 2046 < 2048 <= last 2049. decode_rows below = 2047 -> 43 splits;
+        // GQA splits = ceil(2049 / 32) = 65 -> 64. tiles = (4 * 6 + 7) / 8 = 3; fused_from(4) = 4096 > 2049.
         let plan = nvfp4(&shape(4, 2045), RELAXED);
         assert_eq!(
             names(&plan),
@@ -963,7 +949,7 @@ mod tests {
         assert_eq!(plan[1].grid, [4 * 64, 4, 1]);
         assert_eq!(plan[1].block, [96, 1, 1]);
         let stride = 24u64 * 64 * 258;
-        // :728: ..., row_stride, from, fused (0).
+        // ..., row_stride, from, fused (0).
         assert_eq!(
             words(&plan[1]),
             [QK, KEYS, VALUES, 24, 4, POSITION, SCRATCH, stride, 2048, 0]
@@ -985,7 +971,7 @@ mod tests {
 
     #[test]
     fn fused_verifier_from_table_by_rows() {
-        // fused_from (:66-67): rows 2..=8 -> 49152, 16384, 4096, 2048, 16384, 16384, 12288 keys. The fused kernel
+        // fused_from: rows 2..=8 -> 49152, 16384, 4096, 2048, 16384, 16384, 12288 keys. The fused kernel
         // runs before the GQA twin when last >= fused_from(rows), tiles = max(2, ceil(rows * group / 8)) <= 6.
         let fused = |rows: u32, group_heads: (u32, u32), last: u64| {
             let s = with_group(shape(rows, last - u64::from(rows)), group_heads.0, group_heads.1);
@@ -1048,11 +1034,11 @@ mod tests {
         // splits = ceil(2048 / 32) = 64. Fused: kv_heads * splits CTAs of 32 * (2 * 4 + 1) threads.
         assert_eq!(plan[1].grid, [4 * 64, 1, 1]);
         assert_eq!(plan[1].block, [288, 1, 1]);
-        // 2 * 16 * 264 * 2 + 4 * 1024 + 4 * 768 + 2 * 4 * 16 * 144 + 1024 + 8 * (12 + 16) = 43744 (:61-63).
+        // 2 * 16 * 264 * 2 + 4 * 1024 + 4 * 768 + 2 * 4 * 16 * 144 + 1024 + 8 * (12 + 16) = 43744.
         assert_eq!(plan[1].shared_bytes, 43744);
         assert!(plan[1].programmatic);
         let stride = 24u64 * 64 * 258;
-        // :723: ..., row_stride, rows, from.
+        // ..., row_stride, rows, from.
         assert_eq!(
             words(&plan[1]),
             [QK, KEYS, VALUES, 24, 4, POSITION, SCRATCH, stride, 5, 2048]
@@ -1107,7 +1093,7 @@ mod tests {
 
     #[test]
     fn fused_never_for_bf16_and_never_past_eight_rows() {
-        // BF16 has no fused kernels (:720: kernels->fused[0] != NULL).
+        // BF16 has no fused kernels (its fused kernel table is empty).
         let bf16 = causal(CacheFormat::Bf16, &shape(5, 59_000), RELAXED).unwrap();
         assert_eq!(
             names(&bf16),
@@ -1117,7 +1103,7 @@ mod tests {
             ]
         );
         assert_eq!(*bf16[0].args.words().last().unwrap(), 0);
-        // Row-exact with 9 rows: fused_from(9) = u32::MAX (:68).
+        // Row-exact with 9 rows: fused_from(9) = u32::MAX.
         let mut s = with_group(shape(9, 100_000), 4, 4);
         s.cache_length = 200_000;
         let plan = nvfp4(&s, ROW_EXACT);
@@ -1131,7 +1117,7 @@ mod tests {
 
     #[test]
     fn twin_validation_falls_through_to_the_other_branches() {
-        // rows 5 with start + rows past the cache: not twin, not row-exact: validation rejects (:749).
+        // rows 5 with start + rows past the cache: not twin, not row-exact: validation rejects.
         let mut s = shape(5, 96);
         s.cache_length = 100;
         assert_eq!(causal(CacheFormat::Nvfp4, &s, RELAXED), Err(PlanError::InvalidArgument));
@@ -1146,7 +1132,7 @@ mod tests {
         );
     }
 
-    // ---- row-exact recursion (qwen_layer_ops.c:736-746) ----
+    // ---- row-exact recursion ----
 
     #[test]
     fn row_exact_over_64_rows_recurses_per_row_with_offsets() {
@@ -1160,7 +1146,7 @@ mod tests {
             let merge = &plan[2 * row as usize + 1];
             assert_eq!(decode.kernel.name(), "euhedral_attention_decode_nvfp4");
             assert_eq!(merge.kernel.name(), "euhedral_attention_merge_nvfp4");
-            // :740-742: query_key and gate advance by width, output by out; start by row; offset arg by row.
+            // query_key and gate advance by width, output by out; start by row; offset arg by row.
             assert_eq!(
                 words(decode),
                 [
@@ -1192,7 +1178,7 @@ mod tests {
             exact_numerics: true,
         };
         let count = |rows: u32| nvfp4(&shape(rows, 10), both).len();
-        assert_eq!(count(1), 2); // one row is plain decode, the recursion is not entered (:736 needs rows > 1)
+        assert_eq!(count(1), 2); // one row is plain decode, the recursion is not entered (the recursion needs rows > 1)
         assert_eq!(count(2), 4);
         assert_eq!(count(7), 14);
         assert_eq!(count(1000), 2000);
@@ -1208,7 +1194,7 @@ mod tests {
 
     #[test]
     fn row_exact_recursion_uses_gqa_from_each_rows_own_length() {
-        // Exact numerics off, 65 rows: row j has length start + j + 1; rows from 2048 keys take GQA (:797).
+        // Exact numerics off, 65 rows: row j has length start + j + 1; rows from 2048 keys take GQA.
         let mut s = shape(65, 2000);
         s.cache_length = 3000;
         let plan = nvfp4(&s, ROW_EXACT);
@@ -1243,7 +1229,7 @@ mod tests {
 
     #[test]
     fn decode_split_counts_do_not_wrap_near_the_key_limit() {
-        // C sums in u64 (:781, :798): length = 4294967294 (start 4294967293) gives (length + 47) / 48 and
+        // The sums are u64: length = 4294967294 (start 4294967293) gives (length + 47) / 48 and
         // (length + 31) / 32, both far above 64, so 64 splits. Group 6 and relaxed: GQA, grid 4 * 64.
         let mut s = shape(1, 4_294_967_293);
         s.cache_length = 4_294_967_294;
@@ -1260,14 +1246,14 @@ mod tests {
 
     #[test]
     fn plans_never_panic_on_pointer_wrap() {
-        // C's pointer arithmetic wraps; so does the plan.
+        // The pointer arithmetic wraps; so does the plan.
         let mut s = shape(65, 10);
         s.query_key = ptr(u64::MAX - 100);
         s.cache_length = 200;
         assert!(causal(CacheFormat::Nvfp4, &s, ROW_EXACT).is_ok());
     }
 
-    // ---- KV append (qwen_layer_ops.c:552-582) ----
+    // ---- KV append ----
 
     fn append_shape(rows: u32) -> AppendShape {
         AppendShape {
@@ -1291,7 +1277,7 @@ mod tests {
 
     #[test]
     fn kv_append_grid_is_rows_times_width_over_1024() {
-        // :581: (rows * 1024 / 256 + 3) / 4 = (4 * rows + 3) / 4 = rows for width 1024; 128 threads.
+        // (rows * 1024 / 256 + 3) / 4 = (4 * rows + 3) / 4 = rows for width 1024; 128 threads.
         for rows in [1u32, 2, 3, 8, 33, 512] {
             let plan = append(CacheFormat::Nvfp4, &append_shape(rows)).unwrap();
             assert_eq!(plan.len(), 1);
@@ -1315,7 +1301,6 @@ mod tests {
         }
         let plan = append(CacheFormat::Bf16, &append_shape(2)).unwrap();
         assert_eq!(plan[0].kernel.name(), "euhedral_attention_kv_append_bf16");
-        // :579-580.
         assert_eq!(words(&plan[0]), [QK, GATE, KEYS, VALUES, 2, 6144, 1024, POSITION]);
         assert_eq!(sizes(&plan[0]), [8, 8, 8, 8, 4, 4, 4, 8]);
     }
@@ -1367,12 +1352,12 @@ mod tests {
             }),
             Err(PlanError::InvalidArgument)
         );
-        // count = rows * width past u32 (:568): 4194304 * 1024 = 2^32.
+        // count = rows * width past u32: 4194304 * 1024 = 2^32.
         assert_eq!(bad(append_shape(1 << 22)), Err(PlanError::SizeOverflow));
         assert!(bad(append_shape((1 << 22) - 1)).is_ok());
     }
 
-    // ---- QK norm and RoPE (qwen_layer_ops.c:609-654) ----
+    // ---- QK norm and RoPE ----
 
     fn rope_shape(rows: u32) -> RopeShape {
         RopeShape {
@@ -1404,13 +1389,13 @@ mod tests {
 
     #[test]
     fn rope_one_row_uses_one_cta_per_head() {
-        // :653: blocks = rows * (query_heads + kv_heads), head_dim threads.
+        // blocks = rows * (query_heads + kv_heads), head_dim threads.
         let plan = rope(&rope_shape(1), false).unwrap();
         assert_eq!(names(&plan), ["euhedral_attention_qk_norm_rope_bf16"]);
         assert_eq!(plan[0].grid, [28, 1, 1]);
         assert_eq!(plan[0].block, [256, 1, 1]);
         assert!(plan[0].programmatic);
-        // :648-649: f32 epsilon and f64 theta as their bits; the offset is 0.
+        // f32 epsilon and f64 theta as their bits; the offset is 0.
         let args = &plan[0].args;
         assert_eq!(sizes(&plan[0]), [8, 8, 8, 8, 4, 4, 4, 4, 4, 8, 8, 4, 8]);
         assert_eq!(
@@ -1423,13 +1408,13 @@ mod tests {
 
     #[test]
     fn rope_rows_kernel_from_two_rows_unless_row_exact() {
-        // :651-652: one CTA per row, 256 threads.
+        // one CTA per row, 256 threads.
         for rows in [2u32, 3, 33, 512] {
             let plan = rope(&rope_shape(rows), false).unwrap();
             assert_eq!(names(&plan), ["euhedral_attention_qk_norm_rope_rows_bf16"]);
             assert_eq!(plan[0].grid, [rows, 1, 1]);
             assert_eq!(plan[0].block, [256, 1, 1]);
-            // Row-exact: the per-head kernel over rows * heads blocks (:616, :653).
+            // Row-exact: the per-head kernel over rows * heads blocks.
             let exact = rope(&rope_shape(rows), true).unwrap();
             assert_eq!(names(&exact), ["euhedral_attention_qk_norm_rope_bf16"]);
             assert_eq!(exact[0].grid, [rows * 28, 1, 1]);
@@ -1440,7 +1425,7 @@ mod tests {
 
     #[test]
     fn rope_row_exact_recursion_past_u32_blocks() {
-        // :617-626: 3 rows * (2^31 + 1) heads > u32::MAX: one launch per row, pointers advanced by width,
+        // 3 rows * (2^31 + 1) heads > u32::MAX: one launch per row, pointers advanced by width,
         // offset and the host position advanced by row.
         let mut s = rope_shape(3);
         s.query_heads = 1 << 31;
@@ -1458,7 +1443,7 @@ mod tests {
             assert_eq!(launch.args.words()[4], 1);
             assert_eq!(launch.args.words()[10], row);
         }
-        // Not row-exact: the rows kernel would need rows CTAs, which fit; the host checks blocks first (:636).
+        // Not row-exact: the rows kernel would need rows CTAs, which fit; the host checks blocks first.
         assert_eq!(rope(&s, false), Err(PlanError::SizeOverflow));
     }
 

@@ -1,4 +1,4 @@
-//! The stages of a quantum: one `Stage<Quantum>` per layer operation (`model/qwen38/Stages.java`).
+//! The stages of a quantum: one `Stage<Quantum>` per layer operation.
 //!
 //! A stage is built once with what does not change from quantum to quantum (its weights, the buffer slots it reads
 //! and writes, its layer). Its work is its [`Launch::launch`]: the kernel launches and copies of one quantum on the
@@ -847,7 +847,7 @@ impl Quantum {
 
     /// A quantum of `rows` rows of `kind` starting at `input`'s position, over `workspace` and `seq`, whose stages
     /// submit with `mode` on the lanes of `lanes`. It scores one row (decode, and the last row of a prefill); see
-    /// [`Quantum::with_logits_rows`]. A verification is row-exact and nothing else is (as `Quantum` in Java): `mode`
+    /// [`Quantum::with_logits_rows`]. A verification is row-exact and nothing else is: `mode`
     /// must say so. Refused when the workspace was sized for fewer rows.
     #[allow(
         clippy::too_many_arguments,

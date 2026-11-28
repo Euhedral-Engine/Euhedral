@@ -21,7 +21,8 @@ pub struct CacheSpec<'a> {
     pub config: &'a ModelConfig,
     /// The DFlash2 drafter whose rings the sequences keep, when they draft with it: its checkpoints hold them.
     pub drafter: Option<&'a Dflash2Config>,
-    /// Whether the sequences draft with the MTP layer.
+    /// Whether the requests draft with the MTP layer: the plan drafts with it and the sequences have what drafting
+    /// takes. A cache opened for a sequence that never drafts holds base state alone.
     pub mtp: bool,
     pub format: KvFormat,
     pub settings: PrefixCacheSettings,

@@ -26,7 +26,7 @@ pub use crate::state::SequenceId;
 
 /// What the passes did, as numbers: each pass counts once, however many sequences it holds. A pass is one quantum, so
 /// `passes` is the count of quanta, `segments` the sequences' parts they held and `batched` the quanta that held more
-/// than one part, as the same fields do in the Java engine's per-kind statistics. Only the steps offered to the
+/// than one part. Only the steps offered to the
 /// assembler (the verifications) are counted here, as one total: the other kinds are admitted directly and are not
 /// counted, and the disk and staging byte counts are not kept.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

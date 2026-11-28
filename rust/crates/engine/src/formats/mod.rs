@@ -1,10 +1,10 @@
 //! The linear formats: how one weight multiplies a block of rows.
 //!
 //! [`LinearFormat`] is the contract the stages consume. [`TrellisLinear`] and [`Nvfp4Linear`] implement it with the
-//! kernel choice, grid and K split of the Java formats, [`Bf16Linear`] runs the unquantized projections on the row-exact
+//! kernel choice, grid and K split, [`Bf16Linear`] runs the unquantized projections on the row-exact
 //! BF16 GEMMs, [`Q3Linear`] runs the grouped Q3, Q4 and Q5 tensors and the
 //! P2E2 compressed Q3, and [`TokenEmbedding`] looks up token rows of a Q3, NVFP4 or BF16 table.
-//! [`ShapeRecorder`] lists the launches a format queued, for the tests that compare them with Java's.
+//! [`ShapeRecorder`] lists the launches a format queued, for the tests that check them.
 
 mod bf16;
 mod embedding;

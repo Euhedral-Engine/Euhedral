@@ -1,4 +1,4 @@
-//! The device side of one Flash-Next sequence (`Session.java`'s allocation and its per-chunk launch): the state, the
+//! The device side of one Flash-Next sequence: the state, the
 //! regions and the logits the stages bake into their addresses, the per-bucket graphs, and the quantum each step of
 //! [`FlashOwner`] runs.
 //!
@@ -11,8 +11,7 @@
 //! because the Flash stages take everything else from the carrier they are given: the workspace's input record, the
 //! chunk placement, the n-gram rows and the MoE block.
 //!
-//! Departures from Java: the sequence's state is allocated once and zeroed per request (the stages bake its addresses;
-//! Java allocates a `Sequence` per request), and the cache's pages stay allocated between requests and are truncated
+//! The sequence's state is allocated once and zeroed per request (the stages bake its addresses), and the cache's pages stay allocated between requests and are truncated
 //! at the next request's first chunk. The device allocations are plain allocations, not claims on the memory account.
 
 use std::fmt::{self, Debug, Display, Formatter};

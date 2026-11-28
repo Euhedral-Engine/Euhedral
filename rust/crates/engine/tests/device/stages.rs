@@ -1660,8 +1660,7 @@ fn a_completion_edge_after_the_argmax_finds_its_keys_on_the_host() {
 }
 
 // Independent references for the GDN convolution and recurrence and for the Q/K norm with RoPE, at the model's
-// dimensions. The tolerances are those of the Java operation tests (`LayerGpuOperationsIntegrationTest`,
-// `AttentionCudaIntegrationTest`): 0.004 on the convolution (its state exactly), 0.008 on the recurrence output and
+// dimensions. The tolerances: 0.004 on the convolution (its state exactly), 0.008 on the recurrence output and
 // 1e-4 on its state, 0.012 on the rotated rows.
 
 fn silu(x: f64) -> f64 {

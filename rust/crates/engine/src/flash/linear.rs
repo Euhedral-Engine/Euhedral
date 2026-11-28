@@ -1,4 +1,4 @@
-//! The NVFP4 linears of the stages with Java's route (`CudaGpuMemory.linearNvfp4Bf16`): 1 to 8 rows on the decode
+//! The NVFP4 linears of the stages by route: 1 to 8 rows on the decode
 //! kernels, 9 rows and more on the native route, which quantizes the activations into an expansion scratch, and the
 //! decode or reference kernels where the native route declines. The route is a function of the rows, the shape, the
 //! weight layout, the numerics mode and the device, so a stage settles it when it builds its operations.
@@ -62,7 +62,7 @@ impl Nvfp4Device {
         ))
     }
 
-    /// The linear `output = input * weight^T` of `rows` rows, on the route Java takes for it. A lane's row-exact or
+    /// The linear `output = input * weight^T` of `rows` rows. A lane's row-exact or
     /// exact numerics are settled when the operation is queued ([`Op::queue`]), which skips the native route there.
     #[allow(
         clippy::too_many_arguments,

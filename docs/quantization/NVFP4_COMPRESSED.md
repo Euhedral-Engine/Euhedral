@@ -140,7 +140,7 @@ The plain stack was ahead in 3 of 3 forks at 4K (+1.7 / +1.4 / +0.4%) and at 16K
 
 ## Quality
 
-`TeacherForcedQualityCudaIntegrationTest` decodes the benchmark corpus document teacher-forced:
+`euhedral-bench dump` decodes the benchmark corpus document teacher-forced:
 2048 tokens after a 512-token prefix, recording every step's logits. `tools/compare_teacher_forced.py`
 compares the artifacts on the same tokens:
 

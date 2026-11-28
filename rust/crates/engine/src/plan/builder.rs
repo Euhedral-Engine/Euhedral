@@ -1,5 +1,4 @@
-//! The stage lists of the plan's views, in the order and with the dependencies of Java's views
-//! (`ExecutionPlan.fullModel` rewritten by `prefillView` for the base model's views, `mtpDraft` for the MTP layer's),
+//! The stage lists of the plan's views, in their order and with their dependencies,
 //! and the stages that run them.
 //!
 //! The base views are the fused form every executed view uses: the rounded residual add and the next RMSNorm in one
@@ -224,7 +223,7 @@ pub(crate) enum Make {
         output: BufferSlot,
         rows: LinearRows,
         /// The slot the SwiGLU of `output` goes to, when the linear is a gate/up projection that carries it: its
-        /// format may run both as one launch (`ExecutionPlan`'s fused gate/up node).
+        /// format may run both as one launch.
         swiglu: Option<BufferSlot>,
     },
     GdnConvolution {
@@ -684,7 +683,7 @@ impl<W: WeightLookup + ?Sized> Nodes<'_, W> {
     }
 
     /// The gate/up projection of `layer` with the SwiGLU after it: one node whose stage runs the pair as one launch
-    /// where the weight's format has one (`ExecutionPlan`'s fusion of a Q3 gate/up and its SwiGLU), and the two
+    /// where the weight's format has one, and the two
     /// launches where it has none. Any other weight keeps its linear and its SwiGLU as two nodes.
     fn gate_up_swiglu(&mut self, layer: LayerIndex, deps: &[usize]) -> Result<usize, PlanBuildError> {
         let weight = self.weight(layer, Role::GateUp)?;
@@ -753,7 +752,7 @@ fn head<W: WeightLookup + ?Sized>(
 /// The base model's views: embedding, every layer in the fused form, the final norm, the head and the selection.
 ///
 /// With `tapped`, the rows of the hidden state after each of the drafter's tapped layers are copied to the sequence's
-/// tap buffer (`ExecutionPlan`'s tap stage after the next layer's input norm).
+/// tap buffer (a tap stage after the next layer's input norm).
 pub(crate) fn base_nodes<W: WeightLookup + ?Sized>(
     config: &ModelConfig,
     weights: &W,

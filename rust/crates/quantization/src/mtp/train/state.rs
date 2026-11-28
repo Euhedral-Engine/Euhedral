@@ -1,8 +1,7 @@
 //! Where each part of the parameters lies in the state files. A file is a header, then sections in a fixed order, each
 //! cut into pieces of at most a chunk so that no piece is larger than the lane reads at once.
 //!
-//! The state file (`resume.bin`) holds, for every parameter in order, its values, its first and its second moment (the
-//! order Java's state has), then every parameter's gradient, which Java does not save: a state taken between two
+//! The state file (`resume.bin`) holds, for every parameter in order, its values, its first and its second moment, then every parameter's gradient: a state taken between two
 //! updates has gradients that the next update needs. The best file holds the values only.
 
 use crate::mtp::Parameter;
