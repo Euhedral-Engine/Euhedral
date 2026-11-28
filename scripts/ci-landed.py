@@ -5,9 +5,10 @@ A pull request is tested once, by the run its label `land` starts, on the head t
 it. The merge commit therefore has the head's tree, and this check proves it: the commit is a merge commit whose second parent
 had a successful pull request run of ci.yaml and has the same tree. A commit on main (the branch `rollover promote` starts at
 main) passes only when its tree is a tested one: the commit passes that rule, or it or a parent with its tree had a successful
-run of ci.yaml (a push run of the promoted integration head, or a pull request run). A merge commit that promotion made on main
-has a tree no run saw and fails; landing a pull request (an empty one will do) tests it. A skipped run, another label's run
-(its `land-guard` fails) and a run of another head do not count.
+push run of ci.yaml (the promoted integration head). A pull request run does not vouch for a commit on main: its diff against
+main may be empty, so it may have run no group. A merge commit that promotion made on main has a tree no run saw and fails;
+landing a pull request tests it, because its CI runs every group while main's head is untested. A skipped run, a dispatched
+run, another label's run (its `land-guard` fails) and a run of another head do not count.
 
 usage: ci-landed.py SHA   (environment: GITEA_TOKEN, API_URL such as http://host/api/v1, REPOSITORY owner/name)
        ci-landed.py --tested-tree SHA   the same rule for a commit of main (the head of main): is its tree a tested one?
@@ -67,9 +68,17 @@ def merge_verdict(sha, parents, trees, runs_of):
 PAGE = 50
 
 
+def unmade(error, level):
+    """The annotation for a check that could not be made: an error, or a warning for the head-of-main question."""
+    if level == "error":
+        return f"::error::the check could not be made: {error}"
+    return f"::warning::the check could not be made: {error}; every group runs"
+
+
 def check(sha, is_on_main, parents_of, tree_of, runs_page, level="error"):
     """Exit code for `sha`: 0 landed, 1 not landed, 2 the check could not be made (a ValueError from a collaborator, or an
-    Actions reply that has no `workflow_runs` or is a full page, which may hide the run)."""
+    Actions reply that has no `workflow_runs` or is a full page, which may hide the run). `level` is the annotation of a
+    refusal; any level but "error" is the head-of-main question, whose exit 2 is a `::warning::` that every group runs."""
     def runs_of(commit):
         reply = runs_page(commit, PAGE)
         if not isinstance(reply, dict) or not isinstance(reply.get("workflow_runs"), list):
@@ -81,7 +90,7 @@ def check(sha, is_on_main, parents_of, tree_of, runs_page, level="error"):
     try:
         reason = verdict(sha, is_on_main(sha), parents_of(sha), tree_of, runs_of)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
-        print(f"::error::the check could not be made: {error}", file=sys.stderr)
+        print(unmade(error, level), file=sys.stderr)
         return 2
     if reason:
         print(f"::{level}::{reason}", file=sys.stderr)
@@ -110,7 +119,7 @@ def main(argv):
     try:
         token, api, repository = (os.environ[name] for name in ("GITEA_TOKEN", "API_URL", "REPOSITORY"))
     except KeyError as error:
-        print(f"::error::the check could not be made: {error} is not set", file=sys.stderr)
+        print(unmade(f"{error} is not set", "notice" if argv[:1] == ["--tested-tree"] else "error"), file=sys.stderr)
         return 2
 
     def runs_page(commit, limit):

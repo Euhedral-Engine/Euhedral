@@ -125,6 +125,13 @@ class TestedTreeTest(unittest.TestCase):
         self.assertEqual(self.exit_code({}, reply={"message": "denied"}), 2)
 
 
+class UnmadeTest(unittest.TestCase):
+    def test_the_head_of_main_question_warns_and_the_landed_check_errors(self):
+        self.assertTrue(ci_landed.unmade("x", "notice").startswith("::warning::"))
+        self.assertIn("every group runs", ci_landed.unmade("x", "notice"))
+        self.assertTrue(ci_landed.unmade("x", "error").startswith("::error::"))
+
+
 class CheckTest(unittest.TestCase):
     def run_check(self, reply, on_main=lambda sha: False):
         trees = {MERGE: "t", HEAD: "t"}

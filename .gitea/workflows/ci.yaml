@@ -139,10 +139,11 @@ jobs:
           case "$EVENT" in
             pull_request)
               range="origin/main...HEAD"
-              # A main head no run tested (a merge made on main by a promotion) would hide behind an empty diff: run every
-              # group. An answer that cannot be had (exit 2) runs every group too.
+              # The commit the groups are diffed from (the merge base) is asked about. If no run tested it (a merge made on
+              # main by a promotion), an empty diff would hide it: run every group. An answer that cannot be had (exit 2)
+              # runs every group too.
               tested=0
-              python3 scripts/ci-landed.py --tested-tree "$(git rev-parse origin/main)" || tested=$?
+              python3 scripts/ci-landed.py --tested-tree "$(git merge-base origin/main HEAD)" || tested=$?
               if [ "$tested" -ne 0 ]; then all=true; fi
               ;;
             push)
