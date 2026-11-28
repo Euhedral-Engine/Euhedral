@@ -29,7 +29,7 @@ def check(source, catalog=None, **files):
         (pathlib.Path(directory) / "k.cuh").write_text(source, encoding="utf-8")
         for name, text in files.items():
             (pathlib.Path(directory) / name).write_text(text, encoding="utf-8")
-        return pdl_wait_check.violations(directory, catalog, c_only=())
+        return pdl_wait_check.violations(directory, catalog)
 
 def kernel(before, params="const float* input, const unsigned long long* position, float* out"):
     return f'extern "C" __global__ void k({params}) {{ {before} euhedral_pdl_begin(); out[0] = 1.0f; }}'
@@ -168,13 +168,6 @@ OUTER(5)
         with self.assertRaises(ValueError):
             check(source, catalog=odd)
 
-    def test_dflash_kernels_registered_by_the_host_file_must_wait(self):
-        directory = pathlib.Path(self.scratch) / "dflash"
-        (directory / "host").mkdir(parents=True, exist_ok=True)
-        (directory / "host" / "dflash.c").write_text('static const char* n = "euhedral_dflash_x_bf16";', encoding="utf-8")
-        (directory / "k.cu").write_text('extern "C" __global__ void euhedral_dflash_x_bf16(float* o) { o[0] = 1.0f; }', encoding="utf-8")
-        self.assertIn("euhedral_dflash_x_bf16: registered", "\n".join(pdl_wait_check.violations(directory, c_only=())))
-
     def test_non_ascii_sources_are_read_as_utf_8(self):
         self.assertEqual([], check("// caf\u00e9 \u2014 note\n" + ROW_KERNEL_FIXED))
 
@@ -217,14 +210,6 @@ OUTER(5)
             self.assertEqual([], pdl_wait_check.violations("src", pdl_wait_check.CATALOG))
         finally:
             os.chdir(previous)
-
-    def test_the_c_only_list_applies_only_with_the_qwen_layer_host_file(self):
-        self.assertEqual([], check(kernel("")))  # no host/qwen_layer_ops.c under the root: c_only is not applied
-        directory = pathlib.Path(self.scratch) / "qwen"
-        (directory / "host").mkdir(parents=True, exist_ok=True)
-        (directory / "host" / "qwen_layer_ops.c").write_text("", encoding="utf-8")
-        (directory / "k.cuh").write_text(kernel(""), encoding="utf-8")
-        self.assertIn("euhedral_gdn_control_fp32: registered", "\n".join(pdl_wait_check.violations(directory)))
 
 
 if __name__ == "__main__":

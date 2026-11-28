@@ -605,10 +605,10 @@ jobs:
         run: |
           mise exec -- cargo xtask native
           mise exec -- cargo xtask native-verify
-      # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources and the registry.
+      # Host-only native tests (no card): the programmatic-launch wait rule over the kernel sources.
       - name: Native host tests
         working-directory: native/tests
-        run: python3 -m unittest test_pdl_wait test_pdl_registry
+        run: python3 -m unittest test_pdl_wait
       # The Rust server bundle for linux-x64, from the native product just built.
       - name: Bundle the Rust server (linux-x64)
         working-directory: rust

@@ -169,7 +169,7 @@ python3 tools/compare_teacher_forced.py /tmp/nvfp4.bin /tmp/sd4.bin
 
 **Correctness: each twin computes, bit for bit, the plain kernel on the tensor expanded to plain
 NVFP4.** `native/tests/test_nvfp4.py` and `test_nvfp4_native.py` check this, with every table entry in
-use. Host dispatch (`nvfp4_linear.c`) tells the layouts apart by byte size: the two sizes never coincide.
+use. Host dispatch (the Rust launch planner) tells the layouts apart by byte size: the two sizes never coincide.
 
 **How each kernel family reads the table:**
 - **Decode kernels** decode the table into 16 shared floats once per CTA, beside the E2M1 table they
