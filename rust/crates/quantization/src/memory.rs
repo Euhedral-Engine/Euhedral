@@ -360,11 +360,11 @@ pub fn pinned_bytes(sizes: impl IntoIterator<Item = u64>) -> u64 {
         .fold(0, u64::saturating_add)
 }
 
-/// The pinned staging buffers a run's steps hold at once, by size class: what [`LaneMemory::prewarm`] puts in the pool
-/// before the first step, so that no step allocates page-locked memory.
+/// Pinned staging buffers held at once, by size class: what [`LaneMemory::prewarm`] puts in the pool before the first
+/// step, so that the pool holds enough buffers of every class for the holding it describes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StagingNeeds {
-    /// For each size class in bytes, the most buffers of it one step holds at once.
+    /// For each size class in bytes, the buffers of it held at once; no class has a count of 0.
     classes: BTreeMap<usize, usize>,
 }
 
@@ -392,15 +392,37 @@ impl StagingNeeds {
         Ok(())
     }
 
-    /// The staging of `lanes` lanes that run their steps at the same time: `lanes` times each class's count.
-    pub fn times(&self, lanes: usize) -> StagingNeeds {
-        StagingNeeds {
-            classes: self
-                .classes
-                .iter()
-                .map(|(class, count)| (*class, count.saturating_mul(lanes)))
-                .filter(|(_, count)| *count > 0)
-                .collect(),
+    /// The staging `lanes` lanes hold at most at once when each rounds a different one of `objects`, one at a time,
+    /// where each object's needs are the most its own steps hold at once ([`step`](Self::step)): for each class, the
+    /// sum of the `lanes` largest counts any object has of it. No lanes, or no objects, hold nothing.
+    pub fn together(objects: &[StagingNeeds], lanes: usize) -> StagingNeeds {
+        let mut counts = BTreeMap::<usize, Vec<usize>>::new();
+        for object in objects {
+            for (class, count) in &object.classes {
+                counts.entry(*class).or_default().push(*count);
+            }
+        }
+        let classes = counts
+            .into_iter()
+            .map(|(class, mut held)| {
+                held.sort_unstable_by(|a, b| b.cmp(a));
+                (
+                    class,
+                    held.iter()
+                        .take(lanes)
+                        .fold(0, |sum: usize, count| sum.saturating_add(*count)),
+                )
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        StagingNeeds { classes }
+    }
+
+    /// Adds `other`, a holding at another time than the ones already added: each class keeps the larger count.
+    pub fn cover(&mut self, other: &StagingNeeds) {
+        for (class, count) in &other.classes {
+            let most = self.classes.entry(*class).or_default();
+            *most = (*most).max(*count);
         }
     }
 
@@ -437,9 +459,9 @@ pub(crate) fn warm<T>(
 }
 
 impl LaneMemory {
-    /// Puts the buffers of `needs` in the pinned pool: it holds at least that many of each class, taken from `claim`
-    /// while they are acquired. Allocates (waits on the driver for each new buffer): call it outside a frame, before
-    /// the first step. Fails with the pool's error, or when `claim` is missing or holds fewer bytes than
+    /// Puts the buffers of `needs` in the pinned pool: afterwards it holds at least that many of each class, taken
+    /// from `claim` while they are acquired. Allocates (waits on the driver for each new buffer): call it outside a
+    /// frame, before the first step. Fails with the pool's error, or when `claim` is missing or holds fewer bytes than
     /// [`StagingNeeds::bytes`]; buffers acquired by then stay in the pool.
     pub fn prewarm(&self, needs: &StagingNeeds, claim: &mut Option<Claim>) -> Result<(), MemoryError> {
         warm(needs, claim, |class| Ok(self.pinned.acquire(class)?))
@@ -562,7 +584,7 @@ pub(crate) mod fake {
 
     use euhedral_memory::{Claim, LocationKind, LocationSpec, OwnerSpec, Planner, Priority, Scope};
 
-    use super::MemoryError;
+    use super::{MemoryError, StagingNeeds};
 
     /// A pool of staging buffers that allocates only when it holds none of the class.
     #[derive(Default)]
@@ -609,6 +631,18 @@ pub(crate) mod fake {
             .unwrap();
         (planner, Some(claim))
     }
+
+    /// The class counts of `needs`, smallest class first.
+    pub(crate) fn counts(needs: &StagingNeeds) -> Vec<(usize, usize)> {
+        let mut counts: Vec<(usize, usize)> = Vec::new();
+        for class in needs.buffers() {
+            match counts.last_mut() {
+                Some((last, count)) if *last == class => *count += 1,
+                _ => counts.push((class, 1)),
+            }
+        }
+        counts
+    }
 }
 
 #[cfg(test)]
@@ -620,7 +654,7 @@ pub(crate) mod fake {
 mod tests {
     use std::rc::Rc;
 
-    use super::fake::{FakePool, Loan, acquire, claim_of};
+    use super::fake::{FakePool, Loan, acquire, claim_of, counts};
     use super::*;
 
     fn needs_of(steps: &[&[u64]]) -> StagingNeeds {
@@ -645,12 +679,34 @@ mod tests {
     }
 
     #[test]
-    fn lanes_that_run_together_need_each_class_once_per_lane() {
-        let needs = needs_of(&[&[4096, 4096, 20_000]]);
-        let three = needs.times(3);
-        assert_eq!(three.buffers().count(), 9);
-        assert_eq!(three.bytes(), 3 * needs.bytes());
-        assert_eq!(needs.times(0), StagingNeeds::new());
+    fn lanes_together_hold_each_class_of_their_largest_objects_summed() {
+        let objects = [
+            needs_of(&[&[4096, 4096, 20_000]]),
+            needs_of(&[&[4096], &[100_000]]),
+            needs_of(&[&[1, 2, 3]]),
+        ];
+        // Two lanes: the two largest counts of each class, whichever objects they come from.
+        assert_eq!(
+            counts(&StagingNeeds::together(&objects, 2)),
+            vec![(4096, 5), (32_768, 1), (131_072, 1)]
+        );
+        // More lanes than objects: every object at once.
+        assert_eq!(
+            counts(&StagingNeeds::together(&objects, 5)),
+            vec![(4096, 6), (32_768, 1), (131_072, 1)]
+        );
+        assert_eq!(StagingNeeds::together(&objects, 0), StagingNeeds::new());
+        assert_eq!(StagingNeeds::together(&[], 3), StagingNeeds::new());
+    }
+
+    #[test]
+    fn a_holding_at_another_time_raises_a_class_only_to_its_own_count() {
+        let mut needs = needs_of(&[&[4096, 4096, 20_000]]);
+        needs.cover(&needs_of(&[&[4096, 100_000, 100_000]]));
+        assert_eq!(counts(&needs), vec![(4096, 2), (32_768, 1), (131_072, 2)]);
+        let before = needs.clone();
+        needs.cover(&StagingNeeds::new());
+        assert_eq!(needs, before);
     }
 
     #[test]

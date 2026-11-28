@@ -21,7 +21,7 @@ use super::files::save;
 use super::schedule::{Schedule, Settled};
 use crate::gptq::format::Format;
 use crate::gptq::state::QuantState;
-use crate::gptq::{DeviceRange, Factor, Finished, GptqLane, Refused, RoundRequest, TensorScales, object_staging};
+use crate::gptq::{DeviceRange, Factor, Finished, GptqLane, Refused, RoundRequest, TensorScales};
 use crate::memory::{Claims, StagingNeeds, StepBytes};
 use crate::recipe::{Format as StoredFormat, Recipe};
 use crate::step::idle;
@@ -164,42 +164,14 @@ pub unsafe fn round_all(
     }
 }
 
-/// Puts the pinned staging that `lanes` take rounding `objects` (name, rows, columns; the objects of every layer) in
-/// their shared pool, charging the pool's claim: one set of buffers for each of `width` lanes that run together, where
-/// `width` is the fewer of the lanes and `per_layer`, the objects of one layer. Afterwards no step allocates
-/// page-locked memory. Allocates (waits on the driver): call it before any frame runs. Fails when the staging is more
-/// than `capacity` pool bytes, when the recipe or the planner refuses, or when the pool does.
-pub fn prewarm(
-    services: &Services,
-    lanes: &[GptqLane],
-    objects: &[(String, u64, u64)],
-    per_layer: usize,
-    capacity: u64,
-) -> Result<(), CalibrateError> {
+/// Puts `needs` ([`lane_staging`](crate::gptq::lane_staging)) in the pinned pool `lanes` share, charging the planner's
+/// pinned location while the buffers are acquired: afterwards every class holds at least the buffers `needs` counts.
+/// A step's take of a class can still come back empty while another lane takes or gives back a buffer of the same
+/// class at that moment ([`PinnedPool`](euhedral_inference_cuda::PinnedPool)); that step then allocates one buffer,
+/// which the pool keeps. Allocates (waits on the driver): call it before any frame runs. No lanes warm nothing. Fails
+/// when the planner or the pool refuses.
+pub fn prewarm(services: &Services, lanes: &[GptqLane], needs: &StagingNeeds) -> Result<(), CalibrateError> {
     let Some(lane) = lanes.first() else { return Ok(()) };
-    let mut one = StagingNeeds::new();
-    for (name, rows, columns) in objects {
-        let format = services
-            .settings
-            .recipe
-            .format(name)
-            .map_err(|error| CalibrateError::failed(name, error))?;
-        object_staging(
-            &mut one,
-            *rows,
-            *columns,
-            &rounded(format),
-            services.settings.slice_rows as u64,
-        )
-        .map_err(|error| CalibrateError::failed("the staging the layer needs", error))?;
-    }
-    let needs = one.times(lanes.len().min(per_layer));
-    if needs.bytes() > capacity {
-        return Err(CalibrateError::Failed(format!(
-            "the lanes' pinned staging takes {} bytes, more than the {capacity} the pool holds",
-            needs.bytes()
-        )));
-    }
     let mut claims = claims_for(
         services,
         StepBytes {
@@ -208,7 +180,7 @@ pub fn prewarm(
         },
         "gptq prewarm",
     )?;
-    lane.prewarm_staging(&needs, &mut claims)
+    lane.prewarm_staging(needs, &mut claims)
         .map_err(|error| CalibrateError::failed("the pinned staging prewarm", error))
 }
 
@@ -303,7 +275,7 @@ impl Object {
 }
 
 /// The format the rounding works in, from the one the recipe stores the object in.
-fn rounded(stored: StoredFormat) -> Format {
+pub(crate) fn rounded(stored: StoredFormat) -> Format {
     Format {
         name: stored.name,
         layout: stored.layout,

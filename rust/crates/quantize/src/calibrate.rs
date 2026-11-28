@@ -691,7 +691,7 @@ fn calibrated(
         run.staging_bytes = mib_bytes("--staging-mib", mib)?;
     }
     if let Some(mib) = flags.lane_pinned_mib {
-        run.lane_pinned_bytes = mib_bytes("--lane-pinned-mib", mib)?;
+        run.lane_pinned_bytes = Some(mib_bytes("--lane-pinned-mib", mib)?);
     }
     if let Some(mib) = flags.upload_chunk_mib {
         run.chunk_bytes = usize::try_from(mib_bytes("--upload-chunk-mib", mib)?)
